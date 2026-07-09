@@ -27,6 +27,12 @@ permissions:
   issues: write
   contents: read
 
+# Serialize runs so overlapping triggers (push + schedule + manual) can't race on the
+# check-then-create idempotency and make duplicate issues.
+concurrency:
+  group: make-issues
+  cancel-in-progress: false
+
 jobs:
   make-issues:
     runs-on: ubuntu-latest
