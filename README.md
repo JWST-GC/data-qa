@@ -17,9 +17,11 @@ their own repos; use this one to:
 - Each JWST observation (e.g. `jw02221-o001`, `jw01182-o004`) gets **one tracking
   issue**, auto-created from a template and pre-filled with the observation's
   metadata and links to its data products.
-- Issues are created by `data_qa/make_issues.py`, driven by the observation
-  registry in `data_qa/observations.py`. Creation is **idempotent** (keyed on the
-  issue title) so re-running never duplicates; new metadata is synced into the
+- Issues are created by `data_qa/make_issues.py`. The observation list is
+  **discovered from the public release itself** (`data_qa/observations.py` parses
+  each field's `{field}_images.txt` manifest), so an observation gets a tracking
+  issue as soon as its mosaics are published. Creation is **idempotent** (keyed on
+  the issue title) so re-running never duplicates; metadata is synced into the
   existing issue body.
 - A GitHub Action (`.github/workflows/make-issues.yml`) runs the same script on
   demand / on a schedule, so when new products are produced and registered, their
@@ -52,7 +54,10 @@ python -m data_qa.make_issues --program 2221 1182 --target Brick        # create
 python -m data_qa.make_issues --program 2221 1182 --target Brick --dry-run   # preview
 ```
 
-## Adding an observation
+## Adding a field / observation
 
-Add an entry to `OBSERVATIONS` in `data_qa/observations.py` (or extend the registry
-loader). The next `make_issues` run creates its tracking issue.
+Observations are discovered automatically from the release manifests. To bring a
+newly released **field** in, add it to `FIELDS` in `data_qa/observations.py`; its
+observations are parsed from `{field}_images.txt` on the next run. To attach hand
+notes / epoch / visits to a specific observation, add an entry to `CURATED`
+(keyed by obsid, e.g. `jw02221-o001`).

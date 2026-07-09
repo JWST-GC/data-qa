@@ -1,151 +1,175 @@
 """Registry of JWST Galactic Center observations.
 
-This is the single source of truth that drives the QA tracking issues
-(``make_issues.py``) and the data retrieval (``retrieve_data.py``).  One
-:class:`Observation` == one JWST observation (a program's obs-number) == one
-tracking issue.  Executions (visits) are listed inside the observation.
+Single source of truth that drives the QA tracking issues (``make_issues.py``) and the
+data retrieval (``retrieve_data.py``).  One :class:`Observation` == one JWST observation
+(a program's obs-number, per instrument) == one tracking issue; executions (visits) are
+listed inside.
 
-Add a new observation by appending to :data:`OBSERVATIONS` (or, for bulk
-discovery, use :func:`discover_from_mast`).
+The registry is **discovered from the public release itself**: each field's
+``{field}_images.txt`` on the JWST-GC portal lists the released mosaics, from which the
+(program, obs, instrument, filters) of every observation are parsed.  Curated metadata
+(known issues, epoch, visits) is overlaid per obsid via :data:`CURATED`.  Add a newly
+released field to :data:`FIELDS`; add hand notes to :data:`CURATED`.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List
+import os
+import re
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field as _dc_field
+from typing import Dict, List
 
-# JWST-GC public data-release portal. Per-field pages live at <base>/<field>.html and
-# the authoritative direct-download URL lists at <base>/<field>_{images,catalogs}.txt
-# (those point at the Globus-hosted FITS). make_issues fetches + filters them per obs.
+# JWST-GC public data-release portal. Per-field overview pages live at
+# <base>/<field>.html; the authoritative direct-download URL lists (pointing at the
+# Globus-hosted FITS) at <base>/<field>_{images,catalogs}.txt.
 RELEASE_BASE = "https://starformation.astro.ufl.edu/jwst-gc"
+
+# Released fields -> display name.  Add a field here when its products go public.
+FIELDS: Dict[str, str] = {
+    "brick": "Brick",
+    "cloudc": "Cloud C",
+    "gc2211": "GC 2211",
+    "sgrb2": "Sgr B2",
+    "sgrc": "Sgr C",
+    "sickle": "Sickle",
+    "w51": "W51",
+    "wd1": "Westerlund 1",
+    "wd2": "Westerlund 2",
+}
+
+# Per-obsid curated overlay (optional): known issues, epoch (DATE-OBS), visits.
+CURATED: Dict[str, dict] = {
+    "jw02221-o001": dict(
+        epoch="2022-08-28", visits=["001"],
+        notes="Narrow/medium-band NIRCam. F410M/NRCA5 carries a known per-module "
+              "distortion+filteroffset offset corrected via a per-module split in the "
+              "locked offsets table.",
+    ),
+    "jw01182-o004": dict(
+        epoch="2022-09-14", visits=["001", "002"],
+        notes="Wide-band NIRCam. LW filteroffset module-swap in the 2024 cal was fixed "
+              "2026-07; a residual ~20 mas inter-module offset is addressed by a "
+              "per-module 2-shift tie.",
+    ),
+}
+
+# Parse a mosaic filename: program, obs (tile suffix stripped), instrument, filter.
+#   jw02221-o001_t001_nircam_clear-f182m-merged_i2d.fits
+#   jw05365-o002-998_t001_miri_clear-f770w-mirimage_data_i2d.fits
+#   jw02221-o002_t001_miri_f2550w_i2d.fits
+_MOSAIC_RE = re.compile(
+    r"jw(\d{5})-o(\d{3})(?:-\d+)?_t\d+_(nircam|miri)_(?:clear-)?(f\d{3,4}[wnm])", re.I)
 
 
 @dataclass(frozen=True)
 class Observation:
-    program: str                 # JWST program id, e.g. "2221" (no leading jw/zeros)
-    obs: str                     # observation number, zero-padded 3 char, e.g. "001"
-    target: str                  # human name, e.g. "Brick"
-    instrument: str = "NIRCam"   # JWST instrument
-    filters: List[str] = field(default_factory=list)   # e.g. ["F182M", "F187N", ...]
-    visits: List[str] = field(default_factory=list)    # executions, e.g. ["001", "002"]
-    epoch: str = ""              # observation date (DATE-OBS), e.g. "2022-08-28"
-    notes: str = ""              # free-text (known issues, links to related datasets)
+    program: str                 # e.g. "2221"
+    obs: str                     # zero-padded 3 char, e.g. "001"
+    target: str = ""             # display name, e.g. "Brick"
+    release_field: str = ""      # release-page basename, e.g. "brick" (defaults to target.lower())
+    instrument: str = "NIRCam"   # "NIRCam" | "MIRI"
+    filters: List[str] = _dc_field(default_factory=list)
+    visits: List[str] = _dc_field(default_factory=list)
+    epoch: str = ""
+    notes: str = ""
 
     @property
     def obsid(self) -> str:
-        """Canonical JWST observation id, e.g. 'jw02221-o001'."""
         return f"jw{int(self.program):05d}-o{self.obs}"
 
     @property
+    def field(self) -> str:
+        return self.release_field or self.target.lower()
+
+    @property
     def issue_title(self) -> str:
-        """Stable title used as the idempotency key for the tracking issue."""
+        """Stable idempotency key for the tracking issue."""
         return f"{self.target} — {self.obsid} ({self.instrument})"
 
-    # ---- links to the underlying data products ----
+    # ---- links ----
     @property
     def mast_program_url(self) -> str:
         return (f"https://www.stsci.edu/cgi-bin/get-proposal-info?"
                 f"id={int(self.program)}&observatory=JWST")
 
     @property
-    def mast_search_url(self) -> str:
-        # deep link into the MAST portal filtered to this program
-        return f"https://mast.stsci.edu/search/ui/#/jwst?proposal_id={int(self.program)}"
-
-    @property
-    def field(self) -> str:
-        """Release-page basename for this dataset (target name, lowercased)."""
-        return self.target.lower()
-
-    @property
     def release_url(self) -> str:
-        """The public release page for this field on the JWST-GC portal."""
+        """Field overview page on the JWST-GC portal."""
         return f"{RELEASE_BASE}/{self.field}.html"
 
     @property
     def images_list_url(self) -> str:
-        """Authoritative list of this field's mosaic-image direct-download URLs."""
         return f"{RELEASE_BASE}/{self.field}_images.txt"
 
     @property
     def catalogs_list_url(self) -> str:
-        """Authoritative list of this field's catalog direct-download URLs."""
         return f"{RELEASE_BASE}/{self.field}_catalogs.txt"
 
     def product_glob(self, basepath: str = "/orange/adamginsburg/jwst") -> str:
-        """glob for the combined per-filter i2d mosaics of this observation on disk."""
-        field_dir = self.target.lower()
-        return (f"{basepath}/{field_dir}/*/pipeline/"
-                f"{self.obsid}_t001_nircam_clear-*-merged_i2d.fits")
+        inst = self.instrument.lower()
+        return (f"{basepath}/{self.field}/*/pipeline/"
+                f"{self.obsid}_t001_{inst}_*i2d.fits")
 
 
-# ---------------------------------------------------------------------------
-# Registry.  Seeded with the two Brick datasets; extend as products are made.
-# (jw02221-o002 is Cloud C, jw01182 has many non-Brick observations across the
-# Galactic plane -- add those as their products are produced/registered.)
-# ---------------------------------------------------------------------------
-OBSERVATIONS: List[Observation] = [
-    Observation(
-        program="2221", obs="001", target="Brick", instrument="NIRCam",
-        filters=["F182M", "F187N", "F212N", "F405N", "F410M", "F466N"],
-        visits=["001"], epoch="2022-08-28",
-        notes="Narrow/medium-band NIRCam. F410M/NRCA5 carries a known per-module "
-              "distortion+filteroffset offset corrected via a per-module split in the "
-              "locked offsets table.",
-    ),
-    Observation(
-        program="1182", obs="004", target="Brick", instrument="NIRCam",
-        filters=["F115W", "F200W", "F356W", "F444W"],
-        visits=["001", "002"], epoch="2022-09-14",
-        notes="Wide-band NIRCam. LW filteroffset module-swap in the 2024 cal was fixed "
-              "2026-07; a residual ~20 mas inter-module offset is addressed by a "
-              "per-module 2-shift tie.",
-    ),
-]
+# --------------------------------------------------------------------------- discovery
+def _read_lines(url_or_path):
+    """Read a newline-delimited list from a local path or URL. Empty on failure."""
+    if os.path.exists(url_or_path):
+        with open(url_or_path) as fh:
+            return [ln.strip() for ln in fh if ln.strip()]
+    req = urllib.request.Request(url_or_path, headers={"User-Agent": "jwst-gc-data-qa"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return [ln.strip() for ln in r.read().decode().splitlines() if ln.strip()]
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
+        return []
 
 
-def registry(programs=None, target=None) -> List[Observation]:
-    """Return registered observations, optionally filtered by program id(s)/target."""
-    obs = OBSERVATIONS
+def discover_from_release(base: str = RELEASE_BASE, fields: Dict[str, str] = None,
+                          local_dir: str = None) -> List["Observation"]:
+    """Build the observation list from each field's released image manifest.
+
+    One :class:`Observation` per (field, program, obs, instrument); its filters are every
+    filter with a released science mosaic.  Curated metadata is overlaid by obsid.
+    ``local_dir`` reads ``{local_dir}/{field}_images.txt`` instead of fetching (offline).
+    """
+    fields = fields or FIELDS
+    grouped: Dict[tuple, set] = {}
+    for fld, disp in fields.items():
+        src = (os.path.join(local_dir, f"{fld}_images.txt") if local_dir
+               else f"{base}/{fld}_images.txt")
+        for ln in _read_lines(src):
+            low = ln.lower()
+            if "_i2d.fits" not in low or "resbgsub" in low:
+                continue                       # science mosaics only (skip residual/model)
+            m = _MOSAIC_RE.search(low)
+            if not m:
+                continue
+            prog, ob, inst, filt = m.groups()
+            key = (fld, disp, str(int(prog)), ob, inst.lower())
+            grouped.setdefault(key, set()).add(filt.upper())
+
+    out = []
+    for (fld, disp, prog, ob, inst), filts in sorted(grouped.items()):
+        oid = f"jw{int(prog):05d}-o{ob}"
+        cur = CURATED.get(oid, {})
+        out.append(Observation(
+            program=prog, obs=ob, target=disp, release_field=fld,
+            instrument="NIRCam" if inst == "nircam" else "MIRI",
+            filters=sorted(filts), visits=cur.get("visits", []),
+            epoch=cur.get("epoch", ""), notes=cur.get("notes", ""),
+        ))
+    return out
+
+
+def registry(programs=None, target=None, local_dir=None) -> List["Observation"]:
+    """Discovered observations, optionally filtered by program id(s) / target name."""
+    obs = discover_from_release(local_dir=local_dir)
     if programs:
         progs = {str(int(p)) for p in programs}
         obs = [o for o in obs if o.program in progs]
     if target:
-        obs = [o for o in obs if o.target.lower() == target.lower()]
+        t = target.lower()
+        obs = [o for o in obs if o.target.lower() == t or o.field == t]
     return obs
-
-
-def discover_from_mast(program, instrument="NIRCam"):
-    """Discover observations for a program from MAST (astroquery).  Returns a list of
-    :class:`Observation` with filters/visits/epoch populated from the product table.
-
-    This is the hook for auto-registering NEW observations: run it, diff against the
-    static registry, and append what is missing.  Kept import-light so the module loads
-    without astroquery installed.
-    """
-    from collections import defaultdict
-    from astroquery.mast import Observations as MastObs
-
-    tbl = MastObs.query_criteria(obs_collection="JWST", proposal_id=str(int(program)),
-                                 instrument_name=f"{instrument}*")
-    by_obs = defaultdict(lambda: {"filters": set(), "visits": set(), "epoch": ""})
-    for row in tbl:
-        oid = str(row["obs_id"])            # e.g. jw02221-o001_t001_nircam_...
-        if "-o" not in oid:
-            continue
-        obsnum = oid.split("-o")[1][:3]
-        rec = by_obs[obsnum]
-        filt = str(row["filters"]).upper()
-        for f in filt.replace(";", ",").split(","):
-            f = f.strip()
-            if f.startswith("F") and f not in ("CLEAR", "F"):
-                rec["filters"].add(f)
-        try:
-            rec["epoch"] = str(row["t_min"])   # MJD; caller may convert
-        except (KeyError, TypeError):
-            pass
-    out = []
-    for obsnum, rec in sorted(by_obs.items()):
-        out.append(Observation(program=str(int(program)), obs=obsnum, target="",
-                               filters=sorted(rec["filters"]), visits=sorted(rec["visits"]),
-                               epoch=rec["epoch"]))
-    return out
