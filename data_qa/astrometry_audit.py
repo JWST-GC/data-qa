@@ -203,20 +203,35 @@ def audit_field(field, refcat=None, thr=50.0):
                 res["flags"].append(f"intermodule {filt}: {r['off']:.0f} mas "
                                     f"(>{THRESH['intermodule']:.0f})")
 
-    # anchor = filter with the most merged detections
+    # 2) per-filter internal consistency -- WITHIN channel only.  SW and LW have
+    # independent distortion solutions and detect different stellar populations, so a
+    # SW-vs-LW catalog cross-match is unreliable (few true pairs -> a chance histogram
+    # peak can dominate: this produced spurious ~420 mas "offsets" that the absolute tie
+    # -- uniform ~18 mas across all filters -- disproves).  Compare each filter to the
+    # densest filter of its OWN channel; require many pairs before flagging.  Cross-
+    # channel agreement is assessed by the absolute check instead.
+    def channel(f):
+        return "SW" if int(f[1:4]) <= 212 else "LW"
+
     merged = {f: det.get((f, "merged")) for f in mosaics if det.get((f, "merged")) is not None}
+    res["anchor"] = {}
     if merged:
-        anchor = max(merged, key=lambda f: len(merged[f]))
-        # 2) per-filter internal consistency vs anchor
-        for filt, sc in sorted(merged.items()):
-            if filt == anchor:
+        for chan in ("SW", "LW"):
+            cf = {f: sc for f, sc in merged.items() if channel(f) == chan}
+            if len(cf) < 2:
                 continue
-            r = xcorr(sc, merged[anchor])
-            if r:
-                res["perfilter"][filt] = r
-                if r["off"] > THRESH["perfilter"] and r["peak_ratio"] >= MIN_PEAK_RATIO:
-                    res["flags"].append(f"perfilter {filt} vs {anchor}: {r['off']:.0f} mas")
-        res["anchor"] = anchor
+            anchor = max(cf, key=lambda f: len(cf[f]))
+            res["anchor"][chan] = anchor
+            for filt, sc in sorted(cf.items()):
+                if filt == anchor:
+                    continue
+                r = xcorr(sc, cf[anchor])
+                if r:
+                    r["anchor"] = anchor
+                    res["perfilter"][filt] = r
+                    if (r["off"] > THRESH["perfilter"] and r["peak_ratio"] >= MIN_PEAK_RATIO
+                            and r["npairs"] >= 5000):
+                        res["flags"].append(f"perfilter {filt} vs {anchor}: {r['off']:.0f} mas")
         # 3) absolute vs reference
         if ref_sc is not None:
             for filt, sc in sorted(merged.items()):
@@ -232,7 +247,7 @@ def print_report(r):
     print(f"\n===== {r['field']}  (epoch {r.get('epoch')}) =====")
     if r.get("error"):
         print("  ERROR:", r["error"]); return
-    print(f"  filters: {', '.join(r['filters'])}   anchor={r.get('anchor','—')}")
+    print(f"  filters: {', '.join(r['filters'])}   anchors={r.get('anchor', {})}")
     if r["intermodule"]:
         print("  INTER-MODULE (nrca-nrcb, reference-free):")
         for f, d in r["intermodule"].items():
@@ -240,9 +255,10 @@ def print_report(r):
             print(f"    {f:6s} ({d['dra']:+.1f},{d['ddec']:+.1f}) |{d['off']:.1f} mas| "
                   f"n={d['nshared']}{flag}")
     if r["perfilter"]:
-        print(f"  PER-FILTER vs {r.get('anchor')} (internal):")
+        print("  PER-FILTER (within-channel, internal):")
         for f, d in r["perfilter"].items():
-            print(f"    {f:6s} |{d['off']:.1f} mas| peak/bg={d['peak_ratio']:.0f}")
+            print(f"    {f:6s} vs {d.get('anchor','?')} |{d['off']:.1f} mas| "
+                  f"peak/bg={d['peak_ratio']:.0f} n={d['npairs']}")
     if r["absolute"]:
         print("  ABSOLUTE vs reference:")
         for f, d in r["absolute"].items():
