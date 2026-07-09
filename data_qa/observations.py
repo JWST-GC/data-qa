@@ -13,6 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List
 
+# JWST-GC public data-release portal. Per-field pages live at <base>/<field>.html and
+# the authoritative direct-download URL lists at <base>/<field>_{images,catalogs}.txt
+# (those point at the Globus-hosted FITS). make_issues fetches + filters them per obs.
+RELEASE_BASE = "https://starformation.astro.ufl.edu/jwst-gc"
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -47,9 +52,24 @@ class Observation:
         return f"https://mast.stsci.edu/search/ui/#/jwst?proposal_id={int(self.program)}"
 
     @property
+    def field(self) -> str:
+        """Release-page basename for this dataset (target name, lowercased)."""
+        return self.target.lower()
+
+    @property
     def release_url(self) -> str:
-        # JWST-GC public data release (per-field pages)
-        return "https://data.rc.ufl.edu/pub/adamginsburg/jwst/"
+        """The public release page for this field on the JWST-GC portal."""
+        return f"{RELEASE_BASE}/{self.field}.html"
+
+    @property
+    def images_list_url(self) -> str:
+        """Authoritative list of this field's mosaic-image direct-download URLs."""
+        return f"{RELEASE_BASE}/{self.field}_images.txt"
+
+    @property
+    def catalogs_list_url(self) -> str:
+        """Authoritative list of this field's catalog direct-download URLs."""
+        return f"{RELEASE_BASE}/{self.field}_catalogs.txt"
 
     def product_glob(self, basepath: str = "/orange/adamginsburg/jwst") -> str:
         """glob for the combined per-filter i2d mosaics of this observation on disk."""
