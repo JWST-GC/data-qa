@@ -1,0 +1,49 @@
+name: make-issues
+
+# Auto-create/refresh the per-observation QA tracking issues from the registry.
+# Runs on demand, when the registry changes, and weekly (to pick up newly registered
+# observations).  Idempotent: existing issues are updated, not duplicated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      programs:
+        description: "Space-separated program ids (blank = all registered)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Preview only (do not create/update issues)"
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "data_qa/observations.py"
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  make-issues:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create / refresh QA issues
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.programs }}" ]; then
+            ARGS="--program ${{ github.event.inputs.programs }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python -m data_qa.make_issues $ARGS
