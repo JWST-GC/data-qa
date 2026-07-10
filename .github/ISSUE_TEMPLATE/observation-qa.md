@@ -31,6 +31,9 @@ assignees: ''
 - [ ] **Photometry**: zeropoints consistent across filters/modules
 - [ ] Background / stripes / artifacts acceptable
 - [ ] Catalog produced and vetted
+- [ ] **Depth**: detection luminosity functions reach the expected depth (not missing stars we should be detecting)
+- [ ] **Purity**: minimal junk detections in PSF wings and in extended-emission regions
+- [ ] **Residuals**: PSF-subtracted residual histogram is narrow and centered on zero (no systematic over/under-subtraction)
 - [ ] Known issues triaged (comment below)
 
 > Most observations get this issue auto-created (pre-filled) by

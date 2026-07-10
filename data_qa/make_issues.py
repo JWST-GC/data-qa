@@ -129,6 +129,9 @@ def render_body(o: Observation) -> str:
 - [ ] **Photometry**: zeropoints consistent across filters/modules
 - [ ] Background / stripes / artifacts acceptable
 - [ ] Catalog produced and vetted
+- [ ] **Depth**: detection luminosity functions reach the expected depth (not missing stars we should be detecting)
+- [ ] **Purity**: minimal junk detections in PSF wings and in extended-emission regions
+- [ ] **Residuals**: PSF-subtracted residual histogram is narrow and centered on zero (no systematic over/under-subtraction)
 - [ ] Known issues triaged (comment below)
 
 ---
