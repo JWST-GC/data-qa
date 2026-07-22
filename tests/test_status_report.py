@@ -36,7 +36,8 @@ def test_render_events_comment_marker():
     events = [dict(event="NEW_OBSERVATION", obs_id="jw02221-o001_x",
                    calib_level=3, t_obs_release=59900.0, filters="F405N")]
     body = sr.render_events_comment(events, now="2026-07-21 12:00 UTC")
-    assert body.startswith(sr.STATUS_MARKER)
+    assert body.startswith(sr.MONITOR_MARKER)      # monitor comments self-mark...
+    assert sr.STATUS_MARKER not in body            # ...and never collide w/ status
     assert "NEW_OBSERVATION" in body and "jw02221-o001_x" in body
     assert "WARNING" not in body
 
@@ -100,6 +101,31 @@ def test_post_status_update_last_falls_back_to_post(monkeypatch):
     rc = sr.post_status("T", "NEW", dry_run=False, update_last=True)
     assert rc == 0
     assert calls["posted"] == [(5, "NEW")]
+
+
+def test_post_status_update_last_marker_selects_monitor_comment(monkeypatch):
+    """The monitor's update-in-place path edits ITS comment, not the status one."""
+    comments = [
+        {"id": 10, "body": f"{sr.STATUS_MARKER}\npipeline status"},
+        {"id": 11, "body": f"{sr.MONITOR_MARKER}\nold monitor events"},
+        {"id": 12, "body": "a human comment"},
+    ]
+    calls = _patch_github(monkeypatch, comments)
+    rc = sr.post_status("T", "NEW EVENTS", dry_run=False, update_last=True,
+                        marker=sr.MONITOR_MARKER)
+    assert rc == 0
+    assert calls["updated"] == [(11, "NEW EVENTS")]   # the monitor comment
+    assert calls["posted"] == []
+
+
+def test_post_status_update_last_monitor_marker_absent_posts_new(monkeypatch):
+    comments = [{"id": 10, "body": f"{sr.STATUS_MARKER}\npipeline status"}]
+    calls = _patch_github(monkeypatch, comments)
+    rc = sr.post_status("T", "NEW EVENTS", dry_run=False, update_last=True,
+                        marker=sr.MONITOR_MARKER)
+    assert rc == 0
+    assert calls["updated"] == []                     # status comment untouched
+    assert calls["posted"] == [(5, "NEW EVENTS")]
 
 
 def test_post_status_missing_issue(monkeypatch):

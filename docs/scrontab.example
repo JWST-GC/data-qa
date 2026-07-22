@@ -11,21 +11,32 @@
 #   mkdir -p /blue/adamginsburg/adamginsburg/logs/jwst
 
 # ---- daily: AUTO mode (decision 2026-07-22: download + trigger + report +
-#      commit-state, all --execute).  The ONLY gate is free disk space
-#      (--min-free-tb, checked against the --download-dir filesystem): below the
-#      threshold the run downgrades itself to report-only and posts a loud
-#      LOW DISK warning on the QA issue instead of downloading/submitting.
+#      commit-state, all --execute).  Gates: free disk space (--min-free-tb,
+#      checked against the --download-dir filesystem), the first-run SEED guard
+#      (a missing/empty state file commits a baseline instead of submitting the
+#      whole backlog -- or run `... mast_monitor --seed` once at deployment),
+#      and the --max-submit cap (default 4 (program,obs) groups per run; more
+#      downgrades the run to report-only).  Any failed gate posts a loud
+#      warning on the QA issue instead of downloading/submitting.
+#
+#      --time=00:30:00: every MAST request is now individually time-bounded
+#      (astroquery.mast.conf.timeout = 120 s, set by the code), so a hung
+#      request can no longer eat the whole allocation -- 30 min is ample for
+#      the metadata poll + a handful of submissions.  If you EXPECT --auto to
+#      be actively downloading new releases (large uncal/i2d batches), raise
+#      to --time=04:00:00 so the transfer itself has room.
 #SCRON --account=astronomy-dept
 #SCRON --qos=astronomy-dept-b
 #SCRON --job-name=jwstgc-mastmon-daily
 #SCRON --cpus-per-task=1
 #SCRON --mem=4gb
-#SCRON --time=04:00:00
+#SCRON --time=00:30:00
 #SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_%j.log
 17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --auto --min-free-tb 5 --download-dir /orange/adamginsburg/jwst/ops/downloads
 
 # ---- report-only alternative (the pre-AUTO daily entry): poll + print, touch
-#      nothing.  Swap this in (and drop --auto above) to supervise by hand again.
+#      nothing.  TO SWAP: comment out the AUTO entry above and delete ONE
+#      leading '#' from every line below (##SCRON -> #SCRON, '#17 7' -> '17 7').
 ##SCRON --account=astronomy-dept
 ##SCRON --qos=astronomy-dept-b
 ##SCRON --job-name=jwstgc-mastmon-daily

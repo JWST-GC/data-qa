@@ -36,6 +36,10 @@ from . import _github
 from .observations import FIELDS
 
 STATUS_MARKER = "<!-- data-qa:status -->"
+# mast_monitor --report comments carry their own marker so successive monitor
+# reports (incl. recurring LOW DISK / CAPPED downgrades) edit ONE comment per
+# issue instead of stacking, without clobbering the status_report comment.
+MONITOR_MARKER = "<!-- data-qa:monitor -->"
 DEFAULT_RELEASES_ROOT = "/orange/adamginsburg/jwst/releases"
 DEFAULT_STATE = "/orange/adamginsburg/jwst/ops/mast_state.json"
 _SQUEUE_FIELDS = ("jobid", "name", "state", "elapsed", "reason")
@@ -141,12 +145,13 @@ def render_status(field="", program=None, obsnum="", jobs=None, state=None,
 
 
 def render_events_comment(events: List[dict], now=None, notice=None) -> str:
-    """Markdown comment body for mast_monitor --report (same marker header).
+    """Markdown comment body for mast_monitor --report (MONITOR_MARKER header, so
+    the monitor's update-in-place path finds and edits its own comment).
 
-    ``notice`` (e.g. the --auto LOW DISK downgrade message) renders as a loud
-    warning blockquote above the event list."""
+    ``notice`` (e.g. the --auto LOW DISK / SEED / CAPPED downgrade message)
+    renders as a loud warning blockquote above the event list."""
     from .mast_monitor import mjd_to_iso   # stdlib-only
-    lines = [STATUS_MARKER,
+    lines = [MONITOR_MARKER,
              f"**MAST monitor events** — {now or utc_now()}", ""]
     if notice:
         lines += [f"> **WARNING — {notice}**", ""]
@@ -161,16 +166,25 @@ def render_events_comment(events: List[dict], now=None, notice=None) -> str:
 
 
 # --------------------------------------------------------------------------- posting
-def find_last_status_comment(token, repo, number) -> Optional[dict]:
-    """The most recent comment on the issue that starts with the status marker."""
+def find_last_marked_comment(token, repo, number,
+                             marker=STATUS_MARKER) -> Optional[dict]:
+    """The most recent comment on the issue that starts with ``marker``."""
     ours = [c for c in _github.list_comments(token, repo, number)
-            if (c.get("body") or "").lstrip().startswith(STATUS_MARKER)]
+            if (c.get("body") or "").lstrip().startswith(marker)]
     return ours[-1] if ours else None
 
 
-def post_status(title: str, body: str, repo=None, update_last=False, dry_run=True):
+def find_last_status_comment(token, repo, number) -> Optional[dict]:
+    """The most recent comment on the issue that starts with the status marker."""
+    return find_last_marked_comment(token, repo, number, marker=STATUS_MARKER)
+
+
+def post_status(title: str, body: str, repo=None, update_last=False, dry_run=True,
+                marker=STATUS_MARKER):
     """Post (or, update_last, edit-in-place) the status comment on the issue with
-    this exact title.  Returns 0 on success / dry-run, nonzero on failure."""
+    this exact title.  ``marker`` selects WHICH bot comment update_last edits
+    (STATUS_MARKER for status reports, MONITOR_MARKER for monitor events).
+    Returns 0 on success / dry-run, nonzero on failure."""
     repo = repo or _github.REPO
     if dry_run:
         print(f"DRY-RUN: would {'update last status comment' if update_last else 'comment'} "
@@ -188,7 +202,7 @@ def post_status(title: str, body: str, repo=None, update_last=False, dry_run=Tru
         return 3
     number = issue["number"]
     if update_last:
-        prev = find_last_status_comment(token, repo, number)
+        prev = find_last_marked_comment(token, repo, number, marker=marker)
         if prev is not None:
             status, data = _github.update_comment(token, repo, prev["id"], body)
             print(f"updated status comment {prev['id']} on #{number} ({status})")

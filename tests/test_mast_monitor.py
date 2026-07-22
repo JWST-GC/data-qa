@@ -197,11 +197,19 @@ def _patch_poll(monkeypatch, rows):
     return calls
 
 
+def _seed_state(path, program=2221, obs_id="jw02221-o009_x"):
+    """Write a non-empty baseline state so a run is NOT a first run."""
+    mm.save_state(str(path), {
+        "version": 1,
+        "programs": {str(program): {"obs": {obs_id: {"calib_level": 3}}}}})
+
+
 def test_auto_healthy_disk_runs_everything(monkeypatch, tmp_path):
     calls = _patch_poll(monkeypatch,
                         [_row("jw02221-o001_t001_nircam_clear-f405n")])
     monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
     state = tmp_path / "state.json"
+    _seed_state(state)                           # baseline: not a first run
     rc = mm.main(["--program", "2221", "--auto", "--state", str(state),
                   "--download-dir", str(tmp_path)])
     assert rc == 0
@@ -211,7 +219,9 @@ def test_auto_healthy_disk_runs_everything(monkeypatch, tmp_path):
     assert acted["trigger"]["execute"] is True
     assert acted["report"]["execute"] is True
     assert acted["report"]["notice"] is None
-    assert state.exists()                        # --auto commits state
+    committed = mm.load_state(str(state))        # --auto commits state
+    assert "jw02221-o001_t001_nircam_clear-f405n" in \
+        committed["programs"]["2221"]["obs"]
 
 
 def test_auto_low_disk_downgrades_to_report_only(monkeypatch, tmp_path, capsys):
@@ -228,3 +238,310 @@ def test_auto_low_disk_downgrades_to_report_only(monkeypatch, tmp_path, capsys):
     assert "LOW DISK" in acted["report"]["notice"]   # ...with the loud warning
     assert not state.exists()                    # state NOT committed: re-fires
     assert "LOW DISK" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------- first-run seed (HIGH-1a)
+def test_auto_first_run_is_seed_only(monkeypatch, tmp_path, capsys):
+    """Missing state + --auto: commit the baseline, act on NOTHING (no herd)."""
+    calls = _patch_poll(monkeypatch,
+                        [_row("jw02221-o001_t001_nircam_clear-f405n"),
+                         _row("jw02221-o002_t001_nircam_clear-f405n")])
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    rc = mm.main(["--program", "2221", "--auto", "--state", str(state),
+                  "--download-dir", str(tmp_path)])
+    assert rc == 0
+    acted = dict(calls)
+    assert set(acted) == {"report"}              # no download, no trigger
+    assert "SEED RUN" in acted["report"]["notice"]
+    assert state.exists()                        # baseline committed
+    committed = mm.load_state(str(state))
+    assert len(committed["programs"]["2221"]["obs"]) == 2
+    assert "SEED RUN" in capsys.readouterr().err
+
+
+def test_execute_first_run_is_seed_only(monkeypatch, tmp_path):
+    """--download --trigger --execute (non-auto) on an empty state also seeds."""
+    calls = _patch_poll(monkeypatch,
+                        [_row("jw02221-o001_t001_nircam_clear-f405n")])
+    state = tmp_path / "state.json"
+    rc = mm.main(["--program", "2221", "--download", "--trigger", "--execute",
+                  "--state", str(state)])
+    assert rc == 0
+    assert calls == []                           # nothing acted (no report asked)
+    assert state.exists()                        # but the baseline committed
+
+
+def test_first_run_dry_run_unchanged(monkeypatch, tmp_path):
+    """Without --execute the first run still dry-runs the actions as before."""
+    calls = _patch_poll(monkeypatch,
+                        [_row("jw02221-o001_t001_nircam_clear-f405n")])
+    state = tmp_path / "state.json"
+    rc = mm.main(["--program", "2221", "--download", "--trigger",
+                  "--state", str(state)])
+    assert rc == 0
+    acted = dict(calls)
+    assert set(acted) == {"download", "trigger"}
+    assert acted["trigger"]["execute"] is False
+    assert not state.exists()                    # dry-run commits nothing
+
+
+def test_seed_verb_commits_without_acting(monkeypatch, tmp_path, capsys):
+    calls = _patch_poll(monkeypatch,
+                        [_row("jw02221-o001_t001_nircam_clear-f405n")])
+    state = tmp_path / "state.json"
+    rc = mm.main(["--program", "2221", "--seed", "--state", str(state)])
+    assert rc == 0
+    assert calls == []
+    assert state.exists()
+    assert "SEED RUN" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------- submission cap (HIGH-1b)
+def _rows_n_groups(n):
+    return [_row(f"jw02221-o{i:03d}_t001_nircam_clear-f405n")
+            for i in range(1, n + 1)]
+
+
+def test_capped_run_acts_on_nothing(monkeypatch, tmp_path, capsys):
+    calls = _patch_poll(monkeypatch, _rows_n_groups(3))
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state)                           # not a first run
+    rc = mm.main(["--program", "2221", "--auto", "--max-submit", "2",
+                  "--state", str(state), "--download-dir", str(tmp_path)])
+    assert rc == 0
+    acted = dict(calls)
+    assert set(acted) == {"report"}              # all-or-nothing: nothing acted
+    assert "CAPPED" in acted["report"]["notice"]
+    committed = mm.load_state(str(state))        # state NOT committed: re-fires
+    assert "jw02221-o001_t001_nircam_clear-f405n" not in \
+        committed["programs"]["2221"]["obs"]
+    assert "CAPPED" in capsys.readouterr().err
+
+
+def test_under_cap_runs_everything(monkeypatch, tmp_path):
+    calls = _patch_poll(monkeypatch, _rows_n_groups(2))
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    rc = mm.main(["--program", "2221", "--auto", "--max-submit", "2",
+                  "--state", str(state), "--download-dir", str(tmp_path)])
+    assert rc == 0
+    assert set(dict(calls)) == {"download", "trigger", "report"}
+
+
+# ----------------------------------------------------------- in-flight dedup (HIGH-1c)
+def _trigger_events(obsnum="001", field="brick", filters="F405N;F410M"):
+    return [dict(event="NEW_OBSERVATION", program=2221, obsnum=obsnum,
+                 obs_id=f"jw02221-o{obsnum}_t001_nircam_clear-f405n",
+                 field=field, tile=None, calib_level=3, released=True,
+                 t_obs_release=59900.0, instrument_name="NIRCAM/IMAGE",
+                 filters=filters, target_name="GAL_CENTER")]
+
+
+def _patch_submit(monkeypatch):
+    from data_qa import pipeline_trigger
+    submitted = []
+    monkeypatch.setattr(pipeline_trigger, "submit",
+                        lambda **kw: submitted.append(kw))
+    return submitted
+
+
+def test_act_trigger_skips_inflight_job(monkeypatch, tmp_path, capsys):
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names",
+                        lambda: {"brick2221-o001-reduce", "other-job"})
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state={}, state_path=str(tmp_path / "state.json"))
+    assert submitted == []
+    assert "SKIPPED(in-flight)" in capsys.readouterr().err
+
+
+def test_act_trigger_skips_already_triggered(monkeypatch, tmp_path, capsys):
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state = {"triggered": {"2221-o001": "2026-07-21 00:00 UTC"}}
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state=state, state_path=str(tmp_path / "state.json"))
+    assert submitted == []
+    assert "SKIPPED(already-triggered)" in capsys.readouterr().err
+
+
+def test_act_trigger_records_triggered_immediately(monkeypatch, tmp_path):
+    """A successful submit persists the 'triggered' map to DISK at once, even
+    though the event baselines are not committed."""
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = tmp_path / "state.json"
+    state = {"version": 1, "programs": {}}
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state=state, state_path=str(state_path))
+    assert len(submitted) == 1
+    on_disk = mm.load_state(str(state_path))
+    assert "2221-o001" in on_disk["triggered"]        # persisted immediately
+    assert on_disk["programs"] == {}                  # events NOT committed
+    assert "2221-o001" in state["triggered"]          # mirrored in memory
+
+
+def test_act_trigger_dry_run_does_not_record(monkeypatch, tmp_path):
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names",
+                        lambda: pytest.fail("squeue must not run on dry-run"))
+    state_path = tmp_path / "state.json"
+    mm.act_trigger(_trigger_events("001"), execute=False,
+                   state={}, state_path=str(state_path))
+    assert len(submitted) == 1
+    assert submitted[0]["execute"] is False
+    assert not state_path.exists()
+
+
+# ------------------------------------------------------- MAST failure isolation (HIGH-2)
+def test_query_failure_skips_program_not_poll(monkeypatch, tmp_path, capsys):
+    import requests
+
+    def fake_query(prog):
+        if int(prog) == 2221:
+            raise requests.exceptions.ConnectionError("MAST down")
+        return [_row("jw01182-o004_t001_nircam_clear-f405n")]
+
+    calls = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", fake_query)
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: calls.append(("report", evs)))
+    state = tmp_path / "state.json"
+    rc = mm.main(["--program", "2221", "1182", "--report",
+                  "--commit-state", "--state", str(state)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "2221" in err
+    (name, evs), = calls
+    assert [e["program"] for e in evs] == [1182]      # 1182 still processed
+    committed = mm.load_state(str(state))
+    assert "1182" in committed["programs"]
+    assert "2221" not in committed["programs"]        # failed program untouched
+
+
+# ------------------------------------------------------------- filter parsing (MED-5)
+@pytest.mark.parametrize("raw,expected", [
+    ("CLEAR;F212N", ["F212N"]),
+    ("F444W;F470N", ["F444W", "F470N"]),
+    ("F212N;F480M", ["F212N", "F480M"]),
+    ("F150W2;CLEAR", ["F150W2"]),
+    ("F770W", ["F770W"]),                  # MIRI 3-digit
+    ("F1000W;F770W", ["F1000W", "F770W"]),  # MIRI 4-digit
+    ("GRISMR;F322W2", ["F322W2"]),
+    ("F212N;F212N;F480M", ["F212N", "F480M"]),   # dedupe, stable order
+    ("MASKRND;WLP8;junk;", []),
+    ("", []),
+    (None, []),
+])
+def test_parse_filters(raw, expected):
+    assert mm.parse_filters(raw) == expected
+
+
+def test_act_trigger_drops_clear_token(monkeypatch, tmp_path):
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    mm.act_trigger(_trigger_events("001", filters="CLEAR;F212N"), execute=False)
+    assert submitted[0]["filters"] == ["F212N"]
+
+
+def test_act_trigger_all_junk_filters_skips(monkeypatch, capsys):
+    submitted = _patch_submit(monkeypatch)
+    mm.act_trigger(_trigger_events("001", filters="CLEAR;GRISMR"), execute=False)
+    assert submitted == []
+    assert "no filters known" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------- size precheck (MED-4)
+def _patch_download(monkeypatch, size, free_tb=10.0):
+    from data_qa import retrieve_data
+    fetched = []
+    monkeypatch.setattr(retrieve_data, "product_list_size_bytes",
+                        lambda *a, **kw: size)
+    monkeypatch.setattr(retrieve_data, "retrieve",
+                        lambda *a, **kw: fetched.append(kw))
+    monkeypatch.setattr(mm, "disk_gate",
+                        lambda d, m: (free_tb >= m, free_tb, "gate"))
+    return fetched
+
+
+def test_act_download_skips_oversize_group(monkeypatch, capsys):
+    # free 10 TB, floor 5 TB -> 5 TB headroom; 6 TB projected -> skip
+    fetched = _patch_download(monkeypatch, size=6e12, free_tb=10.0)
+    mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0)
+    assert fetched == []
+    assert "SKIPPED(oversize)" in capsys.readouterr().err
+
+
+def test_act_download_proceeds_when_size_fits(monkeypatch):
+    fetched = _patch_download(monkeypatch, size=1e12, free_tb=10.0)
+    mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0)
+    assert len(fetched) == 1
+    assert fetched[0]["dry_run"] is False
+
+
+def test_act_download_unknown_size_skips_by_default(monkeypatch, capsys):
+    fetched = _patch_download(monkeypatch, size=None, free_tb=10.0)
+    mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0)
+    assert fetched == []
+    assert "SKIPPED(unknown-size)" in capsys.readouterr().err
+
+
+def test_act_download_unknown_size_forced(monkeypatch, capsys):
+    fetched = _patch_download(monkeypatch, size=None, free_tb=10.0)
+    mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0,
+                    force_unknown_size=True)
+    assert len(fetched) == 1
+    assert "force-download-unknown-size" in capsys.readouterr().err
+
+
+def test_act_download_rechecks_disk_gate_per_group(monkeypatch, capsys):
+    fetched = _patch_download(monkeypatch, size=1e12, free_tb=2.0)   # below floor
+    mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0)
+    assert fetched == []
+    assert "SKIPPED(low-disk)" in capsys.readouterr().err
+
+
+def test_act_download_dry_run_skips_prechecks(monkeypatch):
+    from data_qa import retrieve_data
+    fetched = []
+    monkeypatch.setattr(retrieve_data, "product_list_size_bytes",
+                        lambda *a, **kw: pytest.fail("no size query on dry-run"))
+    monkeypatch.setattr(retrieve_data, "retrieve",
+                        lambda *a, **kw: fetched.append(kw))
+    mm.act_download(_trigger_events("001"), execute=False)
+    assert len(fetched) == 1
+    assert fetched[0]["dry_run"] is True
+
+
+# ------------------------------------------------------------------------- LOW items
+def test_act_download_skips_unmapped_program(monkeypatch, capsys):
+    from data_qa import retrieve_data
+    monkeypatch.setattr(retrieve_data, "retrieve",
+                        lambda *a, **kw: pytest.fail("must not download"))
+    events = _trigger_events("001", field="")        # no field mapping
+    mm.act_download(events, execute=False)
+    assert "no field mapping" in capsys.readouterr().err
+
+
+def test_save_state_unlinks_orphan_tmp_on_failure(tmp_path):
+    path = tmp_path / "state.json"
+    with pytest.raises(TypeError):                   # sets aren't JSON-able
+        mm.save_state(str(path), {"bad": {1, 2, 3}})
+    assert not list(tmp_path.glob("*.tmp.*"))        # no orphan tmp left
+    assert not path.exists()
+
+
+def test_act_report_updates_in_place_with_monitor_marker(monkeypatch):
+    from data_qa import status_report
+    posted = []
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, **kw: posted.append((title, body, kw)))
+    mm.act_report(_trigger_events("001"), execute=True, notice="CAPPED — x")
+    (title, body, kw), = posted
+    assert kw["update_last"] is True
+    assert kw["marker"] == status_report.MONITOR_MARKER
+    assert "CAPPED" in body

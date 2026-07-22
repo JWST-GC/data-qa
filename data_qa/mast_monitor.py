@@ -11,9 +11,32 @@ effect is individually gated:
   --execute        actually do it (download / sbatch / post); without it the actions
                    above are dry-run prints
   --auto           fully automatic: --download --trigger --report --commit-state
-                   --execute, gated ONLY by available file space (--min-free-tb,
-                   checked against the --download-dir filesystem); below the
-                   threshold it downgrades to report-only with a LOW DISK warning
+                   --execute, gated by the disk-space check (--min-free-tb,
+                   against the --download-dir filesystem), the first-run seed
+                   guard, and the --max-submit cap; any failed gate downgrades
+                   the run to report-only with a loud notice
+  --seed           baseline run: commit the full current state, act on NOTHING
+                   (use once at deployment so the backlog never fires as "new")
+  --max-submit N   when more than N (program,obs) groups would act in one run,
+                   act on NOTHING and report everything (default 4)
+
+Safety gates on acting runs (--auto, or --download/--trigger with --execute):
+  * FIRST-RUN SEED: a missing/empty state file means EVERY observation would
+    fire as NEW_OBSERVATION; an acting run instead behaves like --seed
+    (commit state, report "SEED RUN", no downloads/submissions).  Plain
+    dry-run invocations are unchanged.
+  * SUBMISSION CAP (--max-submit): a MAST re-index / bulk release emitting
+    many groups at once downgrades to report-only, state NOT committed, so
+    the events re-fire.  All-or-nothing on purpose: acting on a subset would
+    need a partial state commit (only the acted events), and partially
+    committed state is a known silent-corruption class -- simpler to act on
+    nothing and let a human raise the cap or act by hand.
+  * IN-FLIGHT DEDUP (--trigger): a group is skipped when squeue already has a
+    job named ``<field><program>-o<obs>-*`` or when the state file's
+    ``triggered`` map marks the obs as already submitted (the map is written
+    immediately on every successful submission, even when the event state is
+    not committed, so a partial failure cannot double-submit; delete the
+    entry to re-arm).
 
 Events:
   NEW_OBSERVATION  obs_id not previously in the state file
@@ -41,9 +64,10 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
 # Monitored programs: program id -> {obs number -> release field}.  Mirrors the
 # reduction's field_to_reg_mapping (PipelineRerunNIRCAM-LONG.py) restricted to the
@@ -95,6 +119,26 @@ def obsnum_from_obs_id(obs_id: str) -> str:
     return m.group(2) if m else ""
 
 
+# Valid JWST filter token: F212N, F480M, F444W, F150W2, MIRI F1000W...  MAST's
+# `filters` column mixes in pupil/CLEAR/GRISM tokens (CLEAR;F212N, F444W;F470N)
+# that must never reach the reduction's FILTERS array.
+FILTER_TOKEN = re.compile(r"^F\d{3,4}[WNM]2?$")
+
+
+def parse_filters(filters_str) -> List[str]:
+    """MAST `filters` string -> validated filter tokens.
+
+    Splits on ';' (also tolerating ','), validates each token against
+    FILTER_TOKEN, drops CLEAR/pupil/GRISM/junk, dedupes, keeps first-seen
+    (stable) order."""
+    out: List[str] = []
+    for tok in (filters_str or "").replace(",", ";").split(";"):
+        tok = tok.strip().upper()
+        if FILTER_TOKEN.match(tok) and tok not in out:
+            out.append(tok)
+    return out
+
+
 def field_for(program, obsnum: str) -> str:
     if int(program) == TREASURY_PROGRAM:
         # Treasury tiles (GC_<n>) all reduce into the one gc-treasury field; the
@@ -139,8 +183,14 @@ def mast_login_if_token(token_path="~/.mast_api_token") -> bool:
 
 
 def query_program(program) -> List[dict]:
-    """MAST observations for one program as plain-python dict rows (lazy astroquery)."""
+    """MAST observations for one program as plain-python dict rows (lazy astroquery).
+
+    The request is time-bounded (retrieve_data.configure_mast: astroquery.mast.conf
+    timeout/pagesize -- the 22h-hang lesson); network failures propagate as
+    ``retrieve_data.mast_query_errors()`` for the caller's per-program isolation."""
     from astroquery.mast import Observations
+    from .retrieve_data import configure_mast
+    configure_mast()
     tbl = Observations.query_criteria(proposal_id=str(int(program)),
                                       obs_collection="JWST")
     cols = [c for c in MONITOR_COLUMNS if c in tbl.colnames]
@@ -221,14 +271,59 @@ def load_state(path) -> dict:
 
 
 def save_state(path, state: dict):
-    """Atomic write (tmp + rename); auto-creates the parent directory."""
+    """Atomic write (tmp + rename); auto-creates the parent directory.  A failure
+    between write and replace unlinks the orphan tmp file (the exception still
+    propagates)."""
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w") as fh:
-        json.dump(state, fh, indent=1, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(state, fh, indent=1, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)          # no-op on success: os.replace consumed it
+        except FileNotFoundError:
+            pass
+
+
+# ---------------------------------------------------------------- trigger dedup state
+def trigger_key(program, obsnum) -> str:
+    """Key in the state file's ``triggered`` map: '<program>-o<obs>'."""
+    return f"{int(program)}-o{obsnum}"
+
+
+def record_triggered(state_path, key: str, when: str, state: Optional[dict] = None):
+    """Persist a successful submission into the state file's ``triggered`` map
+    IMMEDIATELY (fresh read-modify-write of the on-disk state), so a crash or a
+    deliberately uncommitted run cannot re-fire the same submission.  Only the
+    ``triggered`` map is touched on disk -- the event baselines (``programs``)
+    keep whatever commit decision the caller made.  Also mirrors the entry into
+    the caller's in-memory ``state`` so a later full commit carries it."""
+    disk = load_state(state_path)
+    disk.setdefault("triggered", {})[key] = when
+    save_state(state_path, disk)
+    if state is not None:
+        state.setdefault("triggered", {})[key] = when
+
+
+def inflight_job_names(timeout_s=30) -> Optional[Set[str]]:
+    """Job names currently in ``squeue --me`` (set), or None when squeue is
+    unavailable/failing (caller proceeds with a warning -- it cannot check)."""
+    try:
+        proc = subprocess.run(["squeue", "--me", "--noheader", "--format=%j"],
+                              capture_output=True, text=True, timeout=timeout_s)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as ex:
+        print(f"mast_monitor: squeue unavailable ({ex.__class__.__name__}); "
+              "cannot check for in-flight jobs", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(f"mast_monitor: squeue failed: {proc.stderr.strip()}; "
+              "cannot check for in-flight jobs", file=sys.stderr)
+        return None
+    return {ln.strip() for ln in proc.stdout.splitlines() if ln.strip()}
 
 
 def format_event(ev: dict) -> str:
@@ -253,6 +348,7 @@ def _group_by_obs(events):
 
 # -------------------------------------------------------------------------- disk gate
 DEFAULT_MIN_FREE_TB = 5.0
+DEFAULT_MAX_SUBMIT = 4
 DEFAULT_DOWNLOAD_DIR = "./data"          # matches retrieve_data.retrieve's default
 
 
@@ -284,40 +380,106 @@ def disk_gate(download_dir, min_free_tb=DEFAULT_MIN_FREE_TB):
 
 
 # ---------------------------------------------------------------------------- actions
-def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR):
-    from .retrieve_data import retrieve   # lazy: astroquery
+def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
+                 min_free_tb=DEFAULT_MIN_FREE_TB, force_unknown_size=False):
+    from . import retrieve_data   # lazy: astroquery
     for (program, obsnum), evs in sorted(_group_by_obs(events).items()):
+        if not evs[0]["field"]:
+            # mirror act_trigger: an unmapped program has nowhere to reduce, so
+            # do not fill the disk for it either
+            print(f"--download: SKIP program {program} obs {obsnum}: no field "
+                  "mapping (add it to mast_monitor.PROGRAMS)", file=sys.stderr)
+            continue
+        if execute:
+            # re-check the disk gate BETWEEN groups: an earlier group's download
+            # may have eaten the headroom the run-level gate saw
+            ok, free_tb, msg = disk_gate(download_dir, min_free_tb)
+            if not ok:
+                print(f"--download: SKIPPED(low-disk) program {program} obs "
+                      f"{obsnum}: {msg}", file=sys.stderr)
+                continue
+            headroom_tb = free_tb - min_free_tb
+            try:
+                size = retrieve_data.product_list_size_bytes(
+                    program, obsnum, product_type=("uncal", "i2d"))
+            except retrieve_data.mast_query_errors() as ex:
+                print(f"--download: WARNING program {program} obs {obsnum}: "
+                      f"size query failed ({ex.__class__.__name__}: {ex})",
+                      file=sys.stderr)
+                size = None
+            if size is None:
+                if not force_unknown_size:
+                    print(f"--download: SKIPPED(unknown-size) program {program} "
+                          f"obs {obsnum}: could not determine the projected "
+                          "download size; rerun with --force-download-unknown-size "
+                          "to download anyway", file=sys.stderr)
+                    continue
+                print(f"--download: WARNING program {program} obs {obsnum}: "
+                      "unknown projected size; proceeding under "
+                      "--force-download-unknown-size", file=sys.stderr)
+            elif size / 1e12 > headroom_tb:
+                print(f"--download: SKIPPED(oversize) program {program} obs "
+                      f"{obsnum}: projected {size / 1e12:.2f} TB exceeds the "
+                      f"{headroom_tb:.2f} TB headroom ({free_tb:.1f} TB free - "
+                      f"{min_free_tb:.1f} TB --min-free-tb floor)", file=sys.stderr)
+                continue
         print(f"--download: program {program} obs {obsnum} "
               f"({len(evs)} event(s); dry_run={not execute})")
-        retrieve(program, obsnum, product_type=("uncal", "i2d"),
-                 download_dir=download_dir, dry_run=not execute)
+        retrieve_data.retrieve(program, obsnum, product_type=("uncal", "i2d"),
+                               download_dir=download_dir, dry_run=not execute)
 
 
-def act_trigger(events, execute=False, pipe_root=None):
+def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=None):
     from .pipeline_trigger import submit   # stdlib-only
+    triggered = (state or {}).get("triggered", {})
+    inflight = inflight_job_names() if execute else None
     for (program, obsnum), evs in sorted(_group_by_obs(events).items()):
         field = evs[0]["field"]
         if not field:
             print(f"--trigger: SKIP program {program} obs {obsnum}: no field mapping "
                   "(add it to mast_monitor.PROGRAMS)", file=sys.stderr)
             continue
-        filters = sorted({f for ev in evs for f in (ev.get("filters") or "").split(";")
-                          if f and f != "?"})
+        filters: List[str] = []
+        for ev in evs:
+            for tok in parse_filters(ev.get("filters")):
+                if tok not in filters:
+                    filters.append(tok)
         if not filters:
             print(f"--trigger: SKIP program {program} obs {obsnum}: no filters known",
                   file=sys.stderr)
             continue
+        key = trigger_key(program, obsnum)
+        if key in triggered:
+            print(f"--trigger: SKIPPED(already-triggered) program {program} obs "
+                  f"{obsnum}: state marks a submission at {triggered[key]} "
+                  "(delete the 'triggered' entry in the state file to re-arm)",
+                  file=sys.stderr)
+            continue
+        prefix = f"{field}{int(program)}-o{obsnum}-"
+        if inflight and any(name.startswith(prefix) for name in inflight):
+            print(f"--trigger: SKIPPED(in-flight) program {program} obs {obsnum}: "
+                  f"squeue --me already has a job named {prefix}*", file=sys.stderr)
+            continue
         submit(program=program, obs=obsnum, field=field, filters=filters,
                pipe_root=pipe_root, execute=execute)
+        if execute and state_path:
+            # written IMMEDIATELY (not at the end-of-run commit) so a partial
+            # failure in a later group cannot re-fire this submission
+            record_triggered(state_path, key, mjd_to_iso(now_mjd()), state=state)
 
 
-def act_report(events, execute=False, repo=None, update_last=False, notice=None):
+def act_report(events, execute=False, repo=None, update_last=True, notice=None):
     from . import status_report
     for (program, obsnum), evs in sorted(_group_by_obs(events).items()):
         field = evs[0]["field"]
         title = status_report.issue_title_for(program, obsnum, field=field)
         body = status_report.render_events_comment(evs, notice=notice)
+        # update-in-place on the monitor-marked comment: successive monitor
+        # reports (esp. recurring LOW DISK / CAPPED downgrades, which re-fire
+        # daily because state is not committed) edit ONE comment per issue
+        # instead of stacking identical ones
         status_report.post_status(title, body, repo=repo, update_last=update_last,
+                                  marker=status_report.MONITOR_MARKER,
                                   dry_run=not execute)
 
 
@@ -341,9 +503,21 @@ def main(argv=None):
                     help="comment events on the per-observation QA issue")
     ap.add_argument("--auto", action="store_true",
                     help="AUTO mode: --download --trigger --report --commit-state "
-                         "--execute in one flag, gated ONLY by the disk-space "
-                         "check (--min-free-tb); below threshold it downgrades "
-                         "to report-only with a loud LOW DISK warning")
+                         "--execute in one flag, gated by the disk-space check "
+                         "(--min-free-tb), the first-run seed guard and the "
+                         "--max-submit cap; a failed gate downgrades the run "
+                         "to report-only with a loud warning")
+    ap.add_argument("--seed", action="store_true",
+                    help="baseline run: commit the full current state, take NO "
+                         "download/trigger actions (use once at deployment so "
+                         "the existing backlog never fires as new)")
+    ap.add_argument("--max-submit", type=int, default=DEFAULT_MAX_SUBMIT,
+                    help="max (program,obs) groups an acting run may touch; more "
+                         "than this downgrades the WHOLE run to report-only "
+                         f"(default {DEFAULT_MAX_SUBMIT})")
+    ap.add_argument("--force-download-unknown-size", action="store_true",
+                    help="download even when the projected product size cannot "
+                         "be determined (default: skip with a warning)")
     ap.add_argument("--min-free-tb", type=float, default=DEFAULT_MIN_FREE_TB,
                     help="minimum free space (TB) on the --download-dir "
                          f"filesystem for --auto (default {DEFAULT_MIN_FREE_TB})")
@@ -378,12 +552,26 @@ def main(argv=None):
               "but events carry no field mapping", file=sys.stderr)
 
     state = load_state(args.state)
+    # first run = no committed observation baseline anywhere (missing/empty state)
+    first_run = not any((p or {}).get("obs")
+                        for p in state.get("programs", {}).values())
     mast_login_if_token()
     poll_mjd = now_mjd()
 
-    all_events = []
+    from .retrieve_data import mast_query_errors
+    all_events, failed_programs = [], []
     for prog in programs:
-        rows = query_program(prog)
+        try:
+            rows = query_program(prog)
+        except mast_query_errors() as ex:
+            # per-program isolation: one hung/failed MAST request must not kill
+            # the whole poll; the program's old state is left untouched so its
+            # events fire on the next successful poll
+            print(f"WARNING: MAST query for program {prog} failed "
+                  f"({ex.__class__.__name__}: {ex}); skipping this program "
+                  "this poll", file=sys.stderr)
+            failed_programs.append(prog)
+            continue
         new_obs = summarize(rows, poll_mjd)
         old_obs = state.get("programs", {}).get(str(prog), {}).get("obs", {})
         all_events.extend(diff_events(prog, old_obs, new_obs))
@@ -398,14 +586,47 @@ def main(argv=None):
         for ev in all_events:
             print(format_event(ev))
         if not all_events:
-            print(f"no new events across {len(programs)} program(s)")
+            print(f"no new events across {len(programs)} program(s)"
+                  + (f" ({len(failed_programs)} query failure(s))"
+                     if failed_programs else ""))
+
+    # FIRST-RUN SEED gate: with no baseline, every observation fires as NEW --
+    # an acting run (auto, or download/trigger with --execute) must not submit
+    # the entire backlog.  Seed instead: commit state, act on nothing.
+    acting = args.execute and (args.download or args.trigger)
+    seed = args.seed or (first_run and bool(all_events) and acting)
+    if seed:
+        notice = (f"SEED RUN — actions suppressed: committing the current state "
+                  f"({len(all_events)} event(s)) as the baseline; nothing "
+                  "downloaded or submitted.  Subsequent runs act only on "
+                  "genuinely new events."
+                  + ("" if args.seed else "  (state file was missing/empty)"))
+        print(f"--seed: {notice}", file=sys.stderr)
+        args.download = args.trigger = False
+        args.commit_state = True
+    elif acting:
+        # SUBMISSION CAP: all-or-nothing (see module docstring for why a
+        # partial commit is worse than acting on nothing)
+        n_groups = len(_group_by_obs(all_events))
+        if n_groups > args.max_submit:
+            notice = (f"CAPPED — actions suppressed: {n_groups} (program,obs) "
+                      f"groups would act, exceeding --max-submit "
+                      f"{args.max_submit}.  Downgraded to report-only; state "
+                      "NOT committed, so these events re-fire.  Raise "
+                      "--max-submit or act by hand (all-or-nothing: acting on "
+                      "a subset would require a partial state commit).")
+            print(f"--max-submit: {notice}", file=sys.stderr)
+            args.download = args.trigger = args.commit_state = False
 
     if all_events:
         if args.download:
             act_download(all_events, execute=args.execute,
-                         download_dir=args.download_dir)
+                         download_dir=args.download_dir,
+                         min_free_tb=args.min_free_tb,
+                         force_unknown_size=args.force_download_unknown_size)
         if args.trigger:
-            act_trigger(all_events, execute=args.execute, pipe_root=args.pipe_root)
+            act_trigger(all_events, execute=args.execute, pipe_root=args.pipe_root,
+                        state=state, state_path=args.state)
         if args.report:
             act_report(all_events, execute=args.execute, repo=args.repo,
                        notice=notice)
