@@ -162,10 +162,15 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     obs = f"{int(args.obs):03d}"     # zero-pad so globs use -o001 not -o1
+    # display name must match the issue title exactly -- use the FIELDS map ("cloudc"->"Cloud
+    # C", "sgrb2"->"Sgr B2"), NOT field.title() ("Cloudc"), else the issue lookup misses and
+    # no status comment is posted.
+    from .observations import FIELDS
+    _target = args.target or FIELDS.get(args.field or "", (args.field or "").title())
 
     class _O:                       # light stand-in so this runs without the portal registry
         program = str(int(args.program))
-        field = args.field or ""; target = args.target or (args.field or "").title()
+        field = args.field or ""; target = _target
         instrument = "NIRCam"
         obsid = f"jw{int(args.program):05d}-o{obs}"
         issue_title = f"{target} — {obsid} (NIRCam)"
