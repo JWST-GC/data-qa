@@ -14,9 +14,40 @@ from __future__ import annotations
 import argparse
 import sys
 
+# Bound every MAST HTTP call.  History: an unbounded astroquery MAST request once
+# hung a pipeline job for 22 h; astroquery's default conf.timeout is 600 s PER
+# request with silent retries on top.  120 s is generous for a metadata query.
+MAST_TIMEOUT_S = 120
+MAST_PAGESIZE = 5000
+
+
+def configure_mast(timeout_s=MAST_TIMEOUT_S, pagesize=MAST_PAGESIZE):
+    """Set the astroquery MAST request timeout + page size.
+
+    Note: modern astroquery (>=0.4) has NO ``Observations.TIMEOUT`` attribute --
+    the knobs live on the module-level config object ``astroquery.mast.conf``
+    (read at request time), so setting them here bounds every subsequent
+    query_criteria / get_product_list / download call.  Returns the conf object.
+    """
+    from astroquery.mast import conf
+    conf.timeout = timeout_s
+    conf.pagesize = pagesize
+    return conf
+
+
+def mast_query_errors():
+    """Exception classes a MAST query can raise on timeout / network failure
+    (lazy import, so the module stays stdlib-importable)."""
+    import requests.exceptions
+    from astroquery.exceptions import (RemoteServiceError,
+                                       TimeoutError as AstroqueryTimeoutError)
+    return (requests.exceptions.RequestException, RemoteServiceError,
+            AstroqueryTimeoutError, ConnectionError, TimeoutError)
+
 
 def _observations_table(program, instrument="NIRCam"):
     from astroquery.mast import Observations as MastObs
+    configure_mast()
     return MastObs.query_criteria(obs_collection="JWST",
                                   proposal_id=str(int(program)),
                                   instrument_name=f"{instrument}*")
@@ -30,14 +61,9 @@ def list_observations(program, instrument="NIRCam"):
     return obsnums
 
 
-def retrieve(program, obs, product_type=("i2d",), instrument="NIRCam",
-             download_dir="./data", dry_run=False):
-    """Download products for one observation.
-
-    Filters the MAST product list to this obs-number and the requested suffix(es).
-    Returns the manifest table (astroquery download result), or the filtered product
-    table when ``dry_run``.
-    """
+def filtered_products(program, obs, product_type=("i2d",), instrument="NIRCam"):
+    """The MAST product table for one observation, filtered to the requested
+    suffix(es).  Returns None (with a note) when the observation is not on MAST."""
     from astroquery.mast import Observations as MastObs
 
     tbl = _observations_table(program, instrument)
@@ -50,10 +76,45 @@ def retrieve(program, obs, product_type=("i2d",), instrument="NIRCam",
     suffixes = tuple(p.lower() for p in product_type)
     keep = [i for i, fn in enumerate(products["productFilename"])
             if any(f"_{s}." in str(fn).lower() for s in suffixes)]
-    products = products[keep]
+    return products[keep]
+
+
+def product_list_size_bytes(program, obs, product_type=("i2d",),
+                            instrument="NIRCam"):
+    """Projected download size (bytes) of the filtered product list, from the MAST
+    ``size`` column.  Returns None when the size cannot be determined (missing
+    observation, missing/masked column) -- network failures propagate
+    (``mast_query_errors()``) so the caller can warn per-observation."""
+    products = filtered_products(program, obs, product_type=product_type,
+                                 instrument=instrument)
+    if products is None or "size" not in products.colnames:
+        return None
+    try:
+        return int(sum(int(s) for s in products["size"]))
+    except (TypeError, ValueError):     # masked / non-numeric size entries
+        return None
+
+
+def retrieve(program, obs, product_type=("i2d",), instrument="NIRCam",
+             download_dir="./data", dry_run=False):
+    """Download products for one observation.
+
+    Filters the MAST product list to this obs-number and the requested suffix(es).
+    Returns the manifest table (astroquery download result), or the filtered product
+    table when ``dry_run``.
+    """
+    from astroquery.mast import Observations as MastObs
+
+    products = filtered_products(program, obs, product_type=product_type,
+                                 instrument=instrument)
+    if products is None:
+        return None
+    oid = f"jw{int(program):05d}-o{obs}"
+    suffixes = tuple(p.lower() for p in product_type)
     print(f"{oid}: {len(products)} products matching {suffixes}")
     if dry_run:
         return products
+    configure_mast()     # bound the download requests too
     return MastObs.download_products(products, download_dir=download_dir)
 
 

@@ -17,13 +17,10 @@ import json
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
 
-from .observations import Observation, registry
-
-REPO = os.environ.get("QA_REPO", "JWST-GC/data-qa")
-API = "https://api.github.com"
+from . import observations
+from ._github import API, REPO, ensure_labels, existing_issues, request as _req
+from .observations import Observation, _read_lines, registry
 
 # Marker so we can recognize (and update) an auto-generated body without clobbering
 # human discussion, which lives in the comments, not the body.
@@ -35,13 +32,10 @@ FILTER_TOKEN = re.compile(r"^(f\d{3}[wnm])[_-]")
 
 
 def _fetch_lines(url):
-    """Best-effort fetch of a newline-delimited URL list. Empty on any failure."""
-    req = urllib.request.Request(url, headers={"User-Agent": "jwst-gc-data-qa"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return [ln.strip() for ln in r.read().decode().splitlines() if ln.strip()]
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
-        return []
+    """Fetch a newline-delimited URL list. Empty on failure, but LOUD (stderr +
+    ``observations.LAST_FETCH_ERRORS``) so a network failure can never masquerade
+    as an empty release manifest."""
+    return _read_lines(url)
 
 
 def release_links(o: Observation):
@@ -159,6 +153,7 @@ def render_body(o: Observation) -> str:
 - [{_ck(interm_ok)}] **Astrometry**: no inter-module (NRCA/NRCB) offset (proper-motion grade)
 - [{_ck(phot_ok)}] **Photometry**: zeropoints consistent across filters/modules
 - [ ] Background / stripes / artifacts acceptable
+- [ ] **Destreak**: assessed whether 1/f striping requires destreak (SW/LW per module); noted decision (cataloging defaults to the plain `align` crf products)
 - [{_ck(catalog_ok)}] Catalog produced and vetted
 - [{_ck(catalog_ok)}] **Depth**: detection luminosity functions reach the expected depth (not missing stars we should be detecting)
 - [ ] **Purity**: minimal junk detections in PSF wings and in extended-emission regions
@@ -175,50 +170,9 @@ def labels_for(o: Observation):
     return ["QA", o.instrument, f"program:{int(o.program)}", f"target:{o.target}"]
 
 
-# --------------------------------------------------------------------------- GitHub API
-def _req(method, url, token, data=None):
-    body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, method=method)
-    req.add_header("Authorization", f"token {token}")
-    req.add_header("Accept", "application/vnd.github+json")
-    req.add_header("User-Agent", "jwst-gc-data-qa")
-    if body is not None:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode() or "{}")
-
-
-def existing_issues(token, repo):
-    """title -> issue dict, over all states (paginated)."""
-    out, page = {}, 1
-    while True:
-        url = f"{API}/repos/{repo}/issues?state=all&per_page=100&page={page}"
-        status, data = _req("GET", url, token)
-        if status != 200 or not data:
-            break
-        for it in data:
-            if "pull_request" in it:      # issues endpoint also returns PRs
-                continue
-            out[it["title"]] = it
-        if len(data) < 100:
-            break
-        page += 1
-    return out
-
-
-def ensure_labels(token, repo, names):
-    """Create any missing labels (best-effort; ignores 'already exists')."""
-    palette = {"QA": "0e8a16", "NIRCam": "1d76db", "MIRI": "5319e7"}
-    for n in names:
-        color = palette.get(n, "ededed")
-        _req("POST", f"{API}/repos/{repo}/labels", token,
-             {"name": n, "color": color})
-
-
 # --------------------------------------------------------------------------- main
+# GitHub API plumbing (_req/existing_issues/ensure_labels) lives in data_qa._github
+# (shared with status_report.py); behavior is unchanged.
 _CK_LINE = re.compile(r"^(\s*- \[)([ xX])(\] )(.*)$")
 
 
@@ -276,6 +230,15 @@ def main(argv=None):
 
     obs = registry(programs=args.program, target=args.target)
     if not obs:
+        if observations.LAST_FETCH_ERRORS:
+            # A manifest fetch FAILED and the registry came back empty: this is a
+            # network problem, not an empty release.  Refuse to "sync" (which would
+            # render stale/empty issue bodies) and exit loudly for CI.
+            print("ABORT: registry empty AND manifest fetch(es) failed -- refusing "
+                  "to sync an empty registry:", file=sys.stderr)
+            for msg in observations.LAST_FETCH_ERRORS:
+                print(f"  {msg}", file=sys.stderr)
+            return 3
         print("no matching observations in the registry", file=sys.stderr)
         return 1
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")

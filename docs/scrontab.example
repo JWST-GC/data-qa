@@ -1,0 +1,60 @@
+# scrontab entries for the JWST-GC MAST monitor (HiPerGator).
+#
+# Activation: on a HiPerGator login node run `scrontab -e` and paste these entries
+# (or `scrontab < docs/scrontab.example` to REPLACE your scrontab -- careful if you
+# already have entries).  scrontab runs each entry as a SLURM job; the #SCRON lines
+# above an entry are its sbatch directives.  Check with `scrontab -l`;
+# jobs appear in `squeue --me` at the scheduled times.
+#
+# Both entries are metadata-only (anonymous MAST queries + a JSON state file):
+# tiny resource ask.  Log directory must exist:
+#   mkdir -p /blue/adamginsburg/adamginsburg/logs/jwst
+
+# ---- daily: AUTO mode (decision 2026-07-22: download + trigger + report +
+#      commit-state, all --execute).  Gates: free disk space (--min-free-tb,
+#      checked against the --download-dir filesystem), the first-run SEED guard
+#      (a missing/empty state file commits a baseline instead of submitting the
+#      whole backlog -- or run `... mast_monitor --seed` once at deployment),
+#      and the --max-submit cap (default 4 (program,obs) groups per run; more
+#      downgrades the run to report-only).  Any failed gate posts a loud
+#      warning on the QA issue instead of downloading/submitting.
+#
+#      --time=00:30:00: every MAST request is now individually time-bounded
+#      (astroquery.mast.conf.timeout = 120 s, set by the code), so a hung
+#      request can no longer eat the whole allocation -- 30 min is ample for
+#      the metadata poll + a handful of submissions.  If you EXPECT --auto to
+#      be actively downloading new releases (large uncal/i2d batches), raise
+#      to --time=04:00:00 so the transfer itself has room.
+#SCRON --account=astronomy-dept
+#SCRON --qos=astronomy-dept-b
+#SCRON --job-name=jwstgc-mastmon-daily
+#SCRON --cpus-per-task=1
+#SCRON --mem=4gb
+#SCRON --time=00:30:00
+#SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_%j.log
+17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --auto --min-free-tb 5 --download-dir /orange/adamginsburg/jwst/ops/downloads
+
+# ---- report-only alternative (the pre-AUTO daily entry): poll + print, touch
+#      nothing.  TO SWAP: comment out the AUTO entry above and delete ONE
+#      leading '#' from every line below (##SCRON -> #SCRON, '#17 7' -> '17 7').
+##SCRON --account=astronomy-dept
+##SCRON --qos=astronomy-dept-b
+##SCRON --job-name=jwstgc-mastmon-daily
+##SCRON --cpus-per-task=1
+##SCRON --mem=4gb
+##SCRON --time=00:30:00
+##SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_%j.log
+#17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor
+
+# ---- weekly (Mondays): poll + COMMIT the state, so a report-only daily would
+#      only re-report events younger than a week.  Redundant while the daily
+#      --auto entry commits state itself, but harmless (and it keeps the state
+#      fresh if the daily entry is ever swapped back to report-only).
+#SCRON --account=astronomy-dept
+#SCRON --qos=astronomy-dept-b
+#SCRON --job-name=jwstgc-mastmon-weekly
+#SCRON --cpus-per-task=1
+#SCRON --mem=4gb
+#SCRON --time=00:30:00
+#SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_commit_%j.log
+47 7 * * 1 cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --commit-state
