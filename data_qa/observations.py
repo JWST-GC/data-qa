@@ -60,7 +60,7 @@ CURATED: Dict[str, dict] = {
 #   jw05365-o002-998_t001_miri_clear-f770w-mirimage_data_i2d.fits
 #   jw02221-o002_t001_miri_f2550w_i2d.fits
 _MOSAIC_RE = re.compile(
-    r"jw(\d{5})-o(\d{3})(?:-\d+)?_t\d+_(nircam|miri)_(?:clear-)?(f\d{3,4}[wnm])", re.I)
+    r"jw(\d{5})-o(\d{3})(?:-(\d+))?_t\d+_(nircam|miri)_(?:clear-)?(f\d{3,4}[wnm])", re.I)
 
 
 @dataclass(frozen=True)
@@ -74,6 +74,7 @@ class Observation:
     visits: List[str] = _dc_field(default_factory=list)
     epoch: str = ""
     notes: str = ""
+    merged_obsids: List[str] = _dc_field(default_factory=list)  # other obs drizzled into the same tile
 
     @property
     def obsid(self) -> str:
@@ -88,11 +89,26 @@ class Observation:
         """Stable idempotency key for the tracking issue."""
         return f"{self.target} — {self.obsid} ({self.instrument})"
 
+    @property
+    def mosaic_obsid(self) -> str:
+        """Obsid stem the RELEASE mosaics actually carry.  When this observation is drizzled
+        together with others into one combined tile (e.g. jw05365-o002-998), the released
+        i2d is named for the combined id, not the bare obsid -- so the on-disk path and the
+        download links must use this, not ``obsid``."""
+        if self.merged_obsids:
+            return f"{self.obsid}-{'-'.join(self.merged_obsids)}"
+        return self.obsid
+
     # ---- links ----
     @property
     def mast_program_url(self) -> str:
-        return (f"https://www.stsci.edu/cgi-bin/get-proposal-info?"
-                f"id={int(self.program)}&observatory=JWST")
+        """Public APT program summary (the old get-proposal-info cgi now 404s)."""
+        return f"https://www.stsci.edu/jwst/phase2-public/{int(self.program)}.pdf"
+
+    @property
+    def mast_search_url(self) -> str:
+        """MAST data search filtered to this program."""
+        return f"https://mast.stsci.edu/search/ui/#/jwst?proposal_id={int(self.program)}"
 
     @property
     def release_url(self) -> str:
@@ -108,9 +124,11 @@ class Observation:
         return f"{RELEASE_BASE}/{self.field}_catalogs.txt"
 
     def product_glob(self, basepath: str = "/orange/adamginsburg/jwst") -> str:
+        # wildcard after the obs number so combined tiles (jw05365-o002-998_t001...) match,
+        # not only the bare-obsid single-observation products.
         inst = self.instrument.lower()
         return (f"{basepath}/{self.field}/*/pipeline/"
-                f"{self.obsid}_t001_{inst}_*i2d.fits")
+                f"{self.obsid}*_t001_{inst}_*i2d.fits")
 
 
 # --------------------------------------------------------------------------- discovery
@@ -153,6 +171,7 @@ def discover_from_release(base: str = RELEASE_BASE, fields: Dict[str, str] = Non
     fields = fields or FIELDS
     LAST_FETCH_ERRORS.clear()
     grouped: Dict[tuple, set] = {}
+    merged: Dict[tuple, set] = {}
     for fld, disp in fields.items():
         src = (os.path.join(local_dir, f"{fld}_images.txt") if local_dir
                else f"{base}/{fld}_images.txt")
@@ -163,9 +182,11 @@ def discover_from_release(base: str = RELEASE_BASE, fields: Dict[str, str] = Non
             m = _MOSAIC_RE.search(low)
             if not m:
                 continue
-            prog, ob, inst, filt = m.groups()
+            prog, ob, tile, inst, filt = m.groups()
             key = (fld, disp, str(int(prog)), ob, inst.lower())
             grouped.setdefault(key, set()).add(filt.upper())
+            if tile:                                   # combined-tile obsid: jw..-oOOO-TTT
+                merged.setdefault(key, set()).add(tile)
 
     out = []
     for (fld, disp, prog, ob, inst), filts in sorted(grouped.items()):
@@ -176,6 +197,7 @@ def discover_from_release(base: str = RELEASE_BASE, fields: Dict[str, str] = Non
             instrument="NIRCam" if inst == "nircam" else "MIRI",
             filters=sorted(filts), visits=cur.get("visits", []),
             epoch=cur.get("epoch", ""), notes=cur.get("notes", ""),
+            merged_obsids=sorted(merged.get((fld, disp, prog, ob, inst.lower()), set())),
         ))
     return out
 

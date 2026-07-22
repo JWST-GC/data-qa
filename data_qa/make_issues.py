@@ -88,8 +88,36 @@ def _qa_metrics(o: Observation) -> dict:
         return {}
 
 
+def _guidestar_json():
+    path = os.path.join(os.path.dirname(__file__), "guidestar.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
 def _ck(cond) -> str:
     return "x" if cond else " "
+
+
+def _guidestar_block(o: Observation) -> str:
+    gs = _guidestar_json().get(o.obsid)
+    if not gs:
+        return ""
+    gid = gs.get("gdstarid")
+    ra, dec = gs.get("gs_ra"), gs.get("gs_dec")
+    mag, ver = gs.get("gs_mag"), gs.get("gsc_ver")
+    from .guidestar import gsss_webform_url, POS_SOURCE_DOC
+    coord = f"{ra:.6f}, {dec:.6f}" if isinstance(ra, (int, float)) and isinstance(dec, (int, float)) else "—"
+    lines = ["### Guide star",
+             f"- ID (`GDSTARID`): `{gid}`" + (f" · catalog `{ver}`" if ver else ""),
+             f"- Position (ICRS): `{coord}`" + (f" · mag `{mag:.2f}`" if isinstance(mag, (int, float)) else ""),
+             f"- Resolve full entry / `posSource`: [GSSS webform]({gsss_webform_url(gid)}) "
+             f"(HST_ID pre-filled, catalog GSC3.1) → [source-code table]({POS_SOURCE_DOC})"]
+    return "\n".join(lines) + "\n"
 
 
 def render_body(o: Observation) -> str:
@@ -110,6 +138,11 @@ def render_body(o: Observation) -> str:
                           for f in o.filters) or "  - (filters TBD)"
     visits = ", ".join(o.visits) or "—"
     notes = f"\n> **Notes:** {o.notes}\n" if o.notes else ""
+    guidestar = _guidestar_block(o)
+
+    # combined-tile note: released mosaics carry a merged obsid (jw..-oOOO-TTT), so say so
+    merged_note = (f" (mosaic merges obs {o.obs} + {' + '.join(o.merged_obsids)}; "
+                   f"product id `{o.mosaic_obsid}`)" if o.merged_obsids else "")
 
     mosaics, per_filter, field_cats = release_links(o)
     dl = []
@@ -129,7 +162,7 @@ def render_body(o: Observation) -> str:
 | field | value |
 |-------|-------|
 | Program | `{int(o.program)}` |
-| Observation | `{o.obs}` (`{o.obsid}`) |
+| Observation | `{o.obs}` (`{o.obsid}`){merged_note} |
 | Target | {o.target} |
 | Instrument | {o.instrument} |
 | Filters | {", ".join(f"`{f}`" for f in o.filters) or "—"} |
@@ -138,9 +171,11 @@ def render_body(o: Observation) -> str:
 
 ### Release
 - Release page: {o.release_url}
-- MAST program: {o.mast_program_url}
+- APT program (PDF): {o.mast_program_url}
+- MAST data search: {o.mast_search_url}
 - On-disk mosaics: `{o.product_glob()}`
 
+{guidestar}
 ### Direct downloads
 {downloads}
 {notes}
