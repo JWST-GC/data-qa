@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# runtime QA artifacts (generated on the cluster, not committed)
+data_qa/metrics/

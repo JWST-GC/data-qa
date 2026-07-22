@@ -81,7 +81,33 @@ def _fmt_links(items):
 
 
 # --------------------------------------------------------------------------- body
+def _qa_metrics(o: Observation) -> dict:
+    """Load the per-obs diagnostic metrics (written by ``data_qa.diagnostics``) that drive
+    checkbox state.  Absent file -> empty dict -> every box renders unchecked (as before)."""
+    path = os.path.join(os.path.dirname(__file__), "metrics", f"{o.obsid}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _ck(cond) -> str:
+    return "x" if cond else " "
+
+
 def render_body(o: Observation) -> str:
+    M = _qa_metrics(o)
+    s1, s2, s3, s4 = (M.get(f"stage{n}", {}) for n in (1, 2, 3, 4))
+    THRESH_ABS, THRESH_IM = 75.0, 15.0     # mas; mirror data_qa.astrometry_audit
+    delivered = bool(s1.get("passed"))
+    frame_ok = s4.get("bulk_off") is not None and s4["bulk_off"] < THRESH_ABS
+    interm_ok = s4.get("intermodule_off") is not None and s4["intermodule_off"] < THRESH_IM
+    phot_ok = bool(s3.get("passed"))
+    catalog_ok = bool(s2.get("passed"))
+
     filt_rows = "\n".join(f"  - [ ] `{f}` — mosaic reviewed; astrometry + photometry OK"
                           for f in o.filters) or "  - (filters TBD)"
     visits = ", ".join(o.visits) or "—"
@@ -121,15 +147,16 @@ def render_body(o: Observation) -> str:
 {downloads}
 {notes}
 ### QA checklist
-- [ ] Observation delivered / retrieved
-- [ ] Per-filter mosaics (`i2d`) present and complete
+<sub>boxes with a ✓ are auto-set from the diagnostic replies below (`data_qa.diagnostics`); the rest are manual.</sub>
+- [{_ck(delivered)}] Observation delivered / retrieved
+- [{_ck(delivered)}] Per-filter mosaics (`i2d`) present and complete
 {filt_rows}
-- [ ] **Astrometry**: absolute frame tie (VIRAC2/Gaia) within survey noise
-- [ ] **Astrometry**: no inter-module (NRCA/NRCB) offset (proper-motion grade)
-- [ ] **Photometry**: zeropoints consistent across filters/modules
+- [{_ck(frame_ok)}] **Astrometry**: absolute frame tie (VIRAC2/Gaia) within survey noise
+- [{_ck(interm_ok)}] **Astrometry**: no inter-module (NRCA/NRCB) offset (proper-motion grade)
+- [{_ck(phot_ok)}] **Photometry**: zeropoints consistent across filters/modules
 - [ ] Background / stripes / artifacts acceptable
-- [ ] Catalog produced and vetted
-- [ ] **Depth**: detection luminosity functions reach the expected depth (not missing stars we should be detecting)
+- [{_ck(catalog_ok)}] Catalog produced and vetted
+- [{_ck(catalog_ok)}] **Depth**: detection luminosity functions reach the expected depth (not missing stars we should be detecting)
 - [ ] **Purity**: minimal junk detections in PSF wings and in extended-emission regions
 - [ ] **Residuals**: PSF-subtracted residual histogram is narrow and centered on zero (no systematic over/under-subtraction)
 - [ ] Known issues triaged (comment below)
