@@ -31,17 +31,16 @@ MARKER = "<!-- data-qa:pipeline-status -->"
 DONE, RUN, PEND, WARN, SKIP = "✅", "🔄", "⬜", "⚠️", "⏭️"
 
 
-def _newest(pats, stat_cap=400):
-    """(mtime, count) for a glob set.  Count is exact (glob doesn't stat); the newest mtime
-    is taken over at most ``stat_cap`` files -- on NFS a full stat of a 16k-file per-frame
-    set costs minutes, and an approximate 'last run' timestamp is all the status needs."""
+def _newest(pats):
+    """(mtime, count) for a glob set.  mtime is the true max over ALL matches (correctness:
+    an arbitrary slice can miss the newest and flip the re-alignment gate).  Scoping the
+    globs to one obsid (below) keeps the set small enough to stat on NFS."""
     files = []
     for pat in pats:
         files += glob.glob(pat)
     if not files:
         return None, 0
-    sample = files if len(files) <= stat_cap else files[-stat_cap:]
-    return max(os.path.getmtime(f) for f in sample), len(files)
+    return max(os.path.getmtime(f) for f in files), len(files)
 
 
 def _ts(mtime):
@@ -72,15 +71,26 @@ def stage_rows(o, offset_mas=None, offset_thresh=75.0):
         rows.append((label, status, _ts(mtime), detail))
         return mtime
 
+    # obsid-scoped products (carry -o{obs}/{obs} in the filename)
     crf_t, crf_n = _newest([f"{P}/*/pipeline/{prop}*-o{o.obs}*_crf.fits",
                             f"{P}/*/pipeline/{prop}{o.obs}*_crf.fits"])
     add("CRF (Image3 outlier detection)", crf_t, crf_n, detail=f"{crf_n} frames" if crf_n else "")
-    ds_t, ds_n = _newest([f"{P}/*/pipeline/{prop}{o.obs}*_destreak.fits"])
+    ds_t, ds_n = _newest([f"{P}/*/pipeline/{prop}*-o{o.obs}*_destreak.fits",
+                          f"{P}/*/pipeline/{prop}{o.obs}*_destreak.fits"])
     add("destreak", ds_t, ds_n, detail=f"{ds_n} frames" if ds_n else "")
+
+    # FIELD-SHARED products: per-frame cats + merged catalogs carry no obsid, so on a field
+    # whose dir holds more than one program (e.g. Brick = 2221 + 1182) these counts can
+    # include a sibling observation's products.  Flag that rather than falsely obs-attribute.
+    n_programs = len({os.path.basename(p)[2:7]
+                      for p in glob.glob(f"{P}/*/pipeline/jw?????*-o*_crf.fits")})
+    shared = " · field-shared, may include sibling obs" if n_programs > 1 else ""
     sf_t, sf_n = _newest([f"{P}/*/*visit*_daophot_basic.fits"])
-    add("single-frame cataloging", sf_t, sf_n, detail=f"{sf_n} per-exposure catalogs" if sf_n else "")
+    add("single-frame cataloging", sf_t, sf_n,
+        detail=(f"{sf_n} per-exposure catalogs" + shared) if sf_n else "")
     m7_t, m7_n = _newest([f"{P}/catalogs/*m7*.fits"])
-    add("cross-frame catalog merge (m7)", m7_t, m7_n, detail="merged multi-band" if m7_t else "")
+    add("cross-frame catalog merge (m7)", m7_t, m7_n,
+        detail=("merged multi-band" + shared) if m7_t else "")
 
     # refcat comparison + JWST reference-frame creation
     off_txt = ""
@@ -106,11 +116,11 @@ def stage_rows(o, offset_mas=None, offset_thresh=75.0):
     else:
         add("re-alignment of frames", None, 0, status=PEND)
 
-    # cataloging m1..m8
+    # cataloging m1..m8 (field-shared: see caveat above)
     for k in range(1, 9):
         mt, mn = _newest([f"{P}/catalogs/*_m{k}_*.fits", f"{P}/catalogs/*_m{k}.fits"])
         st = DONE if mt else PEND
-        add(f"cataloging m{k}", mt, mn, status=st, detail=f"{mn} catalogs" if mn else "")
+        add(f"cataloging m{k}", mt, mn, status=st, detail=(f"{mn} catalogs" + shared) if mn else "")
     return rows
 
 
@@ -138,17 +148,25 @@ def main(argv=None):
     ap.add_argument("--repo", default=os.environ.get("QA_REPO", "JWST-GC/data-qa"))
     args = ap.parse_args(argv)
 
+    obs = f"{int(args.obs):03d}"     # zero-pad so globs use -o001 not -o1
+
     class _O:                       # light stand-in so this runs without the portal registry
-        program = str(int(args.program)); obs = args.obs
+        program = str(int(args.program))
         field = args.field or ""; target = args.target or (args.field or "").title()
         instrument = "NIRCam"
-        obsid = f"jw{int(args.program):05d}-o{args.obs}"
+        obsid = f"jw{int(args.program):05d}-o{obs}"
         issue_title = f"{target} — {obsid} (NIRCam)"
+    _O.obs = obs
     o = _O()
     block = render_status_block(o, offset_mas=args.offset_mas)
     print(block)
     if args.post:
-        from .post_diagnostics import _token, _issue_number, _find_stage_comment, _req, API
+        try:
+            from .post_diagnostics import _token, _issue_number, _find_stage_comment, _req, API
+        except ImportError:
+            print("post requires data_qa.post_diagnostics (merges with PR #17); skipping post",
+                  file=sys.stderr)
+            return 3
         import json
         token = _token()
         num = _issue_number(args.repo, token, o.issue_title)
@@ -156,13 +174,16 @@ def main(argv=None):
             print(f"no issue titled {o.issue_title!r}", file=sys.stderr); return 1
         existing = _find_stage_comment(args.repo, token, num, MARKER)
         if existing:
-            _req("PATCH", f"{API}/repos/{args.repo}/issues/comments/{existing['id']}", token,
-                 data=json.dumps({"body": block}).encode())
-            print(f"updated status comment on #{num}")
+            st, data = _req("PATCH", f"{API}/repos/{args.repo}/issues/comments/{existing['id']}",
+                            token, data=json.dumps({"body": block}).encode())
+            action = "updated"
         else:
-            _req("POST", f"{API}/repos/{args.repo}/issues/{num}/comments", token,
-                 data=json.dumps({"body": block}).encode())
-            print(f"created status comment on #{num}")
+            st, data = _req("POST", f"{API}/repos/{args.repo}/issues/{num}/comments",
+                            token, data=json.dumps({"body": block}).encode())
+            action = "created"
+        if st >= 300:
+            print(f"comment {action} FAILED ({st}): {data}", file=sys.stderr); return 1
+        print(f"{action} status comment on #{num}")
     return 0
 
 
