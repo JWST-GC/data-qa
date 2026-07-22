@@ -38,6 +38,17 @@ def test_render_events_comment_marker():
     body = sr.render_events_comment(events, now="2026-07-21 12:00 UTC")
     assert body.startswith(sr.STATUS_MARKER)
     assert "NEW_OBSERVATION" in body and "jw02221-o001_x" in body
+    assert "WARNING" not in body
+
+
+def test_render_events_comment_notice_and_tile():
+    events = [dict(event="NEW_OBSERVATION", obs_id="jw10678-o017_x",
+                   calib_level=1, t_obs_release=59900.0,
+                   filters="F212N;F480M", tile="GC_17")]
+    body = sr.render_events_comment(events, now="2026-07-22 12:00 UTC",
+                                    notice="LOW DISK: only 1.0 TB free")
+    assert "> **WARNING — LOW DISK: only 1.0 TB free**" in body
+    assert "tile `GC_17`" in body
 
 
 def test_post_status_dry_run_prints(capsys):

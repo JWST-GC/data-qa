@@ -153,6 +153,7 @@ def render_body(o: Observation) -> str:
 - [{_ck(interm_ok)}] **Astrometry**: no inter-module (NRCA/NRCB) offset (proper-motion grade)
 - [{_ck(phot_ok)}] **Photometry**: zeropoints consistent across filters/modules
 - [ ] Background / stripes / artifacts acceptable
+- [ ] **Destreak**: assessed whether 1/f striping requires destreak (SW/LW per module); noted decision (cataloging defaults to the plain `align` crf products)
 - [{_ck(catalog_ok)}] Catalog produced and vetted
 - [{_ck(catalog_ok)}] **Depth**: detection luminosity functions reach the expected depth (not missing stars we should be detecting)
 - [ ] **Purity**: minimal junk detections in PSF wings and in extended-emission regions

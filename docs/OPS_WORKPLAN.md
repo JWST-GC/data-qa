@@ -147,10 +147,34 @@ that already exists.
    human reviews dry-run output → `--execute` each stage once → tighten.
 5. Backfill `jwst-gc-treasury-hips` field by field (SLURM), validate, push.
 
-## Open questions (answers change defaults, not structure)
+## Open questions — RESOLVED (user decisions, 2026-07-22)
 
-Collected in the session summary; the big ones: auto-submit vs approval gate
-on new data; treasury-HiPS field list + final serving location; F405N
-fallback acceptability where F480M doesn't exist; validation bar for the
-avm_images push (AVM round-trip vs star-position check); whether ops should
-split into its own org repo later.
+1. **Auto-submit vs approval gate: AUTO.** The monitor downloads + triggers the
+   pipeline automatically on new data (`mast_monitor --auto` = `--download
+   --trigger --report --commit-state --execute`). The ONLY gate is available
+   file space: `--min-free-tb` (default 5.0 TB) checked against the
+   `--download-dir` filesystem; below threshold the run downgrades to
+   report-only with a loud LOW DISK warning on the QA issue.
+2. **Treasury HiPS = program 10678 ONLY.** 10678 is the GC Treasury program
+   (MAST: 1668 planned observations, GC_<n> tile targets, NIRCam F212N;F480M +
+   MIRI F770W; everything calib_level −1 / unreleased as of 2026-07-22). It is
+   the monitor's priority watch (`mast_monitor.TREASURY_PROGRAM`, field label
+   `gc-treasury`, tile name carried on events). Pre-treasury fields (sgrb2
+   5365, sgrc 4147, sickle 3958, …) stay OUT of the treasury HiPS — they
+   belong to the existing pre-treasury CMZ products
+   (`docs/cmz_pretreasury_spec.example.json` on the imaging branch; sickle may
+   use F210M as its blue band there).
+3. **Treasury root/publish layout as staged: APPROVED**
+   (`/orange/adamginsburg/jwst/treasury_hips/...` staging root, published via
+   `publish avm` to `htdocs/avm_images/`).
+4. **avm push validation bar: BOTH.** AVM/WCS round-trip AND the
+   star-position/catalog-flux check (`rgb_treasury --validate-stars`) as a
+   second gate; skipped star checks need an explicit `--no-star-check`
+   acknowledgment at publish time, failed ones block outright.
+5. **Cataloging trigger default: plain crf (no destreak).** `EACH_SUFFIX`
+   defaults to `align_o<obs>_crf` (fix_alignment always runs; the no-destreak
+   path names per-exposure crfs `*_align_o<field>_crf.fits`). Destreak stays
+   available via `pipeline_trigger --destreak`; the QA checklist now ASKS
+   whether destreak is needed per observation.
+6. **MIRI 2221 o003: ignored** (left unmapped in `PROGRAMS`; no globulars.)
+7. **Ops stays in data-qa** (no split into its own org repo).

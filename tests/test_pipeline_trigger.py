@@ -34,11 +34,27 @@ def test_modules_never_in_export():
 
 
 def test_cataloging_golden_command():
+    """Default EACH_SUFFIX is the plain no-destreak crf form (align_o<obs>_crf):
+    fix_alignment always runs, and the no-destreak reduction path names the
+    per-exposure crfs *_align_o<field>_crf.fits."""
     step = pt.cataloging_step(2221, "001", "brick", FILTERS, pipe_root="/pipe")
     assert pt.shell_line(step) == (
-        "DEP='<REDUCTION_JOBID>' EACH_SUFFIX=destreak_o001_crf FIELD=001 "
+        "DEP='<REDUCTION_JOBID>' EACH_SUFFIX=align_o001_crf FIELD=001 "
         "FILTERS='F405N F410M F466N F212N' MODULES=merged PROPOSAL=2221 "
         "TARGET=brick /pipe/scripts/reduction/submit_cataloging_chain.sh")
+
+
+def test_cataloging_destreak_optin():
+    """--destreak selects the destreaked products' suffix."""
+    step = pt.cataloging_step(2221, "001", "brick", FILTERS, pipe_root="/pipe",
+                              destreak=True)
+    assert step["env"]["EACH_SUFFIX"] == "destreak_o001_crf"
+
+
+def test_cataloging_each_suffix_override_wins():
+    step = pt.cataloging_step(2221, "001", "brick", FILTERS, pipe_root="/pipe",
+                              each_suffix="custom_o001_crf", destreak=True)
+    assert step["env"]["EACH_SUFFIX"] == "custom_o001_crf"
 
 
 def test_cataloging_guard_vars_all_present():
@@ -52,6 +68,12 @@ def test_build_plan_field_from_programs_map():
     plan = pt.build_plan(4147, "012", filters=["F405N"], pipe_root="/pipe")
     assert plan[0]["argv"][2] == "--job-name=sgrc4147-o012-reduce"
     assert plan[1]["env"]["TARGET"] == "sgrc"
+    assert plan[1]["env"]["EACH_SUFFIX"] == "align_o012_crf"
+
+
+def test_build_plan_destreak_flag_threads_through():
+    plan = pt.build_plan(4147, "012", filters=["F405N"], pipe_root="/pipe",
+                         destreak=True)
     assert plan[1]["env"]["EACH_SUFFIX"] == "destreak_o012_crf"
 
 

@@ -140,16 +140,22 @@ def render_status(field="", program=None, obsnum="", jobs=None, state=None,
     return "\n".join(lines)
 
 
-def render_events_comment(events: List[dict], now=None) -> str:
-    """Markdown comment body for mast_monitor --report (same marker header)."""
+def render_events_comment(events: List[dict], now=None, notice=None) -> str:
+    """Markdown comment body for mast_monitor --report (same marker header).
+
+    ``notice`` (e.g. the --auto LOW DISK downgrade message) renders as a loud
+    warning blockquote above the event list."""
     from .mast_monitor import mjd_to_iso   # stdlib-only
     lines = [STATUS_MARKER,
              f"**MAST monitor events** — {now or utc_now()}", ""]
+    if notice:
+        lines += [f"> **WARNING — {notice}**", ""]
     for ev in events:
         rel = mjd_to_iso(ev.get("t_obs_release"))
+        tile = f", tile `{ev['tile']}`" if ev.get("tile") else ""
         lines.append(f"- **{ev['event']}**: `{ev['obs_id']}` "
                      f"(calib level {ev.get('calib_level')}, release {rel}, "
-                     f"filters `{ev.get('filters') or '?'}`)")
+                     f"filters `{ev.get('filters') or '?'}`{tile})")
     lines += ["", "_Posted by `data_qa/mast_monitor.py --report`._"]
     return "\n".join(lines)
 

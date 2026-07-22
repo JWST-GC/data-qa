@@ -10,6 +10,10 @@ effect is individually gated:
   --report         comment the events on the per-observation QA issue (status_report)
   --execute        actually do it (download / sbatch / post); without it the actions
                    above are dry-run prints
+  --auto           fully automatic: --download --trigger --report --commit-state
+                   --execute, gated ONLY by available file space (--min-free-tb,
+                   checked against the --download-dir filesystem); below the
+                   threshold it downgrades to report-only with a LOW DISK warning
 
 Events:
   NEW_OBSERVATION  obs_id not previously in the state file
@@ -26,6 +30,8 @@ Usage:
     python -m data_qa.mast_monitor --commit-state                   # accept as seen
     python -m data_qa.mast_monitor --download --trigger --report    # dry-run actions
     python -m data_qa.mast_monitor --download --trigger --report --execute
+    python -m data_qa.mast_monitor --auto --min-free-tb 5 \\
+        --download-dir /orange/adamginsburg/jwst/ops/downloads
 """
 from __future__ import annotations
 
@@ -34,6 +40,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from typing import Dict, List
@@ -42,7 +49,20 @@ from typing import Dict, List
 # reduction's field_to_reg_mapping (PipelineRerunNIRCAM-LONG.py) restricted to the
 # GC-treasury/QA programs; field names match data_qa.observations.FIELDS keys where
 # released (cloudef/sgra/ngc6334 have no public release page yet).
+#
+# ================================ PRIORITY WATCH =================================
+# 10678 is THE GC Treasury program: ~1668 planned observations tiling the GC as
+# GC_<n> targets (NIRCam F212N;F480M + MIRI F770W).  As of 2026-07-22 EVERY
+# observation is calib_level=-1 / unreleased, so ANY event from 10678 is the first
+# sign of treasury data arriving.  Its obs numbers cannot be enumerated in advance
+# (they land as the tiles execute), so it maps program-wide to the 'gc-treasury'
+# field via field_for(); the GC_<n> tile name rides each event as 'tile'.
+# =================================================================================
+TREASURY_PROGRAM = 10678
+TREASURY_FIELD = "gc-treasury"
+
 PROGRAMS: Dict[int, Dict[str, str]] = {
+    TREASURY_PROGRAM: {},   # GC Treasury: every obs -> gc-treasury (see field_for)
     2221: {"001": "brick", "002": "cloudc"},
     1182: {"004": "brick", "002": "w51"},           # w51 = broadband
     2211: {"023": "gc2211", "028": "gc2211", "046": "gc2211",
@@ -76,6 +96,10 @@ def obsnum_from_obs_id(obs_id: str) -> str:
 
 
 def field_for(program, obsnum: str) -> str:
+    if int(program) == TREASURY_PROGRAM:
+        # Treasury tiles (GC_<n>) all reduce into the one gc-treasury field; the
+        # per-obs tile name is carried on the event as 'tile' instead.
+        return TREASURY_FIELD
     return PROGRAMS.get(int(program), {}).get(obsnum, "")
 
 
@@ -164,8 +188,11 @@ def diff_events(program, old_obs: Dict[str, dict], new_obs: Dict[str, dict]):
     events = []
     for obs_id, rec in sorted(new_obs.items()):
         obsnum = obsnum_from_obs_id(obs_id)
+        # Treasury events carry the GC_<n> tile name (the MAST target_name)
+        tile = (rec.get("target_name")
+                if int(program) == TREASURY_PROGRAM else None)
         base = dict(program=int(program), obs_id=obs_id, obsnum=obsnum,
-                    field=field_for(program, obsnum),
+                    field=field_for(program, obsnum), tile=tile,
                     calib_level=rec.get("calib_level"),
                     released=rec.get("released"),
                     t_obs_release=rec.get("t_obs_release"),
@@ -209,8 +236,9 @@ def format_event(ev: dict) -> str:
              if ev["event"] == "CALIB_LEVEL_UP"
              else f" calib={ev['calib_level']} release={mjd_to_iso(ev['t_obs_release'])}")
     field = ev["field"] or "?unmapped?"
+    tile = f" tile={ev['tile']}" if ev.get("tile") else ""
     return (f"{ev['event']:16s} {ev['program']} {ev['obs_id']} "
-            f"[field={field} filters={ev.get('filters') or '?'}]" + extra)
+            f"[field={field}{tile} filters={ev.get('filters') or '?'}]" + extra)
 
 
 def _group_by_obs(events):
@@ -223,14 +251,46 @@ def _group_by_obs(events):
     return grouped
 
 
+# -------------------------------------------------------------------------- disk gate
+DEFAULT_MIN_FREE_TB = 5.0
+DEFAULT_DOWNLOAD_DIR = "./data"          # matches retrieve_data.retrieve's default
+
+
+def free_terabytes(path) -> float:
+    """Free space (TB, 1e12 bytes) on the filesystem holding ``path``.  Climbs to
+    the nearest EXISTING parent so a not-yet-created download dir still reports
+    its destination filesystem."""
+    p = os.path.abspath(path)
+    while not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return shutil.disk_usage(p).free / 1e12
+
+
+def disk_gate(download_dir, min_free_tb=DEFAULT_MIN_FREE_TB):
+    """The ONLY gate on --auto: (ok, free_tb, message).  Below-threshold means
+    auto must downgrade to report-only (no download/trigger/commit-state)."""
+    free_tb = free_terabytes(download_dir)
+    if free_tb >= min_free_tb:
+        return True, free_tb, (f"disk gate OK: {free_tb:.1f} TB free at "
+                               f"{download_dir} (threshold {min_free_tb:.1f} TB)")
+    return False, free_tb, (
+        f"LOW DISK: only {free_tb:.1f} TB free on the filesystem of "
+        f"{download_dir} (< {min_free_tb:.1f} TB threshold) -- auto mode "
+        f"downgraded to report-only; NOT downloading, NOT triggering, NOT "
+        f"committing state (events will re-fire once space is freed)")
+
+
 # ---------------------------------------------------------------------------- actions
-def act_download(events, execute=False):
+def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR):
     from .retrieve_data import retrieve   # lazy: astroquery
     for (program, obsnum), evs in sorted(_group_by_obs(events).items()):
         print(f"--download: program {program} obs {obsnum} "
               f"({len(evs)} event(s); dry_run={not execute})")
         retrieve(program, obsnum, product_type=("uncal", "i2d"),
-                 dry_run=not execute)
+                 download_dir=download_dir, dry_run=not execute)
 
 
 def act_trigger(events, execute=False, pipe_root=None):
@@ -251,12 +311,12 @@ def act_trigger(events, execute=False, pipe_root=None):
                pipe_root=pipe_root, execute=execute)
 
 
-def act_report(events, execute=False, repo=None, update_last=False):
+def act_report(events, execute=False, repo=None, update_last=False, notice=None):
     from . import status_report
     for (program, obsnum), evs in sorted(_group_by_obs(events).items()):
         field = evs[0]["field"]
         title = status_report.issue_title_for(program, obsnum, field=field)
-        body = status_report.render_events_comment(evs)
+        body = status_report.render_events_comment(evs, notice=notice)
         status_report.post_status(title, body, repo=repo, update_last=update_last,
                                   dry_run=not execute)
 
@@ -279,12 +339,36 @@ def main(argv=None):
                     help="build the reduction+cataloging submissions (pipeline_trigger)")
     ap.add_argument("--report", action="store_true",
                     help="comment events on the per-observation QA issue")
+    ap.add_argument("--auto", action="store_true",
+                    help="AUTO mode: --download --trigger --report --commit-state "
+                         "--execute in one flag, gated ONLY by the disk-space "
+                         "check (--min-free-tb); below threshold it downgrades "
+                         "to report-only with a loud LOW DISK warning")
+    ap.add_argument("--min-free-tb", type=float, default=DEFAULT_MIN_FREE_TB,
+                    help="minimum free space (TB) on the --download-dir "
+                         f"filesystem for --auto (default {DEFAULT_MIN_FREE_TB})")
+    ap.add_argument("--download-dir", default=DEFAULT_DOWNLOAD_DIR,
+                    help="download destination for --download/--auto "
+                         f"(default {DEFAULT_DOWNLOAD_DIR})")
     ap.add_argument("--pipe-root", default=None,
                     help="jwst-gc-pipeline checkout for --trigger")
     ap.add_argument("--repo", default=None, help="owner/name for --report")
     ap.add_argument("--execute", action="store_true",
                     help="really download/submit/post (default: dry-run actions)")
     args = ap.parse_args(argv)
+
+    notice = None
+    if args.auto:
+        args.download = args.trigger = args.report = True
+        args.commit_state = args.execute = True
+        ok, _free, msg = disk_gate(args.download_dir, args.min_free_tb)
+        print(f"--auto: {msg}", file=sys.stderr if not ok else sys.stdout)
+        if not ok:
+            # report-only downgrade: the issue comment still posts (with the
+            # LOW DISK warning), but nothing is downloaded/submitted and the
+            # state is NOT committed so the events re-fire next run.
+            args.download = args.trigger = args.commit_state = False
+            notice = msg
 
     programs = ([int(p) for p in args.programs] if args.programs
                 else sorted(PROGRAMS))
@@ -318,11 +402,13 @@ def main(argv=None):
 
     if all_events:
         if args.download:
-            act_download(all_events, execute=args.execute)
+            act_download(all_events, execute=args.execute,
+                         download_dir=args.download_dir)
         if args.trigger:
             act_trigger(all_events, execute=args.execute, pipe_root=args.pipe_root)
         if args.report:
-            act_report(all_events, execute=args.execute, repo=args.repo)
+            act_report(all_events, execute=args.execute, repo=args.repo,
+                       notice=notice)
 
     if args.commit_state:
         save_state(args.state, state)

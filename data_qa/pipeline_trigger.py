@@ -30,7 +30,7 @@ import subprocess
 import sys
 from typing import Dict, List, Optional
 
-from .mast_monitor import PROGRAMS
+from .mast_monitor import field_for
 
 DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
 REDUCTION_SBATCH = "scripts/reduction/submit_reduction.sbatch"
@@ -62,15 +62,25 @@ def reduction_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
 
 
 def cataloging_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
-                    modules="merged", each_suffix=None,
+                    modules="merged", each_suffix=None, destreak=False,
                     dep: Optional[str] = DEP_PLACEHOLDER) -> dict:
-    """The cataloging chain (env-var driven; DEP gates it on the reduction array)."""
+    """The cataloging chain (env-var driven; DEP gates it on the reduction array).
+
+    EACH_SUFFIX default is the plain (no-destreak) crf form ``align_o<obs>_crf``:
+    the reduction ALWAYS runs fix_alignment, and on the no-destreak path it copies
+    ``*_cal.fits`` -> ``*_align.fits`` before Image3, so the per-exposure crf
+    products are named ``*_align_o<field>_crf.fits`` (PipelineRerunNIRCAM-LONG.py
+    destreak/align loop + its CRF-naming fix).  ``destreak=True`` selects the
+    destreaked products' ``destreak_o<obs>_crf`` instead -- whether an observation
+    needs destreak is a per-observation QA decision (see the QA-issue checklist).
+    """
     env = {
         "PROPOSAL": str(int(program)),
         "FIELD": obs,
         "TARGET": field,
         "MODULES": modules,
-        "EACH_SUFFIX": each_suffix or f"destreak_o{obs}_crf",
+        "EACH_SUFFIX": each_suffix
+        or f"{'destreak' if destreak else 'align'}_o{obs}_crf",
         "FILTERS": " ".join(filters),
     }
     if dep:
@@ -81,9 +91,9 @@ def cataloging_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
 
 def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_ROOT,
                modules="nrca,nrcb,merged", catalog_modules="merged",
-               each_suffix=None, skip_step12=False) -> List[dict]:
+               each_suffix=None, destreak=False, skip_step12=False) -> List[dict]:
     """The full submission sequence for one observation (list of step dicts)."""
-    field = field or PROGRAMS.get(int(program), {}).get(obs, "")
+    field = field or field_for(program, obs)
     if not field:
         raise ValueError(f"no field mapping for program {program} obs {obs}; "
                          "pass --field or add it to mast_monitor.PROGRAMS")
@@ -93,7 +103,8 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_RO
         reduction_step(program, obs, field, filters, pipe_root=pipe_root,
                        modules=modules, skip_step12=skip_step12),
         cataloging_step(program, obs, field, filters, pipe_root=pipe_root,
-                        modules=catalog_modules, each_suffix=each_suffix),
+                        modules=catalog_modules, each_suffix=each_suffix,
+                        destreak=destreak),
     ]
 
 
@@ -170,7 +181,11 @@ def main(argv=None):
     ap.add_argument("--catalog-modules", default="merged",
                     help="cataloging MODULES (default merged)")
     ap.add_argument("--each-suffix", default=None,
-                    help="cataloging EACH_SUFFIX (default destreak_o<obs>_crf)")
+                    help="cataloging EACH_SUFFIX (default align_o<obs>_crf, the "
+                         "plain no-destreak crf products)")
+    ap.add_argument("--destreak", action="store_true",
+                    help="catalog the destreaked products "
+                         "(EACH_SUFFIX destreak_o<obs>_crf)")
     ap.add_argument("--skip-step12", action="store_true",
                     help="SKIP=1: reuse existing *_cal.fits (default SKIP=0 "
                          "for fresh data)")
@@ -182,7 +197,8 @@ def main(argv=None):
         submit(args.program, args.obs, field=args.field, filters=args.filters,
                pipe_root=args.pipe_root, execute=args.execute,
                modules=args.modules, catalog_modules=args.catalog_modules,
-               each_suffix=args.each_suffix, skip_step12=args.skip_step12)
+               each_suffix=args.each_suffix, destreak=args.destreak,
+               skip_step12=args.skip_step12)
     except (ValueError, FileNotFoundError, RuntimeError) as ex:
         print(f"ERROR: {ex}", file=sys.stderr)
         return 1

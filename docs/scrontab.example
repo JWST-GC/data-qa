@@ -10,19 +10,35 @@
 # tiny resource ask.  Log directory must exist:
 #   mkdir -p /blue/adamginsburg/adamginsburg/logs/jwst
 
-# ---- daily: poll + report events (report-only: prints to the log, changes nothing)
+# ---- daily: AUTO mode (decision 2026-07-22: download + trigger + report +
+#      commit-state, all --execute).  The ONLY gate is free disk space
+#      (--min-free-tb, checked against the --download-dir filesystem): below the
+#      threshold the run downgrades itself to report-only and posts a loud
+#      LOW DISK warning on the QA issue instead of downloading/submitting.
 #SCRON --account=astronomy-dept
 #SCRON --qos=astronomy-dept-b
 #SCRON --job-name=jwstgc-mastmon-daily
 #SCRON --cpus-per-task=1
 #SCRON --mem=4gb
-#SCRON --time=00:30:00
+#SCRON --time=04:00:00
 #SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_%j.log
-17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor
+17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --auto --min-free-tb 5 --download-dir /orange/adamginsburg/jwst/ops/downloads
 
-# ---- weekly (Mondays): poll + COMMIT the state, so the daily runs only re-report
-#      events younger than a week.  Add --report (and, once trusted, --download
-#      --trigger, each still dry-run without --execute) to act on new data.
+# ---- report-only alternative (the pre-AUTO daily entry): poll + print, touch
+#      nothing.  Swap this in (and drop --auto above) to supervise by hand again.
+##SCRON --account=astronomy-dept
+##SCRON --qos=astronomy-dept-b
+##SCRON --job-name=jwstgc-mastmon-daily
+##SCRON --cpus-per-task=1
+##SCRON --mem=4gb
+##SCRON --time=00:30:00
+##SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_%j.log
+#17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor
+
+# ---- weekly (Mondays): poll + COMMIT the state, so a report-only daily would
+#      only re-report events younger than a week.  Redundant while the daily
+#      --auto entry commits state itself, but harmless (and it keeps the state
+#      fresh if the daily entry is ever swapped back to report-only).
 #SCRON --account=astronomy-dept
 #SCRON --qos=astronomy-dept-b
 #SCRON --job-name=jwstgc-mastmon-weekly
