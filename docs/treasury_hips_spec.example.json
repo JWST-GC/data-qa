@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Spec for data_qa.hips_treasury: the jwst-gc-treasury-hips.",
+    "TREASURY = PROGRAM 10678 ONLY (user decision 2026-07-22): the GC Treasury",
+    "program -- MAST lists 1668 planned observations tiling the GC as GC_<n>",
+    "targets, NIRCam F212N;F480M (+ MIRI F770W), so F212N + F480M are",
+    "guaranteed per design for every tile.  NO DATA DELIVERED YET: every",
+    "observation is calib_level=-1 (unreleased) as of 2026-07-22; the fields",
+    "list below is a TODO template until the first tiles land.",
+    "Pre-treasury CMZ fields (sgrb2 5365, sgrc 4147, sickle 3958, ...) do NOT",
+    "belong here -- they extend the pre-treasury CMZ imagery via",
+    "docs/cmz_pretreasury_spec.example.json instead.",
+    "The GC_001 entry is a TEMPLATE showing the ANTICIPATED path convention",
+    "under /orange/adamginsburg/jwst/gc-treasury/ -- convention TBD on first",
+    "delivery; confirm against the real products before building.",
+    "'root' is a LOCAL staging tree; publish it to the server with",
+    "  python -m data_qa.publish avm --src <root> --name jwst-gc-treasury-hips",
+    "which lands at htdocs/avm_images/jwst-gc-treasury-hips/."
+  ],
+  "root": "/orange/adamginsburg/jwst/treasury_hips/jwst-gc-treasury-hips",
+  "fields": [
+    {
+      "name": "GC_001",
+      "f212n_i2d": "TODO:/orange/adamginsburg/jwst/gc-treasury/F212N/pipeline/jw10678-oNNN_tNNN_nircam_clear-f212n-merged_i2d.fits <convention TBD on first delivery>",
+      "long_i2d": "TODO:/orange/adamginsburg/jwst/gc-treasury/F480M/pipeline/jw10678-oNNN_tNNN_nircam_clear-f480m-merged_i2d.fits <convention TBD on first delivery>",
+      "long_band": "F480M"
+    }
+  ]
+}

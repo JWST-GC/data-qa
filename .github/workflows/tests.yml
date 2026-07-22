@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy astropy pytest reproject pyavm pillow requests
+
+      # Test modules use pytest.importorskip for optional heavy deps, so a
+      # missing extra skips its tests instead of failing collection.
+      # Both test roots are covered: top-level tests/ (ops layer, PR #19)
+      # and data_qa/tests/ (imaging + publish, PR #21) -- whichever exist.
+      - name: Run tests
+        run: |
+          paths="data_qa"
+          if [ -d tests ]; then paths="tests $paths"; fi
+          pytest $paths -q

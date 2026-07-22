@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Spec for data_qa.hips_treasury: the PRE-TREASURY CMZ HiPS.",
+    "Extends the existing pre-treasury CMZ imagery (the survey fields observed",
+    "BEFORE the 10678 GC Treasury program): sgrb2 (5365), sgrc (4147), sickle",
+    "(3958), ....  These fields stay OUT of the 10678-only treasury HiPS",
+    "(docs/treasury_hips_spec.example.json) per user decision 2026-07-22.",
+    "sgrb2 paths are real, verified 2026-07-21.  sgrc/sickle are placeholders:",
+    "no clear-*-merged_i2d.fits science mosaics existed for their F212N/F480M",
+    "pipeline dirs at that date; fill them in (TODO) when the mosaics land.",
+    "sickle has no F212N: per user decision its BLUE band is F210M ('blue_band'",
+    "overrides the F212N member tag; the mosaic still folds into the F212N",
+    "substrate tree).",
+    "'root' is a LOCAL staging tree; publish it to the server with",
+    "  python -m data_qa.publish avm --src <root> --name jwst-cmz-pretreasury-hips",
+    "which lands at htdocs/avm_images/jwst-cmz-pretreasury-hips/."
+  ],
+  "root": "/orange/adamginsburg/jwst/treasury_hips/jwst-cmz-pretreasury-hips",
+  "fields": [
+    {
+      "name": "sgrb2",
+      "f212n_i2d": "/orange/adamginsburg/jwst/sgrb2/F212N/pipeline/jw05365-o001_t001_nircam_clear-f212n-merged_i2d.fits",
+      "long_i2d": "/orange/adamginsburg/jwst/sgrb2/F480M/pipeline/jw05365-o001_t001_nircam_clear-f480m-merged_i2d.fits",
+      "long_band": "F480M"
+    },
+    {
+      "name": "sgrc",
+      "f212n_i2d": "TODO:/orange/adamginsburg/jwst/sgrc/F212N/pipeline/<f212n-merged_i2d.fits not yet built>",
+      "long_i2d": "TODO:/orange/adamginsburg/jwst/sgrc/F480M/pipeline/<f480m-merged_i2d.fits not yet built>",
+      "long_band": "F480M"
+    },
+    {
+      "name": "sickle",
+      "f212n_i2d": "TODO:/orange/adamginsburg/jwst/sickle/F210M/pipeline/jw03958-o007_t001_nircam_clear-f210m-merged_i2d.fits <F210M is sickle's blue band (no F212N); verify mosaic before use>",
+      "blue_band": "F210M",
+      "long_i2d": "TODO:/orange/adamginsburg/jwst/sickle/F480M/pipeline/<f480m-merged_i2d.fits not yet built; only mergedcat model/residual i2ds exist>",
+      "long_band": "F480M"
+    }
+  ]
+}
