@@ -19,6 +19,10 @@ import urllib.request
 from .observations import Observation
 
 API = "https://api.github.com"
+
+
+class PostError(Exception):
+    """A GitHub post/upload step failed; caller decides whether to continue other stages."""
 UPLOADS = "https://uploads.github.com"
 ASSET_RELEASE_TAG = os.environ.get("QA_ASSET_TAG", "qa-assets")
 DIAG_MARKER = "<!-- data-qa:diag:stage{n} -->"
@@ -27,7 +31,7 @@ DIAG_MARKER = "<!-- data-qa:diag:stage{n} -->"
 def _token():
     tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if not tok:
-        raise SystemExit("GITHUB_TOKEN not set")
+        raise PostError("GITHUB_TOKEN not set")
     return tok
 
 
@@ -64,7 +68,7 @@ def _ensure_release(repo, token):
         "prerelease": True,
     }).encode())
     if st >= 300:
-        raise SystemExit(f"could not create {ASSET_RELEASE_TAG} release: {rel}")
+        raise PostError(f"could not create {ASSET_RELEASE_TAG} release: {rel}")
     return rel
 
 
@@ -81,7 +85,7 @@ def upload_asset(repo, token, png_path, asset_name):
     url = f"{UPLOADS}/repos/{repo}/releases/{rel['id']}/assets?name={asset_name}"
     st, data = _req("POST", url, token, data=blob, headers={"Content-Type": ctype})
     if st >= 300:
-        raise SystemExit(f"asset upload failed ({st}): {data}")
+        raise PostError(f"asset upload failed ({st}): {data}")
     return data["browser_download_url"]
 
 
@@ -128,7 +132,7 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None):
     token = token or _token()
     num = _issue_number(repo, token, o.issue_title)
     if num is None:
-        raise SystemExit(f"no issue titled {o.issue_title!r} in {repo}")
+        raise PostError(f"no issue titled {o.issue_title!r} in {repo}")
     asset_name = f"{o.obsid}_stage{stage}.png"
     img_url = upload_asset(repo, token, png_path, asset_name)
     marker = DIAG_MARKER.format(n=stage)
@@ -146,6 +150,6 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None):
                         data=json.dumps({"body": body}).encode())
         action = "created"
     if st >= 300:
-        raise SystemExit(f"comment {action} failed ({st}): {data}")
+        raise PostError(f"comment {action} failed ({st}): {data}")
     print(f"  stage {stage}: {action} comment on #{num} -> {data.get('html_url')}")
     return data

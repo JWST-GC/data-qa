@@ -610,30 +610,38 @@ def main(argv=None):
         o = replace(o, target=args.target)
     sw, lw = pick_filters(o.filters, args.sw, args.lw)
     print(f"{o.obsid}: SW={sw} LW={lw} filters={o.filters}")
-    all_metrics = {}
-    for n in args.stage:
-        png, metrics = build_stage(o, n, sw, lw)
-        all_metrics[f"stage{n}"] = metrics
-        print(f"  stage {n}: {png}  passed={metrics.get('passed')}")
-        if args.post:
-            from .post_diagnostics import post_stage
-            post_stage(o, n, png, caption_for(n, metrics), args.repo)
-    # write metrics json where make_issues.render_body reads it to drive checkbox state.
-    # Small text (committable); figures stay in OUTDIR and are hosted on the GitHub CDN.
+    # metrics json where make_issues.render_body reads checkbox state; write INCREMENTALLY
+    # and isolate each stage so a corrupt FITS / photutils failure / GitHub 5xx on one stage
+    # doesn't drop the metrics of the stages that succeeded or stop later stages.
     mdir = os.path.join(os.path.dirname(__file__), "metrics")
     os.makedirs(mdir, exist_ok=True)
-    # merge into any existing metrics so a single-stage run doesn't drop other stages
     mpath = os.path.join(mdir, f"{o.obsid}.json")
-    prev = {}
+    all_metrics = {}
     if os.path.exists(mpath):
         try:
             with open(mpath) as fh:
-                prev = json.load(fh)
+                all_metrics = json.load(fh)
         except (OSError, ValueError):
-            prev = {}
-    prev.update(all_metrics)
-    with open(mpath, "w") as fh:
-        json.dump(prev, fh, indent=2)
+            all_metrics = {}
+    for n in args.stage:
+        try:
+            png, metrics = build_stage(o, n, sw, lw)
+        except (OSError, ValueError, IndexError, KeyError, RuntimeError) as e:
+            print(f"  stage {n}: FAILED to build: {type(e).__name__}: {e}", file=sys.stderr)
+            all_metrics[f"stage{n}"] = dict(stage=n, error=f"{type(e).__name__}: {e}", passed=False)
+            with open(mpath, "w") as fh:
+                json.dump(all_metrics, fh, indent=2)
+            continue
+        all_metrics[f"stage{n}"] = metrics
+        print(f"  stage {n}: {png}  passed={metrics.get('passed')}")
+        with open(mpath, "w") as fh:          # persist before the (fallible) network post
+            json.dump(all_metrics, fh, indent=2)
+        if args.post:
+            try:
+                from .post_diagnostics import post_stage, PostError
+                post_stage(o, n, png, caption_for(n, metrics), args.repo)
+            except (PostError, OSError) as e:
+                print(f"  stage {n}: post FAILED (figure built OK): {e}", file=sys.stderr)
     print(f"metrics -> {mpath}")
     return 0
 

@@ -100,11 +100,15 @@ def _ck(cond) -> str:
 
 def render_body(o: Observation) -> str:
     M = _qa_metrics(o)
-    s1, s2, s3, s4 = (M.get(f"stage{n}", {}) for n in (1, 2, 3, 4))
-    THRESH_ABS, THRESH_IM = 75.0, 15.0     # mas; mirror data_qa.astrometry_audit
+    s1, s2, s3, s4, s5 = (M.get(f"stage{n}", {}) for n in (1, 2, 3, 4, 5))
+    from . import astrometry_audit as aa
+    THRESH_ABS, THRESH_IM = aa.THRESH["absolute"], aa.THRESH["intermodule"]
     delivered = bool(s1.get("passed"))
     frame_ok = s4.get("bulk_off") is not None and s4["bulk_off"] < THRESH_ABS
-    interm_ok = s4.get("intermodule_off") is not None and s4["intermodule_off"] < THRESH_IM
+    # inter-module: prefer stage 5's reference-free overlap offset, else stage 4's.  Absent =
+    # 'not yet measured' -> left unchecked (the sticky-merge won't downgrade a prior check).
+    im = s5.get("intermodule_off", s4.get("intermodule_off"))
+    interm_ok = im is not None and im < THRESH_IM
     phot_ok = bool(s3.get("passed"))
     catalog_ok = bool(s2.get("passed"))
 
@@ -215,6 +219,32 @@ def ensure_labels(token, repo, names):
 
 
 # --------------------------------------------------------------------------- main
+_CK_LINE = re.compile(r"^(\s*- \[)([ xX])(\] )(.*)$")
+
+
+def _sticky_checkboxes(new_body: str, old_body: str) -> str:
+    """Carry checked marks from the CURRENT remote body into the regenerated body.
+
+    The body is machine-overwritten every run, which otherwise (a) unchecks every
+    metrics-derived box on the scheduled CI run (which has no cluster ``metrics/`` file) and
+    (b) clobbers boxes a human ticked.  Rule: a box CHECKED in either the new render or the
+    remote body stays checked (sticky/union), keyed on the checklist label text.  Never
+    unchecks -- a regression is surfaced in the diagnostic reply, not by silently unticking.
+    """
+    old_checked = set()
+    for ln in (old_body or "").splitlines():
+        m = _CK_LINE.match(ln)
+        if m and m.group(2) in "xX":
+            old_checked.add(m.group(4).strip())
+    out = []
+    for ln in new_body.splitlines():
+        m = _CK_LINE.match(ln)
+        if m and m.group(2) == " " and m.group(4).strip() in old_checked:
+            ln = f"{m.group(1)}x{m.group(3)}{m.group(4)}"
+        out.append(ln)
+    return "\n".join(out)
+
+
 def sync_observation(o, token, repo, existing, dry_run=False):
     title, body, labels = o.issue_title, render_body(o), labels_for(o)
     if title in existing:
@@ -222,6 +252,7 @@ def sync_observation(o, token, repo, existing, dry_run=False):
         num = it["number"]
         if dry_run:
             return f"UPDATE #{num}: {title}"
+        body = _sticky_checkboxes(body, it.get("body", ""))     # preserve human + prior marks
         _req("PATCH", f"{API}/repos/{repo}/issues/{num}", token,
              {"body": body, "labels": labels})
         return f"updated #{num}: {title}"
