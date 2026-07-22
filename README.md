@@ -3,10 +3,7 @@
 Data-quality assessment and issue tracking for the JWST Galactic Center surveys.
 
 **This repository is for reporting and discussing data-quality issues on individual
-datasets — one GitHub issue per observation.** It is deliberately *not* a reduction
-or analysis repository (that scope creep is what made the ACES `reduction_ACES` repo
-hard to navigate). Keep reduction pipelines, science analysis, and catalog code in
-their own repos; use this one to:
+datasets — one GitHub issue per observation.**
 
 - track QA status per observation (astrometry, photometry, mosaics, catalogs),
 - report problems tied to specific data products, with links, and
@@ -61,3 +58,7 @@ newly released **field** in, add it to `FIELDS` in `data_qa/observations.py`; it
 observations are parsed from `{field}_images.txt` on the next run. To attach hand
 notes / epoch / visits to a specific observation, add an entry to `CURATED`
 (keyed by obsid, e.g. `jw02221-o001`).
+
+## TODO
+
+We still need to set up a cron job to poll the MAST archive, trigger downloads, and trigger job runs and issue creation when new data are delivered.
