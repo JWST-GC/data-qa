@@ -10,7 +10,7 @@ Stage order (rising):
     -> JWST reference-frame creation (w/ measured offset) -> re-alignment
     -> cataloging m1 -> ... -> m8
 
-Status: ✅ done   🔄 running/queued   ⬜ pending   ⚠️ done, flagged   ⏭️ skipped
+Status: ✅ done   🔄 running/queued   ⬜ pending   ⚠️ done, flagged   🛑 stale   ⏭️ skipped
 
 Stdlib + glob only for the status; posting reuses the GitHub helpers.
 
@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 
 BASE = os.environ.get("QA_BASE", "/orange/adamginsburg/jwst")
 MARKER = "<!-- data-qa:pipeline-status -->"
-DONE, RUN, PEND, WARN, SKIP = "✅", "🔄", "⬜", "⚠️", "⏭️"
+DONE, RUN, PEND, WARN, SKIP, STALE = "✅", "🔄", "⬜", "⚠️", "⏭️", "🛑"
 
 
 def _newest(pats):
@@ -116,11 +116,24 @@ def stage_rows(o, offset_mas=None, offset_thresh=75.0):
     else:
         add("re-alignment of frames", None, 0, status=PEND)
 
-    # cataloging m1..m8 (field-shared: see caveat above)
+    # cataloging m1..m8 (field-shared: see caveat above).  These must be monotonically
+    # non-decreasing in time (m8 is derived from m7, ...).  A later stage whose newest file
+    # is OLDER than an earlier stage means it was NOT regenerated after that earlier stage
+    # changed -> it is STALE (🛑), not done: the pipeline must re-run it.
+    newest_earlier = None
     for k in range(1, 9):
         mt, mn = _newest([f"{P}/catalogs/*_m{k}_*.fits", f"{P}/catalogs/*_m{k}.fits"])
-        st = DONE if mt else PEND
-        add(f"cataloging m{k}", mt, mn, status=st, detail=(f"{mn} catalogs" + shared) if mn else "")
+        if not mt:
+            st, det = PEND, ""
+        elif newest_earlier is not None and mt < newest_earlier - 1.0:
+            st = STALE
+            det = f"{mn} catalogs · STALE (older than an earlier m-stage; re-run)" + shared
+        else:
+            st = DONE
+            det = f"{mn} catalogs" + shared
+        add(f"cataloging m{k}", mt, mn, status=st, detail=det)
+        if mt:
+            newest_earlier = mt if newest_earlier is None else max(newest_earlier, mt)
     return rows
 
 
@@ -129,7 +142,7 @@ def render_status_block(o, offset_mas=None):
     now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     head = (f"{MARKER}\n### Pipeline progress — `{o.obsid}` ({o.target})\n"
             f"<sub>auto-updated {now} · ✅ done · 🔄 running/queued · ⬜ pending · "
-            f"⚠️ done, flagged · ⏭️ skipped</sub>\n\n"
+            f"⚠️ done, flagged · 🛑 stale (out-of-order timestamp) · ⏭️ skipped</sub>\n\n"
             f"| stage | status | last run (UTC) | detail |\n"
             f"|-------|:------:|----------------|--------|\n")
     body = "\n".join(f"| {lab} | {st} | {when} | {det} |" for lab, st, when, det in rows)
