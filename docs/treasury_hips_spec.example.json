@@ -1,32 +1,28 @@
 {
   "_comment": [
-    "Example spec for data_qa.hips_treasury (jwst-gc-treasury-hips).",
+    "Spec for data_qa.hips_treasury: the jwst-gc-treasury-hips.",
+    "TREASURY = PROGRAM 10678 ONLY (user decision 2026-07-22): the GC Treasury",
+    "program -- MAST lists 1668 planned observations tiling the GC as GC_<n>",
+    "targets, NIRCam F212N;F480M (+ MIRI F770W), so F212N + F480M are",
+    "guaranteed per design for every tile.  NO DATA DELIVERED YET: every",
+    "observation is calib_level=-1 (unreleased) as of 2026-07-22; the fields",
+    "list below is a TODO template until the first tiles land.",
+    "Pre-treasury CMZ fields (sgrb2 5365, sgrc 4147, sickle 3958, ...) do NOT",
+    "belong here -- they extend the pre-treasury CMZ imagery via",
+    "docs/cmz_pretreasury_spec.example.json instead.",
+    "The GC_001 entry is a TEMPLATE showing the ANTICIPATED path convention",
+    "under /orange/adamginsburg/jwst/gc-treasury/ -- convention TBD on first",
+    "delivery; confirm against the real products before building.",
     "'root' is a LOCAL staging tree; publish it to the server with",
     "  python -m data_qa.publish avm --src <root> --name jwst-gc-treasury-hips",
-    "which lands at htdocs/avm_images/jwst-gc-treasury-hips/.",
-    "sgrb2 paths are real, verified 2026-07-21.  sgrc/sickle are placeholders:",
-    "no clear-*-merged_i2d.fits science mosaics existed for their F212N/F480M",
-    "pipeline dirs at that date (sickle has no F212N at all -- F187N/F210M",
-    "field); fill them in (TODO) when the mosaics land."
+    "which lands at htdocs/avm_images/jwst-gc-treasury-hips/."
   ],
   "root": "/orange/adamginsburg/jwst/treasury_hips/jwst-gc-treasury-hips",
   "fields": [
     {
-      "name": "sgrb2",
-      "f212n_i2d": "/orange/adamginsburg/jwst/sgrb2/F212N/pipeline/jw05365-o001_t001_nircam_clear-f212n-merged_i2d.fits",
-      "long_i2d": "/orange/adamginsburg/jwst/sgrb2/F480M/pipeline/jw05365-o001_t001_nircam_clear-f480m-merged_i2d.fits",
-      "long_band": "F480M"
-    },
-    {
-      "name": "sgrc",
-      "f212n_i2d": "TODO:/orange/adamginsburg/jwst/sgrc/F212N/pipeline/<f212n-merged_i2d.fits not yet built>",
-      "long_i2d": "TODO:/orange/adamginsburg/jwst/sgrc/F480M/pipeline/<f480m-merged_i2d.fits not yet built>",
-      "long_band": "F480M"
-    },
-    {
-      "name": "sickle",
-      "f212n_i2d": "TODO:<sickle has no F212N; nearest short band is F210M at /orange/adamginsburg/jwst/sickle/F210M/pipeline/jw03958-o007_t001_nircam_clear-f210m-merged_i2d.fits>",
-      "long_i2d": "TODO:/orange/adamginsburg/jwst/sickle/F480M/pipeline/<f480m-merged_i2d.fits not yet built; only mergedcat model/residual i2ds exist>",
+      "name": "GC_001",
+      "f212n_i2d": "TODO:/orange/adamginsburg/jwst/gc-treasury/F212N/pipeline/jw10678-oNNN_tNNN_nircam_clear-f212n-merged_i2d.fits <convention TBD on first delivery>",
+      "long_i2d": "TODO:/orange/adamginsburg/jwst/gc-treasury/F480M/pipeline/jw10678-oNNN_tNNN_nircam_clear-f480m-merged_i2d.fits <convention TBD on first delivery>",
       "long_band": "F480M"
     }
   ]

@@ -9,15 +9,25 @@ R=long, B=F212N, G=0.5*(R+B), global stretch).
 Spec (JSON)::
 
     {
-      "root": ".../avm_images/jwst-gc-treasury-hips",
+      "root": ".../treasury_hips/jwst-gc-treasury-hips",
       "fields": [
-        {"name": "sgrb2",
-         "f212n_i2d": ".../jw05365-o001_t001_nircam_clear-f212n-merged_i2d.fits",
-         "long_i2d":  ".../jw05365-o001_t001_nircam_clear-f480m-merged_i2d.fits",
+        {"name": "GC_001",
+         "f212n_i2d": ".../jw10678-oNNN_tNNN_nircam_clear-f212n-merged_i2d.fits",
+         "long_i2d":  ".../jw10678-oNNN_tNNN_nircam_clear-f480m-merged_i2d.fits",
          "long_band": "F480M"},
         ...
       ]
     }
+
+Optional per-field ``"blue_band"`` overrides the blue member TAG (sickle's
+F210M) while the mosaic still folds into the F212N substrate tree.
+
+Two maintained example specs (user decision 2026-07-22): the treasury spec
+(``docs/treasury_hips_spec.example.json``) is PROGRAM 10678 ONLY (GC_<n>
+tiles, F212N+F480M by design; nothing delivered yet), while the pre-treasury
+CMZ fields (sgrb2/sgrc/sickle...) live in
+``docs/cmz_pretreasury_spec.example.json`` with its own root
+(``jwst-cmz-pretreasury-hips``).
 
 Verbs (``plan`` is the default and touches nothing):
 
@@ -153,7 +163,10 @@ def build_field(spec, name, pipe_root=None, threads=8):
         if not i2d:
             print(f"[hips_treasury] {name}: no {key} in spec; skipping {band}")
             continue
-        tag = field.get("long_band") if band == LONG_DIR else BLUE_BAND
+        # blue_band overrides the F212N member tag (sickle: F210M blue) while
+        # the mosaic still folds into the F212N substrate tree
+        tag = (field.get("long_band") if band == LONG_DIR
+               else field.get("blue_band", BLUE_BAND))
         print(f"[hips_treasury] {band} += {name} ({i2d})")
         stats[band] = hips.add_field_to_mono_hips(
             dirs[band], [i2d], name, tag=tag, threads=threads)

@@ -93,6 +93,83 @@ def test_local_asinh_matches_pipeline_if_importable():
                                hips._asinh_norm(x, 0.0, 1.0))
 
 
+# ------------------------------------------------------------------ star positions
+def test_find_ref_catalog_convention(tmp_path):
+    catdir = tmp_path / "sgrb2" / "catalogs"
+    catdir.mkdir(parents=True)
+    gaia = catdir / "gaia_refcat_epoch2022.70.fits"
+    gaia.write_bytes(b"")
+    assert RT.find_ref_catalog("sgrb2", root=str(tmp_path)) == str(gaia)
+    virac = catdir / "gaia_virac2_refcat_epoch2022.70.fits"
+    virac.write_bytes(b"")
+    # gaia_virac2 preferred over the gaia-only fallback
+    assert RT.find_ref_catalog("sgrb2", root=str(tmp_path)) == str(virac)
+    assert RT.find_ref_catalog("nope", root=str(tmp_path)) is None
+    assert RT.find_ref_catalog(None, root=str(tmp_path)) is None
+
+
+def test_star_positions_pass(star_grid_pair, tmp_path):
+    f212n, longp, refcat, _wcs = star_grid_pair
+    out = str(tmp_path / "stars_rgb")
+    rc = RT.main(["--f212n", f212n, "--long", longp, "--out", out,
+                  "--ref-catalog", refcat, "--validate-stars"])
+    assert rc == 0
+    with open(out + ".validation.json") as fh:
+        verdict = json.load(fh)
+    stars = verdict["checks"]["star_positions"]
+    assert stars["pass"] is True
+    assert stars["median_offset_px"] <= RT.STAR_PASS_MEDIAN_PX
+    assert stars["n_used"] >= RT.STAR_MIN_USED
+    assert stars["matched_fraction"] >= RT.STAR_MIN_MATCH_FRACTION
+    assert stars["ref_catalog"] == os.path.abspath(refcat)
+    assert verdict["pass"] is True
+
+
+def test_star_positions_fail_on_shifted_wcs(star_grid_pair, tmp_path):
+    """A catalog offset by ~3 px (a shifted-WCS image would look identical to
+    the matcher) must FAIL the star gate and the whole verdict."""
+    from astropy.table import Table
+    f212n, longp, refcat, wcs = star_grid_pair
+    tbl = Table.read(refcat)
+    x, y = wcs.wcs_world2pix(np.asarray(tbl["RA"]), np.asarray(tbl["DEC"]), 0)
+    shifted = wcs.pixel_to_world(x + 3.0, y)     # rigid +3 px shift in x
+    tbl["RA"], tbl["DEC"] = shifted.ra.deg, shifted.dec.deg
+    badcat = str(tmp_path / "gaia_virac2_refcat_shifted.fits")
+    tbl.write(badcat)
+    out = str(tmp_path / "shifted_rgb")
+    rc = RT.main(["--f212n", f212n, "--long", longp, "--out", out,
+                  "--ref-catalog", badcat])
+    assert rc == 1
+    with open(out + ".validation.json") as fh:
+        verdict = json.load(fh)
+    stars = verdict["checks"]["star_positions"]
+    assert stars["pass"] is False
+    assert verdict["pass"] is False              # star fail fails the verdict
+    # WCS/alpha checks alone still pass: the failure is the star gate
+    assert verdict["checks"]["wcs_pass"] is True
+
+
+def test_star_positions_skipped_without_catalog(synthetic_pair, tmp_path):
+    f212n, longp = synthetic_pair
+    out = str(tmp_path / "nocat_rgb")
+    assert RT.main(["--f212n", f212n, "--long", longp, "--out", out]) == 0
+    with open(out + ".validation.json") as fh:
+        verdict = json.load(fh)
+    stars = verdict["checks"]["star_positions"]
+    assert stars["skipped"] is True
+    assert "reason" in stars
+    assert verdict["pass"] is True               # skip never fails the verdict
+
+
+def test_validate_stars_requires_a_catalog(synthetic_pair, tmp_path, capsys):
+    f212n, longp = synthetic_pair
+    out = str(tmp_path / "required_rgb")
+    rc = RT.main(["--f212n", f212n, "--long", longp, "--out", out,
+                  "--validate-stars"])
+    assert rc == 1
+    assert "no reference catalog" in capsys.readouterr().err
+
+
 def test_batch_spec_dry_run(synthetic_pair, tmp_path, capsys):
     f212n, longp = synthetic_pair
     spec = tmp_path / "fields.json"

@@ -28,6 +28,18 @@ F212N FITS WCS at the reference pixel + 4 corners (PASS: max offset < 0.1");
 checks alpha/NaN consistency and the nonzero finite fraction; writes
 ``<out>.validation.json``.  Exits nonzero on FAIL.
 
+Star-position check (the SECOND avm-publish gate, user decision 4): whenever a
+reference catalog is available -- ``--ref-catalog``, or found by convention
+from ``--field`` (``/orange/adamginsburg/jwst/<field>/catalogs/``,
+``gaia_virac2_refcat*.fits`` preferred, ``gaia_refcat*.fits`` fallback) -- up
+to ~200 bright catalog stars are projected through the PNG's embedded AVM WCS
+and matched to local luminance peaks (+-4 px box).  PASS: median offset <= 2
+px, matched fraction >= 0.5, >= 20 usable stars.  The result is recorded under
+``checks.star_positions`` in the validation JSON; with no catalog it records
+``{skipped: true, reason}`` and ``publish.py`` requires an explicit
+``--no-star-check`` acknowledgment to push.  ``--validate-stars`` makes a
+missing catalog an error instead of a skip.
+
 Usage::
 
     python -m data_qa.rgb_treasury --f212n F212N_i2d.fits --long F480M_i2d.fits \
@@ -43,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import glob
 import hashlib
 import json
 import os
@@ -54,6 +67,15 @@ DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
 LONG_BANDS = ("F480M", "F405N")
 WCS_PASS_ARCSEC = 0.1
 PERCENTILES = (1.0, 99.5)   # same limits the cmz.hips global stretch uses
+
+# Star-position check (the SECOND avm gate, user decision 4 2026-07-22):
+# reference-catalog stars must land on luminance peaks in the written PNG.
+REFCAT_ROOT = "/orange/adamginsburg/jwst"
+STAR_MAX_STARS = 200        # brightest finite-mag stars inside the footprint
+STAR_BOX_PX = 4             # +-box around the predicted pixel to search
+STAR_PASS_MEDIAN_PX = 2.0   # PASS: median |predicted - peak| <= this
+STAR_MIN_MATCH_FRACTION = 0.5
+STAR_MIN_USED = 20          # refuse to conclude from fewer usable stars
 
 
 # --------------------------------------------------------------------------- helpers
@@ -211,6 +233,109 @@ def build_rgb(f212n_path, long_path, out_base, long_band="F480M", exact=False,
     return png, jpg, red, blue, wcs
 
 
+# ---------------------------------------------------------------- star positions gate
+def find_ref_catalog(field, root=REFCAT_ROOT):
+    """Reference catalog by field convention:
+    ``<root>/<field>/catalogs/gaia_virac2_refcat*.fits`` preferred,
+    ``gaia_refcat*.fits`` fallback.  None when the field has neither."""
+    if not field:
+        return None
+    for pattern in ("gaia_virac2_refcat*.fits", "gaia_refcat*.fits"):
+        hits = sorted(glob.glob(os.path.join(root, field, "catalogs", pattern)))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _refcat_radec_mag(tbl):
+    """(ra, dec, mag) float arrays from a reference catalog table, tolerant of
+    the column-name conventions in use (RA/DEC/refmag is the
+    gaia_virac2_refcat form)."""
+    cols = {c.lower(): c for c in tbl.colnames}
+    if "ra" not in cols or "dec" not in cols:
+        raise ValueError(f"reference catalog lacks RA/DEC columns "
+                         f"(has {tbl.colnames})")
+    ra = np.asarray(tbl[cols["ra"]], float)
+    dec = np.asarray(tbl[cols["dec"]], float)
+    for name in ("refmag", "mag", "ks", "phot_g_mean_mag"):
+        if name in cols:
+            mag = np.asarray(tbl[cols[name]], float)
+            break
+    else:
+        raise ValueError(f"reference catalog lacks a magnitude column "
+                         f"(has {tbl.colnames})")
+    return ra, dec, mag
+
+
+def validate_star_positions(out_base, ref_catalog, max_stars=STAR_MAX_STARS,
+                            box_px=STAR_BOX_PX):
+    """Star-position check against ``ref_catalog`` (the second avm gate).
+
+    Projects up to ``max_stars`` bright finite-mag catalog stars through the
+    PNG's EMBEDDED AVM WCS (exactly as a consumer would) to pixel coordinates
+    and measures the offset to the local luminance peak within a +-``box_px``
+    box.  A star whose box maximum sits on the box border has no local peak
+    there (it is a gradient toward something else) and is excluded as
+    unmatched.  PASS requires median offset <= STAR_PASS_MEDIAN_PX px, matched
+    fraction >= STAR_MIN_MATCH_FRACTION, and >= STAR_MIN_USED usable stars.
+
+    Returns the ``checks.star_positions`` dict (``pass`` is the verdict)."""
+    import pyavm
+    from astropy.table import Table
+    from PIL import Image
+
+    png = out_base + ".png"
+    avm_wcs = pyavm.AVM.from_image(png).to_wcs()
+    with Image.open(png) as im:
+        arr = np.asarray(im.convert("RGBA"), dtype=float)
+    arr = np.flipud(arr)                     # back to FITS (bottom-up) rows
+    lum = arr[..., :3].mean(axis=2)
+    lum[arr[..., 3] == 0] = np.nan           # transparent = no data
+    ny, nx = lum.shape
+
+    ra, dec, mag = _refcat_radec_mag(Table.read(ref_catalog))
+    finite = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(mag)
+    ra, dec, mag = ra[finite], dec[finite], mag[finite]
+    xs, ys = avm_wcs.wcs_world2pix(ra, dec, 0)
+    # footprint: full box inside the image, on an opaque (data) pixel
+    xi = np.round(xs).astype(int)
+    yi = np.round(ys).astype(int)
+    inside = ((xi >= box_px) & (xi < nx - box_px)
+              & (yi >= box_px) & (yi < ny - box_px))
+    on_data = np.zeros(len(xs), dtype=bool)
+    on_data[inside] = np.isfinite(lum[yi[inside], xi[inside]])
+    order = np.argsort(mag)                  # brightest (smallest mag) first
+    keep = order[on_data[order]][:max_stars]
+
+    offsets = []
+    n_selected = int(len(keep))
+    for k in keep:
+        box = lum[yi[k] - box_px: yi[k] + box_px + 1,
+                  xi[k] - box_px: xi[k] + box_px + 1]
+        if not np.any(np.isfinite(box)):
+            continue
+        py, px = np.unravel_index(np.nanargmax(box), box.shape)
+        if py in (0, 2 * box_px) or px in (0, 2 * box_px):
+            continue                         # peak on the border: no local peak
+        offsets.append(float(np.hypot(xi[k] - box_px + px - xs[k],
+                                      yi[k] - box_px + py - ys[k])))
+
+    n_used = len(offsets)
+    matched_fraction = (n_used / n_selected) if n_selected else 0.0
+    median = float(np.median(offsets)) if offsets else None
+    ok = (n_used >= STAR_MIN_USED
+          and matched_fraction >= STAR_MIN_MATCH_FRACTION
+          and median is not None and median <= STAR_PASS_MEDIAN_PX)
+    return {
+        "pass": bool(ok),
+        "median_offset_px": median,
+        "n_used": n_used,
+        "n_selected": n_selected,
+        "matched_fraction": float(matched_fraction),
+        "ref_catalog": os.path.abspath(ref_catalog),
+    }
+
+
 # --------------------------------------------------------------------------- validate
 def _wcs_points(wcs, shape):
     """Reference pixel + 4 corners, as (x, y) 0-based pixel coordinates."""
@@ -223,13 +348,20 @@ def _wcs_points(wcs, shape):
 
 
 def validate(out_base, f212n_path, long_path, long_band="F480M",
-             red_reproj=None, write_json=True):
-    """Validate ``<out>.png`` against the F212N FITS WCS + alpha/NaN rules.
+             red_reproj=None, write_json=True, field=None, ref_catalog=None):
+    """Validate ``<out>.png`` against the F212N FITS WCS + alpha/NaN rules,
+    plus the star-position check whenever a reference catalog is available.
 
     ``red_reproj`` (the reprojected long array) enables the EXACT two-sided
     alpha check; standalone validation (no reprojection in hand) falls back to
     the one-sided check "finite F212N pixel => opaque", which every correctly
     written image also satisfies (alpha=0 only where BOTH bands are NaN).
+
+    The star check runs AUTOMATICALLY when ``ref_catalog`` is given or the
+    ``field`` convention finds one (``find_ref_catalog``); with no catalog it
+    is recorded as ``checks.star_positions = {skipped: true, reason}`` --
+    ``publish.py``'s avm gate then demands an explicit ``--no-star-check``
+    acknowledgment.  A star check that RUNS and FAILS fails the whole verdict.
     Returns the verdict dict (``verdict['pass']`` is the overall result)."""
     import pyavm
     from PIL import Image
@@ -277,8 +409,20 @@ def validate(out_base, f212n_path, long_path, long_band="F480M",
     checks["finite_fraction"] = frac
     checks["finite_pass"] = bool(frac > 0.0)
 
+    # -- star positions (second gate): automatic whenever a catalog is known
+    cat = ref_catalog or find_ref_catalog(field)
+    if cat:
+        checks["star_positions"] = validate_star_positions(out_base, cat)
+    else:
+        reason = (f"no reference catalog for field {field!r} under "
+                  f"{REFCAT_ROOT}/{field}/catalogs/" if field
+                  else "no --field/--ref-catalog given")
+        checks["star_positions"] = {"skipped": True, "reason": reason}
+
     ok = all(checks[k] for k in ("wcs_pass", "shape_pass", "alpha_pass",
                                  "finite_pass"))
+    if not checks["star_positions"].get("skipped"):
+        ok = ok and checks["star_positions"]["pass"]
     verdict = {
         "pass": bool(ok),
         "checks": checks,
@@ -289,6 +433,7 @@ def validate(out_base, f212n_path, long_path, long_band="F480M",
             "long": {"path": os.path.abspath(long_path),
                      "sha256": _sha256(long_path)},
             "long_band": long_band,
+            "ref_catalog": os.path.abspath(cat) if cat else None,
         },
         "outputs": {"png": os.path.abspath(png),
                     "jpg": os.path.abspath(out_base + ".jpg")},
@@ -301,7 +446,16 @@ def validate(out_base, f212n_path, long_path, long_band="F480M",
 
 # --------------------------------------------------------------------------- CLI
 def _one_field(f212n, long_path, long_band, out_base, exact=False,
-               pipe_root=None, validate_only=False, percentiles=PERCENTILES):
+               pipe_root=None, validate_only=False, percentiles=PERCENTILES,
+               field=None, ref_catalog=None, require_stars=False):
+    cat = ref_catalog or find_ref_catalog(field)
+    if require_stars and not cat:
+        print(f"[rgb_treasury] ERROR: --validate-stars but no reference "
+              f"catalog (field={field!r}; looked for "
+              f"gaia_virac2_refcat*/gaia_refcat* under "
+              f"{REFCAT_ROOT}/<field>/catalogs/; or pass --ref-catalog)",
+              file=sys.stderr)
+        return False
     if validate_only:
         red = None
     else:
@@ -310,12 +464,19 @@ def _one_field(f212n, long_path, long_band, out_base, exact=False,
             percentiles=percentiles, pipe_root=pipe_root)
         print(f"[rgb_treasury] wrote {png} + {jpg}")
     verdict = validate(out_base, f212n, long_path, long_band=long_band,
-                       red_reproj=red)
+                       red_reproj=red, field=field, ref_catalog=cat)
     status = "PASS" if verdict["pass"] else "FAIL"
+    stars = verdict["checks"]["star_positions"]
+    star_txt = ("stars skipped"
+                if stars.get("skipped") else
+                f"stars {'PASS' if stars['pass'] else 'FAIL'} "
+                f"(median {stars['median_offset_px']} px, "
+                f"n={stars['n_used']}/{stars['n_selected']})")
     print(f"[rgb_treasury] validation {status}: "
           f"wcs max offset {verdict['checks'].get('wcs_max_offset_arcsec', -1):.4g}\" "
           f"({verdict['checks'].get('alpha_mode')}), "
-          f"finite fraction {verdict['checks'].get('finite_fraction', 0):.3f} "
+          f"finite fraction {verdict['checks'].get('finite_fraction', 0):.3f}, "
+          f"{star_txt} "
           f"-> {out_base}.validation.json")
     return verdict["pass"]
 
@@ -334,6 +495,14 @@ def build_parser():
                    help="flux-conserving reproject_exact (slow); default interp")
     p.add_argument("--validate", action="store_true",
                    help="skip the build; validate existing <out>.png only")
+    p.add_argument("--field", help="field name (e.g. sgrb2): finds the "
+                                   "reference catalog by convention and runs "
+                                   "the star-position check automatically")
+    p.add_argument("--ref-catalog", help="explicit reference catalog FITS "
+                                         "(overrides the --field convention)")
+    p.add_argument("--validate-stars", action="store_true",
+                   help="REQUIRE the star-position check (error if no "
+                        "reference catalog can be found)")
     p.add_argument("--percentiles", nargs=2, type=float, default=list(PERCENTILES),
                    metavar=("LO", "HI"), help="global stretch percentiles")
     p.add_argument("--pipe-root", default=DEFAULT_PIPE_ROOT,
@@ -362,14 +531,19 @@ def main(argv=None):
             ok &= _one_field(f["f212n_i2d"], f["long_i2d"],
                              f.get("long_band", "F480M"), out,
                              exact=args.exact, pipe_root=args.pipe_root,
-                             validate_only=args.validate, percentiles=pct)
+                             validate_only=args.validate, percentiles=pct,
+                             field=f.get("field", f["name"]),
+                             ref_catalog=f.get("ref_catalog"),
+                             require_stars=args.validate_stars)
         return 0 if ok else 1
     if not (args.f212n and args.long_path and args.out):
         build_parser().error("--f212n, --long and --out are required "
                              "(or use --fields-spec)")
     ok = _one_field(args.f212n, args.long_path, args.long_band, args.out,
                     exact=args.exact, pipe_root=args.pipe_root,
-                    validate_only=args.validate, percentiles=pct)
+                    validate_only=args.validate, percentiles=pct,
+                    field=args.field, ref_catalog=args.ref_catalog,
+                    require_stars=args.validate_stars)
     return 0 if ok else 1
 
 

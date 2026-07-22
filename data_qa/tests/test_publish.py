@@ -11,9 +11,20 @@ import pytest
 from data_qa import publish as PB
 
 
-def _write_validation(path, ok=True):
+def _write_validation(path, ok=True, stars="pass"):
+    """stars: 'pass' | 'fail' | 'skipped' | 'absent' (pre-star-check JSON)."""
+    checks = {}
+    if stars == "pass":
+        checks["star_positions"] = {"pass": True, "median_offset_px": 0.4,
+                                    "n_used": 60, "matched_fraction": 0.9}
+    elif stars == "fail":
+        checks["star_positions"] = {"pass": False, "median_offset_px": 6.2,
+                                    "n_used": 40, "matched_fraction": 0.6}
+    elif stars == "skipped":
+        checks["star_positions"] = {"skipped": True,
+                                    "reason": "no reference catalog"}
     with open(path, "w") as fh:
-        json.dump({"pass": bool(ok), "checks": {}}, fh)
+        json.dump({"pass": bool(ok), "checks": checks}, fh)
 
 
 # --------------------------------------------------------------------------- avm
@@ -67,6 +78,62 @@ def test_avm_gate_refuses_unvalidated_hips_tree(tmp_path):
 def test_no_force_flag_exists():
     with pytest.raises(SystemExit):
         PB.main(["avm", "--src", ".", "--force"])
+
+
+# ------------------------------------------------------- avm star-position gate
+def test_avm_gate_star_skipped_needs_acknowledgment(tmp_path, capsys):
+    (tmp_path / "foo.png").write_bytes(b"\x89PNG\r\n")
+    _write_validation(tmp_path / "foo.validation.json", ok=True,
+                      stars="skipped")
+    rc = PB.main(["avm", "--src", str(tmp_path)])
+    assert rc == 1
+    assert "--no-star-check" in capsys.readouterr().err
+
+
+def test_avm_gate_star_skipped_accepted_with_flag(tmp_path, capsys):
+    (tmp_path / "foo.png").write_bytes(b"\x89PNG\r\n")
+    _write_validation(tmp_path / "foo.validation.json", ok=True,
+                      stars="skipped")
+    rc = PB.main(["avm", "--src", str(tmp_path), "--no-star-check"])
+    assert rc == 0
+    assert "dry-run" in capsys.readouterr().out
+
+
+def test_avm_gate_star_failed_is_fail_closed(tmp_path, capsys):
+    """A star check that RAN and FAILED refuses even with --no-star-check."""
+    (tmp_path / "foo.png").write_bytes(b"\x89PNG\r\n")
+    _write_validation(tmp_path / "foo.validation.json", ok=True, stars="fail")
+    assert PB.main(["avm", "--src", str(tmp_path)]) == 1
+    rc = PB.main(["avm", "--src", str(tmp_path), "--no-star-check"])
+    assert rc == 1
+    assert "fail-closed" in capsys.readouterr().err
+
+
+def test_avm_gate_star_absent_treated_as_skipped(tmp_path):
+    """Pre-star-check validation JSON (no star_positions key) needs the same
+    explicit acknowledgment as a skip."""
+    (tmp_path / "foo.png").write_bytes(b"\x89PNG\r\n")
+    _write_validation(tmp_path / "foo.validation.json", ok=True,
+                      stars="absent")
+    ok, problems = PB.gate_avm(str(tmp_path))
+    assert not ok
+    assert "absent" in problems[0]
+    ok, problems = PB.gate_avm(str(tmp_path), no_star_check=True)
+    assert ok, problems
+
+
+def test_avm_gate_hips_tree_star_skipped(tmp_path):
+    tree = tmp_path / "tree_hips"
+    tiledir = tree / "Norder3" / "Dir0"
+    tiledir.mkdir(parents=True)
+    (tiledir / "Npix7.png").write_bytes(b"\x89PNG\r\n")
+    (tree / "properties").write_text("hips_order = 3\n")
+    _write_validation(tmp_path / "tree_hips.validation.json", ok=True,
+                      stars="skipped")
+    ok, _ = PB.gate_avm(str(tmp_path))
+    assert not ok
+    ok, problems = PB.gate_avm(str(tmp_path), no_star_check=True)
+    assert ok, problems
 
 
 # --------------------------------------------------------------------- products

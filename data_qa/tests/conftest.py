@@ -34,6 +34,47 @@ def _star_field(shape, rng, nstars=25, fwhm_pix=2.0):
 
 
 @pytest.fixture
+def star_grid_pair(tmp_path):
+    """(f212n_path, long_path, refcat_path, wcs): a 128x128 pair with a 5x5
+    grid of BRIGHT gaussian stars at known (jittered) pixel positions, plus a
+    reference catalog (RA/DEC/refmag -- the gaia_virac2_refcat column form)
+    built from the injection positions.  Both bands share the star field, so
+    every catalog star is a luminance peak in the composed RGB."""
+    fits = pytest.importorskip("astropy.io.fits")
+    from astropy.table import Table
+
+    rng = np.random.default_rng(7)
+    shape = (128, 128)
+    wcs = _make_wcs((266.5, -28.9), (64.5, 64.5), 0.06 / 3600, 88.0)
+    ny, nx = shape
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    img = rng.normal(1.0, 0.02, size=shape)
+    sig = 2.0 / 2.355
+    xs, ys = [], []
+    for gy in range(5):
+        for gx in range(5):
+            x0 = 20.0 + gx * 22 + rng.uniform(-1, 1)
+            y0 = 20.0 + gy * 22 + rng.uniform(-1, 1)
+            img += 40 * np.exp(-((xx - x0) ** 2 + (yy - y0) ** 2)
+                               / (2 * sig ** 2))
+            xs.append(x0)
+            ys.append(y0)
+
+    f212n = tmp_path / "stargrid_f212n_i2d.fits"
+    longp = tmp_path / "stargrid_f480m_i2d.fits"
+    for path in (f212n, longp):
+        hdu = fits.ImageHDU(data=img.astype("float32"),
+                            header=wcs.to_header(), name="SCI")
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path)
+
+    world = wcs.pixel_to_world(np.array(xs), np.array(ys))
+    refcat = tmp_path / "gaia_virac2_refcat_synthetic.fits"
+    Table({"RA": world.ra.deg, "DEC": world.dec.deg,
+           "refmag": np.linspace(10.0, 12.4, len(xs))}).write(refcat)
+    return str(f212n), str(longp), str(refcat), wcs
+
+
+@pytest.fixture
 def synthetic_pair(tmp_path):
     """(f212n_path, long_path): overlapping 64x64 / 80x80 mosaics, GC coords,
     rotated WCS, NaN edge strip in the blue band."""

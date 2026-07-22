@@ -12,7 +12,11 @@ Verbs:
   with ``"pass": true`` (written by ``data_qa.rgb_treasury``), OR sit inside a
   HiPS tile tree (a directory carrying a ``properties`` file) whose SOURCE
   image validated -- i.e. ``<treename>.validation.json`` next to the tree root
-  passes.
+  passes.  SECOND gate (user decision 4): the verdict's
+  ``checks.star_positions`` must PASS; a verdict whose star check was skipped
+  (no reference catalog) or predates the check needs an explicit
+  ``--no-star-check`` acknowledgment, and a star check that ran and FAILED
+  refuses outright (fail-closed, no override).
 
 * ``products --field <f> --src <dir> [--dest-sub S]`` -> ``htdocs/jwst-gc/``.
   Gate: the field must actually be STAGED -- ``stage_release.py`` marks staged
@@ -49,40 +53,83 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg")
 
 
 # --------------------------------------------------------------------------- gates
-def _validation_passes(path):
-    """True iff ``path`` is a validation JSON with ``"pass": true``."""
+def _load_validation(path):
+    """The validation JSON dict at ``path``; None when missing/unreadable."""
     if not os.path.exists(path):
-        return False
+        return None
     try:
         with open(path) as fh:
-            return bool(json.load(fh).get("pass"))
+            return json.load(fh)
     except (json.JSONDecodeError, OSError):
-        return False
+        return None
 
 
-def _covered_by_validation(img, top):
-    """An image is pushable if its own sibling validation passes, or an
-    enclosing HiPS tree's source validation passes."""
+def _star_state(verdict):
+    """The star-position (second-gate) state of a validation verdict:
+    'pass' | 'fail' | 'skipped' | 'absent' (pre-star-check validation JSON)."""
+    sp = (verdict.get("checks") or {}).get("star_positions")
+    if not isinstance(sp, dict):
+        return "absent"
+    if sp.get("skipped"):
+        return "skipped"
+    return "pass" if sp.get("pass") else "fail"
+
+
+def _covering_verdicts(img, top):
+    """[(sidecar_path, verdict_dict)] candidates covering ``img``: its own
+    sibling validation first, then each enclosing HiPS tree's source
+    validation (tree root = dir with a 'properties' file; sidecar lives NEXT
+    TO the tree root as <treename>.validation.json)."""
+    out = []
     stem, _ = os.path.splitext(img)
-    if _validation_passes(stem + ".validation.json"):
-        return True
-    # walk up: HiPS tree root = dir with a 'properties' file; its validation
-    # sidecar lives NEXT TO the tree root as <treename>.validation.json
+    sib = stem + ".validation.json"
+    verdict = _load_validation(sib)
+    if verdict is not None:
+        out.append((sib, verdict))
     d = os.path.dirname(os.path.abspath(img))
     top = os.path.abspath(top)
     while len(d) >= len(top):
         if os.path.exists(os.path.join(d, "properties")):
             sidecar = os.path.join(os.path.dirname(d),
                                    os.path.basename(d) + ".validation.json")
-            if _validation_passes(sidecar):
-                return True
+            verdict = _load_validation(sidecar)
+            if verdict is not None:
+                out.append((sidecar, verdict))
         if d == top:
             break
         d = os.path.dirname(d)
-    return False
+    return out
 
 
-def gate_avm(src):
+def _image_problem(img, top, no_star_check=False):
+    """Why ``img`` is not pushable (None when it is).
+
+    Pushable = some covering validation passes AND its star-position check
+    (the second gate, user decision 4) is satisfied: star 'pass', or
+    'skipped'/'absent' explicitly acknowledged via --no-star-check.  A star
+    check that RAN and FAILED is fail-closed: no flag overrides it."""
+    candidates = _covering_verdicts(img, top)
+    if not candidates:
+        return "no validation.json (sibling or HiPS-tree)"
+    reasons = []
+    for sidecar, verdict in candidates:
+        if not verdict.get("pass"):
+            reasons.append(f"validation FAILED ({sidecar})")
+            continue
+        stars = _star_state(verdict)
+        if stars == "pass" or (no_star_check
+                               and stars in ("skipped", "absent")):
+            return None
+        if stars == "fail":
+            reasons.append(f"star-position check FAILED ({sidecar}); "
+                           "fail-closed, --no-star-check cannot override")
+        else:
+            reasons.append(f"star-position check {stars} ({sidecar}); pass "
+                           "--no-star-check to acknowledge pushing without it")
+    return "; ".join(reasons)
+
+
+def gate_avm(src, no_star_check=False):
     """Return (ok, problems).  Every PNG/JPG under ``src`` must be covered."""
     src = os.path.abspath(src)
     if os.path.isfile(src):
@@ -93,8 +140,11 @@ def gate_avm(src):
                                      recursive=True)
                 if p.lower().endswith(IMAGE_EXTS)]
         top = src
-    problems = [f"{p}: no passing validation.json (sibling or HiPS-tree)"
-                for p in sorted(imgs) if not _covered_by_validation(p, top)]
+    problems = []
+    for p in sorted(imgs):
+        why = _image_problem(p, top, no_star_check=no_star_check)
+        if why:
+            problems.append(f"{p}: {why}")
     if not imgs:
         problems.append(f"{src}: no PNG/JPG images found to push")
     return (not problems), problems
@@ -198,6 +248,10 @@ def build_parser():
     a.add_argument("--src", required=True, help="directory (or single image)")
     a.add_argument("--name", help="server subdir under avm_images/ "
                                   "(default: src basename)")
+    a.add_argument("--no-star-check", action="store_true",
+                   help="acknowledge pushing images whose star-position check "
+                        "was SKIPPED (no reference catalog); a star check that "
+                        "ran and FAILED still refuses")
     a.add_argument("--execute", action="store_true")
 
     r = sub.add_parser("products", help="push release-products web content")
@@ -227,7 +281,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     if args.verb == "avm":
-        ok, problems = gate_avm(args.src)
+        ok, problems = gate_avm(args.src, no_star_check=args.no_star_check)
         if not ok:
             print("[publish] REFUSING avm push; gate failed:", file=sys.stderr)
             for pr in problems:
