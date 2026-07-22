@@ -1,0 +1,33 @@
+# scrontab entries for the JWST-GC MAST monitor (HiPerGator).
+#
+# Activation: on a HiPerGator login node run `scrontab -e` and paste these entries
+# (or `scrontab < docs/scrontab.example` to REPLACE your scrontab -- careful if you
+# already have entries).  scrontab runs each entry as a SLURM job; the #SCRON lines
+# above an entry are its sbatch directives.  Check with `scrontab -l`;
+# jobs appear in `squeue --me` at the scheduled times.
+#
+# Both entries are metadata-only (anonymous MAST queries + a JSON state file):
+# tiny resource ask.  Log directory must exist:
+#   mkdir -p /blue/adamginsburg/adamginsburg/logs/jwst
+
+# ---- daily: poll + report events (report-only: prints to the log, changes nothing)
+#SCRON --account=astronomy-dept
+#SCRON --qos=astronomy-dept-b
+#SCRON --job-name=jwstgc-mastmon-daily
+#SCRON --cpus-per-task=1
+#SCRON --mem=4gb
+#SCRON --time=00:30:00
+#SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_%j.log
+17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor
+
+# ---- weekly (Mondays): poll + COMMIT the state, so the daily runs only re-report
+#      events younger than a week.  Add --report (and, once trusted, --download
+#      --trigger, each still dry-run without --execute) to act on new data.
+#SCRON --account=astronomy-dept
+#SCRON --qos=astronomy-dept-b
+#SCRON --job-name=jwstgc-mastmon-weekly
+#SCRON --cpus-per-task=1
+#SCRON --mem=4gb
+#SCRON --time=00:30:00
+#SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_commit_%j.log
+47 7 * * 1 cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --commit-state

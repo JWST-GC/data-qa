@@ -31,10 +31,29 @@ data_qa/
   observations.py   # registry: the observations + their metadata (single source of truth)
   make_issues.py    # render the filled QA template per observation, create/update GitHub issues
   retrieve_data.py  # MAST retrieval of the underlying JWST products (astroquery)
+  mast_monitor.py   # ops: stateful MAST poll -> new/released/calib-up events (+ actions)
+  pipeline_trigger.py  # ops: reduction+cataloging SLURM submission sequence (dry-run first)
+  status_report.py  # ops: squeue/state/release status -> comment on the QA issue
+  _github.py        # shared stdlib GitHub REST helpers (make_issues + status_report)
 .github/
   ISSUE_TEMPLATE/observation-qa.md   # the per-observation QA template (also usable manually)
   workflows/make-issues.yml          # automation
+docs/
+  OPS_WORKPLAN.md      # the ops-layer plan (monitor -> trigger -> images -> publish)
+  scrontab.example     # HiPerGator scrontab entries for the daily/weekly monitor
 ```
+
+## Ops layer
+
+The repo also carries the operations layer described in
+[docs/OPS_WORKPLAN.md](docs/OPS_WORKPLAN.md): `mast_monitor.py` polls MAST per
+program and diffs against a state file to emit NEW_OBSERVATION / NEWLY_RELEASED /
+CALIB_LEVEL_UP events; `pipeline_trigger.py` turns an event into the
+jwst-gc-pipeline submission sequence (reduction filter-array then the cataloging
+chain, dependency-gated); `status_report.py` collects `squeue`/monitor/release
+state and posts it as a marked comment on the observation's QA issue. Every CLI is
+dry-run by default and takes `--execute` for real side effects; deploy the monitor
+via `scrontab` using [docs/scrontab.example](docs/scrontab.example).
 
 ## Usage
 
@@ -61,4 +80,8 @@ notes / epoch / visits to a specific observation, add an entry to `CURATED`
 
 ## TODO
 
-We still need to set up a cron job to poll the MAST archive, trigger downloads, and trigger job runs and issue creation when new data are delivered.
+- [x] Set up a cron job to poll the MAST archive, trigger downloads, and trigger job
+  runs and issue creation when new data are delivered — implemented as the ops layer
+  (`data_qa/mast_monitor.py` + `pipeline_trigger.py` + `status_report.py`; deploy per
+  [docs/scrontab.example](docs/scrontab.example)). Remaining: imaging/publish stages
+  (PR-2 in [docs/OPS_WORKPLAN.md](docs/OPS_WORKPLAN.md)).
