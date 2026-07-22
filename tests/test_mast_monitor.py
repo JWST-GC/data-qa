@@ -39,7 +39,8 @@ def test_field_mapping():
 
 def test_programs_cross_check_release_fields():
     """Every mapped field that has a public release page is a known FIELDS key."""
-    unreleased = {"cloudef", "sgra", "ngc6334"}   # no release page yet
+    unreleased = {"cloudef", "sgra", "ngc6334",
+                  "arches", "quintuplet"}          # no release page yet
     for prog, obsmap in mm.PROGRAMS.items():
         for field in obsmap.values():
             assert field in FIELDS or field in unreleased, (prog, field)
@@ -545,3 +546,377 @@ def test_act_report_updates_in_place_with_monitor_marker(monkeypatch):
     assert kw["update_last"] is True
     assert kw["marker"] == status_report.MONITOR_MARKER
     assert "CAPPED" in body
+
+
+# ------------------------------------------------- masked MAST values (BLOCKER 2)
+class _FakeTable:
+    """Minimal stand-in for the astroquery result table (colnames + row[c])."""
+    def __init__(self, rows):
+        self.rows = rows
+        self.colnames = list(rows[0]) if rows else []
+
+    def __iter__(self):
+        return iter(self.rows)
+
+
+def _patch_fake_mast(monkeypatch, rows):
+    import sys
+    import types
+    fake_mast = types.SimpleNamespace(
+        Observations=types.SimpleNamespace(
+            query_criteria=lambda **kw: _FakeTable(rows)),
+        conf=types.SimpleNamespace(timeout=0, pagesize=0))
+    monkeypatch.setitem(sys.modules, "astroquery",
+                        types.SimpleNamespace(mast=fake_mast))
+    monkeypatch.setitem(sys.modules, "astroquery.mast", fake_mast)
+
+
+def test_scalar_masked_nan_none():
+    import numpy as np
+    assert mm._scalar(np.ma.masked, int, default=-1) == -1
+    assert mm._scalar(np.ma.masked, float) is None
+    assert mm._scalar(np.ma.masked, str) is None
+    assert mm._scalar(float("nan"), float) is None
+    assert mm._scalar(None, str) is None
+    assert mm._scalar("3", int) == 3
+    assert mm._scalar(59900.5, float) == 59900.5
+    assert mm._scalar("junk", int, default=-1) == -1
+
+
+def test_mjd_to_iso_unknown_for_none_nan_masked():
+    import numpy as np
+    assert mm.mjd_to_iso(None) == "unknown"
+    assert mm.mjd_to_iso(float("nan")) == "unknown"
+    assert mm.mjd_to_iso(np.ma.masked) == "unknown"
+    assert "UTC" in mm.mjd_to_iso(59900.0)
+
+
+def test_query_program_masked_planned_row_end_to_end(monkeypatch):
+    """A planned/unreleased row (the 10678 watch target: masked calib_level +
+    t_obs_release) must survive query_program -> summarize -> diff_events ->
+    format_event without raising (int(masked) raises numpy.ma.MaskError;
+    float(masked) -> NaN used to crash mjd_to_iso at report time)."""
+    import numpy as np
+    _patch_fake_mast(monkeypatch, [{
+        "obs_id": "jw10678-o101_t001_nircam_clear-f212n",
+        "t_max": np.ma.masked, "t_obs_release": np.ma.masked,
+        "calib_level": np.ma.masked, "instrument_name": "NIRCAM/IMAGE",
+        "filters": "F212N;F480M", "target_name": "GC_101"}])
+    (row,) = mm.query_program(10678)
+    assert row["calib_level"] == -1              # masked -> -1 (not a crash)
+    assert row["t_obs_release"] is None
+    assert row["t_max"] is None
+    new = mm.summarize([row], POLL)
+    (ev,) = mm.diff_events(10678, {}, new)
+    assert ev["released"] is False
+    assert ev["calib_level"] == -1
+    line = mm.format_event(ev)                   # report-time formatting
+    assert "PLANNED" in line
+    assert "unknown" in line                     # masked release date
+
+
+# ---------------------------------------------- released/calib gate (BLOCKER 3)
+def _planned_events(obsnum="101", program=10678, field="gc-treasury",
+                    tile="GC_101"):
+    return [dict(event="NEW_OBSERVATION", program=program, obsnum=obsnum,
+                 obs_id=f"jw{program:05d}-o{obsnum}_t001_nircam_clear-f212n",
+                 field=field, tile=tile, calib_level=-1, released=False,
+                 t_obs_release=None, instrument_name="NIRCAM/IMAGE",
+                 filters="F212N;F480M", target_name=tile)]
+
+
+def test_event_ready_gate():
+    (planned,) = _planned_events()
+    assert mm.event_ready(planned) is False
+    (released,) = _trigger_events("001")         # calib 3, released
+    assert mm.event_ready(released) is True
+    uncal = dict(released, calib_level=1)        # released but uncal-only
+    assert mm.event_ready(uncal) is False
+    unreleased = dict(released, released=False)  # calibrated but embargoed
+    assert mm.event_ready(unreleased) is False
+
+
+def test_act_trigger_planned_obs_no_trigger_no_burn(monkeypatch, tmp_path, capsys):
+    """A planned obs (calib -1, unreleased) must not submit AND must not burn
+    the one-shot 'triggered' key (the key burn was refusing the REAL trigger
+    when the data later arrived)."""
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = tmp_path / "state.json"
+    state = {"version": 1, "programs": {}}
+    mm.act_trigger(_planned_events(), execute=True,
+                   state=state, state_path=str(state_path))
+    assert submitted == []
+    assert "SKIPPED(planned)" in capsys.readouterr().err
+    assert "triggered" not in state              # key NOT burned...
+    assert not state_path.exists()               # ...in memory or on disk
+
+
+def test_act_trigger_fires_once_after_release(monkeypatch, tmp_path):
+    """Planned -> skipped without burning; released later -> triggers exactly
+    once; a re-fire is then refused via the burned key."""
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = str(tmp_path / "state.json")
+    state = {"version": 1, "programs": {}}
+    mm.act_trigger(_planned_events(), execute=True,
+                   state=state, state_path=state_path)
+    assert submitted == []
+    released = _planned_events()
+    released[0].update(calib_level=3, released=True, t_obs_release=POLL - 1)
+    mm.act_trigger(released, execute=True, state=state, state_path=state_path)
+    assert len(submitted) == 1
+    assert "10678-o101" in state["triggered"]    # burned on the REAL submit
+    mm.act_trigger(released, execute=True, state=state, state_path=state_path)
+    assert len(submitted) == 1                   # one-shot holds
+
+
+def test_act_download_planned_obs_skips(monkeypatch, capsys):
+    fetched = _patch_download(monkeypatch, size=1e12, free_tb=10.0)
+    mm.act_download(_planned_events(), execute=True, min_free_tb=5.0)
+    assert fetched == []
+    assert "SKIPPED(planned)" in capsys.readouterr().err
+
+
+# ------------------------------------------- instrument-aware keying (MED-b)
+def test_instrument_class():
+    assert mm.instrument_class("NIRCAM/IMAGE") == "NIRCam"
+    assert mm.instrument_class("MIRI/IMAGE") == "MIRI"
+    assert mm.instrument_class("NIRCAM") == "NIRCam"
+    assert mm.instrument_class(None) == ""
+    assert mm.instrument_class("") == ""
+
+
+def _dual_instrument_events():
+    """The real jw02221-o002 shape: NIRCam and MIRI deliveries of one obs."""
+    base = dict(event="NEW_OBSERVATION", program=2221, obsnum="002",
+                field="cloudc", tile=None, calib_level=3, released=True,
+                t_obs_release=59900.0, target_name="CLOUDC")
+    return [dict(base, obs_id="jw02221-o002_t001_nircam_clear-f405n",
+                 instrument_name="NIRCAM/IMAGE", filters="F405N;F212N"),
+            dict(base, obs_id="jw02221-o002_t001_miri_f770w",
+                 instrument_name="MIRI/IMAGE", filters="F770W")]
+
+
+def test_group_by_obs_splits_instrument_classes():
+    grouped = mm._group_by_obs(_dual_instrument_events())
+    assert set(grouped) == {(2221, "002", "NIRCam"), (2221, "002", "MIRI")}
+
+
+def test_act_trigger_skips_miri_group_triggers_nircam(monkeypatch, tmp_path,
+                                                      capsys):
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    mm.act_trigger(_dual_instrument_events(), execute=True, state={},
+                   state_path=str(tmp_path / "state.json"))
+    assert len(submitted) == 1                   # the NIRCam group only
+    assert submitted[0]["filters"] == ["F405N", "F212N"]
+    err = capsys.readouterr().err
+    assert "SKIPPED(not-automated)" in err and "NIRCam-only" in err
+
+
+def test_act_report_titles_by_instrument(monkeypatch):
+    """Comments land on the instrument-matched issue: '(NIRCam)' vs '(MIRI)'."""
+    from data_qa import status_report
+    posted = []
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, **kw: posted.append(title) or 0)
+    mm.act_report(_dual_instrument_events(), execute=False)
+    assert sorted(posted) == ["Cloud C — jw02221-o002 (MIRI)",
+                              "Cloud C — jw02221-o002 (NIRCam)"]
+
+
+def test_act_download_dual_instrument_separate_keys(monkeypatch, tmp_path):
+    """NIRCam and MIRI downloads of one obs burn SEPARATE 'downloaded' keys."""
+    from data_qa import retrieve_data
+    fetched = []
+    monkeypatch.setattr(retrieve_data, "product_list_size_bytes",
+                        lambda *a, **kw: 1e9)
+    monkeypatch.setattr(retrieve_data, "retrieve",
+                        lambda *a, **kw: fetched.append(kw) or "manifest")
+    monkeypatch.setattr(mm, "disk_gate", lambda d, m: (True, 10.0, "gate"))
+    state_path = str(tmp_path / "state.json")
+    state = {"version": 1, "programs": {}}
+    mm.act_download(_dual_instrument_events(), execute=True, min_free_tb=5.0,
+                    state=state, state_path=state_path)
+    assert len(fetched) == 2
+    assert {kw["instrument"] for kw in fetched} == {"NIRCam", "MIRI"}
+    on_disk = mm.load_state(state_path)
+    assert set(on_disk["downloaded"]) == {"2221-o002-NIRCam", "2221-o002-MIRI"}
+
+
+# ------------------------------------------------ PROGRAMS completeness (MED-c)
+_PIPE_FILE = ("/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline/"
+              "jwst_gc_pipeline/reduction/PipelineRerunNIRCAM-LONG.py")
+# Globular-cluster programs ride the pipeline for testing only; they are not
+# GC-monitor targets.  Arches/Quintuplet (2045) and Sgr A* (1939) ARE GC fields.
+_GLOBULAR_PROGRAMS = {1334, 1979, 8322, 12587}
+
+
+def _pipeline_field_map():
+    import ast
+    with open(_PIPE_FILE) as fh:
+        tree = ast.parse(fh.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "field_to_reg_mapping":
+                    val = node.value
+                    if isinstance(val, ast.Subscript):
+                        val = val.value
+                    return ast.literal_eval(val)
+    return None
+
+
+@pytest.mark.skipif(not __import__("os").path.exists(_PIPE_FILE),
+                    reason="jwst-gc-pipeline checkout not available")
+def test_programs_complete_vs_pipeline_field_mapping():
+    """Every GC program/obs the reduction pipeline maps must be monitored
+    (globular-cluster test programs excluded)."""
+    mapping = _pipeline_field_map()
+    assert mapping, "could not parse field_to_reg_mapping from the pipeline"
+    for prog_str, obsmap in mapping.items():
+        prog = int(prog_str)
+        if prog in _GLOBULAR_PROGRAMS:
+            continue
+        assert prog in mm.PROGRAMS, \
+            f"pipeline maps program {prog} but mast_monitor.PROGRAMS lacks it"
+        for obsnum, field in obsmap.items():
+            assert obsnum in mm.PROGRAMS[prog], (prog, obsnum)
+            assert mm.PROGRAMS[prog][obsnum] == field, (prog, obsnum, field)
+
+
+# --------------------------------------------- treasury rolling issue (MED-d)
+def test_act_report_treasury_single_rolling_issue(monkeypatch):
+    """All treasury events pool into ONE rolling-issue post (not ~1668 per-obs
+    rc=3 failures), created with QA + program labels, sharing one issue cache."""
+    from data_qa import status_report
+    posted = []
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, **kw: posted.append((title, body, kw))
+                        or 0)
+    evs = []
+    for n in (101, 102, 103):
+        evs += _planned_events(obsnum=str(n), tile=f"GC_{n}")
+    evs += _trigger_events("001")                # one regular brick event
+    mm.act_report(evs, execute=False)
+    treasury = [(t, b, kw) for t, b, kw in posted
+                if t == mm.TREASURY_ISSUE_TITLE]
+    assert len(treasury) == 1                    # ONE post for all 3 tiles
+    title, body, kw = treasury[0]
+    assert body.count("NEW_OBSERVATION") == 3
+    assert kw["create_labels"] == ["QA", "program:10678"]
+    caches = {id(kw["issue_cache"]) for _, _, kw in posted}
+    assert len(caches) == 1                      # one shared cache per run
+
+
+# ---------------------------------------------------- per-program seed (MED-e)
+def test_per_program_seed_after_failed_seed_query(monkeypatch, tmp_path, capsys):
+    """A program whose query FAILED during the seed run is seeded (baseline
+    committed, actions suppressed) on its first successful poll later."""
+    import requests
+    state = tmp_path / "state.json"
+    calls = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "act_download",
+                        lambda evs, **kw: calls.append(("download", list(evs))))
+    monkeypatch.setattr(mm, "act_trigger",
+                        lambda evs, **kw: calls.append(("trigger", list(evs))))
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: calls.append(("report", list(evs))))
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+
+    def q_seed(prog):
+        if int(prog) == 1182:
+            raise requests.exceptions.ConnectionError("MAST down")
+        return [_row("jw02221-o001_t001_nircam_clear-f405n")]
+
+    monkeypatch.setattr(mm, "query_program", q_seed)
+    rc = mm.main(["--program", "2221", "1182", "--auto", "--state", str(state),
+                  "--download-dir", str(tmp_path)])
+    assert rc == 0
+    assert mm.load_state(str(state))["seeded_programs"] == ["2221"]
+
+    calls.clear()
+
+    def q_later(prog):                           # 1182 back, with a backlog
+        if int(prog) == 1182:
+            return [_row("jw01182-o004_t001_nircam_clear-f405n")]
+        return [_row("jw02221-o001_t001_nircam_clear-f405n")]
+
+    monkeypatch.setattr(mm, "query_program", q_later)
+    rc = mm.main(["--program", "2221", "1182", "--auto", "--state", str(state),
+                  "--download-dir", str(tmp_path)])
+    assert rc == 0
+    acted = dict(calls)
+    assert acted["trigger"] == []                # 1182 backlog NOT acted on
+    assert acted["download"] == []
+    assert [e["program"] for e in acted["report"]] == [1182]   # but reported
+    assert "PER-PROGRAM SEED" in capsys.readouterr().err
+    st = mm.load_state(str(state))
+    assert st["seeded_programs"] == ["1182", "2221"]           # now seeded
+    assert "jw01182-o004_t001_nircam_clear-f405n" in \
+        st["programs"]["1182"]["obs"]
+
+
+# --------------------------------------- download dedup + missing obs (MED-f)
+def test_act_download_records_and_dedups(monkeypatch, tmp_path, capsys):
+    """A successful release-gated download burns the 'downloaded' key
+    (mirroring 'triggered'); the next run skips it."""
+    from data_qa import retrieve_data
+    fetched = []
+    monkeypatch.setattr(retrieve_data, "product_list_size_bytes",
+                        lambda *a, **kw: 1e9)
+    monkeypatch.setattr(retrieve_data, "retrieve",
+                        lambda *a, **kw: fetched.append(kw) or "manifest")
+    monkeypatch.setattr(mm, "disk_gate", lambda d, m: (True, 10.0, "gate"))
+    state_path = str(tmp_path / "state.json")
+    state = {"version": 1, "programs": {}}
+    mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0,
+                    state=state, state_path=state_path)
+    assert len(fetched) == 1
+    assert "2221-o001-NIRCam" in mm.load_state(state_path)["downloaded"]
+    mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0,
+                    state=state, state_path=state_path)
+    assert len(fetched) == 1                     # deduplicated
+    assert "SKIPPED(already-downloaded)" in capsys.readouterr().err
+
+
+def test_act_download_failed_download_does_not_burn(monkeypatch, tmp_path):
+    """retrieve() returning None (no products / failure) must NOT burn the
+    'downloaded' key."""
+    from data_qa import retrieve_data
+    monkeypatch.setattr(retrieve_data, "product_list_size_bytes",
+                        lambda *a, **kw: 1e9)
+    monkeypatch.setattr(retrieve_data, "retrieve", lambda *a, **kw: None)
+    monkeypatch.setattr(mm, "disk_gate", lambda d, m: (True, 10.0, "gate"))
+    state_path = str(tmp_path / "state.json")
+    state = {"version": 1, "programs": {}}
+    mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0,
+                    state=state, state_path=state_path)
+    assert "downloaded" not in state
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_disappeared_obs_kept_with_missing_since(monkeypatch, tmp_path, capsys):
+    """An obs that vanishes from MAST is kept in state under 'missing_since'
+    (report-only note; no silent drop, no event storm on reappearance)."""
+    state = tmp_path / "state.json"
+    _seed_state(state, obs_id="jw02221-o009_x")
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: [])   # o009 vanished
+    rc = mm.main(["--program", "2221", "--commit-state", "--state", str(state)])
+    assert rc == 0
+    assert "disappeared" in capsys.readouterr().err
+    rec = mm.load_state(str(state))["programs"]["2221"]["obs"]["jw02221-o009_x"]
+    assert "missing_since" in rec
+    assert rec["calib_level"] == 3               # original record preserved
+    # reappearance: still in the baseline, so NOT a NEW_OBSERVATION storm
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_row("jw02221-o009_x")])
+    rc = mm.main(["--program", "2221", "--commit-state", "--state", str(state)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "NEW_OBSERVATION" not in out
+    rec = mm.load_state(str(state))["programs"]["2221"]["obs"]["jw02221-o009_x"]
+    assert "missing_since" not in rec            # cleared on reappearance

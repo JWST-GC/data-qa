@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import shutil
@@ -92,7 +93,9 @@ PROGRAMS: Dict[int, Dict[str, str]] = {
     2211: {"023": "gc2211", "028": "gc2211", "046": "gc2211",
            "049": "gc2211", "050": "gc2211"},
     4147: {"012": "sgrc"},
-    5365: {"001": "sgrb2"},
+    5365: {"001": "sgrb2"},                          # NIRCam + MIRI obs
+    6151: {"001": "w51"},
+    2045: {"001": "arches", "003": "quintuplet"},
     3958: {"001": "sickle", "002": "sickle", "007": "sickle"},
     2092: {"002": "cloudef", "005": "cloudef"},
     1939: {"001": "sgra"},
@@ -139,6 +142,38 @@ def parse_filters(filters_str) -> List[str]:
     return out
 
 
+# Only observations with RELEASED, pipeline-ready products may trigger/download.
+# calib_level -1 (masked on MAST) = planned/unexecuted; 1 = uncal-only; >= 2 has
+# the *_cal/*_i2d products the reduction consumes.
+MIN_ACTIONABLE_CALIB_LEVEL = 2
+
+
+def event_ready(ev: dict) -> bool:
+    """True when the event's observation has released, calibrated data
+    (``released`` and ``calib_level >= 2``; both ride on the event payload).
+
+    Planned/unreleased rows -- the 10678 treasury watch target -- fire
+    NEW_OBSERVATION long before any data exists; they must REPORT (tagged
+    PLANNED) but never trigger/download, and crucially must NOT burn the
+    one-shot ``triggered`` key, or the real trigger is refused when the data
+    finally arrives."""
+    return (bool(ev.get("released"))
+            and (ev.get("calib_level") or 0) >= MIN_ACTIONABLE_CALIB_LEVEL)
+
+
+def instrument_class(instrument_name) -> str:
+    """MAST ``instrument_name`` ('NIRCAM/IMAGE', 'MIRI/IMAGE') -> 'NIRCam' /
+    'MIRI' ('' when absent/unknown).  NIRCam and MIRI observations of the same
+    (program, obs) are DIFFERENT deliveries: separate QA issues, and only the
+    NIRCam side is trigger-automated today."""
+    name = (instrument_name or "").split("/")[0].strip().upper()
+    if name.startswith("NIRCAM"):
+        return "NIRCam"
+    if name.startswith("MIRI"):
+        return "MIRI"
+    return name.title() if name else ""
+
+
 def field_for(program, obsnum: str) -> str:
     if int(program) == TREASURY_PROGRAM:
         # Treasury tiles (GC_<n>) all reduce into the one gc-treasury field; the
@@ -152,11 +187,51 @@ def now_mjd() -> float:
 
 
 def mjd_to_iso(mjd) -> str:
+    """MJD -> ISO string; ``"unknown"`` for None / NaN / masked / uncastable
+    (planned-but-unexecuted MAST rows have a masked ``t_obs_release``, which
+    reaches here as None or NaN -- it must never crash the report)."""
     if mjd is None:
-        return "?"
-    ts = (float(mjd) - 40587.0) * 86400.0
+        return "unknown"
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None and np.ma.is_masked(mjd):
+        return "unknown"
+    try:
+        ts = (float(mjd) - 40587.0) * 86400.0
+    except (TypeError, ValueError):
+        return "unknown"
+    if math.isnan(ts):
+        return "unknown"
     return datetime.datetime.fromtimestamp(
         ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _scalar(val, cast, default=None):
+    """One MAST table cell -> a plain-python scalar via ``cast``; ``default`` for
+    masked / NaN / None / uncastable cells.
+
+    Planned/unreleased rows (e.g. every 10678 treasury tile) carry MASKED
+    ``calib_level`` / ``t_obs_release``: ``int(np.ma.masked)`` raises
+    ``numpy.ma.MaskError`` (NOT a TypeError/ValueError) and ``float(np.ma.masked)``
+    silently returns NaN that later crashes ``mjd_to_iso`` -- so masked-ness is
+    checked explicitly (lazy numpy import keeps the module stdlib-importable)."""
+    if val is None:
+        return default
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None and np.ma.is_masked(val):
+        return default
+    try:
+        out = cast(val)
+    except (TypeError, ValueError):
+        return default
+    if isinstance(out, float) and math.isnan(out):
+        return default
+    return out
 
 
 # ------------------------------------------------------------------------------ MAST
@@ -200,17 +275,14 @@ def query_program(program) -> List[dict]:
         for c in cols:
             v = r[c]
             if c in ("t_max", "t_obs_release"):
-                try:
-                    row[c] = float(v)
-                except (TypeError, ValueError):
-                    row[c] = None
+                row[c] = _scalar(v, float, default=None)
             elif c == "calib_level":
-                try:
-                    row[c] = int(v)
-                except (TypeError, ValueError):
-                    row[c] = None
+                # planned/unreleased rows have a MASKED calib_level: -1 marks
+                # "no calibrated products" and keeps the row un-actionable
+                # (event_ready requires calib_level >= 2)
+                row[c] = _scalar(v, int, default=-1)
             else:
-                row[c] = None if v is None else str(v)
+                row[c] = _scalar(v, str, default=None)
         rows.append(row)
     return rows
 
@@ -295,18 +367,40 @@ def trigger_key(program, obsnum) -> str:
     return f"{int(program)}-o{obsnum}"
 
 
-def record_triggered(state_path, key: str, when: str, state: Optional[dict] = None):
-    """Persist a successful submission into the state file's ``triggered`` map
+def download_key(program, obsnum, instrument="NIRCam") -> str:
+    """Key in the state file's ``downloaded`` map: '<program>-o<obs>-<instr>'
+    (instrument-qualified: the NIRCam and MIRI product sets of one (program,obs)
+    are separate downloads)."""
+    return f"{int(program)}-o{obsnum}-{instrument or 'NIRCam'}"
+
+
+def _record_state_key(state_path, mapname: str, key: str, when: str,
+                      state: Optional[dict] = None):
+    """Persist a one-shot action key (``triggered``/``downloaded`` map)
     IMMEDIATELY (fresh read-modify-write of the on-disk state), so a crash or a
-    deliberately uncommitted run cannot re-fire the same submission.  Only the
-    ``triggered`` map is touched on disk -- the event baselines (``programs``)
-    keep whatever commit decision the caller made.  Also mirrors the entry into
-    the caller's in-memory ``state`` so a later full commit carries it."""
+    deliberately uncommitted run cannot re-fire the same action.  Only the named
+    map is touched on disk -- the event baselines (``programs``) keep whatever
+    commit decision the caller made.  Also mirrors the entry into the caller's
+    in-memory ``state`` so a later full commit carries it."""
     disk = load_state(state_path)
-    disk.setdefault("triggered", {})[key] = when
+    disk.setdefault(mapname, {})[key] = when
     save_state(state_path, disk)
     if state is not None:
-        state.setdefault("triggered", {})[key] = when
+        state.setdefault(mapname, {})[key] = when
+
+
+def record_triggered(state_path, key: str, when: str, state: Optional[dict] = None):
+    """Persist a successful submission into the ``triggered`` map (see
+    ``_record_state_key``).  Only release-gated successful submits reach this
+    (act_trigger's event_ready gate), so a planned/unreleased observation can
+    never burn its one-shot key."""
+    _record_state_key(state_path, "triggered", key, when, state=state)
+
+
+def record_downloaded(state_path, key: str, when: str, state: Optional[dict] = None):
+    """Persist a successful download into the ``downloaded`` map (mirror of the
+    ``triggered`` map; release-gated the same way)."""
+    _record_state_key(state_path, "downloaded", key, when, state=state)
 
 
 def inflight_job_names(timeout_s=30) -> Optional[Set[str]]:
@@ -332,24 +426,36 @@ def format_event(ev: dict) -> str:
              else f" calib={ev['calib_level']} release={mjd_to_iso(ev['t_obs_release'])}")
     field = ev["field"] or "?unmapped?"
     tile = f" tile={ev['tile']}" if ev.get("tile") else ""
+    planned = "" if event_ready(ev) else " PLANNED(no released calibrated data yet)"
     return (f"{ev['event']:16s} {ev['program']} {ev['obs_id']} "
-            f"[field={field}{tile} filters={ev.get('filters') or '?'}]" + extra)
+            f"[field={field}{tile} filters={ev.get('filters') or '?'}]"
+            + extra + planned)
 
 
 def _group_by_obs(events):
-    """Events -> {(program, obsnum): [events]} for per-observation actions
-    (obs-level only: skips events whose obsnum could not be parsed)."""
+    """Events -> {(program, obsnum, instrument_class): [events]} for
+    per-observation actions (obs-level only: skips events whose obsnum could not
+    be parsed).  Instrument-qualified: NIRCam and MIRI deliveries of the same
+    (program, obs) -- e.g. jw02221-o002 -- are distinct groups with distinct QA
+    issues, and only NIRCam groups are trigger-automated."""
     grouped = {}
     for ev in events:
         if ev["obsnum"]:
-            grouped.setdefault((ev["program"], ev["obsnum"]), []).append(ev)
+            key = (ev["program"], ev["obsnum"],
+                   instrument_class(ev.get("instrument_name")))
+            grouped.setdefault(key, []).append(ev)
     return grouped
 
 
 # -------------------------------------------------------------------------- disk gate
 DEFAULT_MIN_FREE_TB = 5.0
 DEFAULT_MAX_SUBMIT = 4
-DEFAULT_DOWNLOAD_DIR = "./data"          # matches retrieve_data.retrieve's default
+# Absolute (matches docs/scrontab.example): a relative "./data" filled whatever
+# directory the scrontab happened to run from.  NOTE this ops download tree is a
+# STAGING copy for QA inspection of what arrived -- the reduction pipeline
+# downloads its own inputs into its working tree and does NOT consume this copy
+# (deliberately not unified for now).
+DEFAULT_DOWNLOAD_DIR = "/orange/adamginsburg/jwst/ops/downloads"
 
 
 def free_terabytes(path) -> float:
@@ -381,14 +487,36 @@ def disk_gate(download_dir, min_free_tb=DEFAULT_MIN_FREE_TB):
 
 # ---------------------------------------------------------------------------- actions
 def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
-                 min_free_tb=DEFAULT_MIN_FREE_TB, force_unknown_size=False):
+                 min_free_tb=DEFAULT_MIN_FREE_TB, force_unknown_size=False,
+                 state=None, state_path=None):
+    """Download the products for each actionable (program, obs, instrument) group.
+
+    The download tree is a STAGING copy for QA inspection -- the reduction
+    downloads its own inputs (see DEFAULT_DOWNLOAD_DIR).  Release-gated
+    (event_ready) and deduplicated via the state file's ``downloaded`` map
+    (burned only on a successful release-gated download)."""
     from . import retrieve_data   # lazy: astroquery
-    for (program, obsnum), evs in sorted(_group_by_obs(events).items()):
+    downloaded = (state or {}).get("downloaded", {})
+    for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
         if not evs[0]["field"]:
             # mirror act_trigger: an unmapped program has nowhere to reduce, so
             # do not fill the disk for it either
             print(f"--download: SKIP program {program} obs {obsnum}: no field "
                   "mapping (add it to mast_monitor.PROGRAMS)", file=sys.stderr)
+            continue
+        if not any(event_ready(ev) for ev in evs):
+            print(f"--download: SKIPPED(planned) program {program} obs {obsnum} "
+                  f"({instr or '?'}): no released calib_level>="
+                  f"{MIN_ACTIONABLE_CALIB_LEVEL} data yet -- report-only",
+                  file=sys.stderr)
+            continue
+        instrument = instr or "NIRCam"
+        dkey = download_key(program, obsnum, instrument)
+        if dkey in downloaded:
+            print(f"--download: SKIPPED(already-downloaded) program {program} "
+                  f"obs {obsnum} ({instrument}): state marks a download at "
+                  f"{downloaded[dkey]} (delete the 'downloaded' entry in the "
+                  "state file to re-arm)", file=sys.stderr)
             continue
         if execute:
             # re-check the disk gate BETWEEN groups: an earlier group's download
@@ -401,7 +529,8 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
             headroom_tb = free_tb - min_free_tb
             try:
                 size = retrieve_data.product_list_size_bytes(
-                    program, obsnum, product_type=("uncal", "i2d"))
+                    program, obsnum, product_type=("uncal", "i2d"),
+                    instrument=instrument)
             except retrieve_data.mast_query_errors() as ex:
                 print(f"--download: WARNING program {program} obs {obsnum}: "
                       f"size query failed ({ex.__class__.__name__}: {ex})",
@@ -423,24 +552,47 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
                       f"{headroom_tb:.2f} TB headroom ({free_tb:.1f} TB free - "
                       f"{min_free_tb:.1f} TB --min-free-tb floor)", file=sys.stderr)
                 continue
-        print(f"--download: program {program} obs {obsnum} "
-              f"({len(evs)} event(s); dry_run={not execute})")
-        retrieve_data.retrieve(program, obsnum, product_type=("uncal", "i2d"),
-                               download_dir=download_dir, dry_run=not execute)
+        print(f"--download: program {program} obs {obsnum} ({instrument}; "
+              f"{len(evs)} event(s); dry_run={not execute})")
+        result = retrieve_data.retrieve(
+            program, obsnum, product_type=("uncal", "i2d"),
+            instrument=instrument, download_dir=download_dir,
+            dry_run=not execute)
+        if execute and state_path and result is not None:
+            # burned only on a successful, release-gated download (mirrors the
+            # 'triggered' map semantics)
+            record_downloaded(state_path, dkey, mjd_to_iso(now_mjd()), state=state)
 
 
 def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=None):
     from .pipeline_trigger import submit   # stdlib-only
     triggered = (state or {}).get("triggered", {})
     inflight = inflight_job_names() if execute else None
-    for (program, obsnum), evs in sorted(_group_by_obs(events).items()):
+    for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
         field = evs[0]["field"]
         if not field:
             print(f"--trigger: SKIP program {program} obs {obsnum}: no field mapping "
                   "(add it to mast_monitor.PROGRAMS)", file=sys.stderr)
             continue
+        ready = [ev for ev in evs if event_ready(ev)]
+        if not ready:
+            # planned/unreleased (calib_level -1, future/absent release): report
+            # only.  Crucially does NOT record_triggered -- the one-shot key
+            # stays armed for the REAL trigger when the data arrives.
+            print(f"--trigger: SKIPPED(planned) program {program} obs {obsnum} "
+                  f"({instr or '?'}): no released calib_level>="
+                  f"{MIN_ACTIONABLE_CALIB_LEVEL} data yet -- report-only; "
+                  "trigger stays armed for the data arrival", file=sys.stderr)
+            continue
+        if instr != "NIRCam":
+            # the trigger path (submit_reduction.sbatch + cataloging chain) is
+            # NIRCam-only today; MIRI (e.g. 5365, treasury F770W) is manual
+            print(f"--trigger: SKIPPED(not-automated) program {program} obs "
+                  f"{obsnum} ({instr or 'unknown instrument'}): the trigger "
+                  "path is NIRCam-only today -- reduce by hand", file=sys.stderr)
+            continue
         filters: List[str] = []
-        for ev in evs:
+        for ev in ready:
             for tok in parse_filters(ev.get("filters")):
                 if tok not in filters:
                     filters.append(tok)
@@ -468,11 +620,25 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
             record_triggered(state_path, key, mjd_to_iso(now_mjd()), state=state)
 
 
+# All treasury deliveries report into ONE rolling issue: per-obs issues would
+# mean ~1668 title lookups/creations (rate-limit hazard + issue spam).
+TREASURY_ISSUE_TITLE = f"GC Treasury — program {TREASURY_PROGRAM} deliveries"
+
+
 def act_report(events, execute=False, repo=None, update_last=True, notice=None):
     from . import status_report
-    for (program, obsnum), evs in sorted(_group_by_obs(events).items()):
+    # ONE existing_issues() fetch for the whole run, shared by every
+    # post_status call below (a per-group refetch is the ~1668-treasury-group
+    # rate-limit hazard); post_status fills it on first use.
+    issue_cache: dict = {}
+    treasury = [ev for ev in events if ev.get("field") == TREASURY_FIELD]
+    regular = [ev for ev in events if ev.get("field") != TREASURY_FIELD]
+    for (program, obsnum, instr), evs in sorted(_group_by_obs(regular).items()):
         field = evs[0]["field"]
-        title = status_report.issue_title_for(program, obsnum, field=field)
+        # instrument-qualified title: NIRCam vs MIRI deliveries of the same
+        # (program, obs) have separate QA issues (e.g. jw02221-o002)
+        title = status_report.issue_title_for(program, obsnum, field=field,
+                                              instrument=instr or "NIRCam")
         body = status_report.render_events_comment(evs, notice=notice)
         # update-in-place on the monitor-marked comment: successive monitor
         # reports (esp. recurring LOW DISK / CAPPED downgrades, which re-fire
@@ -480,7 +646,16 @@ def act_report(events, execute=False, repo=None, update_last=True, notice=None):
         # instead of stacking identical ones
         status_report.post_status(title, body, repo=repo, update_last=update_last,
                                   marker=status_report.MONITOR_MARKER,
-                                  dry_run=not execute)
+                                  dry_run=not execute, issue_cache=issue_cache)
+    if treasury:
+        # single rolling issue (auto-created if absent) instead of per-obs
+        # rc=3 "no issue titled ..." failures for every treasury tile
+        body = status_report.render_events_comment(treasury, notice=notice)
+        status_report.post_status(
+            TREASURY_ISSUE_TITLE, body, repo=repo, update_last=update_last,
+            marker=status_report.MONITOR_MARKER, dry_run=not execute,
+            issue_cache=issue_cache,
+            create_labels=["QA", f"program:{TREASURY_PROGRAM}"])
 
 
 # ------------------------------------------------------------------------------- main
@@ -552,14 +727,21 @@ def main(argv=None):
               "but events carry no field mapping", file=sys.stderr)
 
     state = load_state(args.state)
-    # first run = no committed observation baseline anywhere (missing/empty state)
-    first_run = not any((p or {}).get("obs")
-                        for p in state.get("programs", {}).values())
+    # per-program seed baseline: a program counts as seeded once it has EITHER
+    # an entry in the 'seeded_programs' set or (back-compat with older state
+    # files) a committed obs baseline.  A program whose query FAILED during the
+    # seed run gets seeded on its first successful poll later (actions
+    # suppressed for it that run) instead of firing its whole backlog.
+    seeded = set(state.get("seeded_programs", []))
+    seeded |= {p for p, rec in state.get("programs", {}).items()
+               if (rec or {}).get("obs")}
+    # first run = nothing seeded anywhere (missing/empty state)
+    first_run = not seeded
     mast_login_if_token()
     poll_mjd = now_mjd()
 
     from .retrieve_data import mast_query_errors
-    all_events, failed_programs = [], []
+    all_events, failed_programs, newly_seeded = [], [], []
     for prog in programs:
         try:
             rows = query_program(prog)
@@ -575,7 +757,21 @@ def main(argv=None):
         new_obs = summarize(rows, poll_mjd)
         old_obs = state.get("programs", {}).get(str(prog), {}).get("obs", {})
         all_events.extend(diff_events(prog, old_obs, new_obs))
-        state.setdefault("programs", {})[str(prog)] = {"obs": new_obs}
+        # an obs that DISAPPEARED from MAST is kept under a 'missing_since'
+        # note (report-only; no event, no silent drop) until it reappears
+        merged_obs = dict(new_obs)
+        for obs_id, rec in old_obs.items():
+            if obs_id not in merged_obs:
+                kept = dict(rec)
+                kept.setdefault("missing_since", mjd_to_iso(poll_mjd))
+                merged_obs[obs_id] = kept
+                print(f"note: program {prog} obs {obs_id} disappeared from "
+                      f"MAST; kept in state (missing_since "
+                      f"{kept['missing_since']})", file=sys.stderr)
+        state.setdefault("programs", {})[str(prog)] = {"obs": merged_obs}
+        if str(prog) not in seeded:
+            newly_seeded.append(str(prog))
+    state["seeded_programs"] = sorted(seeded | set(newly_seeded))
     state["version"] = 1
     state["last_poll_mjd"] = poll_mjd
     state["last_poll_utc"] = mjd_to_iso(poll_mjd)
@@ -595,6 +791,7 @@ def main(argv=None):
     # the entire backlog.  Seed instead: commit state, act on nothing.
     acting = args.execute and (args.download or args.trigger)
     seed = args.seed or (first_run and bool(all_events) and acting)
+    actionable = all_events
     if seed:
         notice = (f"SEED RUN — actions suppressed: committing the current state "
                   f"({len(all_events)} event(s)) as the baseline; nothing "
@@ -605,9 +802,25 @@ def main(argv=None):
         args.download = args.trigger = False
         args.commit_state = True
     elif acting:
+        # PER-PROGRAM SEED: a program polled successfully for the first time
+        # (e.g. its query failed during the seed run) fires its whole backlog
+        # as NEW -- commit it as baseline, but suppress actions for it this run
+        if newly_seeded:
+            suppressed_progs = sorted({str(ev["program"]) for ev in all_events
+                                       if str(ev["program"]) in set(newly_seeded)})
+            actionable = [ev for ev in all_events
+                          if str(ev["program"]) not in set(newly_seeded)]
+            if suppressed_progs:
+                msg = (f"PER-PROGRAM SEED — program(s) "
+                       f"{', '.join(suppressed_progs)} polled successfully for "
+                       "the first time: their events are committed as baseline; "
+                       "actions suppressed for them this run.")
+                print(f"--seed(per-program): {msg}", file=sys.stderr)
+                if notice is None:
+                    notice = msg
         # SUBMISSION CAP: all-or-nothing (see module docstring for why a
         # partial commit is worse than acting on nothing)
-        n_groups = len(_group_by_obs(all_events))
+        n_groups = len(_group_by_obs(actionable))
         if n_groups > args.max_submit:
             notice = (f"CAPPED — actions suppressed: {n_groups} (program,obs) "
                       f"groups would act, exceeding --max-submit "
@@ -620,14 +833,16 @@ def main(argv=None):
 
     if all_events:
         if args.download:
-            act_download(all_events, execute=args.execute,
+            act_download(actionable, execute=args.execute,
                          download_dir=args.download_dir,
                          min_free_tb=args.min_free_tb,
-                         force_unknown_size=args.force_download_unknown_size)
+                         force_unknown_size=args.force_download_unknown_size,
+                         state=state, state_path=args.state)
         if args.trigger:
-            act_trigger(all_events, execute=args.execute, pipe_root=args.pipe_root,
+            act_trigger(actionable, execute=args.execute, pipe_root=args.pipe_root,
                         state=state, state_path=args.state)
         if args.report:
+            # report EVERYTHING (incl. per-program-seed-suppressed events)
             act_report(all_events, execute=args.execute, repo=args.repo,
                        notice=notice)
 

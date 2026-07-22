@@ -149,8 +149,10 @@ def render_events_comment(events: List[dict], now=None, notice=None) -> str:
     the monitor's update-in-place path finds and edits its own comment).
 
     ``notice`` (e.g. the --auto LOW DISK / SEED / CAPPED downgrade message)
-    renders as a loud warning blockquote above the event list."""
-    from .mast_monitor import mjd_to_iso   # stdlib-only
+    renders as a loud warning blockquote above the event list.  Events without
+    released calibrated data (planned treasury tiles: masked/-1 calib level)
+    carry a PLANNED tag -- they are report-only, never triggered/downloaded."""
+    from .mast_monitor import event_ready, mjd_to_iso   # stdlib-only
     lines = [MONITOR_MARKER,
              f"**MAST monitor events** — {now or utc_now()}", ""]
     if notice:
@@ -158,7 +160,8 @@ def render_events_comment(events: List[dict], now=None, notice=None) -> str:
     for ev in events:
         rel = mjd_to_iso(ev.get("t_obs_release"))
         tile = f", tile `{ev['tile']}`" if ev.get("tile") else ""
-        lines.append(f"- **{ev['event']}**: `{ev['obs_id']}` "
+        planned = "" if event_ready(ev) else " **PLANNED** — no released calibrated data yet;"
+        lines.append(f"- **{ev['event']}**:{planned} `{ev['obs_id']}` "
                      f"(calib level {ev.get('calib_level')}, release {rel}, "
                      f"filters `{ev.get('filters') or '?'}`{tile})")
     lines += ["", "_Posted by `data_qa/mast_monitor.py --report`._"]
@@ -180,10 +183,19 @@ def find_last_status_comment(token, repo, number) -> Optional[dict]:
 
 
 def post_status(title: str, body: str, repo=None, update_last=False, dry_run=True,
-                marker=STATUS_MARKER):
+                marker=STATUS_MARKER, issue_cache=None, create_labels=None):
     """Post (or, update_last, edit-in-place) the status comment on the issue with
     this exact title.  ``marker`` selects WHICH bot comment update_last edits
     (STATUS_MARKER for status reports, MONITOR_MARKER for monitor events).
+
+    ``issue_cache``: an (initially empty) dict shared across calls in one run --
+    the ``existing_issues()`` title index is fetched ONCE and reused, so a run
+    with many groups (the treasury's ~1668) costs one listing, not one per group.
+
+    ``create_labels``: when set and no issue with this title exists, CREATE it
+    (with these labels) instead of failing rc=3 -- the rolling-issue path
+    (mast_monitor treasury channel).
+
     Returns 0 on success / dry-run, nonzero on failure."""
     repo = repo or _github.REPO
     if dry_run:
@@ -196,10 +208,30 @@ def post_status(title: str, body: str, repo=None, update_last=False, dry_run=Tru
         print("no GitHub token (GITHUB_TOKEN/GH_TOKEN or `gh auth login`)",
               file=sys.stderr)
         return 2
-    issue = _github.existing_issues(token, repo).get(title)
+    if issue_cache is not None and "issues" in issue_cache:
+        existing = issue_cache["issues"]
+    else:
+        existing = _github.existing_issues(token, repo)
+        if issue_cache is not None:
+            issue_cache["issues"] = existing
+    issue = existing.get(title)
     if issue is None:
-        print(f"no issue titled {title!r} in {repo}", file=sys.stderr)
-        return 3
+        if create_labels is None:
+            print(f"no issue titled {title!r} in {repo}", file=sys.stderr)
+            return 3
+        _github.ensure_labels(token, repo, create_labels)
+        status, data = _github.create_issue(
+            token, repo, title,
+            "Rolling monitor issue (auto-created by `data_qa`); events arrive "
+            "as comments below.",
+            labels=create_labels)
+        if status >= 300:
+            print(f"failed to create issue {title!r} in {repo} ({status}): "
+                  f"{data.get('message')}", file=sys.stderr)
+            return 4
+        print(f"created rolling issue #{data['number']}: {title}")
+        existing[title] = data          # keep the shared cache consistent
+        issue = data
     number = issue["number"]
     if update_last:
         prev = find_last_marked_comment(token, repo, number, marker=marker)

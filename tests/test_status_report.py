@@ -132,3 +132,75 @@ def test_post_status_missing_issue(monkeypatch):
     monkeypatch.setattr(_github, "get_token", lambda: "tok")
     monkeypatch.setattr(_github, "existing_issues", lambda token, repo: {})
     assert sr.post_status("Nope", "B", dry_run=False) == 3
+
+
+# --------------------------------------------- PLANNED tag (unreleased events)
+def test_render_events_comment_planned_tag():
+    ev = dict(event="NEW_OBSERVATION", obs_id="jw10678-o101_x", calib_level=-1,
+              released=False, t_obs_release=None, filters="F212N;F480M",
+              tile="GC_101")
+    body = sr.render_events_comment([ev], now="2026-07-22 12:00 UTC")
+    assert "PLANNED" in body
+    assert "release unknown" in body             # masked date -> 'unknown'
+
+
+def test_render_events_comment_released_has_no_planned_tag():
+    ev = dict(event="NEWLY_RELEASED", obs_id="jw02221-o001_x", calib_level=3,
+              released=True, t_obs_release=59900.0, filters="F405N")
+    body = sr.render_events_comment([ev], now="2026-07-22 12:00 UTC")
+    assert "PLANNED" not in body
+
+
+# ------------------------------------------ shared issue cache + rolling issue
+def test_post_status_shared_issue_cache_fetches_once(monkeypatch):
+    """One existing_issues() listing per run when callers share an issue_cache
+    (the ~1668-treasury-group rate-limit hazard)."""
+    fetches = []
+    monkeypatch.setattr(_github, "get_token", lambda: "tok")
+    monkeypatch.setattr(_github, "existing_issues",
+                        lambda token, repo: fetches.append(repo)
+                        or {"T": {"number": 5}})
+    monkeypatch.setattr(_github, "list_comments", lambda *a: [])
+    monkeypatch.setattr(_github, "post_comment", lambda *a: (201, {}))
+    cache = {}
+    assert sr.post_status("T", "b1", dry_run=False, issue_cache=cache) == 0
+    assert sr.post_status("T", "b2", dry_run=False, issue_cache=cache) == 0
+    assert len(fetches) == 1                     # fetched ONCE, reused
+
+
+def test_post_status_creates_rolling_issue_when_missing(monkeypatch):
+    """create_labels turns the rc=3 'no issue' failure into issue creation
+    (the treasury rolling-issue path), and the shared cache learns it."""
+    created, posted = [], []
+    monkeypatch.setattr(_github, "get_token", lambda: "tok")
+    monkeypatch.setattr(_github, "existing_issues", lambda token, repo: {})
+    monkeypatch.setattr(_github, "ensure_labels", lambda token, repo, names: None)
+    monkeypatch.setattr(_github, "create_issue",
+                        lambda token, repo, title, body, labels=():
+                        created.append((title, list(labels)))
+                        or (201, {"number": 9}))
+    monkeypatch.setattr(_github, "list_comments", lambda *a: [])
+    monkeypatch.setattr(_github, "post_comment",
+                        lambda token, repo, number, body:
+                        posted.append(number) or (201, {}))
+    cache = {}
+    rc = sr.post_status("GC Treasury — program 10678 deliveries", "events",
+                        dry_run=False, issue_cache=cache,
+                        create_labels=["QA", "program:10678"])
+    assert rc == 0
+    assert created == [("GC Treasury — program 10678 deliveries",
+                        ["QA", "program:10678"])]
+    assert posted == [9]
+    rc = sr.post_status("GC Treasury — program 10678 deliveries", "more",
+                        dry_run=False, issue_cache=cache,
+                        create_labels=["QA", "program:10678"])
+    assert rc == 0
+    assert len(created) == 1                     # cached: not re-created
+    assert posted == [9, 9]
+
+
+def test_post_status_missing_issue_still_fails_without_create_labels(monkeypatch):
+    """Per-obs issues are still make_issues-owned: no silent creation."""
+    monkeypatch.setattr(_github, "get_token", lambda: "tok")
+    monkeypatch.setattr(_github, "existing_issues", lambda token, repo: {})
+    assert sr.post_status("Nope", "B", dry_run=False, issue_cache={}) == 3
