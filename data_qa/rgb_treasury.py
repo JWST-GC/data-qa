@@ -26,7 +26,10 @@ Validation (``--validate``, and ALWAYS run automatically after a write):
 re-reads the AVM from the PNG, reconstructs the WCS, and compares it against the
 F212N FITS WCS at the reference pixel + 4 corners (PASS: max offset < 0.1");
 checks alpha/NaN consistency and the nonzero finite fraction; writes
-``<out>.validation.json``.  Exits nonzero on FAIL.
+``<out>.validation.json``.  Exits nonzero on FAIL.  The verdict records
+``outputs.{png,jpg}_sha256`` -- the hashes of the exact files it validated --
+which ``publish.py``'s avm gate re-checks at push time (stale-verdict
+protection).
 
 Star-position check (the SECOND avm-publish gate, user decision 4): whenever a
 reference catalog is available -- ``--ref-catalog``, or found by convention
@@ -76,6 +79,8 @@ STAR_BOX_PX = 4             # +-box around the predicted pixel to search
 STAR_PASS_MEDIAN_PX = 2.0   # PASS: median |predicted - peak| <= this
 STAR_MIN_MATCH_FRACTION = 0.5
 STAR_MIN_USED = 20          # refuse to conclude from fewer usable stars
+STAR_PLATEAU_MIN_PX = 3     # >= this many px at the box max = a plateau
+STAR_SATURATED_LUM = 255.0  # uint8 luminance ceiling: star top is clipped
 
 
 # --------------------------------------------------------------------------- helpers
@@ -267,6 +272,31 @@ def _refcat_radec_mag(tbl):
     return ra, dec, mag
 
 
+def _box_peak(box, box_px):
+    """Peak position ``(py, px)`` (floats) in a ``(2*box_px+1)``-square
+    luminance box, plateau-aware; ``None`` when there is no interior peak.
+
+    ``nanargmax`` returns the FIRST index of the maximum, which for a
+    flat-topped (clipped / near-saturated) star biases the "peak" toward the
+    low-index corner of the plateau by up to the plateau radius -- enough to
+    push a perfectly registered star past the 2 px gate.  So when the
+    max-value region is a plateau (>= STAR_PLATEAU_MIN_PX pixels at the max)
+    the plateau CENTROID is used instead.  A max region touching the box
+    border is a gradient toward something outside the box, not a local peak
+    -> ``None`` (unmatched)."""
+    if not np.any(np.isfinite(box)):
+        return None
+    mx = np.nanmax(box)
+    pys, pxs = np.nonzero(box == mx)
+    edge = 2 * box_px
+    if np.any((pys == 0) | (pys == edge) | (pxs == 0) | (pxs == edge)):
+        return None                          # max touches the border: no peak
+    if len(pys) >= STAR_PLATEAU_MIN_PX:
+        return float(np.mean(pys)), float(np.mean(pxs))
+    py, px = np.unravel_index(np.nanargmax(box), box.shape)
+    return float(py), float(px)
+
+
 def validate_star_positions(out_base, ref_catalog, max_stars=STAR_MAX_STARS,
                             box_px=STAR_BOX_PX):
     """Star-position check against ``ref_catalog`` (the second avm gate).
@@ -274,10 +304,13 @@ def validate_star_positions(out_base, ref_catalog, max_stars=STAR_MAX_STARS,
     Projects up to ``max_stars`` bright finite-mag catalog stars through the
     PNG's EMBEDDED AVM WCS (exactly as a consumer would) to pixel coordinates
     and measures the offset to the local luminance peak within a +-``box_px``
-    box.  A star whose box maximum sits on the box border has no local peak
-    there (it is a gradient toward something else) and is excluded as
-    unmatched.  PASS requires median offset <= STAR_PASS_MEDIAN_PX px, matched
-    fraction >= STAR_MIN_MATCH_FRACTION, and >= STAR_MIN_USED usable stars.
+    box (plateau-aware centroid, see ``_box_peak``).  A star whose box
+    maximum sits on the box border has no local peak there (it is a gradient
+    toward something else) and is excluded as unmatched.  Saturated stars
+    (box max at the uint8 ceiling, 255) carry no reliable centroid and are
+    SKIPPED whenever >= STAR_MIN_USED unsaturated stars remain.  PASS
+    requires median offset <= STAR_PASS_MEDIAN_PX px, matched fraction >=
+    STAR_MIN_MATCH_FRACTION, and >= STAR_MIN_USED usable stars.
 
     Returns the ``checks.star_positions`` dict (``pass`` is the verdict)."""
     import pyavm
@@ -297,28 +330,42 @@ def validate_star_positions(out_base, ref_catalog, max_stars=STAR_MAX_STARS,
     finite = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(mag)
     ra, dec, mag = ra[finite], dec[finite], mag[finite]
     xs, ys = avm_wcs.wcs_world2pix(ra, dec, 0)
+    # a star far off the projection can come back non-finite: not in footprint
+    proj = np.isfinite(xs) & np.isfinite(ys)
+    xi = np.full(xs.shape, -1, dtype=int)
+    yi = np.full(ys.shape, -1, dtype=int)
+    xi[proj] = np.round(xs[proj]).astype(int)
+    yi[proj] = np.round(ys[proj]).astype(int)
     # footprint: full box inside the image, on an opaque (data) pixel
-    xi = np.round(xs).astype(int)
-    yi = np.round(ys).astype(int)
-    inside = ((xi >= box_px) & (xi < nx - box_px)
+    inside = (proj & (xi >= box_px) & (xi < nx - box_px)
               & (yi >= box_px) & (yi < ny - box_px))
     on_data = np.zeros(len(xs), dtype=bool)
     on_data[inside] = np.isfinite(lum[yi[inside], xi[inside]])
     order = np.argsort(mag)                  # brightest (smallest mag) first
     keep = order[on_data[order]][:max_stars]
 
-    offsets = []
+    usable = []                              # (offset_px, saturated) per star
     n_selected = int(len(keep))
     for k in keep:
         box = lum[yi[k] - box_px: yi[k] + box_px + 1,
                   xi[k] - box_px: xi[k] + box_px + 1]
-        if not np.any(np.isfinite(box)):
-            continue
-        py, px = np.unravel_index(np.nanargmax(box), box.shape)
-        if py in (0, 2 * box_px) or px in (0, 2 * box_px):
-            continue                         # peak on the border: no local peak
-        offsets.append(float(np.hypot(xi[k] - box_px + px - xs[k],
-                                      yi[k] - box_px + py - ys[k])))
+        peak = _box_peak(box, box_px)
+        if peak is None:
+            continue                         # no interior local peak
+        py, px = peak
+        off = float(np.hypot(xi[k] - box_px + px - xs[k],
+                             yi[k] - box_px + py - ys[k]))
+        usable.append((off, bool(np.nanmax(box) >= STAR_SATURATED_LUM)))
+
+    # saturated (uint8-clipped) stars have no reliable peak position; skip
+    # them whenever enough unsaturated stars remain to conclude from
+    unsaturated = [off for off, sat in usable if not sat]
+    if len(unsaturated) >= STAR_MIN_USED:
+        offsets = unsaturated
+        n_saturated_skipped = len(usable) - len(unsaturated)
+    else:
+        offsets = [off for off, _sat in usable]
+        n_saturated_skipped = 0
 
     n_used = len(offsets)
     matched_fraction = (n_used / n_selected) if n_selected else 0.0
@@ -326,14 +373,19 @@ def validate_star_positions(out_base, ref_catalog, max_stars=STAR_MAX_STARS,
     ok = (n_used >= STAR_MIN_USED
           and matched_fraction >= STAR_MIN_MATCH_FRACTION
           and median is not None and median <= STAR_PASS_MEDIAN_PX)
-    return {
+    result = {
         "pass": bool(ok),
         "median_offset_px": median,
         "n_used": n_used,
         "n_selected": n_selected,
+        "n_saturated_skipped": n_saturated_skipped,
         "matched_fraction": float(matched_fraction),
         "ref_catalog": os.path.abspath(ref_catalog),
     }
+    if n_selected == 0:
+        # distinct from "stars matched poorly": nothing to check at all
+        result["reason"] = "catalog does not overlap image footprint"
+    return result
 
 
 # --------------------------------------------------------------------------- validate
@@ -435,8 +487,15 @@ def validate(out_base, f212n_path, long_path, long_band="F480M",
             "long_band": long_band,
             "ref_catalog": os.path.abspath(cat) if cat else None,
         },
+        # sha256 of the EXACT files this verdict vouches for: publish.py
+        # re-hashes at push time and refuses on mismatch, so a PNG/JPG
+        # regenerated after validation can never ride a stale verdict.
         "outputs": {"png": os.path.abspath(png),
-                    "jpg": os.path.abspath(out_base + ".jpg")},
+                    "png_sha256": _sha256(png),
+                    "jpg": os.path.abspath(out_base + ".jpg"),
+                    "jpg_sha256": (_sha256(out_base + ".jpg")
+                                   if os.path.exists(out_base + ".jpg")
+                                   else None)},
     }
     if write_json:
         with open(out_base + ".validation.json", "w") as fh:

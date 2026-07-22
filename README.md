@@ -59,6 +59,32 @@ observations are parsed from `{field}_images.txt` on the next run. To attach han
 notes / epoch / visits to a specific observation, add an entry to `CURATED`
 (keyed by obsid, e.g. `jw02221-o001`).
 
+## Imaging + publishing (ops)
+
+The imaging/publish stage of the ops layer lives in three modules:
+
+```
+data_qa/
+  rgb_treasury.py   # two-band -> three-color RGB PNG/JPG with embedded AVM + validation verdict
+  hips_treasury.py  # spec-driven two-color treasury HiPS builder (plan / build / color / sbatch)
+  publish.py        # gated rsync pushes to the web host (avm / products / manifests verbs)
+```
+
+- `rgb_treasury.py` composes the CMZ house two-color scheme (B=F212N,
+  R=F480M/F405N, G=0.5(R+B)) into an AVM-tagged PNG (+ JPG preview) and always
+  writes a `<out>.validation.json` verdict: WCS round-trip, alpha/NaN
+  consistency, a reference-catalog star-position check, and
+  `outputs.{png,jpg}_sha256` hashes binding the verdict to the exact files it
+  validated.
+- `hips_treasury.py` drives `jwst_gc_pipeline.cmz.hips` from a JSON spec to
+  grow the incremental mono HiPS substrates and derive the two-color layer.
+- `publish.py` is the only sanctioned path to the web server. Every verb is
+  dry-run by default; `--execute` pushes only if the gates pass (fail-closed,
+  no `--force`): images need a passing, hash-bound validation verdict (a
+  regenerated file with a stale verdict is refused), the push manifest is
+  checked against the gate's scope (`--allow-extra-files` for uncovered
+  files), and release products need the `stage_release.py` MANIFEST marker.
+
 ## TODO
 
 We still need to set up a cron job to poll the MAST archive, trigger downloads, and trigger job runs and issue creation when new data are delivered.

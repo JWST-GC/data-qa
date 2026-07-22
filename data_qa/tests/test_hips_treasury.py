@@ -58,6 +58,26 @@ def test_plan_detects_existing_member(spec_file):
     assert p["LONG"]["new"] == ["fieldA", "fieldB"]   # LONG registry untouched
 
 
+def test_plan_member_matches_through_symlink(spec_file, tmp_path):
+    """Membership comparison is realpath-normalized: a member registered
+    under the real path still matches a spec that references it through a
+    symlink (and vice versa)."""
+    path, spec = spec_file
+    root = spec["root"]
+    os.makedirs(root, exist_ok=True)
+    real = spec["fields"][0]["f212n_i2d"]
+    link = str(tmp_path / "alias_f212n_i2d.fits")
+    os.symlink(real, link)
+    # registry holds the REAL path; the spec now points at the symlink
+    with open(os.path.join(root, "F212N.members.json"), "w") as fh:
+        json.dump({"members": [{"i2d": os.path.abspath(real),
+                                "field": "fieldA", "tag": "F212N"}]}, fh)
+    spec["fields"][0]["f212n_i2d"] = link
+    p = HT.plan(spec)
+    assert p["F212N"]["present"] == ["fieldA"]
+    assert "fieldA" not in p["F212N"]["new"]
+
+
 def test_plan_cli_default_verb(spec_file, capsys):
     path, _spec = spec_file
     assert HT.main(["--spec", path]) == 0

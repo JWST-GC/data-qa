@@ -94,12 +94,15 @@ def band_dirs(spec):
 
 def registry_members(master_dir):
     """Member i2d paths already folded into ``master_dir`` (its members.json
-    sidecar, same path convention as ``cmz.hips.add_field_to_mono_hips``)."""
+    sidecar, same path convention as ``cmz.hips.add_field_to_mono_hips``).
+    Paths are ``os.path.realpath``-normalized so a member registered through a
+    symlink (or /orange automount alias) still matches the spec path."""
     path = master_dir.rstrip("/") + ".members.json"
     if not os.path.exists(path):
         return set()
     with open(path) as fh:
-        return {m["i2d"] for m in json.load(fh).get("members", [])}
+        return {os.path.realpath(m["i2d"])
+                for m in json.load(fh).get("members", [])}
 
 
 def plan(spec):
@@ -117,7 +120,7 @@ def plan(spec):
                 continue
             if i2d.startswith("TODO") or not os.path.exists(i2d):
                 missing.append(f["name"])
-            elif os.path.abspath(i2d) in members:
+            elif os.path.realpath(i2d) in members:
                 present.append(f["name"])
             else:
                 new.append(f["name"])

@@ -16,7 +16,13 @@ Verbs:
   ``checks.star_positions`` must PASS; a verdict whose star check was skipped
   (no reference catalog) or predates the check needs an explicit
   ``--no-star-check`` acknowledgment, and a star check that ran and FAILED
-  refuses outright (fail-closed, no override).
+  refuses outright (fail-closed, no override).  THIRD gate (stale-verdict
+  protection): the verdict must be BOUND to the pushed bytes -- its
+  ``outputs.{png,jpg}_sha256`` is re-hashed against each pushed image (HiPS
+  trees: against the tree's source PNG recorded at build time; an unbound
+  tree verdict needs ``--accept-unbound-tree``).  Gate scope = push scope:
+  the push builds an explicit file manifest (logged on every ``--execute``);
+  non-image files outside a HiPS tree need ``--allow-extra-files``.
 
 * ``products --field <f> --src <dir> [--dest-sub S]`` -> ``htdocs/jwst-gc/``.
   Gate: the field must actually be STAGED -- ``stage_release.py`` marks staged
@@ -41,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -48,11 +55,24 @@ import sys
 SSH_ALIAS = "starformation"
 DOCROOT = "/h/cnswww-starformation.astro/starformation.astro.ufl.edu/htdocs"
 RELEASE_ROOT = "/orange/adamginsburg/jwst/releases"
-RSYNC = ["rsync", "-ravpu", "--partial"]
+# No -u (--update): -u skips destination files newer than the source, so a
+# CORRECTED re-publish of an image the server already has would be silently
+# dropped exactly when it matters most.  Corrected re-publishes must always
+# overwrite; --partial covers interrupted transfers.
+RSYNC = ["rsync", "-ravp", "--partial"]
 IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+VALIDATION_SUFFIX = ".validation.json"
 
 
 # --------------------------------------------------------------------------- gates
+def _sha256(path, blocksize=1 << 22):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(blocksize), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def _load_validation(path):
     """The validation JSON dict at ``path``; None when missing/unreadable."""
     if not os.path.exists(path):
@@ -76,60 +96,118 @@ def _star_state(verdict):
 
 
 def _covering_verdicts(img, top):
-    """[(sidecar_path, verdict_dict)] candidates covering ``img``: its own
-    sibling validation first, then each enclosing HiPS tree's source
-    validation (tree root = dir with a 'properties' file; sidecar lives NEXT
-    TO the tree root as <treename>.validation.json)."""
+    """[(sidecar_path, verdict_dict, kind)] candidates covering ``img``:
+    its own sibling validation first (kind='sibling'), then each enclosing
+    HiPS tree's source validation (kind='tree'; tree root = dir with a
+    'properties' file; sidecar lives NEXT TO the tree root as
+    <treename>.validation.json)."""
     out = []
     stem, _ = os.path.splitext(img)
-    sib = stem + ".validation.json"
+    sib = stem + VALIDATION_SUFFIX
     verdict = _load_validation(sib)
     if verdict is not None:
-        out.append((sib, verdict))
+        out.append((sib, verdict, "sibling"))
     d = os.path.dirname(os.path.abspath(img))
     top = os.path.abspath(top)
     while len(d) >= len(top):
         if os.path.exists(os.path.join(d, "properties")):
             sidecar = os.path.join(os.path.dirname(d),
-                                   os.path.basename(d) + ".validation.json")
+                                   os.path.basename(d) + VALIDATION_SUFFIX)
             verdict = _load_validation(sidecar)
             if verdict is not None:
-                out.append((sidecar, verdict))
+                out.append((sidecar, verdict, "tree"))
         if d == top:
             break
         d = os.path.dirname(d)
     return out
 
 
-def _image_problem(img, top, no_star_check=False):
+def _binding_problem(img, sidecar, verdict, kind, accept_unbound_tree=False):
+    """Stale-verdict protection: why the verdict is not BOUND to the pushed
+    bytes (None when it is).
+
+    'sibling': the verdict's ``outputs.{png,jpg}_sha256`` (recorded by
+    rgb_treasury at validation time) must match a re-hash of ``img`` NOW --
+    an image regenerated after its validation is refused, as is a verdict
+    predating the binding (no outputs hashes).
+
+    'tree': HiPS tiles are derived, so the tile itself cannot be re-hashed
+    against the verdict; instead bind to the tree's SOURCE PNG recorded at
+    build time -- re-hash ``<treename>.png`` next to the tree (or the
+    verdict's ``outputs.png`` path) against ``outputs.png_sha256``.  A tree
+    verdict lacking the binding (or whose source PNG is gone) requires an
+    explicit ``--accept-unbound-tree`` acknowledgment."""
+    outputs = verdict.get("outputs")
+    outputs = outputs if isinstance(outputs, dict) else {}
+    if kind == "sibling":
+        key = ("png_sha256" if img.lower().endswith(".png")
+               else "jpg_sha256")
+        expected = outputs.get(key)
+        if not expected:
+            return (f"verdict {sidecar} has no outputs.{key} binding; "
+                    "re-run rgb_treasury validation to bind the verdict to "
+                    "the current file")
+        if _sha256(img) != expected:
+            return (f"STALE verdict {sidecar}: outputs.{key} does not match "
+                    "the current file (image regenerated after validation); "
+                    "re-validate before pushing")
+        return None
+    # kind == "tree"
+    expected = outputs.get("png_sha256")
+    base = sidecar[: -len(VALIDATION_SUFFIX)]
+    candidates = [base + ".png"]
+    if outputs.get("png"):
+        candidates.append(outputs["png"])
+    src_png = next((c for c in candidates if os.path.exists(c)), None)
+    if expected and src_png:
+        if _sha256(src_png) != expected:
+            return (f"STALE tree verdict {sidecar}: source PNG {src_png} "
+                    "changed after validation; re-validate + rebuild the "
+                    "HiPS tree before pushing")
+        return None
+    if accept_unbound_tree:
+        return None
+    detail = ("no outputs.png_sha256 in the verdict" if not expected
+              else f"source PNG not found (looked for {candidates})")
+    return (f"HiPS-tree verdict {sidecar} is not bound to its source PNG "
+            f"({detail}); pass --accept-unbound-tree to acknowledge")
+
+
+def _image_problem(img, top, no_star_check=False, accept_unbound_tree=False):
     """Why ``img`` is not pushable (None when it is).
 
-    Pushable = some covering validation passes AND its star-position check
-    (the second gate, user decision 4) is satisfied: star 'pass', or
-    'skipped'/'absent' explicitly acknowledged via --no-star-check.  A star
+    Pushable = some covering validation passes, its star-position check
+    (the second gate, user decision 4) is satisfied (star 'pass', or
+    'skipped'/'absent' explicitly acknowledged via --no-star-check), AND the
+    verdict is BOUND to the pushed bytes (``_binding_problem``).  A star
     check that RAN and FAILED is fail-closed: no flag overrides it."""
     candidates = _covering_verdicts(img, top)
     if not candidates:
         return "no validation.json (sibling or HiPS-tree)"
     reasons = []
-    for sidecar, verdict in candidates:
+    for sidecar, verdict, kind in candidates:
         if not verdict.get("pass"):
             reasons.append(f"validation FAILED ({sidecar})")
             continue
         stars = _star_state(verdict)
-        if stars == "pass" or (no_star_check
-                               and stars in ("skipped", "absent")):
-            return None
         if stars == "fail":
             reasons.append(f"star-position check FAILED ({sidecar}); "
                            "fail-closed, --no-star-check cannot override")
-        else:
+            continue
+        if not (stars == "pass" or (no_star_check
+                                    and stars in ("skipped", "absent"))):
             reasons.append(f"star-position check {stars} ({sidecar}); pass "
                            "--no-star-check to acknowledge pushing without it")
+            continue
+        why = _binding_problem(img, sidecar, verdict, kind,
+                               accept_unbound_tree=accept_unbound_tree)
+        if why is None:
+            return None
+        reasons.append(why)
     return "; ".join(reasons)
 
 
-def gate_avm(src, no_star_check=False):
+def gate_avm(src, no_star_check=False, accept_unbound_tree=False):
     """Return (ok, problems).  Every PNG/JPG under ``src`` must be covered."""
     src = os.path.abspath(src)
     if os.path.isfile(src):
@@ -142,12 +220,62 @@ def gate_avm(src, no_star_check=False):
         top = src
     problems = []
     for p in sorted(imgs):
-        why = _image_problem(p, top, no_star_check=no_star_check)
+        why = _image_problem(p, top, no_star_check=no_star_check,
+                             accept_unbound_tree=accept_unbound_tree)
         if why:
             problems.append(f"{p}: {why}")
     if not imgs:
         problems.append(f"{src}: no PNG/JPG images found to push")
     return (not problems), problems
+
+
+# ------------------------------------------------------------ push-scope manifest
+def push_manifest(src):
+    """Explicit [(relpath, abspath)] manifest of every file the avm rsync
+    will transfer -- the gate must see exactly what the push sends."""
+    src = os.path.abspath(src)
+    if os.path.isfile(src):
+        return [(os.path.basename(src), src)]
+    out = []
+    for root, _dirs, files in os.walk(src):
+        for f in files:
+            p = os.path.join(root, f)
+            out.append((os.path.relpath(p, src), p))
+    return sorted(out)
+
+
+def _in_hips_tree(path, top):
+    """True when ``path`` sits inside a HiPS tile tree (some ancestor dir up
+    to ``top`` carries a 'properties' file)."""
+    d = os.path.dirname(os.path.abspath(path))
+    top = os.path.abspath(top)
+    while len(d) >= len(top):
+        if os.path.exists(os.path.join(d, "properties")):
+            return True
+        if d == top:
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return False
+
+
+def manifest_extra_files(src):
+    """Manifest entries the avm gate does NOT cover: not an image, not a
+    ``.validation.json`` sidecar, and not part of a HiPS tile tree.  Pushing
+    these (.fits/.html/...) needs an explicit --allow-extra-files."""
+    src_abs = os.path.abspath(src)
+    top = os.path.dirname(src_abs) if os.path.isfile(src_abs) else src_abs
+    extras = []
+    for rel, path in push_manifest(src):
+        low = path.lower()
+        if low.endswith(IMAGE_EXTS) or low.endswith(VALIDATION_SUFFIX):
+            continue
+        if _in_hips_tree(path, top):
+            continue
+        extras.append(rel)
+    return extras
 
 
 def find_staged_dir(field, release_root=RELEASE_ROOT, version=None):
@@ -252,6 +380,13 @@ def build_parser():
                    help="acknowledge pushing images whose star-position check "
                         "was SKIPPED (no reference catalog); a star check that "
                         "ran and FAILED still refuses")
+    a.add_argument("--accept-unbound-tree", action="store_true",
+                   help="acknowledge pushing a HiPS tree whose verdict lacks "
+                        "a source-PNG sha256 binding (pre-binding verdict or "
+                        "source PNG no longer present)")
+    a.add_argument("--allow-extra-files", action="store_true",
+                   help="allow pushing non-image files (.fits/.html/...) that "
+                        "sit outside a HiPS tree and thus outside the gate")
     a.add_argument("--execute", action="store_true")
 
     r = sub.add_parser("products", help="push release-products web content")
@@ -281,12 +416,31 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     if args.verb == "avm":
-        ok, problems = gate_avm(args.src, no_star_check=args.no_star_check)
+        ok, problems = gate_avm(args.src, no_star_check=args.no_star_check,
+                                accept_unbound_tree=args.accept_unbound_tree)
         if not ok:
             print("[publish] REFUSING avm push; gate failed:", file=sys.stderr)
             for pr in problems:
                 print(f"  - {pr}", file=sys.stderr)
             return 1
+        # gate scope must equal push scope: rsync transfers EVERYTHING under
+        # --src, so files the image gate never saw need an explicit ack
+        manifest = push_manifest(args.src)
+        extras = manifest_extra_files(args.src)
+        if extras:
+            print(f"[publish] WARNING: {len(extras)} file(s) in the push "
+                  "manifest are outside the avm gate (non-image, non-HiPS):",
+                  file=sys.stderr)
+            for rel in extras:
+                print(f"  - {rel}", file=sys.stderr)
+            if not args.allow_extra_files:
+                print("[publish] REFUSING avm push; pass --allow-extra-files "
+                      "to push them anyway", file=sys.stderr)
+                return 1
+        if args.execute:
+            print(f"[publish] push manifest ({len(manifest)} files):")
+            for rel, _path in manifest:
+                print(f"  {rel}")
         return _run_or_print(build_avm_command(args.src, args.name),
                              args.execute)
 
