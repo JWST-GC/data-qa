@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy astropy pytest reproject pyavm pillow requests
+          pip install numpy astropy pytest reproject pyavm pillow requests astroquery
 
       # Test modules use pytest.importorskip for optional heavy deps, so a
       # missing extra skips its tests instead of failing collection.

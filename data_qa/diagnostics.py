@@ -393,16 +393,38 @@ def _per_detector_offsets(o, filt, ref_sc):
     return out
 
 
-def _module_i2d(o, filt):
-    """(nrcaPath, nrcbPath, mergedPath) for a filter -- SW modules or LW long, whichever ships."""
+def _cutout_mosaic(o, filt):
+    """Best full drizzled mosaic for the overlap-zone cutout gallery.  Prefer the all-detector
+    'merged'; else a single-module mosaic ('nrcb'/'nrca' -- sickle is NRCB-only and names its
+    mosaic 'nrcb', not 'merged')."""
     d = f"{BASE}/{o.field}/{filt}/pipeline"
     def pick(tag):
         hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
                 if not any(s in p.lower() for s in ("residual", "model", "resbgsub", "bg_i2d"))]
         return hits[0] if hits else None
-    a = pick("nrca") or pick("nrcalong")
-    b = pick("nrcb") or pick("nrcblong")
-    return a, b, pick("merged")
+    return pick("merged") or pick("nrcb") or pick("nrca") or _mosaic_path(o, filt)
+
+
+def _module_positions(o, filt):
+    """(NRCA, NRCB) SkyCoords for the A/B tie, pooled from the per-detector daophot cats.
+    The PIPELINE emits no merged-per-module mosaics (any on disk are stale, out-of-date
+    artifacts), so the per-detector cats are the PRIMARY and only source.  Either module may
+    be None for a single-module observation (e.g. sickle = NRCB only)."""
+    from astropy.table import vstack, Table
+
+    def pool(dets):
+        cats = []
+        for d in dets:
+            cats += glob.glob(f"{BASE}/{o.field}/{filt}/{filt.lower()}_{d}_visit*_*_m3_daophot_basic.fits")
+        if not cats:
+            return None
+        try:
+            T = vstack([Table.read(c) for c in cats], metadata_conflicts="silent")
+        except (OSError, ValueError):
+            return None
+        return T["skycoord_centroid"] if "skycoord_centroid" in T.colnames else None
+
+    return pool(["nrca1", "nrca2", "nrca3", "nrca4"]), pool(["nrcb1", "nrcb2", "nrcb3", "nrcb4"])
 
 
 def stage5_intermodule(o: Observation, sw):
@@ -411,32 +433,43 @@ def stage5_intermodule(o: Observation, sw):
     (2) reference-free NRCA-vs-NRCB overlap: median offset + RMS of the SAME stars;
     (3) doubled-star cutout gallery on the module-overlap zone (mis-tie -> split PSF)."""
     import astropy.units as u
-    from astropy.coordinates import search_around_sky
+    from astropy.coordinates import search_around_sky, SkyCoord
     from astropy.io import fits
     from astropy.wcs import WCS
     from astropy.nddata import Cutout2D
     filt = sw
     metrics = dict(stage=5, filt=filt)
     ref = _viraccache_path(o) or _refcat_path(o)
-    apath, bpath, mpath = _module_i2d(o, filt)
-    ep = aa.epoch_of(apath or mpath) if (apath or mpath) else None
+    mpath = _cutout_mosaic(o, filt)                       # full mosaic for the cutout gallery
+    ep = aa.epoch_of(mpath) if mpath else None
     ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
 
-    # (2) reference-free A vs B overlap
+    # (2) reference-free A vs B overlap from the per-detector cats (primary source).
+    # CROWDING-ROBUST: the bulk A-B offset is the peak of the pair-separation histogram
+    # (aa.xcorr) -- a direct search_around_sky+median fabricates pairs in a dense field (400k
+    # chance coincidences within 0.3", RMS blown to ~100 mas). The RMS (tie precision) is the
+    # residual scatter of the SAME stars: align A onto B by the peak, keep the tight matches.
     ov = None
-    a_sc = aa.detect(apath)[0] if apath else None
-    b_sc = aa.detect(bpath)[0] if bpath else None
-    if a_sc is not None and b_sc is not None:
-        ia, ib, sep, _ = search_around_sky(a_sc, b_sc, 0.3 * u.arcsec)
-        if len(ia) >= 20:
-            dra = (a_sc[ia].ra - b_sc[ib].ra).to(u.mas).value * np.cos(np.radians(a_sc[ia].dec.deg))
-            dde = (a_sc[ia].dec - b_sc[ib].dec).to(u.mas).value
-            ov = dict(dra=float(np.median(dra)), dde=float(np.median(dde)),
-                      off=float(np.hypot(np.median(dra), np.median(dde))),
-                      rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
-                      n=int(len(ia)),
-                      pos=[(a_sc[i].ra.deg, a_sc[i].dec.deg) for i in ia])
-            metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"])
+    single_module = None
+    a_sc, b_sc = _module_positions(o, filt)
+    if (a_sc is None) ^ (b_sc is None):
+        single_module = "NRCA" if a_sc is not None else "NRCB"
+    if a_sc is not None and b_sc is not None and len(a_sc) >= 50 and len(b_sc) >= 50:
+        xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
+        if xc and xc["peak_ratio"] >= aa.MIN_PEAK_RATIO and xc["npairs"] >= 100:
+            cosd = float(np.cos(np.radians(np.median(a_sc.dec.deg))))
+            a_al = SkyCoord((a_sc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
+                            (a_sc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
+            ia, ib, sep, _ = search_around_sky(a_al, b_sc, 0.08 * u.arcsec)  # same star after align
+            if len(ia) >= 20:
+                dra = (a_al[ia].ra - b_sc[ib].ra).to(u.mas).value * cosd
+                dde = (a_al[ia].dec - b_sc[ib].dec).to(u.mas).value
+                ov = dict(dra=float(xc["dra"]), dde=float(xc["ddec"]), off=float(xc["off"]),
+                          rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
+                          n=int(len(ia)), peak_ratio=float(xc["peak_ratio"]),
+                          pos=[(b_sc[i].ra.deg, b_sc[i].dec.deg) for i in ib[:200]])
+                metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"],
+                               n_overlap=ov["n"])
 
     # (1) per-detector residuals vs VIRAC, bulk-subtracted
     det = _per_detector_offsets(o, filt, ref_sc) if ref_sc is not None else {}
@@ -475,16 +508,23 @@ def stage5_intermodule(o: Observation, sw):
         axq.text(0.5, 0.5, "per-detector cats unavailable", ha="center", va="center", fontsize=8)
 
     if ov:
+        # dra/dde are the same-star residuals after aligning A onto B by the histogram peak;
+        # they scatter about 0 (RMS = tie precision). The bulk offset is the title number.
         axo.hexbin(dra, dde, gridsize=40, bins="log", cmap="cividis", mincnt=1)
         axo.axhline(0, color="w", lw=0.5); axo.axvline(0, color="w", lw=0.5)
-        axo.plot(ov["dra"], ov["dde"], "r+", ms=12, mew=2)
-        axo.set_xlabel("NRCA-NRCB dRA [mas]"); axo.set_ylabel("dDec [mas]")
-        lim = max(50, 3 * ov["rms"])
+        axo.set_xlabel("NRCA-NRCB residual dRA [mas]"); axo.set_ylabel("residual dDec [mas]")
+        lim = max(50, 4 * ov["rms"])
         axo.set_xlim(-lim, lim); axo.set_ylim(-lim, lim)
-        axo.set_title(f"A-vs-B overlap ({ov['n']} shared stars)\n"
+        axo.set_title(f"A-vs-B overlap ({ov['n']} matched stars)\n"
                       f"offset={ov['off']:.1f} mas  RMS={ov['rms']:.1f} mas", fontsize=9)
+    elif single_module:
+        axo.text(0.5, 0.5, f"single module ({single_module} only)\nno A/B tie to check",
+                 ha="center", va="center", fontsize=9)
+        axo.set_xticks([]); axo.set_yticks([])
     else:
-        axo.text(0.5, 0.5, "no A/B overlap stars", ha="center", va="center", fontsize=8)
+        axo.text(0.5, 0.5, "A/B overlap not measurable\n(need per-detector cats both modules)",
+                 ha="center", va="center", fontsize=8)
+        axo.set_xticks([]); axo.set_yticks([])
 
     # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
     ncut = 6
@@ -517,7 +557,10 @@ def stage5_intermodule(o: Observation, sw):
             shown += 1
         fig.text(0.5, 0.02, f"overlap-zone star cutouts from the merged mosaic "
                  f"(a mis-tie doubles/elongates these)", ha="center", fontsize=8)
-    metrics["passed"] = bool(ov and ov["off"] < aa.THRESH["intermodule"])
+    # single-module obs (sickle = NRCB only) has no A/B tie to fail -> N/A passes.
+    if single_module:
+        metrics["single_module"] = single_module
+    metrics["passed"] = bool(single_module or (ov and ov["off"] < aa.THRESH["intermodule"]))
     fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module tie ({filt})", fontsize=11)
     return _save(fig, f"{o.obsid}_stage5.png"), metrics
 
@@ -600,7 +643,11 @@ def main(argv=None):
     ap.add_argument("--repo", default=os.environ.get("QA_REPO", "JWST-GC/data-qa"))
     args = ap.parse_args(argv)
 
-    obs = [o for o in registry(programs=[args.program]) if o.obs == args.obs]
+    # diagnostics are NIRCam-only; when the portal registry is reachable it returns BOTH the
+    # NIRCam and MIRI observation for a shared obsid (e.g. cloudc 2221-o002), so filter to
+    # NIRCam explicitly -- else obs[0] can be the MIRI one (F2550W etc).
+    obs = [o for o in registry(programs=[args.program])
+           if o.obs == args.obs and o.instrument == "NIRCam"]
     o = obs[0] if obs else _obs_from_disk(args.program, args.obs)
     if o is None:
         print(f"no obs for program {args.program} obs {args.obs} (portal + on-disk both empty)",
