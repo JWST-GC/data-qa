@@ -73,31 +73,46 @@ def _mosaic_path(o: Observation, filt):
     return None
 
 
-_KIND_RE = re.compile(r"(m8_dedup|m8|m7|abfix)", re.I)
+_MLEVEL_RE = re.compile(r"_m([1-8])(?:_|\b)", re.I)
+
+
+def _catalog_priority(basename):
+    """Rising-priority rank of a catalog by pipeline stage (higher = preferred):
+    MAST-shipped defaults (lowest) < m1 < m2 < ... < m8.  Returns (tier, kind_label)."""
+    low = basename.lower()
+    if "m8_dedup" in low:
+        return 8, "m8_dedup"
+    m = _MLEVEL_RE.search(low)
+    if m:
+        return int(m.group(1)), f"m{m.group(1)}"
+    # raw MAST products (pipeline source catalogs) sit below every m-stage merge
+    if low.endswith("_cat.fits") or "source_catalog" in low or "_segm" in low:
+        return 0, "mast"
+    return 0, "merged"       # un-tagged field merge: lowest tier, size breaks the tie
 
 
 def _catalog_candidates(o: Observation):
-    """All merged catalogs for the field.  Naming is inconsistent across fields (m7/m8 tags
-    for some, other suffixes elsewhere), so glob EVERY catalog; the caller filters by column
-    presence and picks the largest.  Skip obvious residual/model/region sidecars."""
+    """All catalogs for the field, each tagged with its (priority-tier, kind).  Glob EVERY
+    catalog (naming is inconsistent across fields); the caller filters by column presence
+    and picks the highest tier, largest.  Skip residual/model/region sidecars."""
     out = []
     for p in sorted(glob.glob(f"{BASE}/{o.field}/catalogs/*.fits")):
         low = os.path.basename(p).lower()
         if any(s in low for s in ("_residual", "_model", "_reproject", "region")):
             continue
-        m = _KIND_RE.search(low)
-        out.append((p, m.group(1).lower() if m else "merged"))
+        tier, kind = _catalog_priority(low)
+        out.append((p, kind, tier))
     return out
 
 
 def _catalog_for(o: Observation, sw, lw):
-    """Catalog that actually contains VEGA mags for both requested filters (correct obs).
-    Among all candidates that have both columns, pick the LARGEST by row count -- the full
-    field merge, not a small curated subset (e.g. brick's 83-star dual-excess list).
+    """Catalog that contains VEGA mags for both requested filters, chosen by RISING pipeline
+    priority (MAST default < m1 < ... < m8), size breaking ties within a tier.  A cheap
+    FITS-header probe (TTYPE/NAXIS2) avoids reading catalog data.
     Returns (path, kind, sw_col, lw_col) or (None,...)."""
     from astropy.io import fits
-    best = (None, None, None, None, -1)
-    for p, tag in _catalog_candidates(o):
+    best = (None, None, None, None, (-1, -1))
+    for p, kind, tier in _catalog_candidates(o):
         try:
             hdr = fits.getheader(p, ext=1)             # header only -- cheap, no data read
         except (OSError, IndexError):
@@ -111,9 +126,9 @@ def _catalog_for(o: Observation, sw, lw):
                                      f"mag_ab_{lw.lower()}") if k in low), None)
         if not (csw and clw):
             continue
-        nrow = hdr.get("NAXIS2", 0)
-        if nrow > best[-1]:
-            best = (p, tag, csw, clw, nrow)
+        rank = (tier, hdr.get("NAXIS2", 0))
+        if rank > best[-1]:
+            best = (p, kind, csw, clw, rank)
     return best[:4]
 
 
@@ -213,7 +228,8 @@ def stage2_cmd(o: Observation, sw, lw):
         msw = np.asarray(t[csw], float); mlw = np.asarray(t[clw], float)
         g = np.isfinite(msw) & np.isfinite(mlw)
         color = msw[g] - mlw[g]
-        a.hexbin(color, mlw[g], gridsize=120, bins="log", cmap="viridis", mincnt=1)
+        hb = a.hexbin(color, mlw[g], gridsize=120, bins="log", cmap="viridis", mincnt=1)
+        fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
         a.set_xlabel(f"{sw} - {lw}"); a.set_ylabel(lw)
         a.invert_yaxis()
         a.set_xlim(np.nanpercentile(color, [1, 99]))
@@ -266,7 +282,8 @@ def stage3_calibration(o: Observation, sw):
     slope, zp = np.polyfit(x, y, 1)
     resid = y - (slope * x + zp)
     scat = float(aa.mad_std(resid))
-    a.hexbin(x, y, gridsize=80, bins="log", cmap="magma", mincnt=1)
+    hb = a.hexbin(x, y, gridsize=80, bins="log", cmap="magma", mincnt=1)
+    fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
     xs = np.array([np.nanmin(x), np.nanmax(x)])
     a.plot(xs, slope * xs + zp, "c-", lw=1, label=f"slope={slope:.2f} zp={zp:.2f}")
     a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} instr mag")
@@ -283,34 +300,16 @@ def stage4_offsets(o: Observation, sw):
     reference-free inter-module (NRCA vs NRCB) offset."""
     import astropy.units as u
     from astropy.coordinates import search_around_sky
-    fig, ax = _fig(1, 2, 5.4, 5.0)
     metrics = dict(stage=4, sw=sw)
     path = _mosaic_path(o, sw)
     ref = _refcat_path(o)
     ep = aa.epoch_of(path) if path else None
     ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
     jsc, _ = aa.detect(path) if path else (None, None)
-    a0, a1 = ax[0][0], ax[0][1]
-    if jsc is not None and ref_sc is not None:
-        bulk = aa.xcorr(jsc, ref_sc)
-        ia, ib, sep, _ = search_around_sky(jsc, ref_sc, 0.3 * u.arcsec)
-        if len(ia) >= 30:
-            dra = (ref_sc[ib].ra - jsc[ia].ra).to(u.arcsec).value * np.cos(np.radians(jsc[ia].dec.value)) * 1000
-            dde = (ref_sc[ib].dec - jsc[ia].dec).to(u.arcsec).value * 1000
-            a0.hexbin(dra, dde, gridsize=60, bins="log", cmap="cividis", mincnt=1)
-            a0.axhline(0, color="w", lw=0.5); a0.axvline(0, color="w", lw=0.5)
-            a0.set_xlabel("dRA [mas]"); a0.set_ylabel("dDec [mas]")
-            # window shows BOTH the origin and the bulk cloud (off-frame fields sit far off 0)
-            lim = max(100.0, 1.4 * (abs(bulk["off"]) if bulk else 0.0))
-            a0.set_xlim(-lim, lim); a0.set_ylim(-lim, lim)
-            a0.set_title(f"JWST-VIRAC  bulk={bulk['off']:.0f} mas" if bulk else "JWST-VIRAC", fontsize=9)
-            metrics.update(bulk_off=float(bulk["off"]) if bulk else None,
-                           bulk_dra=float(bulk["dra"]) if bulk else None,
-                           bulk_ddec=float(bulk["ddec"]) if bulk else None,
-                           n_matched=int(len(ia)))
-    else:
-        a0.text(0.5, 0.5, "need mosaic + VIRAC", ha="center", va="center")
-    # inter-module
+
+    # inter-module offset -- ONLY when the release actually ships per-module (NRCA/NRCB)
+    # mosaics for some filter.  Most releases are 'merged' only, so we simply omit the panel
+    # rather than drawing an empty "no per-module mosaics" frame.
     mos = aa.find_mosaics(o.field)
     im = None
     for filt in (sw, o.filters[0] if o.filters else sw):
@@ -320,16 +319,38 @@ def stage4_offsets(o: Observation, sw):
         if A is not None and B is not None:
             im = aa.direct_intermodule(A, B)
             if im:
-                a1.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
-                a1.axhline(0, color="k", lw=0.5)
-                a1.axhline(aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
-                a1.axhline(-aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
-                a1.set_ylabel("NRCA-NRCB [mas]")
-                a1.set_title(f"inter-module {filt}  off={im['off']:.0f} mas", fontsize=9)
                 metrics.update(intermodule_off=float(im["off"]), intermodule_filt=filt)
             break
-    if im is None:
-        a1.text(0.5, 0.5, "no per-module mosaics", ha="center", va="center", fontsize=8)
+
+    fig, ax = _fig(1, 2 if im else 1, 5.4, 5.0)
+    a0 = ax[0][0]
+    if jsc is not None and ref_sc is not None:
+        bulk = aa.xcorr(jsc, ref_sc)
+        ia, ib, sep, _ = search_around_sky(jsc, ref_sc, 0.3 * u.arcsec)
+        if len(ia) >= 30:
+            dra = (ref_sc[ib].ra - jsc[ia].ra).to(u.arcsec).value * np.cos(np.radians(jsc[ia].dec.value)) * 1000
+            dde = (ref_sc[ib].dec - jsc[ia].dec).to(u.arcsec).value * 1000
+            hb = a0.hexbin(dra, dde, gridsize=60, bins="log", cmap="cividis", mincnt=1)
+            fig.colorbar(hb, ax=a0, label="log N pairs", shrink=0.85)
+            a0.axhline(0, color="w", lw=0.5); a0.axvline(0, color="w", lw=0.5)
+            a0.set_xlabel("dRA [mas]"); a0.set_ylabel("dDec [mas]")
+            lim = max(100.0, 1.4 * (abs(bulk["off"]) if bulk else 0.0))
+            a0.set_xlim(-lim, lim); a0.set_ylim(-lim, lim)
+            a0.set_title(f"JWST-VIRAC  bulk={bulk['off']:.0f} mas" if bulk else "JWST-VIRAC", fontsize=9)
+            metrics.update(bulk_off=float(bulk["off"]) if bulk else None,
+                           bulk_dra=float(bulk["dra"]) if bulk else None,
+                           bulk_ddec=float(bulk["ddec"]) if bulk else None,
+                           n_matched=int(len(ia)))
+    else:
+        a0.text(0.5, 0.5, "need mosaic + VIRAC", ha="center", va="center")
+    if im:
+        a1 = ax[0][1]
+        a1.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
+        a1.axhline(0, color="k", lw=0.5)
+        a1.axhline(aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
+        a1.axhline(-aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
+        a1.set_ylabel("NRCA-NRCB [mas]")
+        a1.set_title(f"inter-module {metrics['intermodule_filt']}  off={im['off']:.0f} mas", fontsize=9)
     bo = metrics.get("bulk_off"); io = metrics.get("intermodule_off")
     metrics["passed"] = bool((bo is not None and bo < aa.THRESH["absolute"]) and
                              (io is None or io < aa.THRESH["intermodule"]))
