@@ -358,7 +358,176 @@ def stage4_offsets(o: Observation, sw):
     return _save(fig, f"{o.obsid}_stage4.png"), metrics
 
 
-STAGES = {1: stage1_mosaics, 2: stage2_cmd, 3: stage3_calibration, 4: stage4_offsets}
+# --------------------------------------------------------------------------- STAGE 5
+_SW_DETS = ["nrca1", "nrca2", "nrca3", "nrca4", "nrcb1", "nrcb2", "nrcb3", "nrcb4"]
+
+
+def _per_detector_offsets(o, filt, ref_sc):
+    """Per-detector median residual vs a common frame, from the per-exposure daophot cats
+    (pooled), for the 8 SW detectors.  Returns {det: dict(ra,dec,dra,dde,mad,n)} in mas.
+    Uses the catalogs' skycoord_centroid (same WCS generation as the current mosaic)."""
+    import astropy.units as u
+    from astropy.table import vstack
+    from astropy.coordinates import search_around_sky
+    from astropy.table import Table
+    out = {}
+    for d in _SW_DETS:
+        cats = glob.glob(f"{BASE}/{o.field}/{filt}/{filt.lower()}_{d}_visit*_*_m3_daophot_basic.fits")
+        if not cats:
+            continue
+        try:
+            T = vstack([Table.read(c) for c in cats], metadata_conflicts='silent')
+        except (OSError, ValueError):
+            continue
+        if "skycoord_centroid" not in T.colnames:
+            continue
+        sc = T["skycoord_centroid"]
+        ia, ib, sep, _ = search_around_sky(sc, ref_sc, 0.15 * u.arcsec)
+        if len(ia) < 50:
+            continue
+        dra = (ref_sc[ib].ra - sc[ia].ra).to(u.mas).value * np.cos(np.radians(sc[ia].dec.deg))
+        dde = (ref_sc[ib].dec - sc[ia].dec).to(u.mas).value
+        out[d] = dict(ra=float(np.median(sc[ia].ra.deg)), dec=float(np.median(sc[ia].dec.deg)),
+                      dra=float(np.median(dra)), dde=float(np.median(dde)),
+                      mad=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))), n=int(len(ia)))
+    return out
+
+
+def _module_i2d(o, filt):
+    """(nrcaPath, nrcbPath, mergedPath) for a filter -- SW modules or LW long, whichever ships."""
+    d = f"{BASE}/{o.field}/{filt}/pipeline"
+    def pick(tag):
+        hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
+                if not any(s in p.lower() for s in ("residual", "model", "resbgsub", "bg_i2d"))]
+        return hits[0] if hits else None
+    a = pick("nrca") or pick("nrcalong")
+    b = pick("nrcb") or pick("nrcblong")
+    return a, b, pick("merged")
+
+
+def stage5_intermodule(o: Observation, sw):
+    """Inter-detector / inter-module tie quality:
+    (1) per-detector residual quiver vs VIRAC, bulk-subtracted (relative ties);
+    (2) reference-free NRCA-vs-NRCB overlap: median offset + RMS of the SAME stars;
+    (3) doubled-star cutout gallery on the module-overlap zone (mis-tie -> split PSF)."""
+    import astropy.units as u
+    from astropy.coordinates import search_around_sky
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.nddata import Cutout2D
+    filt = sw
+    metrics = dict(stage=5, filt=filt)
+    ref = _viraccache_path(o) or _refcat_path(o)
+    apath, bpath, mpath = _module_i2d(o, filt)
+    ep = aa.epoch_of(apath or mpath) if (apath or mpath) else None
+    ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+
+    # (2) reference-free A vs B overlap
+    ov = None
+    a_sc = aa.detect(apath)[0] if apath else None
+    b_sc = aa.detect(bpath)[0] if bpath else None
+    if a_sc is not None and b_sc is not None:
+        ia, ib, sep, _ = search_around_sky(a_sc, b_sc, 0.3 * u.arcsec)
+        if len(ia) >= 20:
+            dra = (a_sc[ia].ra - b_sc[ib].ra).to(u.mas).value * np.cos(np.radians(a_sc[ia].dec.deg))
+            dde = (a_sc[ia].dec - b_sc[ib].dec).to(u.mas).value
+            ov = dict(dra=float(np.median(dra)), dde=float(np.median(dde)),
+                      off=float(np.hypot(np.median(dra), np.median(dde))),
+                      rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
+                      n=int(len(ia)),
+                      pos=[(a_sc[i].ra.deg, a_sc[i].dec.deg) for i in ia])
+            metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"])
+
+    # (1) per-detector residuals vs VIRAC, bulk-subtracted
+    det = _per_detector_offsets(o, filt, ref_sc) if ref_sc is not None else {}
+    if det:
+        gdra = np.median([v["dra"] for v in det.values()])
+        gdde = np.median([v["dde"] for v in det.values()])
+        for v in det.values():
+            v["rdra"], v["rdde"] = v["dra"] - gdra, v["dde"] - gdde
+        mA = np.array([[det[d]["rdra"], det[d]["rdde"]] for d in det if d.startswith("nrca")])
+        mB = np.array([[det[d]["rdra"], det[d]["rdde"]] for d in det if d.startswith("nrcb")])
+        if len(mA) and len(mB):
+            metrics["intermodule_diff"] = float(np.hypot(*(mA.mean(0) - mB.mean(0))))
+            metrics["worst_detector"] = max(det, key=lambda d: np.hypot(det[d]["rdra"], det[d]["rdde"]))
+
+    # ---- figure: 2 rows (quiver+overlap ; cutout gallery)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(11, 8.5))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.15, 0.85])
+    axq, axo = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+
+    if det:
+        xs = [v["ra"] for v in det.values()]; ys = [v["dec"] for v in det.values()]
+        us = [v["rdra"] for v in det.values()]; vs = [v["rdde"] for v in det.values()]
+        cols = ["#4477aa" if d.startswith("nrca") else "#ee6677" for d in det]
+        q = axq.quiver(xs, ys, us, vs, color=cols, angles="xy", scale_units="xy",
+                       scale=2000, width=0.007)
+        axq.quiverkey(q, 0.12, 1.03, 5, "5 mas", labelpos="E", fontproperties={"size": 8})
+        for d, v in det.items():
+            axq.annotate(d, (v["ra"], v["dec"]), fontsize=6.5, ha="center", va="bottom")
+        axq.invert_xaxis(); axq.set_xlabel("RA"); axq.set_ylabel("Dec")
+        axq.set_title(f"per-detector residual (bulk-removed) — {filt}\n"
+                      f"A-B diff = {metrics.get('intermodule_diff', float('nan')):.1f} mas", fontsize=9)
+    else:
+        axq.text(0.5, 0.5, "per-detector cats unavailable", ha="center", va="center", fontsize=8)
+
+    if ov:
+        axo.hexbin(dra, dde, gridsize=40, bins="log", cmap="cividis", mincnt=1)
+        axo.axhline(0, color="w", lw=0.5); axo.axvline(0, color="w", lw=0.5)
+        axo.plot(ov["dra"], ov["dde"], "r+", ms=12, mew=2)
+        axo.set_xlabel("NRCA-NRCB dRA [mas]"); axo.set_ylabel("dDec [mas]")
+        lim = max(50, 3 * ov["rms"])
+        axo.set_xlim(-lim, lim); axo.set_ylim(-lim, lim)
+        axo.set_title(f"A-vs-B overlap ({ov['n']} shared stars)\n"
+                      f"offset={ov['off']:.1f} mas  RMS={ov['rms']:.1f} mas", fontsize=9)
+    else:
+        axo.text(0.5, 0.5, "no A/B overlap stars", ha="center", va="center", fontsize=8)
+
+    # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
+    ncut = 6
+    if ov and mpath and os.path.exists(mpath):
+        with fits.open(mpath) as hdul:
+            sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
+            data = sci.data.astype("float32"); w = WCS(sci.header)
+        from astropy.coordinates import SkyCoord
+        from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
+        picks = ov["pos"][:200]
+        strip = fig.add_subplot(gs[1, :]); strip.axis("off")
+        cut_axes = [strip.inset_axes([i / ncut + 0.01, 0.05, 0.92 / ncut, 0.85])
+                    for i in range(ncut)]
+        shown = 0
+        for ra, dec in picks:
+            if shown >= ncut:
+                break
+            try:
+                x, y = w.world_to_pixel(SkyCoord(ra * u.deg, dec * u.deg))
+                cut = Cutout2D(data, (float(x), float(y)), 25, wcs=w)
+            except (ValueError, IndexError):
+                continue
+            if not np.isfinite(cut.data).any() or np.nanmax(cut.data) <= 0:
+                continue
+            a = cut_axes[shown]
+            norm = ImageNormalize(cut.data, interval=ZScaleInterval(), stretch=AsinhStretch())
+            a.imshow(cut.data, origin="lower", cmap="gray", norm=norm)
+            a.set_xticks([]); a.set_yticks([])
+            a.set_title(f"{shown + 1}", fontsize=7)
+            shown += 1
+        fig.text(0.5, 0.02, f"overlap-zone star cutouts from the merged mosaic "
+                 f"(a mis-tie doubles/elongates these)", ha="center", fontsize=8)
+    metrics["passed"] = bool(ov and ov["off"] < aa.THRESH["intermodule"])
+    fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module tie ({filt})", fontsize=11)
+    return _save(fig, f"{o.obsid}_stage5.png"), metrics
+
+
+STAGES = {1: stage1_mosaics, 2: stage2_cmd, 3: stage3_calibration, 4: stage4_offsets,
+          5: stage5_intermodule}
+
+
+def _build_stage5(o, sw, lw):
+    return stage5_intermodule(o, sw)
 
 
 def build_stage(o, n, sw, lw):
@@ -370,6 +539,8 @@ def build_stage(o, n, sw, lw):
         return stage3_calibration(o, sw)
     if n == 4:
         return stage4_offsets(o, sw)
+    if n == 5:
+        return stage5_intermodule(o, sw)
     raise ValueError(n)
 
 
@@ -383,6 +554,10 @@ CAPTIONS = {
        "means the right stars were matched.",
     4: "**Stage 4 — positional offsets.** JWST−VIRAC ΔRA/ΔDec (bulk {bulk_off:.0f} mas) and the "
        "reference-free inter-module offset. First-order frame-match / proper-motion precursor.",
+    5: "**Stage 5 — inter-detector / inter-module tie.** Per-detector residual quiver "
+       "(bulk-removed; A–B diff {intermodule_diff:.1f} mas), the reference-free NRCA–NRCB overlap "
+       "(offset {intermodule_off:.1f} mas, RMS {intermodule_rms:.1f} mas over {n_overlap} shared "
+       "stars), and overlap-zone star cutouts (a mis-tie doubles them).",
 }
 
 
