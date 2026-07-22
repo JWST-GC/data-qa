@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field as _dc_field
@@ -113,8 +114,20 @@ class Observation:
 
 
 # --------------------------------------------------------------------------- discovery
+# Fetch failures recorded by _read_lines since the last discover_from_release() call.
+# A failed fetch returns [] (so partial discovery still works) but must be LOUD:
+# consumers (make_issues) check this to distinguish "manifest genuinely lists
+# nothing" from "the network fetch errored" and abort rather than sync an empty
+# registry (live issue #4: silent [] made the weekly sync a stale no-op).
+LAST_FETCH_ERRORS: List[str] = []
+
+
 def _read_lines(url_or_path):
-    """Read a newline-delimited list from a local path or URL. Empty on failure."""
+    """Read a newline-delimited list from a local path or URL.
+
+    Empty on fetch failure, but never silently: failures print to stderr and append
+    to :data:`LAST_FETCH_ERRORS`.
+    """
     if os.path.exists(url_or_path):
         with open(url_or_path) as fh:
             return [ln.strip() for ln in fh if ln.strip()]
@@ -122,7 +135,10 @@ def _read_lines(url_or_path):
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return [ln.strip() for ln in r.read().decode().splitlines() if ln.strip()]
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as ex:
+        msg = f"fetch FAILED: {url_or_path}: {ex.__class__.__name__}: {ex}"
+        print(f"data_qa.observations: {msg}", file=sys.stderr)
+        LAST_FETCH_ERRORS.append(msg)
         return []
 
 
@@ -135,6 +151,7 @@ def discover_from_release(base: str = RELEASE_BASE, fields: Dict[str, str] = Non
     ``local_dir`` reads ``{local_dir}/{field}_images.txt`` instead of fetching (offline).
     """
     fields = fields or FIELDS
+    LAST_FETCH_ERRORS.clear()
     grouped: Dict[tuple, set] = {}
     for fld, disp in fields.items():
         src = (os.path.join(local_dir, f"{fld}_images.txt") if local_dir
