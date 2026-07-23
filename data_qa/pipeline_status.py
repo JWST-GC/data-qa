@@ -193,7 +193,8 @@ def main(argv=None):
     print(block)
     if args.post:
         try:
-            from .post_diagnostics import _token, _issue_number, _find_stage_comment, _req, API
+            from .post_diagnostics import (_token, _issue_number, _find_stage_comment, _req,
+                                           API, PostError)
         except ImportError:
             print("post requires data_qa.post_diagnostics (merges with PR #17); skipping post",
                   file=sys.stderr)
@@ -203,7 +204,13 @@ def main(argv=None):
         num = _issue_number(args.repo, token, o.issue_title)
         if num is None:
             print(f"no issue titled {o.issue_title!r}", file=sys.stderr); return 1
-        existing = _find_stage_comment(args.repo, token, num, MARKER)
+        # A lookup failure raises (rather than reporting "not found") so a transient API
+        # hiccup can never make us POST a duplicate status comment -- skip this run instead.
+        try:
+            existing = _find_stage_comment(args.repo, token, num, MARKER)
+        except PostError as e:
+            print(f"status lookup failed, skipping to avoid a duplicate: {e}", file=sys.stderr)
+            return 1
         if existing:
             st, data = _req("PATCH", f"{API}/repos/{args.repo}/issues/comments/{existing['id']}",
                             token, data=json.dumps({"body": block}).encode())

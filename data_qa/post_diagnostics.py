@@ -114,10 +114,19 @@ def _issue_number(repo, token, title):
 
 
 def _find_stage_comment(repo, token, num, marker):
+    """Return the existing marker-keyed comment, or None if it genuinely does not exist.
+
+    CRITICAL: a transient API failure (5xx / rate-limit) must NOT be reported as "not
+    found" -- the caller would then POST a duplicate, spamming the issue on every hiccup.
+    So raise on an API error and only return None when a listing SUCCEEDED without the
+    marker."""
     page = 1
     while True:
         st, data = _req("GET", f"{API}/repos/{repo}/issues/{num}/comments?per_page=100&page={page}", token)
-        if st != 200 or not data:
+        if st != 200:
+            raise PostError(f"comment lookup failed ({st}) on #{num}; refusing to risk a "
+                            f"duplicate post: {data}")
+        if not data:                       # successful empty page -> paginated past the end
             return None
         for c in data:
             if marker in (c.get("body") or ""):
