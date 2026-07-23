@@ -62,6 +62,8 @@ def pick_filters(available, sw=None, lw=None):
 # --------------------------------------------------------------------------- product lookup
 def _mosaic_path(o: Observation, filt):
     """Released merged i2d for this obs+filter, or None."""
+    if not filt:                     # single-filter obs (e.g. gc2211 o028 = F150W only) has no LW
+        return None
     pats = [
         f"{BASE}/{o.field}/{filt}/pipeline/{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_i2d.fits",
         f"{BASE}/{o.field}/*/pipeline/{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_i2d.fits",
@@ -122,9 +124,11 @@ def _catalog_for(o: Observation, sw, lw):
                for i in range(1, ncol + 1) if hdr.get(f"TTYPE{i}")}
         csw = next((low[k] for k in (f"mag_vega_{sw.lower()}", f"mag_{sw.lower()}",
                                      f"mag_ab_{sw.lower()}") if k in low), None)
-        clw = next((low[k] for k in (f"mag_vega_{lw.lower()}", f"mag_{lw.lower()}",
-                                     f"mag_ab_{lw.lower()}") if k in low), None)
-        if not (csw and clw):
+        clw = None if lw is None else next(
+            (low[k] for k in (f"mag_vega_{lw.lower()}", f"mag_{lw.lower()}",
+                              f"mag_ab_{lw.lower()}") if k in low), None)
+        # single-filter obs (lw is None) needs only the SW column
+        if not csw or (lw is not None and not clw):
             continue
         rank = (tier, hdr.get("NAXIS2", 0))
         if rank > best[-1]:
@@ -194,7 +198,7 @@ def stage1_mosaics(o: Observation, sw, lw):
     metrics = dict(stage=1, sw=sw, lw=lw,
                    sw_present=bool(psw), lw_present=bool(plw),
                    finite_fraction=fracs,
-                   passed=bool(psw and plw))
+                   passed=bool(psw and (plw or lw is None)))   # single-filter obs: LW legitimately absent
     return png, metrics
 
 
@@ -218,12 +222,28 @@ def stage2_cmd(o: Observation, sw, lw):
     cat, kind, csw, clw = _catalog_for(o, sw, lw)
     fig, ax = _fig(1, 1, 5.5, 6.0)
     metrics = dict(stage=2, catalog=os.path.basename(cat) if cat else None, kind=kind)
+    want = f"{sw}+{lw}" if lw else f"{sw}"
     if not cat:
-        ax[0][0].text(0.5, 0.5, f"no catalog with {sw}+{lw} mags yet", ha="center", va="center")
+        ax[0][0].text(0.5, 0.5, f"no catalog with {want} mags yet", ha="center", va="center")
         metrics["passed"] = False
         return _save(fig, f"{o.obsid}_stage2.png"), metrics
     t = Table.read(cat)
     a = ax[0][0]
+    if lw is None and csw:
+        # single-filter obs: no colour -> luminosity function only (still tracks depth)
+        m = np.asarray(t[csw], float); g = np.isfinite(m)
+        hh, edges = np.histogram(m[g], bins=60)
+        ctr = 0.5 * (edges[1:] + edges[:-1])
+        a.step(ctr, hh, where="mid", color="k", lw=1.0)
+        peak = ctr[int(np.argmax(hh))]
+        a.axvline(peak, color="r", lw=0.8, label=f"turnover≈{peak:.1f}")
+        a.set_xlabel(sw); a.set_ylabel("N stars"); a.legend(fontsize=8)
+        a.set_title(f"{sw} luminosity function (single filter — no colour)", fontsize=9)
+        metrics.update(n_stars=int(g.sum()), lf_turnover=float(peak),
+                       sw_col=csw, lw_col=None, single_filter=True,
+                       passed=int(g.sum()) > 500)
+        fig.suptitle(f"{o.target} {o.obsid} — LF ({kind})", fontsize=11)
+        return _save(fig, f"{o.obsid}_stage2.png"), metrics
     if csw and clw:
         msw = np.asarray(t[csw], float); mlw = np.asarray(t[clw], float)
         g = np.isfinite(msw) & np.isfinite(mlw)
@@ -397,6 +417,8 @@ def _cutout_mosaic(o, filt):
     """Best full drizzled mosaic for the overlap-zone cutout gallery.  Prefer the all-detector
     'merged'; else a single-module mosaic ('nrcb'/'nrca' -- sickle is NRCB-only and names its
     mosaic 'nrcb', not 'merged')."""
+    if not filt:
+        return None
     d = f"{BASE}/{o.field}/{filt}/pipeline"
     def pick(tag):
         hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
@@ -673,7 +695,7 @@ def main(argv=None):
     for n in args.stage:
         try:
             png, metrics = build_stage(o, n, sw, lw)
-        except (OSError, ValueError, IndexError, KeyError, RuntimeError) as e:
+        except (OSError, ValueError, IndexError, KeyError, RuntimeError, AttributeError) as e:
             print(f"  stage {n}: FAILED to build: {type(e).__name__}: {e}", file=sys.stderr)
             all_metrics[f"stage{n}"] = dict(stage=n, error=f"{type(e).__name__}: {e}", passed=False)
             with open(mpath, "w") as fh:
