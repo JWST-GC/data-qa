@@ -64,9 +64,11 @@ def _mosaic_path(o: Observation, filt):
     """Released merged i2d for this obs+filter, or None."""
     if not filt:                     # single-filter obs (e.g. gc2211 o028 = F150W only) has no LW
         return None
+    stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_i2d.fits"
     pats = [
-        f"{BASE}/{o.field}/{filt}/pipeline/{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_i2d.fits",
-        f"{BASE}/{o.field}/*/pipeline/{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_i2d.fits",
+        f"{BASE}/{o.field}/{filt}/pipeline/{stem}",
+        f"{BASE}/{o.field}/*/pipeline/{stem}",
+        f"{BASE}/{o.field}/images-merged/{stem}",   # not-yet-released fields (e.g. gc2211) land mosaics here
     ]
     for pat in pats:
         hits = sorted(glob.glob(pat))
@@ -419,11 +421,14 @@ def _cutout_mosaic(o, filt):
     mosaic 'nrcb', not 'merged')."""
     if not filt:
         return None
-    d = f"{BASE}/{o.field}/{filt}/pipeline"
+    dirs = [f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"]
     def pick(tag):
-        hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
-                if not any(s in p.lower() for s in ("residual", "model", "resbgsub", "bg_i2d"))]
-        return hits[0] if hits else None
+        for d in dirs:
+            hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
+                    if not any(s in p.lower() for s in ("residual", "model", "resbgsub", "bg_i2d"))]
+            if hits:
+                return hits[0]
+        return None
     return pick("merged") or pick("nrcb") or pick("nrca") or _mosaic_path(o, filt)
 
 
@@ -640,7 +645,9 @@ def _obs_from_disk(program, obs, base=BASE):
     from .observations import CURATED, FIELDS
     for d in sorted(glob.glob(f"{base}/*/")):
         fld = os.path.basename(d.rstrip("/"))
-        hits = glob.glob(f"{base}/{fld}/*/pipeline/jw{int(program):05d}-o{obs}_t001_nircam_clear-*-merged_i2d.fits")
+        stem = f"jw{int(program):05d}-o{obs}_t001_nircam_clear-*-merged_i2d.fits"
+        hits = (glob.glob(f"{base}/{fld}/*/pipeline/{stem}")
+                + glob.glob(f"{base}/{fld}/images-merged/{stem}"))  # not-yet-released layout
         if not hits:
             continue
         filts = sorted({m.group(1).upper() for h in hits
