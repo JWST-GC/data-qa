@@ -1,0 +1,8 @@
+# Runtime dependencies for the QA issue-sync (data_qa.make_issues -> registry ->
+# mast_monitor.query_program -> MAST; render_body -> astrometry_audit).  The
+# make-issues GitHub Action installs these; without them registry() records a loud
+# "dependency MISSING" and make_issues refuses to sync an empty registry.
+astroquery
+astropy
+numpy
+requests

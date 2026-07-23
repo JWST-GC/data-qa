@@ -27,13 +27,22 @@ from typing import Dict, List
 # QA fields -> display name.  ``mast_monitor.PROGRAMS`` maps each program's curated
 # obsids to one of these field keys; the field key is the on-disk basepath subdir
 # (/orange/adamginsburg/jwst/<field>/) and the target's display name is looked up here.
+# Keep a display name for EVERY field key referenced by ``mast_monitor.PROGRAMS``:
+# ``target`` feeds ``issue_title`` (the idempotency key), so a later-added name would
+# rename an existing issue and spawn a duplicate.
 FIELDS: Dict[str, str] = {
     "brick": "Brick",
     "cloudc": "Cloud C",
+    "cloudef": "Cloud E/F",
     "gc2211": "GC 2211",
+    "gc-treasury": "GC Treasury",
+    "arches": "Arches",
+    "quintuplet": "Quintuplet",
+    "sgra": "Sgr A*",
     "sgrb2": "Sgr B2",
     "sgrc": "Sgr C",
     "sickle": "Sickle",
+    "ngc6334": "NGC 6334",
     "w51": "W51",
     "wd1": "Westerlund 1",
     "wd2": "Westerlund 2",
@@ -144,6 +153,16 @@ def _observations_for_program(program) -> List["Observation"]:
 
     try:
         rows = MM.query_program(program)
+    except ImportError as ex:
+        # astroquery/astropy absent (the issue-sync Action installs runtime deps;
+        # a missing one must be LOUD-but-guarded, not an uncaught crash).  Caught
+        # BEFORE mast_query_errors() below: evaluating that tuple itself imports
+        # astroquery.exceptions, which would re-raise the very ModuleNotFoundError.
+        msg = (f"MAST query dependency MISSING: program {int(program)}: "
+               f"{ex.__class__.__name__}: {ex}")
+        print(f"data_qa.observations: {msg}", file=sys.stderr)
+        LAST_FETCH_ERRORS.append(msg)
+        return []
     except mast_query_errors() as ex:            # network / MAST service error
         msg = f"MAST query FAILED: program {int(program)}: {ex.__class__.__name__}: {ex}"
         print(f"data_qa.observations: {msg}", file=sys.stderr)

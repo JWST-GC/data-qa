@@ -122,11 +122,12 @@ that already exists.
 - A `<!-- data-qa:status -->` marker + timestamp header per comment; optional
   `--update-last` edits the bot's own previous comment instead of stacking.
 
-### 7. Repo fix (bundled): loud manifest-fetch failures
-- `observations.py` `_fetch_lines` returning `[]` on ANY failure made the
-  weekly sync silently no-op (live issue #4 shows a stale render). Fetch
-  errors now print to stderr and (in `make_issues`) abort the sync rather
-  than "sync" an empty registry.
+### 7. Repo fix (bundled): loud registry-build failures
+- A MAST query failing (or a missing runtime dep) in `observations.registry()`
+  must not silently no-op the weekly sync (live issue #4 shows a stale render).
+  Per-program failures are recorded to `observations.LAST_FETCH_ERRORS` (printed
+  to stderr) and `make_issues` aborts the sync rather than "sync" an empty
+  registry. (Was the web-manifest `_fetch_lines` path; now the MAST-query path.)
 
 ## Testing policy (sandbox)
 

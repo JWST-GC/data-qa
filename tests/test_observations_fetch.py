@@ -75,6 +75,30 @@ def test_registry_records_mast_failure_loudly(monkeypatch, capsys):
     assert "MAST query FAILED" in capsys.readouterr().err
 
 
+def test_registry_records_missing_dependency_loudly(monkeypatch, capsys):
+    """A missing runtime dep (e.g. astroquery in a stdlib-only Action) is recorded
+    loud-but-guarded, NOT an uncaught crash -- and is caught BEFORE the
+    mast_query_errors() clause, whose evaluation would itself import astroquery and
+    re-raise the ModuleNotFoundError."""
+    def no_dep(prog):
+        raise ModuleNotFoundError("No module named 'astroquery'")
+    monkeypatch.setattr(mast_monitor, "query_program", no_dep)
+    obs = observations.registry(programs=[2211])
+    assert obs == []
+    assert any("dependency MISSING" in m for m in observations.LAST_FETCH_ERRORS)
+    assert "dependency MISSING" in capsys.readouterr().err
+
+
+def test_all_program_fields_have_display_names():
+    """Every field key referenced by mast_monitor.PROGRAMS must have a FIELDS display
+    name: target -> issue_title (idempotency key), so a later-added name would rename
+    an existing issue and spawn a duplicate."""
+    keys = {f for m in mast_monitor.PROGRAMS.values() for f in m.values()}
+    keys.add(mast_monitor.TREASURY_FIELD)
+    missing = keys - set(observations.FIELDS)
+    assert not missing, f"PROGRAMS field(s) missing from FIELDS: {sorted(missing)}"
+
+
 def test_make_issues_aborts_on_empty_registry_with_fetch_errors(monkeypatch, capsys):
     def fake_registry(**kwargs):
         observations.LAST_FETCH_ERRORS.append("MAST query FAILED: program 2211: ConnectionError")

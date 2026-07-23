@@ -15,11 +15,13 @@ datasets — one GitHub issue per observation.**
   issue**, auto-created from a template and pre-filled with the observation's
   metadata and links to its data products.
 - Issues are created by `data_qa/make_issues.py`. The observation list is
-  **discovered from the public release itself** (`data_qa/observations.py` parses
-  each field's `{field}_images.txt` manifest), so an observation gets a tracking
-  issue as soon as its mosaics are published. Creation is **idempotent** (keyed on
-  the issue title) so re-running never duplicates; metadata is synced into the
-  existing issue body.
+  **built from MAST** (`data_qa/observations.py` queries `mast_monitor.query_program`
+  over the curated `mast_monitor.PROGRAMS` obsid→field map, keeping obs with released
+  calibrated products, `calib_level >= 2`), so an observation gets a tracking issue as
+  soon as its data is public on MAST — the *start* of QA, not the web release (which
+  is the last, post-close step and is intentionally absent here). Creation is
+  **idempotent** (keyed on the issue title) so re-running never duplicates; metadata is
+  synced into the existing issue body.
 - A GitHub Action (`.github/workflows/make-issues.yml`) runs the same script on
   demand / on a schedule, so when new products are produced and registered, their
   issues appear automatically.
@@ -72,10 +74,11 @@ python -m data_qa.make_issues --program 2221 1182 --target Brick --dry-run   # p
 
 ## Adding a field / observation
 
-Observations are discovered automatically from the release manifests. To bring a
-newly released **field** in, add it to `FIELDS` in `data_qa/observations.py`; its
-observations are parsed from `{field}_images.txt` on the next run. To attach hand
-notes / epoch / visits to a specific observation, add an entry to `CURATED`
+Observations are discovered automatically from MAST. To bring a **field** in, add its
+program's obsid→field entries to `mast_monitor.PROGRAMS` and a display name to `FIELDS`
+in `data_qa/observations.py`; its observations (with released calibrated products) are
+picked up on the next run. To attach hand notes / epoch / visits to a specific
+observation, add an entry to `CURATED`
 (keyed by obsid, e.g. `jw02221-o001`).
 
 ## Imaging + publishing (ops)
