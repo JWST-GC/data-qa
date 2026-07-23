@@ -1,0 +1,27 @@
+# scrontab entry to refresh every open GC QA issue on a schedule (HiPerGator).
+# Install with:   EDITOR=nano scrontab -e     then paste the block below.
+# Docs: https://docs.rc.ufl.edu/scheduler/scrontab/
+#
+# scrontab runs the command DIRECTLY as a Slurm batch job (NOT via sbatch), so resources go
+# on #SCRON lines and #SBATCH lines in any called script are ignored.  There is no login
+# env, so PATH is set explicitly (the active python313 env + gh) and the GitHub token is read
+# from ~/.config/data-qa/github_token by the script.
+#
+# One-time prerequisites:
+#   mkdir -p ~/.config/data-qa
+#   printf '%s' 'ghp_YOURTOKEN' > ~/.config/data-qa/github_token && chmod 600 ~/.config/data-qa/github_token
+#   #  (fine-grained PAT on JWST-GC/data-qa: Issues=write, Contents=write)
+#
+# --chdir points at the checkout that HAS scripts/ .  Until PR #23 merges use the worktree
+# (data-qa-diagfix); after merge switch to /blue/adamginsburg/adamginsburg/repos/data-qa .
+
+#SCRON --qos=astronomy-dept-b
+#SCRON --account=astronomy-dept
+#SCRON --cpus-per-task=4
+#SCRON --mem=32gb
+#SCRON --time=2:00:00
+#SCRON --job-name=data-qa-refresh-issues
+#SCRON --chdir=/blue/adamginsburg/adamginsburg/repos/data-qa-diagfix
+#SCRON -o /orange/adamginsburg/jwst/logs/dataqa_refresh_%j.out
+# min hour dom mon dow  -- 06:00 and 18:00 daily
+0 6,18 * * *  PATH=/blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin:$HOME/bin:$PATH bash scripts/refresh_all_issues.sh
