@@ -183,19 +183,64 @@ def _save(fig, name):
     return out
 
 
+def _red_flag_figure(o, stage_name, title, reason):
+    """A literal RED FLAG.  When a stage plot would be EMPTY (no data to show), an empty
+    scatter reads as 'fine, nothing wrong' -- the opposite of the truth.  Draw an
+    unmistakable red panel instead so the missing measurement stands out at a glance."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(7.6, 3.4))
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_axis_off()
+    ax.add_patch(plt.Rectangle((0, 0), 1, 1, color="#b30000"))
+    ax.text(0.5, 0.72, "⚑ RED FLAG", color="white", fontsize=30, fontweight="bold",
+            ha="center", va="center")
+    ax.text(0.5, 0.45, title, color="white", fontsize=15, fontweight="bold",
+            ha="center", va="center")
+    ax.text(0.5, 0.22, reason, color="#ffe0e0", fontsize=10, ha="center", va="center",
+            wrap=True)
+    ax.text(0.5, 0.05, f"{o.target} {o.obsid}", color="#ffd0d0", fontsize=8,
+            ha="center", va="center")
+    return _save(fig, f"{o.obsid}_{stage_name}.png")
+
+
 # --------------------------------------------------------------------------- STAGE 1
 def stage1_mosaics(o: Observation, sw, lw):
-    """Grayscale SW + LW mosaics -- confirms the data arrived and looks sane."""
+    """One full-width grayscale panel PER FILTER, stacked vertically.  NIRCam mosaics are
+    wide-aspect strips; a side-by-side SW/LW layout squishes them and leaves huge whitespace,
+    so each filter gets its own row sized to the image's native aspect."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from astropy.io import fits
+
     psw, plw = _mosaic_path(o, sw), _mosaic_path(o, lw)
-    fig, ax = _fig(1, 2, 5.2, 5.2)
+    panels = []                                   # (filt, path, aspect = ny/nx)
+    for filt, p in ((sw, psw), (lw, plw)):
+        if not filt:
+            continue                              # single-filter obs: no LW row at all
+        asp = 0.45
+        if p:
+            with fits.open(p) as h:
+                s = h["SCI"] if "SCI" in h else h[1]
+                ny, nx = s.data.shape
+                asp = ny / nx if nx else 0.45
+        panels.append((filt, p, asp))
+
+    W = 11.0
+    # per-row height from native aspect (clamp so a near-square or a razor-thin strip stays
+    # legible); a missing i2d gets a short placeholder row.
+    heights = [(0.25 if p is None else max(0.18, min(1.0, asp))) * W for _, p, asp in panels]
+    fig = plt.figure(figsize=(W, sum(heights) + 0.35 * len(panels)))
+    gs = fig.add_gridspec(len(panels), 1, height_ratios=heights, hspace=0.18)
     fracs = {}
-    for a, filt, p in ((ax[0][0], sw, psw), (ax[0][1], lw, plw)):
+    for i, (filt, p, _asp) in enumerate(panels):
+        a = fig.add_subplot(gs[i, 0])
         if p:
             fracs[filt] = _grayscale(a, p, f"{o.obsid}  {filt}")
         else:
             a.text(0.5, 0.5, f"{filt}\n(no i2d)", ha="center", va="center")
             a.set_xticks([]); a.set_yticks([])
-    fig.suptitle(f"{o.target} {o.obsid} — first mosaics ({sw} / {lw})", fontsize=11)
     png = _save(fig, f"{o.obsid}_stage1.png")
     metrics = dict(stage=1, sw=sw, lw=lw,
                    sw_present=bool(psw), lw_present=bool(plw),
@@ -219,20 +264,27 @@ def _mag_cols(t, sw, lw):
 
 
 def stage2_cmd(o: Observation, sw, lw):
-    """Colour-magnitude diagram (LW vs SW-LW) + luminosity-function inset."""
+    """Colour-magnitude diagram (LW vs SW-LW) with the luminosity function as a RIGHT-SIDE
+    marginal whose y-axis (magnitude) is locked to the CMD -- the LF reads straight across
+    from the CMD instead of an inset floating on top of the data."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
     from astropy.table import Table
     cat, kind, csw, clw = _catalog_for(o, sw, lw)
-    fig, ax = _fig(1, 1, 5.5, 6.0)
     metrics = dict(stage=2, catalog=os.path.basename(cat) if cat else None, kind=kind)
     want = f"{sw}+{lw}" if lw else f"{sw}"
     if not cat:
+        fig, ax = _fig(1, 1, 5.5, 6.0)
         ax[0][0].text(0.5, 0.5, f"no catalog with {want} mags yet", ha="center", va="center")
         metrics["passed"] = False
         return _save(fig, f"{o.obsid}_stage2.png"), metrics
     t = Table.read(cat)
-    a = ax[0][0]
+
+    # single-filter obs: no colour -> plain luminosity function (still tracks depth)
     if lw is None and csw:
-        # single-filter obs: no colour -> luminosity function only (still tracks depth)
+        fig, ax = _fig(1, 1, 6.5, 5.0)
+        a = ax[0][0]
         m = np.asarray(t[csw], float); g = np.isfinite(m)
         hh, edges = np.histogram(m[g], bins=60)
         ctr = 0.5 * (edges[1:] + edges[:-1])
@@ -240,36 +292,44 @@ def stage2_cmd(o: Observation, sw, lw):
         peak = ctr[int(np.argmax(hh))]
         a.axvline(peak, color="r", lw=0.8, label=f"turnover≈{peak:.1f}")
         a.set_xlabel(sw); a.set_ylabel("N stars"); a.legend(fontsize=8)
-        a.set_title(f"{sw} luminosity function (single filter — no colour)", fontsize=9)
+        a.set_title(f"{o.target} {o.obsid} — {sw} luminosity function "
+                    f"(single filter — no colour)", fontsize=10)
         metrics.update(n_stars=int(g.sum()), lf_turnover=float(peak),
                        sw_col=csw, lw_col=None, single_filter=True,
                        passed=int(g.sum()) > 500)
-        fig.suptitle(f"{o.target} {o.obsid} — LF ({kind})", fontsize=11)
         return _save(fig, f"{o.obsid}_stage2.png"), metrics
-    if csw and clw:
-        msw = np.asarray(t[csw], float); mlw = np.asarray(t[clw], float)
-        g = np.isfinite(msw) & np.isfinite(mlw)
-        color = msw[g] - mlw[g]
-        hb = a.hexbin(color, mlw[g], gridsize=120, bins="log", cmap="viridis", mincnt=1)
-        fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
-        a.set_xlabel(f"{sw} - {lw}"); a.set_ylabel(lw)
-        a.invert_yaxis()
-        a.set_xlim(np.nanpercentile(color, [1, 99]))
-        # LF inset (depth): where do counts turn over
-        ins = a.inset_axes([0.62, 0.62, 0.36, 0.36])
-        hh, edges = np.histogram(mlw[g], bins=40)
-        ctr = 0.5 * (edges[1:] + edges[:-1])
-        ins.step(ctr, hh, where="mid", color="k", lw=0.8)
-        peak = ctr[int(np.argmax(hh))]
-        ins.axvline(peak, color="r", lw=0.8)
-        ins.set_title(f"LF {lw}\nturnover≈{peak:.1f}", fontsize=7)
-        ins.tick_params(labelsize=6)
-        metrics.update(n_stars=int(g.sum()), lf_turnover=float(peak),
-                       sw_col=csw, lw_col=clw, passed=int(g.sum()) > 500)
-    else:
-        a.text(0.5, 0.5, f"no {sw}/{lw} mag cols\nin {os.path.basename(cat)}",
-               ha="center", va="center", fontsize=8)
+
+    if not (csw and clw):
+        fig, ax = _fig(1, 1, 5.5, 6.0)
+        ax[0][0].text(0.5, 0.5, f"no {sw}/{lw} mag cols\nin {os.path.basename(cat)}",
+                      ha="center", va="center", fontsize=8)
         metrics["passed"] = False
+        return _save(fig, f"{o.obsid}_stage2.png"), metrics
+
+    # CMD + shared-y marginal LF
+    msw = np.asarray(t[csw], float); mlw = np.asarray(t[clw], float)
+    g = np.isfinite(msw) & np.isfinite(mlw)
+    color = msw[g] - mlw[g]; mag = mlw[g]
+    fig = plt.figure(figsize=(7.6, 6.2))
+    gs = fig.add_gridspec(1, 2, width_ratios=[4.0, 1.15], wspace=0.04)
+    a = fig.add_subplot(gs[0, 0])
+    amarg = fig.add_subplot(gs[0, 1], sharey=a)          # y-axis (mag) LOCKED to the CMD
+    hb = a.hexbin(color, mag, gridsize=120, bins="log", cmap="viridis", mincnt=1)
+    a.set_xlabel(f"{sw} - {lw}"); a.set_ylabel(lw)
+    a.invert_yaxis()                                     # marginal follows via sharey
+    a.set_xlim(np.nanpercentile(color, [1, 99]))
+    fig.colorbar(hb, ax=amarg, label="log N stars (CMD)", shrink=0.85, pad=0.28)
+    # marginal LF: counts vs magnitude, bars run horizontally so mag lines up with the CMD
+    hh, edges = np.histogram(mag, bins=50)
+    ctr = 0.5 * (edges[1:] + edges[:-1])
+    amarg.step(hh, ctr, where="mid", color="k", lw=0.9)
+    peak = ctr[int(np.argmax(hh))]
+    amarg.axhline(peak, color="r", lw=0.8)
+    amarg.set_xlabel(f"N stars\nturnover≈{peak:.1f}", fontsize=8)
+    amarg.tick_params(labelleft=False, labelsize=7)
+    amarg.margins(y=0)
+    metrics.update(n_stars=int(g.sum()), lf_turnover=float(peak),
+                   sw_col=csw, lw_col=clw, passed=int(g.sum()) > 500)
     fig.suptitle(f"{o.target} {o.obsid} — CMD ({kind})", fontsize=11)
     return _save(fig, f"{o.obsid}_stage2.png"), metrics
 
@@ -344,27 +404,40 @@ def stage4_offsets(o: Observation, sw):
                 metrics.update(intermodule_off=float(im["off"]), intermodule_filt=filt)
             break
 
-    fig, ax = _fig(1, 2 if im else 1, 5.4, 5.0)
-    a0 = ax[0][0]
+    # Measure the JWST-VIRAC pairs BEFORE building the figure so an empty result becomes a
+    # red flag, not an empty scatter that reads as "nothing wrong".
+    bulk = None; dra = dde = None; nmatch = 0
     if jsc is not None and ref_sc is not None:
         bulk = aa.xcorr(jsc, ref_sc)
         ia, ib, sep, _ = search_around_sky(jsc, ref_sc, 0.3 * u.arcsec)
-        if len(ia) >= 30:
+        nmatch = len(ia)
+        if nmatch >= 30:
             dra = (ref_sc[ib].ra - jsc[ia].ra).to(u.arcsec).value * np.cos(np.radians(jsc[ia].dec.value)) * 1000
             dde = (ref_sc[ib].dec - jsc[ia].dec).to(u.arcsec).value * 1000
-            hb = a0.hexbin(dra, dde, gridsize=60, bins="log", cmap="cividis", mincnt=1)
-            fig.colorbar(hb, ax=a0, label="log N pairs", shrink=0.85)
-            a0.axhline(0, color="w", lw=0.5); a0.axvline(0, color="w", lw=0.5)
-            a0.set_xlabel("dRA [mas]"); a0.set_ylabel("dDec [mas]")
-            lim = max(100.0, 1.4 * (abs(bulk["off"]) if bulk else 0.0))
-            a0.set_xlim(-lim, lim); a0.set_ylim(-lim, lim)
-            a0.set_title(f"JWST-VIRAC  bulk={bulk['off']:.0f} mas" if bulk else "JWST-VIRAC", fontsize=9)
-            metrics.update(bulk_off=float(bulk["off"]) if bulk else None,
-                           bulk_dra=float(bulk["dra"]) if bulk else None,
-                           bulk_ddec=float(bulk["ddec"]) if bulk else None,
-                           n_matched=int(len(ia)))
-    else:
-        a0.text(0.5, 0.5, "need mosaic + VIRAC", ha="center", va="center")
+
+    if dra is None:
+        # nothing to plot -> RED FLAG (not an empty panel).  https://github.com/JWST-GC/data-qa/issues/27#issuecomment-5055329892
+        reason = ("no JWST mosaic on disk" if jsc is None else
+                  "no VIRAC reference for this field/epoch" if ref_sc is None else
+                  f"only {nmatch} JWST-VIRAC matches (<30) — frame likely far off-tie")
+        png = _red_flag_figure(o, "stage4", "JWST↔VIRAC OFFSET UNMEASURABLE",
+                               f"The positional-offset plot is empty: {reason}.")
+        metrics.update(red_flag=True, red_flag_reason=reason, n_matched=int(nmatch), passed=False)
+        return png, metrics
+
+    fig, ax = _fig(1, 2 if im else 1, 5.4, 5.0)
+    a0 = ax[0][0]
+    hb = a0.hexbin(dra, dde, gridsize=60, bins="log", cmap="cividis", mincnt=1)
+    fig.colorbar(hb, ax=a0, label="log N pairs", shrink=0.85)
+    a0.axhline(0, color="w", lw=0.5); a0.axvline(0, color="w", lw=0.5)
+    a0.set_xlabel("dRA [mas]"); a0.set_ylabel("dDec [mas]")
+    lim = max(100.0, 1.4 * (abs(bulk["off"]) if bulk else 0.0))
+    a0.set_xlim(-lim, lim); a0.set_ylim(-lim, lim)
+    a0.set_title(f"JWST-VIRAC  bulk={bulk['off']:.0f} mas" if bulk else "JWST-VIRAC", fontsize=9)
+    metrics.update(bulk_off=float(bulk["off"]) if bulk else None,
+                   bulk_dra=float(bulk["dra"]) if bulk else None,
+                   bulk_ddec=float(bulk["ddec"]) if bulk else None,
+                   n_matched=int(nmatch))
     if im:
         a1 = ax[0][1]
         a1.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
@@ -511,30 +584,34 @@ def stage5_intermodule(o: Observation, sw):
             metrics["intermodule_diff"] = float(np.hypot(*(mA.mean(0) - mB.mean(0))))
             metrics["worst_detector"] = max(det, key=lambda d: np.hypot(det[d]["rdra"], det[d]["rdde"]))
 
-    # ---- figure: 2 rows (quiver+overlap ; cutout gallery)
+    # ---- figure layout depends on whether there is an A/B overlap to show.  With NO overlap
+    # (single module, or not measurable) the A/B half + cutout gallery are OMITTED entirely --
+    # an empty panel is noise -- and the figure is just the per-detector quiver.
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig = plt.figure(figsize=(11, 8.5))
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.15, 0.85])
-    axq, axo = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
 
-    if det:
-        xs = [v["ra"] for v in det.values()]; ys = [v["dec"] for v in det.values()]
-        us = [v["rdra"] for v in det.values()]; vs = [v["rdde"] for v in det.values()]
-        cols = ["#4477aa" if d.startswith("nrca") else "#ee6677" for d in det]
-        q = axq.quiver(xs, ys, us, vs, color=cols, angles="xy", scale_units="xy",
-                       scale=2000, width=0.007)
-        axq.quiverkey(q, 0.12, 1.03, 5, "5 mas", labelpos="E", fontproperties={"size": 8})
-        for d, v in det.items():
-            axq.annotate(d, (v["ra"], v["dec"]), fontsize=6.5, ha="center", va="bottom")
-        axq.invert_xaxis(); axq.set_xlabel("RA"); axq.set_ylabel("Dec")
-        axq.set_title(f"per-detector residual (bulk-removed) — {filt}\n"
-                      f"A-B diff = {metrics.get('intermodule_diff', float('nan')):.1f} mas", fontsize=9)
-    else:
-        axq.text(0.5, 0.5, "per-detector cats unavailable", ha="center", va="center", fontsize=8)
+    def _draw_quiver(axq):
+        if det:
+            xs = [v["ra"] for v in det.values()]; ys = [v["dec"] for v in det.values()]
+            us = [v["rdra"] for v in det.values()]; vs = [v["rdde"] for v in det.values()]
+            cols = ["#4477aa" if d.startswith("nrca") else "#ee6677" for d in det]
+            q = axq.quiver(xs, ys, us, vs, color=cols, angles="xy", scale_units="xy",
+                           scale=2000, width=0.007)
+            axq.quiverkey(q, 0.12, 1.03, 5, "5 mas", labelpos="E", fontproperties={"size": 8})
+            for d, v in det.items():
+                axq.annotate(d, (v["ra"], v["dec"]), fontsize=6.5, ha="center", va="bottom")
+            axq.invert_xaxis(); axq.set_xlabel("RA"); axq.set_ylabel("Dec")
+            axq.set_title(f"per-detector residual (bulk-removed) — {filt}\n"
+                          f"A-B diff = {metrics.get('intermodule_diff', float('nan')):.1f} mas", fontsize=9)
+        else:
+            axq.text(0.5, 0.5, "per-detector cats unavailable", ha="center", va="center", fontsize=8)
 
     if ov:
+        fig = plt.figure(figsize=(11, 8.5))
+        gs = fig.add_gridspec(2, 2, height_ratios=[1.15, 0.85])
+        axq, axo = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+        _draw_quiver(axq)
         # dra/dde are the same-star residuals after aligning A onto B by the histogram peak;
         # they scatter about 0 (RMS = tie precision). The bulk offset is the title number.
         axo.hexbin(dra, dde, gridsize=40, bins="log", cmap="cividis", mincnt=1)
@@ -544,51 +621,52 @@ def stage5_intermodule(o: Observation, sw):
         axo.set_xlim(-lim, lim); axo.set_ylim(-lim, lim)
         axo.set_title(f"A-vs-B overlap ({ov['n']} matched stars)\n"
                       f"offset={ov['off']:.1f} mas  RMS={ov['rms']:.1f} mas", fontsize=9)
-    elif single_module:
-        axo.text(0.5, 0.5, f"single module ({single_module} only)\nno A/B tie to check",
-                 ha="center", va="center", fontsize=9)
-        axo.set_xticks([]); axo.set_yticks([])
-    else:
-        axo.text(0.5, 0.5, "A/B overlap not measurable\n(need per-detector cats both modules)",
-                 ha="center", va="center", fontsize=8)
-        axo.set_xticks([]); axo.set_yticks([])
 
-    # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
-    ncut = 6
-    if ov and mpath and os.path.exists(mpath):
-        with fits.open(mpath) as hdul:
-            sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
-            data = sci.data.astype("float32"); w = WCS(sci.header)
-        from astropy.coordinates import SkyCoord
-        from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
-        picks = ov["pos"][:200]
-        strip = fig.add_subplot(gs[1, :]); strip.axis("off")
-        cut_axes = [strip.inset_axes([i / ncut + 0.01, 0.05, 0.92 / ncut, 0.85])
-                    for i in range(ncut)]
-        shown = 0
-        for ra, dec in picks:
-            if shown >= ncut:
-                break
-            try:
-                x, y = w.world_to_pixel(SkyCoord(ra * u.deg, dec * u.deg))
-                cut = Cutout2D(data, (float(x), float(y)), 25, wcs=w)
-            except (ValueError, IndexError):
-                continue
-            if not np.isfinite(cut.data).any() or np.nanmax(cut.data) <= 0:
-                continue
-            a = cut_axes[shown]
-            norm = ImageNormalize(cut.data, interval=ZScaleInterval(), stretch=AsinhStretch())
-            a.imshow(cut.data, origin="lower", cmap="gray", norm=norm)
-            a.set_xticks([]); a.set_yticks([])
-            a.set_title(f"{shown + 1}", fontsize=7)
-            shown += 1
-        fig.text(0.5, 0.02, f"overlap-zone star cutouts from the merged mosaic "
-                 f"(a mis-tie doubles/elongates these)", ha="center", fontsize=8)
+        # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
+        ncut = 6
+        if mpath and os.path.exists(mpath):
+            with fits.open(mpath) as hdul:
+                sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
+                data = sci.data.astype("float32"); w = WCS(sci.header)
+            from astropy.coordinates import SkyCoord
+            from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
+            picks = ov["pos"][:200]
+            strip = fig.add_subplot(gs[1, :]); strip.axis("off")
+            cut_axes = [strip.inset_axes([i / ncut + 0.01, 0.05, 0.92 / ncut, 0.85])
+                        for i in range(ncut)]
+            shown = 0
+            for ra, dec in picks:
+                if shown >= ncut:
+                    break
+                try:
+                    x, y = w.world_to_pixel(SkyCoord(ra * u.deg, dec * u.deg))
+                    cut = Cutout2D(data, (float(x), float(y)), 25, wcs=w)
+                except (ValueError, IndexError):
+                    continue
+                if not np.isfinite(cut.data).any() or np.nanmax(cut.data) <= 0:
+                    continue
+                a = cut_axes[shown]
+                norm = ImageNormalize(cut.data, interval=ZScaleInterval(), stretch=AsinhStretch())
+                a.imshow(cut.data, origin="lower", cmap="gray", norm=norm)
+                a.set_xticks([]); a.set_yticks([])
+                a.set_title(f"{shown + 1}", fontsize=7)
+                shown += 1
+            fig.text(0.5, 0.02, "overlap-zone star cutouts from the merged mosaic "
+                     "(a mis-tie doubles/elongates these)", ha="center", fontsize=8)
+        title_extra = ""
+    else:
+        # no A/B overlap -> quiver only, at a compact size (no empty right half / cutout row)
+        fig = plt.figure(figsize=(6.0, 5.2))
+        _draw_quiver(fig.add_subplot(1, 1, 1))
+        title_extra = (f"  ·  single module ({single_module})" if single_module
+                       else "  ·  A/B overlap not measurable")
+
     # single-module obs (sickle = NRCB only) has no A/B tie to fail -> N/A passes.
     if single_module:
         metrics["single_module"] = single_module
     metrics["passed"] = bool(single_module or (ov and ov["off"] < aa.THRESH["intermodule"]))
-    fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module tie ({filt})", fontsize=11)
+    fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module tie ({filt}){title_extra}",
+                 fontsize=11)
     return _save(fig, f"{o.obsid}_stage5.png"), metrics
 
 
@@ -632,6 +710,10 @@ CAPTIONS = {
 
 
 def caption_for(n, metrics):
+    if metrics.get("red_flag"):
+        return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
+                f"{metrics.get('red_flag_reason', 'no data to show')}. "
+                f"An empty result here means the measurement could not be made — investigate.")
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
