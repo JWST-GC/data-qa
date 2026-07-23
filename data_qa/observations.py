@@ -107,8 +107,17 @@ class Observation:
 
     @property
     def mast_search_url(self) -> str:
-        """MAST data search filtered to this program."""
-        return f"https://mast.stsci.edu/search/ui/#/jwst?proposal_id={int(self.program)}"
+        """MAST data search that actually RUNS the query for this program.
+
+        The bare ``#/jwst?proposal_id=N`` form only opens a blank, unexecuted search
+        form.  The executed-results route is ``#/jwst/results?...&program_id=N``; the
+        ``search_key`` in a shared MAST URL is a session-specific saved-search hash and
+        is intentionally omitted (``useStore=false`` builds the query fresh from the
+        explicit params instead)."""
+        return ("https://mast.stsci.edu/search/ui/#/jwst/results?resolve=true"
+                "&data_types=spectrum,timeseries,image,other"
+                "&instruments=MIRI,NIRCAM,NIRSPEC,NIRISS,FGS"
+                f"&program_id={int(self.program)}&useStore=false")
 
     @property
     def release_url(self) -> str:
