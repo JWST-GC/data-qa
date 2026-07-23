@@ -20,58 +20,11 @@ import sys
 
 from . import observations
 from ._github import API, REPO, ensure_labels, existing_issues, request as _req
-from .observations import Observation, _read_lines, registry
+from .observations import Observation, registry
 
 # Marker so we can recognize (and update) an auto-generated body without clobbering
 # human discussion, which lives in the comments, not the body.
 AUTOGEN_MARKER = "<!-- data-qa:autogen -->"
-
-
-# --------------------------------------------------------------------------- release links
-FILTER_TOKEN = re.compile(r"^(f\d{3}[wnm])[_-]")
-
-
-def _fetch_lines(url):
-    """Fetch a newline-delimited URL list. Empty on failure, but LOUD (stderr +
-    ``observations.LAST_FETCH_ERRORS``) so a network failure can never masquerade
-    as an empty release manifest."""
-    return _read_lines(url)
-
-
-def release_links(o: Observation):
-    """Filter the field's authoritative release lists down to THIS observation.
-
-    Returns (mosaics, per_filter_catalogs, field_catalogs):
-      - mosaics: [(FILTER, url)] science i2d mosaics carrying this obsid
-      - per_filter_catalogs: [(FILTER, url)] vetted catalogs for this obs's filters
-      - field_catalogs: [url] field-level catalogs (merged/seed; shared by the field)
-    """
-    filt_lower = [f.lower() for f in o.filters]
-    mosaics = []
-    for u in _fetch_lines(o.images_list_url):
-        low = u.lower()
-        if o.obsid.lower() in low and "_i2d.fits" in low and "resbgsub" not in low:
-            filt = next((f.upper() for f in filt_lower if f in low), "?")
-            mosaics.append((filt, u))
-    per_filter, field_cats = [], []
-    for u in _fetch_lines(o.catalogs_list_url):
-        base = u.rsplit("/", 1)[-1].lower()
-        m = FILTER_TOKEN.match(base)
-        if m:
-            tok = m.group(1)
-            if tok in filt_lower:                 # per-filter catalog for THIS obs
-                per_filter.append((tok.upper(), u))
-            # else: another observation's filter -> skip
-        else:
-            field_cats.append(u)                  # field-level (merged/seed)
-    mosaics.sort()
-    per_filter.sort()
-    return mosaics, per_filter, field_cats
-
-
-def _fmt_links(items):
-    """items: [(label, url)] -> markdown bullets; '' if empty."""
-    return "\n".join(f"  - [{lab}]({url})" for lab, url in items)
 
 
 # --------------------------------------------------------------------------- body
@@ -144,18 +97,6 @@ def render_body(o: Observation) -> str:
     merged_note = (f" (mosaic merges obs {o.obs} + {' + '.join(o.merged_obsids)}; "
                    f"product id `{o.mosaic_obsid}`)" if o.merged_obsids else "")
 
-    mosaics, per_filter, field_cats = release_links(o)
-    dl = []
-    if mosaics:
-        dl.append("**Mosaics (`i2d`):**\n" + _fmt_links(mosaics))
-    if per_filter:
-        dl.append("**Per-filter catalogs (vetted):**\n" + _fmt_links(per_filter))
-    if field_cats:
-        dl.append("**Field catalogs:**\n"
-                  + _fmt_links((u.rsplit("/", 1)[-1], u) for u in field_cats))
-    downloads = ("\n\n".join(dl) if dl
-                 else f"_(no release files listed yet — see {o.release_url})_")
-
     return f"""{AUTOGEN_MARKER}
 **Observation `{o.obsid}`** — {o.target} / {o.instrument}
 
@@ -169,16 +110,12 @@ def render_body(o: Observation) -> str:
 | Executions (visits) | {visits} |
 | Epoch (DATE-OBS) | {o.epoch or "—"} |
 
-### Release
-- Release page: {o.release_url}
+### Archive & data
 - APT program (PDF): {o.mast_program_url}
 - MAST data search: {o.mast_search_url}
 - On-disk mosaics: `{o.product_glob()}`
 
-{guidestar}
-### Direct downloads
-{downloads}
-{notes}
+{guidestar}{notes}
 ### QA checklist
 <sub>boxes with a ✓ are auto-set from the diagnostic replies below (`data_qa.diagnostics`); the rest are manual.</sub>
 - [{_ck(delivered)}] Observation delivered / retrieved

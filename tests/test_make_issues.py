@@ -1,5 +1,5 @@
-"""Offline tests for data_qa.make_issues body rendering (no network: the
-release-manifest fetch is stubbed out)."""
+"""Tests for data_qa.make_issues body rendering.  render_body reads no network
+(the registry is built from MAST upstream; the body itself only formats)."""
 import pytest
 
 from data_qa import make_issues as mi
@@ -14,16 +14,20 @@ def obs():
                        epoch="2022-08-28")
 
 
-@pytest.fixture(autouse=True)
-def _offline(monkeypatch):
-    monkeypatch.setattr(mi, "_fetch_lines", lambda url: [])
-
-
 def test_render_body_has_checklist_and_marker(obs):
     body = mi.render_body(obs)
     assert body.startswith(mi.AUTOGEN_MARKER)
     assert "### QA checklist" in body
     assert "`F212N`" in body and "`F405N`" in body
+
+
+def test_render_body_has_no_web_release_references(obs):
+    """The starformation web release is the last, post-QA step: it must never appear
+    in the issue body or QA process (only MAST/archive links belong here)."""
+    body = mi.render_body(obs)
+    assert "starformation" not in body
+    assert "Release page" not in body and "Direct downloads" not in body
+    assert "MAST data search" in body            # archive link still present
 
 
 def test_render_body_asks_destreak_decision(obs):
