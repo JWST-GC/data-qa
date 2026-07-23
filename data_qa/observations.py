@@ -5,28 +5,28 @@ data retrieval (``retrieve_data.py``).  One :class:`Observation` == one JWST obs
 (a program's obs-number, per instrument) == one tracking issue; executions (visits) are
 listed inside.
 
-The registry is **discovered from the public release itself**: each field's
-``{field}_images.txt`` on the JWST-GC portal lists the released mosaics, from which the
-(program, obs, instrument, filters) of every observation are parsed.  Curated metadata
-(known issues, epoch, visits) is overlaid per obsid via :data:`CURATED`.  Add a newly
-released field to :data:`FIELDS`; add hand notes to :data:`CURATED`.
+The registry is built from **MAST** -- the authoritative record of what has been
+observed and made public.  ``mast_monitor.query_program`` returns every observation of a
+program (obs number, instrument, filters, calibration level, epoch); an Observation is
+emitted for each obs that has released calibrated products (``calib_level >= 2``) and is
+one of the curated QA obsids in :data:`mast_monitor.PROGRAMS` (which maps obsid -> field).
+Curated hand-notes are overlaid per obsid via :data:`CURATED`.
+
+Deliberately NOT sourced from the public web release (the starformation.astro.ufl.edu
+portal): that portal is the LAST step, published only after an observation's QA issue is
+closed, so it can never be the discovery source without inverting the pipeline.  The QA
+process tracks an observation from the moment its data is public on MAST; the web release
+is downstream of QA and is not referenced here or in the issues.
 """
 from __future__ import annotations
 
-import os
-import re
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field as _dc_field
 from typing import Dict, List
 
-# JWST-GC public data-release portal. Per-field overview pages live at
-# <base>/<field>.html; the authoritative direct-download URL lists (pointing at the
-# Globus-hosted FITS) at <base>/<field>_{images,catalogs}.txt.
-RELEASE_BASE = "https://starformation.astro.ufl.edu/jwst-gc"
-
-# Released fields -> display name.  Add a field here when its products go public.
+# QA fields -> display name.  ``mast_monitor.PROGRAMS`` maps each program's curated
+# obsids to one of these field keys; the field key is the on-disk basepath subdir
+# (/orange/adamginsburg/jwst/<field>/) and the target's display name is looked up here.
 FIELDS: Dict[str, str] = {
     "brick": "Brick",
     "cloudc": "Cloud C",
@@ -39,7 +39,7 @@ FIELDS: Dict[str, str] = {
     "wd2": "Westerlund 2",
 }
 
-# Per-obsid curated overlay (optional): known issues, epoch (DATE-OBS), visits.
+# Per-obsid curated overlay (optional): hand notes, epoch (DATE-OBS) override, visits.
 CURATED: Dict[str, dict] = {
     "jw02221-o001": dict(
         epoch="2022-08-28", visits=["001"],
@@ -55,20 +55,13 @@ CURATED: Dict[str, dict] = {
     ),
 }
 
-# Parse a mosaic filename: program, obs (tile suffix stripped), instrument, filter.
-#   jw02221-o001_t001_nircam_clear-f182m-merged_i2d.fits
-#   jw05365-o002-998_t001_miri_clear-f770w-mirimage_data_i2d.fits
-#   jw02221-o002_t001_miri_f2550w_i2d.fits
-_MOSAIC_RE = re.compile(
-    r"jw(\d{5})-o(\d{3})(?:-(\d+))?_t\d+_(nircam|miri)_(?:clear-)?(f\d{3,4}[wnm])", re.I)
-
 
 @dataclass(frozen=True)
 class Observation:
     program: str                 # e.g. "2221"
     obs: str                     # zero-padded 3 char, e.g. "001"
     target: str = ""             # display name, e.g. "Brick"
-    release_field: str = ""      # release-page basename, e.g. "brick" (defaults to target.lower())
+    release_field: str = ""      # field key / on-disk subdir, e.g. "brick" (defaults to target.lower())
     instrument: str = "NIRCam"   # "NIRCam" | "MIRI"
     filters: List[str] = _dc_field(default_factory=list)
     visits: List[str] = _dc_field(default_factory=list)
@@ -91,15 +84,15 @@ class Observation:
 
     @property
     def mosaic_obsid(self) -> str:
-        """Obsid stem the RELEASE mosaics actually carry.  When this observation is drizzled
-        together with others into one combined tile (e.g. jw05365-o002-998), the released
-        i2d is named for the combined id, not the bare obsid -- so the on-disk path and the
-        download links must use this, not ``obsid``."""
+        """Obsid stem the on-disk mosaics actually carry.  When this observation is
+        drizzled together with others into one combined tile (e.g. jw05365-o002-998),
+        the i2d is named for the combined id, not the bare obsid -- so the on-disk path
+        must use this, not ``obsid``."""
         if self.merged_obsids:
             return f"{self.obsid}-{'-'.join(self.merged_obsids)}"
         return self.obsid
 
-    # ---- links ----
+    # ---- links (MAST / archive only; the web release portal is intentionally absent) ----
     @property
     def mast_program_url(self) -> str:
         """Public APT program summary (the old get-proposal-info cgi now 404s)."""
@@ -110,19 +103,6 @@ class Observation:
         """MAST data search filtered to this program."""
         return f"https://mast.stsci.edu/search/ui/#/jwst?proposal_id={int(self.program)}"
 
-    @property
-    def release_url(self) -> str:
-        """Field overview page on the JWST-GC portal."""
-        return f"{RELEASE_BASE}/{self.field}.html"
-
-    @property
-    def images_list_url(self) -> str:
-        return f"{RELEASE_BASE}/{self.field}_images.txt"
-
-    @property
-    def catalogs_list_url(self) -> str:
-        return f"{RELEASE_BASE}/{self.field}_catalogs.txt"
-
     def product_glob(self, basepath: str = "/orange/adamginsburg/jwst") -> str:
         # wildcard after the obs number so combined tiles (jw05365-o002-998_t001...) match,
         # not only the bare-obsid single-observation products.
@@ -132,82 +112,90 @@ class Observation:
 
 
 # --------------------------------------------------------------------------- discovery
-# Fetch failures recorded by _read_lines since the last discover_from_release() call.
-# A failed fetch returns [] (so partial discovery still works) but must be LOUD:
-# consumers (make_issues) check this to distinguish "manifest genuinely lists
-# nothing" from "the network fetch errored" and abort rather than sync an empty
-# registry (live issue #4: silent [] made the weekly sync a stale no-op).
+# MAST-query failures recorded since the last registry() build.  A failed program query
+# contributes no observations, but must be LOUD: make_issues checks this to distinguish
+# "MAST genuinely returned nothing" from "the MAST query errored" and abort rather than
+# sync an empty registry (live issue #4: a silent [] made the weekly sync a stale no-op).
 LAST_FETCH_ERRORS: List[str] = []
 
 
-def _read_lines(url_or_path):
-    """Read a newline-delimited list from a local path or URL.
+def _epoch_from_tmax(t_max_values) -> str:
+    """Earliest MAST ``t_max`` (MJD) of an observation -> ISO date ('' if unavailable)."""
+    from . import mast_monitor as MM
+    vals = [t for t in t_max_values if t is not None]
+    if not vals:
+        return ""
+    iso = MM.mjd_to_iso(min(vals))
+    return iso[:10] if iso and iso != "unknown" else ""
 
-    Empty on fetch failure, but never silently: failures print to stderr and append
-    to :data:`LAST_FETCH_ERRORS`.
+
+def _observations_for_program(program) -> List["Observation"]:
+    """Emit one Observation per (obs, instrument) for the curated QA obsids of ``program``
+    (``mast_monitor.PROGRAMS``), with metadata from MAST.  Only observations with released
+    calibrated products (``calib_level >= 2``) are emitted.  A MAST failure is recorded to
+    :data:`LAST_FETCH_ERRORS` and yields no observations for the program (never a silent []).
     """
-    if os.path.exists(url_or_path):
-        with open(url_or_path) as fh:
-            return [ln.strip() for ln in fh if ln.strip()]
-    req = urllib.request.Request(url_or_path, headers={"User-Agent": "jwst-gc-data-qa"})
+    from . import mast_monitor as MM
+    from .retrieve_data import mast_query_errors
+
+    want = MM.PROGRAMS.get(int(program), {})     # curated obsnum -> field
+    if not want:
+        return []                                # uncurated / treasury (dynamic obs)
+
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return [ln.strip() for ln in r.read().decode().splitlines() if ln.strip()]
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as ex:
-        msg = f"fetch FAILED: {url_or_path}: {ex.__class__.__name__}: {ex}"
+        rows = MM.query_program(program)
+    except mast_query_errors() as ex:            # network / MAST service error
+        msg = f"MAST query FAILED: program {int(program)}: {ex.__class__.__name__}: {ex}"
         print(f"data_qa.observations: {msg}", file=sys.stderr)
         LAST_FETCH_ERRORS.append(msg)
         return []
 
-
-def discover_from_release(base: str = RELEASE_BASE, fields: Dict[str, str] = None,
-                          local_dir: str = None) -> List["Observation"]:
-    """Build the observation list from each field's released image manifest.
-
-    One :class:`Observation` per (field, program, obs, instrument); its filters are every
-    filter with a released science mosaic.  Curated metadata is overlaid by obsid.
-    ``local_dir`` reads ``{local_dir}/{field}_images.txt`` instead of fetching (offline).
-    """
-    fields = fields or FIELDS
-    LAST_FETCH_ERRORS.clear()
-    grouped: Dict[tuple, set] = {}
-    merged: Dict[tuple, set] = {}
-    for fld, disp in fields.items():
-        src = (os.path.join(local_dir, f"{fld}_images.txt") if local_dir
-               else f"{base}/{fld}_images.txt")
-        for ln in _read_lines(src):
-            low = ln.lower()
-            if "_i2d.fits" not in low or "resbgsub" in low:
-                continue                       # science mosaics only (skip residual/model)
-            m = _MOSAIC_RE.search(low)
-            if not m:
-                continue
-            prog, ob, tile, inst, filt = m.groups()
-            key = (fld, disp, str(int(prog)), ob, inst.lower())
-            grouped.setdefault(key, set()).add(filt.upper())
-            if tile:                                   # combined-tile obsid: jw..-oOOO-TTT
-                merged.setdefault(key, set()).add(tile)
+    grouped: Dict[tuple, dict] = {}
+    for r in rows:
+        obsnum = MM.obsnum_from_obs_id(r.get("obs_id", ""))
+        if obsnum not in want:
+            continue                             # not a curated QA observation of this field
+        if (r.get("calib_level") or -1) < MM.MIN_ACTIONABLE_CALIB_LEVEL:
+            continue                             # planned / uncal-only: nothing to QA yet
+        inst = MM.instrument_class(r.get("instrument_name")) or "NIRCam"
+        g = grouped.setdefault((obsnum, inst), {"filters": [], "t_max": []})
+        for f in MM.parse_filters(r.get("filters")):
+            if f not in g["filters"]:
+                g["filters"].append(f)
+        g["t_max"].append(r.get("t_max"))
 
     out = []
-    for (fld, disp, prog, ob, inst), filts in sorted(grouped.items()):
-        oid = f"jw{int(prog):05d}-o{ob}"
+    for (obsnum, inst), g in sorted(grouped.items()):
+        field = want[obsnum]
+        oid = f"jw{int(program):05d}-o{obsnum}"
         cur = CURATED.get(oid, {})
         out.append(Observation(
-            program=prog, obs=ob, target=disp, release_field=fld,
-            instrument="NIRCam" if inst == "nircam" else "MIRI",
-            filters=sorted(filts), visits=cur.get("visits", []),
-            epoch=cur.get("epoch", ""), notes=cur.get("notes", ""),
-            merged_obsids=sorted(merged.get((fld, disp, prog, ob, inst.lower()), set())),
+            program=str(int(program)), obs=obsnum,
+            target=FIELDS.get(field, field.replace("_", " ").title()),
+            release_field=field, instrument=inst,
+            filters=sorted(g["filters"]),
+            visits=cur.get("visits", []),
+            epoch=cur.get("epoch") or _epoch_from_tmax(g["t_max"]),
+            notes=cur.get("notes", ""),
         ))
     return out
 
 
-def registry(programs=None, target=None, local_dir=None) -> List["Observation"]:
-    """Discovered observations, optionally filtered by program id(s) / target name."""
-    obs = discover_from_release(local_dir=local_dir)
+def registry(programs=None, target=None) -> List["Observation"]:
+    """The QA observation registry, built from MAST over the curated
+    :data:`mast_monitor.PROGRAMS` obsid->field map -- one Observation per (program, obs,
+    instrument) that has released calibrated products (``calib_level >= 2``).  Optionally
+    filtered by program id(s) or target name.  MAST-query failures are recorded to
+    :data:`LAST_FETCH_ERRORS` (checked by make_issues to avoid syncing an empty registry)."""
+    from . import mast_monitor as MM
+    LAST_FETCH_ERRORS.clear()
     if programs:
-        progs = {str(int(p)) for p in programs}
-        obs = [o for o in obs if o.program in progs]
+        progs = [int(p) for p in programs]
+    else:
+        progs = [p for p in MM.PROGRAMS if p != MM.TREASURY_PROGRAM]
+    obs: List[Observation] = []
+    for prog in progs:
+        obs.extend(_observations_for_program(prog))
     if target:
         t = target.lower()
         obs = [o for o in obs if o.target.lower() == t or o.field == t]
