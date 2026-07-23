@@ -156,24 +156,37 @@ def main(argv=None):
     ap.add_argument("--field", default=None, help="on-disk field dir (default: infer)")
     ap.add_argument("--offset-mas", type=float, default=None,
                     help="measured JWST↔refcat bulk offset for the comparison row")
-    ap.add_argument("--target", default=None)
+    ap.add_argument("--target", default=None,
+                    help="issue-title display name (e.g. 'Cloud C'); reverse-maps to the field dir")
+    ap.add_argument("--instrument", default="NIRCam", help="NIRCam | MIRI (issue-title suffix)")
     ap.add_argument("--post", action="store_true")
     ap.add_argument("--repo", default=os.environ.get("QA_REPO", "JWST-GC/data-qa"))
     args = ap.parse_args(argv)
 
     obs = f"{int(args.obs):03d}"     # zero-pad so globs use -o001 not -o1
-    # display name must match the issue title exactly -- use the FIELDS map ("cloudc"->"Cloud
-    # C", "sgrb2"->"Sgr B2"), NOT field.title() ("Cloudc"), else the issue lookup misses and
-    # no status comment is posted.
+    # Resolve BOTH the on-disk field dir and the issue-title display name.  These differ
+    # ("cloudc" <-> "Cloud C") and a program can span two fields (2221 = Brick + Cloud C), so
+    # the display name (from the issue title, via --target) disambiguates.  --field wins if
+    # given; else reverse-map the display name through FIELDS; else fall back to program-name.
     from .observations import FIELDS
-    _target = args.target or FIELDS.get(args.field or "", (args.field or "").title())
+    _rev = {disp: fld for fld, disp in FIELDS.items()}       # "Cloud C" -> "cloudc"
+    if args.field:
+        _field = args.field
+        _target = args.target or FIELDS.get(_field, _field.title())
+    elif args.target:
+        _target = args.target
+        _field = _rev.get(args.target, args.target.lower().replace(" ", ""))
+    else:
+        _field = ""
+        _target = f"jw{int(args.program):05d}"
+    _inst = args.instrument
 
     class _O:                       # light stand-in so this runs without the portal registry
         program = str(int(args.program))
-        field = args.field or ""; target = _target
-        instrument = "NIRCam"
+        field = _field; target = _target
+        instrument = _inst
         obsid = f"jw{int(args.program):05d}-o{obs}"
-        issue_title = f"{target} — {obsid} (NIRCam)"
+        issue_title = f"{target} — {obsid} ({_inst})"
     _O.obs = obs
     o = _O()
     block = render_status_block(o, offset_mas=args.offset_mas)
