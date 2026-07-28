@@ -40,6 +40,17 @@ export GITHUB_TOKEN
 [ -n "${GITHUB_TOKEN:-}" ] || { echo "GITHUB_TOKEN not set" >&2; exit 2; }
 export QA_OUTDIR="${QA_OUTDIR:-$(mktemp -d)}"
 
+# Auth preflight: gh falls back to a possibly-stale token in hosts.yml, and in a headless
+# (scron/cron) env `gh auth token` can hand back an INVALID token -> a 401 that the
+# enumeration below would swallow, silently "refreshing" 0 issues.  Fail LOUDLY instead so a
+# broken token is obvious, not a quiet no-op every day.  (Provide a valid PAT via
+# ~/.config/data-qa/github_token or the GITHUB_TOKEN env.)
+if ! gh api user -q .login >/dev/null 2>&1; then
+    echo "FATAL: GitHub auth failed (token invalid/expired). In a headless env, put a valid" >&2
+    echo "       PAT in ~/.config/data-qa/github_token (Issues+Contents write on $REPO)." >&2
+    exit 2
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
