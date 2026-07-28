@@ -156,26 +156,45 @@ def main(argv=None):
     ap.add_argument("--field", default=None, help="on-disk field dir (default: infer)")
     ap.add_argument("--offset-mas", type=float, default=None,
                     help="measured JWST↔refcat bulk offset for the comparison row")
-    ap.add_argument("--target", default=None)
+    ap.add_argument("--target", default=None,
+                    help="issue-title display name (e.g. 'Cloud C'); reverse-maps to the field dir")
+    ap.add_argument("--instrument", default="NIRCam", help="NIRCam | MIRI (issue-title suffix)")
     ap.add_argument("--post", action="store_true")
     ap.add_argument("--repo", default=os.environ.get("QA_REPO", "JWST-GC/data-qa"))
     args = ap.parse_args(argv)
 
     obs = f"{int(args.obs):03d}"     # zero-pad so globs use -o001 not -o1
+    # Resolve BOTH the on-disk field dir and the issue-title display name.  These differ
+    # ("cloudc" <-> "Cloud C") and a program can span two fields (2221 = Brick + Cloud C), so
+    # the display name (from the issue title, via --target) disambiguates.  --field wins if
+    # given; else reverse-map the display name through FIELDS; else fall back to program-name.
+    from .observations import FIELDS
+    _rev = {disp: fld for fld, disp in FIELDS.items()}       # "Cloud C" -> "cloudc"
+    if args.field:
+        _field = args.field
+        _target = args.target or FIELDS.get(_field, _field.title())
+    elif args.target:
+        _target = args.target
+        _field = _rev.get(args.target, args.target.lower().replace(" ", ""))
+    else:
+        _field = ""
+        _target = f"jw{int(args.program):05d}"
+    _inst = args.instrument
 
     class _O:                       # light stand-in so this runs without the portal registry
         program = str(int(args.program))
-        field = args.field or ""; target = args.target or (args.field or "").title()
-        instrument = "NIRCam"
+        field = _field; target = _target
+        instrument = _inst
         obsid = f"jw{int(args.program):05d}-o{obs}"
-        issue_title = f"{target} — {obsid} (NIRCam)"
+        issue_title = f"{target} — {obsid} ({_inst})"
     _O.obs = obs
     o = _O()
     block = render_status_block(o, offset_mas=args.offset_mas)
     print(block)
     if args.post:
         try:
-            from .post_diagnostics import _token, _issue_number, _find_stage_comment, _req, API
+            from .post_diagnostics import (_token, _issue_number, _find_stage_comment, _req,
+                                           API, PostError)
         except ImportError:
             print("post requires data_qa.post_diagnostics (merges with PR #17); skipping post",
                   file=sys.stderr)
@@ -185,7 +204,13 @@ def main(argv=None):
         num = _issue_number(args.repo, token, o.issue_title)
         if num is None:
             print(f"no issue titled {o.issue_title!r}", file=sys.stderr); return 1
-        existing = _find_stage_comment(args.repo, token, num, MARKER)
+        # A lookup failure raises (rather than reporting "not found") so a transient API
+        # hiccup can never make us POST a duplicate status comment -- skip this run instead.
+        try:
+            existing = _find_stage_comment(args.repo, token, num, MARKER)
+        except PostError as e:
+            print(f"status lookup failed, skipping to avoid a duplicate: {e}", file=sys.stderr)
+            return 1
         if existing:
             st, data = _req("PATCH", f"{API}/repos/{args.repo}/issues/comments/{existing['id']}",
                             token, data=json.dumps({"body": block}).encode())
