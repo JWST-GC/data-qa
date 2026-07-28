@@ -43,12 +43,21 @@ OUTDIR = os.environ.get("QA_OUTDIR", "/tmp/data_qa_figures")
 DIAG_MARKER = "<!-- data-qa:diag:stage{n} -->"
 
 # Filter selection: prefer the requested filters; else nearest SW / LW.
-_SW_PREF = ["F212N", "F200W", "F187N", "F182M", "F162M", "F150W", "F115W"]
-_LW_PREF = ["F480M", "F470N", "F466N", "F444W", "F410M", "F405N", "F360M", "F356W", "F323N", "F300M", "F277W"]
+_SW_PREF = ["F212N", "F210M", "F200W", "F187N", "F182M", "F164N", "F162M", "F150W", "F140M", "F115W"]
+_LW_PREF = ["F480M", "F470N", "F466N", "F444W", "F410M", "F405N", "F360M", "F356W", "F335M",
+            "F323N", "F300M", "F277W", "F250M"]
 
 
 def _channel(filt):
     return "SW" if int(filt[1:4]) <= 212 else "LW"
+
+
+def _has_lw(o: "Observation"):
+    """Does this obs actually carry an LW-channel filter?  Distinguishes a genuine
+    single-channel obs (legitimately no colour) from a PREF-list gap (an LW mosaic exists but
+    wasn't recognised) -- the two must NOT be conflated, or the latter silently PASSes with
+    its LW data unexamined."""
+    return any(_channel(f) == "LW" for f in getattr(o, "filters", []) if f)
 
 
 def pick_filters(available, sw=None, lw=None):
@@ -62,7 +71,7 @@ def pick_filters(available, sw=None, lw=None):
 # --------------------------------------------------------------------------- product lookup
 def _mosaic_path(o: Observation, filt):
     """Released merged i2d for this obs+filter, or None."""
-    if not filt:                     # single-filter obs (e.g. gc2211 o028 = F150W only) has no LW
+    if not filt:                     # obs with no filter for this channel (e.g. a single-band obs)
         return None
     stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_i2d.fits"
     pats = [
@@ -245,7 +254,9 @@ def stage1_mosaics(o: Observation, sw, lw):
     metrics = dict(stage=1, sw=sw, lw=lw,
                    sw_present=bool(psw), lw_present=bool(plw),
                    finite_fraction=fracs,
-                   passed=bool(psw and (plw or lw is None)))   # single-filter obs: LW legitimately absent
+                   # pass on SW alone ONLY when the obs genuinely has no LW-channel filter;
+                   # if an LW filter exists but its mosaic/pick is missing, that is NOT a pass.
+                   passed=bool(psw and (plw or not _has_lw(o))))
     return png, metrics
 
 
@@ -281,8 +292,11 @@ def stage2_cmd(o: Observation, sw, lw):
         return _save(fig, f"{o.obsid}_stage2.png"), metrics
     t = Table.read(cat)
 
-    # single-filter obs: no colour -> plain luminosity function (still tracks depth)
-    if lw is None and csw:
+    # LF-only fallback ONLY for a genuine single-channel obs (no LW filter at all).  If lw is
+    # None but the obs DOES carry an LW-channel filter, that is a PREF-gap / missing-mosaic
+    # problem, not a single-band obs -- fall through so it fails visibly instead of quietly
+    # degrading to a single-band LF with the LW data unexamined.
+    if lw is None and csw and not _has_lw(o):
         fig, ax = _fig(1, 1, 6.5, 5.0)
         a = ax[0][0]
         m = np.asarray(t[csw], float); g = np.isfinite(m)
@@ -310,15 +324,20 @@ def stage2_cmd(o: Observation, sw, lw):
     msw = np.asarray(t[csw], float); mlw = np.asarray(t[clw], float)
     g = np.isfinite(msw) & np.isfinite(mlw)
     color = msw[g] - mlw[g]; mag = mlw[g]
-    fig = plt.figure(figsize=(7.6, 6.2))
-    gs = fig.add_gridspec(1, 2, width_ratios=[4.0, 1.15], wspace=0.04)
+    fig = plt.figure(figsize=(8.2, 6.2))
+    # main CMD | marginal LF | dedicated colorbar column (so the bar doesn't steal marginal width)
+    gs = fig.add_gridspec(1, 3, width_ratios=[4.0, 1.15, 0.16], wspace=0.05)
     a = fig.add_subplot(gs[0, 0])
     amarg = fig.add_subplot(gs[0, 1], sharey=a)          # y-axis (mag) LOCKED to the CMD
+    cax = fig.add_subplot(gs[0, 2])
     hb = a.hexbin(color, mag, gridsize=120, bins="log", cmap="viridis", mincnt=1)
     a.set_xlabel(f"{sw} - {lw}"); a.set_ylabel(lw)
-    a.invert_yaxis()                                     # marginal follows via sharey
     a.set_xlim(np.nanpercentile(color, [1, 99]))
-    fig.colorbar(hb, ax=amarg, label="log N stars (CMD)", shrink=0.85, pad=0.28)
+    # y-range from the mag percentiles (LF outliers otherwise leave ~1/3 of the panel empty);
+    # inverted so brighter is up.
+    ylo, yhi = np.nanpercentile(mag, [0.5, 99.5])
+    a.set_ylim(yhi, ylo)                                  # marginal follows via sharey
+    fig.colorbar(hb, cax=cax, label="log N stars (CMD)")
     # marginal LF: counts vs magnitude, bars run horizontally so mag lines up with the CMD
     hh, edges = np.histogram(mag, bins=50)
     ctr = 0.5 * (edges[1:] + edges[:-1])
@@ -654,10 +673,14 @@ def stage5_intermodule(o: Observation, sw):
             fig.text(0.5, 0.02, "overlap-zone star cutouts from the merged mosaic "
                      "(a mis-tie doubles/elongates these)", ha="center", fontsize=8)
         title_extra = ""
+        suptitle_y = 0.98
     else:
-        # no A/B overlap -> quiver only, at a compact size (no empty right half / cutout row)
-        fig = plt.figure(figsize=(6.0, 5.2))
+        # no A/B overlap -> quiver only, at a compact size (no empty right half / cutout row).
+        # Reserve top room so the suptitle clears the axes title + quiverkey (all top-anchored).
+        fig = plt.figure(figsize=(6.4, 5.9))
         _draw_quiver(fig.add_subplot(1, 1, 1))
+        fig.subplots_adjust(top=0.80)
+        suptitle_y = 0.995
         title_extra = (f"  ·  single module ({single_module})" if single_module
                        else "  ·  A/B overlap not measurable")
 
@@ -666,7 +689,7 @@ def stage5_intermodule(o: Observation, sw):
         metrics["single_module"] = single_module
     metrics["passed"] = bool(single_module or (ov and ov["off"] < aa.THRESH["intermodule"]))
     fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module tie ({filt}){title_extra}",
-                 fontsize=11)
+                 fontsize=11, y=suptitle_y)
     return _save(fig, f"{o.obsid}_stage5.png"), metrics
 
 
@@ -784,7 +807,9 @@ def main(argv=None):
     for n in args.stage:
         try:
             png, metrics = build_stage(o, n, sw, lw)
-        except (OSError, ValueError, IndexError, KeyError, RuntimeError, AttributeError) as e:
+        # NB: AttributeError is deliberately NOT caught -- it almost always means a typo in a
+        # stage, not a data problem (the real None-attr data cases are guarded at the source).
+        except (OSError, ValueError, IndexError, KeyError, RuntimeError) as e:
             print(f"  stage {n}: FAILED to build: {type(e).__name__}: {e}", file=sys.stderr)
             all_metrics[f"stage{n}"] = dict(stage=n, error=f"{type(e).__name__}: {e}", passed=False)
             with open(mpath, "w") as fh:

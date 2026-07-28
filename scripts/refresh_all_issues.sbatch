@@ -15,6 +15,7 @@
 #SBATCH --time=2:00:00
 #SBATCH --job-name=data-qa-refresh-all-issues
 #SBATCH --output=/orange/adamginsburg/jwst/logs/dataqa_refresh_%j.out
+set -euo pipefail
 
 REPO_ROOT="${QA_REPO_ROOT:-/blue/adamginsburg/adamginsburg/repos/data-qa}"
 
@@ -24,8 +25,11 @@ if [ -z "${GITHUB_TOKEN:-}" ] && [ -f "$HOME/.config/data-qa/github_token" ]; th
 fi
 export GITHUB_TOKEN
 
-export QA_OUTDIR="${QA_OUTDIR:-$SLURM_TMPDIR/qafigs}"
-[ -n "${SLURM_TMPDIR:-}" ] || export QA_OUTDIR="/tmp/qafigs_$$"
+# Respect a caller-supplied QA_OUTDIR; only pick a default when it is unset (SLURM_TMPDIR is
+# usually unset here, so keying the default off it would clobber the caller's dir).
+if [ -z "${QA_OUTDIR:-}" ]; then
+    export QA_OUTDIR="${SLURM_TMPDIR:-/tmp}/qafigs_${SLURM_JOB_ID:-$$}"
+fi
 
 cd "$REPO_ROOT"
 bash scripts/refresh_all_issues.sh

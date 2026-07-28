@@ -70,9 +70,16 @@ rev = {d.lower(): f for f, d in FIELDS.items()}          # "W51" -> "w51"
 excl = set((os.environ.get("QA_EXCLUDE_FIELDS") or "").split())
 excl_re = re.compile(os.environ.get("QA_EXCLUDE_RE") or r"(?!x)x", re.I)
 pat = re.compile(r"^(.*?)\s+[—-]\s+jw0*(\d+)-o(\d{3})\s+\((NIRCam|MIRI)\)", re.I)
+obsish = re.compile(r"jw\d{5}-o\d{3}", re.I)
 for line in sys.stdin:
-    m = pat.match(line.strip())
+    t = line.strip()
+    m = pat.match(t)
     if not m:
+        # A title that CARRIES an obsid but did not match the full pattern (odd dash, altered
+        # suffix, rename) would otherwise vanish silently -- this PR is about not letting QA
+        # signals disappear quietly, so say so.  Titles with no obsid at all are meta issues.
+        if obsish.search(t):
+            print(f"WARN unmatched obs-issue title (skipped): {t!r}", file=sys.stderr)
         continue
     disp, prog, obs, inst = m.groups()
     field = rev.get(disp.lower(), disp.lower().replace(" ", ""))
@@ -84,15 +91,20 @@ for line in sys.stdin:
 echo "refresh_all_issues: ${#SPECS[@]} in-scope observation issues in $REPO"
 
 rc_any=0
+# rc_any is a REAL failure signal: set it on a non-zero exit or an error keyword in the
+# output, NOT merely because the display-grep matched nothing (a quiet success prints little).
+note_failure() { case "$1" in *FAILED*|*"no obs"*|*"no issue"*) return 0;; esac; [ "$2" -ne 0 ]; }
 for spec in "${SPECS[@]}"; do
   IFS=$'\t' read -r prog obs inst disp <<< "$spec"
   echo "===== $disp — jw$(printf %05d "$prog")-o$obs ($inst) ====="
   if [ "${inst,,}" = "nircam" ]; then
-    python3 -m data_qa.diagnostics --program "$prog" --obs "$obs" --target "$disp" --stage $STAGES --post \
-      2>&1 | grep -iE "SW=|stage [0-9]:|created|updated|FAILED|no obs" || rc_any=1
+    out=$(python3 -m data_qa.diagnostics --program "$prog" --obs "$obs" --target "$disp" --stage $STAGES --post 2>&1); drc=$?
+    echo "$out" | grep -iE "SW=|stage [0-9]:|created|updated|FAILED|no obs" || true
+    note_failure "$out" "$drc" && rc_any=1
   fi
-  python3 -m data_qa.pipeline_status --program "$prog" --obs "$obs" --target "$disp" --instrument "$inst" --post \
-    2>&1 | grep -iE "created|updated|status comment|no issue|FAILED" | tail -1 || rc_any=1
+  sout=$(python3 -m data_qa.pipeline_status --program "$prog" --obs "$obs" --target "$disp" --instrument "$inst" --post 2>&1); src=$?
+  echo "$sout" | grep -iE "created|updated|status comment|no issue|FAILED" | tail -1 || true
+  note_failure "$sout" "$src" && rc_any=1
 done
 echo "refresh_all_issues: done (rc_any=$rc_any)"
 exit "$rc_any"

@@ -97,7 +97,12 @@ def _issue_number(repo, token, title):
     matches, page = [], 1
     while True:
         st, data = _req("GET", f"{API}/repos/{repo}/issues?state=all&per_page=100&page={page}", token)
-        if st != 200 or not data:
+        if st != 200:
+            # Same "transient error indistinguishable from a real negative" trap as
+            # _find_stage_comment: a 5xx/rate-limit mid-scan must NOT masquerade as "no such
+            # issue" (-> a silent per-issue no-op on a cron run).  Raise instead.
+            raise PostError(f"issue lookup failed ({st}) for {title!r}: {data}")
+        if not data:                       # successful empty page -> end of pagination
             break
         for it in data:
             if "pull_request" in it:
@@ -142,14 +147,17 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None):
     num = _issue_number(repo, token, o.issue_title)
     if num is None:
         raise PostError(f"no issue titled {o.issue_title!r} in {repo}")
+    # Resolve the existing comment BEFORE uploading the asset: _find_stage_comment can raise on
+    # a transient lookup failure, and doing it first keeps that a clean no-op instead of leaving
+    # an already-replaced release asset behind.
+    marker = DIAG_MARKER.format(n=stage)
+    existing = _find_stage_comment(repo, token, num, marker)
     asset_name = f"{o.obsid}_stage{stage}.png"
     img_url = upload_asset(repo, token, png_path, asset_name)
-    marker = DIAG_MARKER.format(n=stage)
     body = (f"{marker}\n### QA diagnostic — stage {stage}\n\n"
             f"{caption}\n\n"
             f"![{asset_name}]({img_url})\n\n"
             f"<sub>auto-posted by `data_qa.diagnostics`; updates in place as the pipeline advances.</sub>")
-    existing = _find_stage_comment(repo, token, num, marker)
     if existing:
         st, data = _req("PATCH", f"{API}/repos/{repo}/issues/comments/{existing['id']}", token,
                         data=json.dumps({"body": body}).encode())
