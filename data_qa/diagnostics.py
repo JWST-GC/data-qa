@@ -151,6 +151,50 @@ def _catalog_for(o: Observation, sw, lw):
     return best[:4]
 
 
+def _catalog_with_vega(o: Observation, filt):
+    """Highest-priority catalog carrying ``mag_vega_<filt>`` (+ its skycoord col), or
+    (None, None, None).  Used to Vega-calibrate the per-exposure instrumental mags."""
+    from astropy.io import fits
+    want_mag = f"mag_vega_{filt.lower()}"
+    want_sc = f"skycoord_{filt.lower()}"
+    best = (None, None, None, -1)
+    for p, kind, tier in _catalog_candidates(o):
+        try:
+            hdr = fits.getheader(p, ext=1)
+        except (OSError, IndexError):
+            continue
+        ncol = hdr.get("TFIELDS", 0)
+        low = {str(hdr.get(f"TTYPE{i}", "")).lower() for i in range(1, ncol + 1)}
+        # skycoord mixin serializes as "<name>.ra"/".dec" in TTYPE
+        if want_mag in low and f"{want_sc}.ra" in low and tier > best[-1]:
+            best = (p, want_mag, want_sc, tier)
+    return best[:3]
+
+
+def _vega_zeropoint(o: Observation, filt, sc, instr):
+    """Robust instrumental->Vega zeropoint ZP (vega = instr + ZP) for one filter, from matching
+    the pooled per-exposure detections to the merged catalog's ``mag_vega_<filt>``.  Uses the
+    bright 40% (where the instrumental mag is well-measured) for the median.  Returns ZP or
+    None when there is no Vega catalog / too few matches."""
+    import astropy.units as u
+    from astropy.table import Table
+    cat, magcol, sccol = _catalog_with_vega(o, filt)
+    if not cat:
+        return None
+    m = Table.read(cat)
+    if sccol not in m.colnames or magcol not in m.colnames:
+        return None
+    vg = np.asarray(m[magcol], float)
+    idx, sep, _ = sc.match_to_catalog_sky(m[sccol])
+    good = (sep < 0.05 * u.arcsec) & np.isfinite(instr) & np.isfinite(vg[idx])
+    if good.sum() < 50:
+        return None
+    ii = instr[good]
+    zz = vg[idx][good] - ii
+    bright = ii <= np.percentile(ii, 40)     # bright end: cleanest instrumental mags
+    return float(np.median(zz[bright])) if bright.sum() >= 20 else float(np.median(zz))
+
+
 def _refcat_path(o: Observation):
     """VIRAC2-Gaia refcat (newest epoch) for the absolute-frame (position-only) check."""
     hits = sorted(glob.glob(f"{BASE}/{o.field}/catalogs/gaia_virac2_refcat_epoch*.fits"))
@@ -864,7 +908,7 @@ def _build_stage5(o, sw, lw):
 
 # --------------------------------------------------------------------------- STAGE 6
 def stage6_astrom_error(o: Observation, sw, lw):
-    """Astrometric precision curve: per-star position sigma (mas) vs instrumental magnitude,
+    """Astrometric precision curve: per-star position sigma (mas) vs Vega magnitude,
     from the per-exposure PSF fits.  The bright-end floor is the astrometric systematic limit;
     the faint-end rise tracks S/N.  One curve per available channel (SW / LW)."""
     import matplotlib
@@ -874,6 +918,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
     fig, ax = _fig(1, 1, 6.8, 5.2)
     a = ax[0][0]
     any_data = False
+    all_vega = True
     for filt, color in [(sw, "#3366cc"), (lw, "#cc3311")]:
         if not filt:
             continue
@@ -881,6 +926,14 @@ def stage6_astrom_error(o: Observation, sw, lw):
         if pooled is None:
             continue
         _sc, sig_ra, sig_de, mag, _flux = pooled
+        # Vega-calibrate the instrumental mag (vega = instr + ZP) via the merged catalog; fall
+        # back to instrumental if there is no Vega catalog for this filter.
+        zp = _vega_zeropoint(o, filt, _sc, mag)
+        if zp is not None:
+            mag = mag + zp
+            metrics[f"vega_zp_{filt.lower()}"] = float(zp)
+        else:
+            all_vega = False
         sig = np.hypot(sig_ra, sig_de) / np.sqrt(2.0)     # per-axis-equivalent astrometric error
         # Drop failed fits: a formal sigma of hundreds-to-thousands of mas is a diverged PSF
         # fit on a noise peak, not astrometry -- keeping it compresses the informative regime.
@@ -889,10 +942,12 @@ def stage6_astrom_error(o: Observation, sw, lw):
         if med is None:
             continue
         any_data = True
-        a.plot(ctr, med, "-", color=color, lw=1.7, label=f"{filt}  (n={int(ok.sum())})")
+        lbl = f"{filt}  (n={int(ok.sum())}" + ("" if zp is not None else ", instr") + ")"
+        a.plot(ctr, med, "-", color=color, lw=1.7, label=lbl)
         a.fill_between(ctr, lo, hi, color=color, alpha=0.20)
         metrics[f"floor_mas_{filt.lower()}"] = float(np.nanmin(med))
         metrics[f"nstars_{filt.lower()}"] = int(ok.sum())
+    metrics["mag_kind"] = "vega" if all_vega else "mixed"
     if not any_data:
         reason = "no per-exposure DAOPHOT catalogs on disk for this obs/filter"
         png = _red_flag_figure(o, "stage6", "ASTROMETRIC-ERROR CURVE UNAVAILABLE",
@@ -901,7 +956,9 @@ def stage6_astrom_error(o: Observation, sw, lw):
         return png, metrics
     a.set_yscale("log")
     a.set_ylim(0.03, 100.0)          # 0.03-100 mas: floor through the S/N rise; junk lives above
-    a.set_xlabel(r"instrumental magnitude  ($-2.5\,\log_{10}\,$flux$_{\rm fit}$)")
+    xlbl = ("Vega magnitude" if all_vega else
+            "magnitude  (Vega where calibrated, else instrumental)")
+    a.set_xlabel(xlbl)
     a.set_ylabel(r"astrometric error  $\sigma_{\rm pos}$ (mas)")
     a.legend(fontsize=9, loc="upper left")
     a.grid(alpha=0.25, which="both")
@@ -941,10 +998,10 @@ CAPTIONS = {
        "(bulk-removed; A–B diff {intermodule_diff:.1f} mas), the reference-free NRCA–NRCB overlap "
        "(offset {intermodule_off:.1f} mas, RMS {intermodule_rms:.1f} mas over {n_overlap} shared "
        "stars), and overlap-zone star cutouts (a mis-tie doubles them).",
-    6: "**Stage 6 — astrometric precision.** Per-star position error σ_pos (mas) vs "
-       "instrumental magnitude from the per-exposure PSF fits, one curve per channel. The "
-       "bright-end floor is the astrometric systematic limit; the faint-end rise tracks S/N. "
-       "Shaded band = 16–84th percentile.",
+    6: "**Stage 6 — astrometric precision.** Per-star position error σ_pos (mas) vs Vega "
+       "magnitude from the per-exposure PSF fits (instrumental mag Vega-calibrated against the "
+       "merged catalog), one curve per channel. The bright-end floor is the astrometric "
+       "systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percentile.",
 }
 
 
