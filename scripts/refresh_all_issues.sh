@@ -18,13 +18,13 @@
 #   QA_REPO             default JWST-GC/data-qa
 #   QA_BASE             default /orange/adamginsburg/jwst   (on-disk products)
 #   QA_OUTDIR           scratch dir for the rendered PNGs   (default: mktemp)
-#   REFRESH_STAGES      default "1 2 3 4 5"
+#   REFRESH_STAGES      default "1 2 3 4 5 6"
 #   QA_EXCLUDE_FIELDS   default "w51 wd1 wd2 ngc6334"       (field keys to skip)
 #   QA_EXCLUDE_RE       default "westerlund|ngc ?6334|globular|w51"  (display-name skip regex)
 set -uo pipefail
 
 REPO="${QA_REPO:-JWST-GC/data-qa}"
-STAGES="${REFRESH_STAGES:-1 2 3 4 5}"
+STAGES="${REFRESH_STAGES:-1 2 3 4 5 6}"
 
 # Token: exported env, else a 600-perm PAT file, else gh's stored creds.
 if [ -z "${GITHUB_TOKEN:-}" ]; then

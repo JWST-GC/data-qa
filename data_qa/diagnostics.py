@@ -47,6 +47,10 @@ _SW_PREF = ["F212N", "F210M", "F200W", "F187N", "F182M", "F164N", "F162M", "F150
 _LW_PREF = ["F480M", "F470N", "F466N", "F444W", "F410M", "F405N", "F360M", "F356W", "F335M",
             "F323N", "F300M", "F277W", "F250M"]
 
+# VIRAC2 per-star PM-error floor (mas/yr): used for the offset-significance denominator when a
+# field's refcache lacks e_pmRA/e_pmDE (median of the columns where they are present).
+PM_ERR_FLOOR = 2.0
+
 
 def _channel(filt):
     return "SW" if int(filt[1:4]) <= 212 else "LW"
@@ -147,6 +151,50 @@ def _catalog_for(o: Observation, sw, lw):
     return best[:4]
 
 
+def _catalog_with_vega(o: Observation, filt):
+    """Highest-priority catalog carrying ``mag_vega_<filt>`` (+ its skycoord col), or
+    (None, None, None).  Used to Vega-calibrate the per-exposure instrumental mags."""
+    from astropy.io import fits
+    want_mag = f"mag_vega_{filt.lower()}"
+    want_sc = f"skycoord_{filt.lower()}"
+    best = (None, None, None, -1)
+    for p, kind, tier in _catalog_candidates(o):
+        try:
+            hdr = fits.getheader(p, ext=1)
+        except (OSError, IndexError):
+            continue
+        ncol = hdr.get("TFIELDS", 0)
+        low = {str(hdr.get(f"TTYPE{i}", "")).lower() for i in range(1, ncol + 1)}
+        # skycoord mixin serializes as "<name>.ra"/".dec" in TTYPE
+        if want_mag in low and f"{want_sc}.ra" in low and tier > best[-1]:
+            best = (p, want_mag, want_sc, tier)
+    return best[:3]
+
+
+def _vega_zeropoint(o: Observation, filt, sc, instr):
+    """Robust instrumental->Vega zeropoint ZP (vega = instr + ZP) for one filter, from matching
+    the pooled per-exposure detections to the merged catalog's ``mag_vega_<filt>``.  Uses the
+    bright 40% (where the instrumental mag is well-measured) for the median.  Returns ZP or
+    None when there is no Vega catalog / too few matches."""
+    import astropy.units as u
+    from astropy.table import Table
+    cat, magcol, sccol = _catalog_with_vega(o, filt)
+    if not cat:
+        return None
+    m = Table.read(cat)
+    if sccol not in m.colnames or magcol not in m.colnames:
+        return None
+    vg = np.asarray(m[magcol], float)
+    idx, sep, _ = sc.match_to_catalog_sky(m[sccol])
+    good = (sep < 0.05 * u.arcsec) & np.isfinite(instr) & np.isfinite(vg[idx])
+    if good.sum() < 50:
+        return None
+    ii = instr[good]
+    zz = vg[idx][good] - ii
+    bright = ii <= np.percentile(ii, 40)     # bright end: cleanest instrumental mags
+    return float(np.median(zz[bright])) if bright.sum() >= 20 else float(np.median(zz))
+
+
 def _refcat_path(o: Observation):
     """VIRAC2-Gaia refcat (newest epoch) for the absolute-frame (position-only) check."""
     hits = sorted(glob.glob(f"{BASE}/{o.field}/catalogs/gaia_virac2_refcat_epoch*.fits"))
@@ -158,6 +206,45 @@ def _viraccache_path(o: Observation):
     The gaia_virac2 refcat carries only a blended 'refmag', unusable for a Ks zeropoint."""
     p = f"{BASE}/{o.field}/astrometry_diag/refcache/virac2.fits"
     return p if os.path.exists(p) else None
+
+
+def _virac_with_errors(o: Observation, epoch):
+    """VIRAC2 cache PM-propagated to ``epoch`` WITH per-star position sigma at that epoch:
+    sigma = hypot(base position error, |baseline| * PM error).  The gaia_virac2 refcat used
+    elsewhere carries no per-star error, so offset SIGNIFICANCE needs the raw cache
+    (e_RAJ2000/e_pmRA...).  Returns (SkyCoord, sig_ra_mas, sig_de_mas) or None.  At an ~8.7 yr
+    baseline the PM-error term (~2 mas/yr) dominates -- so it is the right denominator for
+    'is the measured offset significant?', not the JWST single-exposure sigma alone."""
+    p = _viraccache_path(o)
+    if not p:
+        return None
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    t = Table.read(p)
+    need = {"RAJ2000", "DEJ2000", "e_RAJ2000", "e_DEJ2000", "pmRA", "pmDE"}
+    if not need.issubset(set(t.colnames)):
+        return None
+    ra = np.asarray(t["RAJ2000"], float); dec = np.asarray(t["DEJ2000"], float)
+    pmra = np.nan_to_num(np.asarray(t["pmRA"], float))
+    pmdec = np.nan_to_num(np.asarray(t["pmDE"], float))
+    dt = epoch - 2014.0                                 # VIRAC2 base epoch
+    ra = ra + (pmra * dt / 3.6e6) / np.cos(np.radians(dec))
+    dec = dec + pmdec * dt / 3.6e6
+    # Some field caches carry position errors but not per-star PM errors; the PM-error term
+    # dominates at an 8.7 yr baseline, so fall back to VIRAC2's ~2 mas/yr median rather than
+    # dropping it (which would spuriously inflate the offset significance).
+    e_pmra = np.asarray(t["e_pmRA"], float) if "e_pmRA" in t.colnames else np.full(len(t), PM_ERR_FLOOR)
+    e_pmde = np.asarray(t["e_pmDE"], float) if "e_pmDE" in t.colnames else np.full(len(t), PM_ERR_FLOOR)
+    e_pmra = np.where(np.isfinite(e_pmra), e_pmra, PM_ERR_FLOOR)
+    e_pmde = np.where(np.isfinite(e_pmde), e_pmde, PM_ERR_FLOOR)
+    sra = np.hypot(np.asarray(t["e_RAJ2000"], float), abs(dt) * e_pmra)
+    sde = np.hypot(np.asarray(t["e_DEJ2000"], float), abs(dt) * e_pmde)
+    g = (np.isfinite(ra) & np.isfinite(dec) & np.isfinite(sra) & np.isfinite(sde) &
+         (sra > 0) & (sde > 0))
+    if g.sum() < 30:
+        return None
+    return SkyCoord(ra[g] * u.deg, dec[g] * u.deg), sra[g], sde[g]
 
 
 # --------------------------------------------------------------------------- figure helpers
@@ -190,6 +277,12 @@ def _save(fig, name):
     import matplotlib.pyplot as plt
     plt.close(fig)
     return out
+
+
+def plt_circle(r, color):
+    """Dashed origin-centred circle patch (used to mark n-sigma contours)."""
+    from matplotlib.patches import Circle
+    return Circle((0, 0), r, fill=False, ec=color, lw=1.0, ls="--")
 
 
 def _red_flag_figure(o, stage_name, title, reason):
@@ -396,12 +489,74 @@ def stage3_calibration(o: Observation, sw):
 
 
 # --------------------------------------------------------------------------- STAGE 4
+def _pooled_daophot(o: Observation, filt, max_files=64):
+    """Pool the per-exposure DAOPHOT cats for one filter into (position, per-star astrometric
+    sigma, instrumental mag, flux).  Unlike the merged science catalog, the per-exposure cats
+    carry the formal PSF-fit position uncertainty: ``dra``/``ddec`` are the RA/Dec 1-sigma
+    errors in arcsec (== x_err/y_err * pixel scale, so no pixel-scale assumption is needed).
+    Returns (SkyCoord, sig_ra_mas, sig_de_mas, instr_mag, flux) or None."""
+    import astropy.units as u
+    from astropy.table import vstack, Table
+    cats = sorted(glob.glob(
+        f"{BASE}/{o.field}/{filt}/{filt.lower()}_*_visit*_*_m3_daophot_basic.fits"))
+    if not cats:
+        return None
+    cats = cats[:max_files]            # a full field-filter can be 100+ exposures; cap the pool
+    need = {"skycoord_centroid", "dra", "ddec", "flux_fit"}
+    tabs = []
+    for c in cats:
+        try:
+            t = Table.read(c)
+        except (OSError, ValueError):
+            continue
+        if need.issubset(set(t.colnames)):
+            tabs.append(t["skycoord_centroid", "dra", "ddec", "flux_fit"])
+    if not tabs:
+        return None
+    T = vstack(tabs, metadata_conflicts="silent")
+    sc = T["skycoord_centroid"]
+    sig_ra = np.asarray(T["dra"], float) * 1000.0     # arcsec -> mas
+    sig_de = np.asarray(T["ddec"], float) * 1000.0
+    flux = np.asarray(T["flux_fit"], float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mag = -2.5 * np.log10(flux)
+    good = (np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(sig_ra) &
+            np.isfinite(sig_de) & (sig_ra > 0) & (sig_de > 0) & np.isfinite(mag) & (flux > 0))
+    if good.sum() < 50:
+        return None
+    return sc[good], sig_ra[good], sig_de[good], mag[good], flux[good]
+
+
+def _binned_stat(x, y, width=0.5, minn=15):
+    """Median + 16/84 percentile band of ``y`` in fixed-width bins of ``x``.  Bins with fewer
+    than ``minn`` points are dropped.  Returns (med, p16, p84, centre) arrays or (None,)*4."""
+    g = np.isfinite(x) & np.isfinite(y) & (y > 0)
+    x, y = x[g], y[g]
+    if x.size < minn:
+        return None, None, None, None
+    edges = np.arange(np.floor(x.min() / width) * width,
+                      np.ceil(x.max() / width) * width + width, width)
+    idx = np.digitize(x, edges)
+    ctr, med, p16, p84 = [], [], [], []
+    for b in range(1, len(edges)):
+        m = idx == b
+        if m.sum() < minn:
+            continue
+        ctr.append(0.5 * (edges[b - 1] + edges[b]))
+        med.append(np.median(y[m]))
+        p16.append(np.percentile(y[m], 16)); p84.append(np.percentile(y[m], 84))
+    if len(ctr) < 3:
+        return None, None, None, None
+    return np.array(med), np.array(p16), np.array(p84), np.array(ctr)
+
+
 def stage4_offsets(o: Observation, sw):
-    """JWST-VIRAC per-star dRA/dDec across the field (frame tie / PM precursor) + the
-    reference-free inter-module (NRCA vs NRCB) offset."""
+    """JWST-VIRAC per-star dRA/dDec across the field (frame tie / PM precursor), the per-star
+    offset SIGNIFICANCE (measured offset / its uncertainty), and the reference-free
+    inter-module (NRCA vs NRCB) offset."""
     import astropy.units as u
     from astropy.coordinates import search_around_sky
-    metrics = dict(stage=4, sw=sw)
+    metrics = dict(stage=4, sw=sw, offset_signif_med=None, offset_med_mas=None)
     path = _mosaic_path(o, sw)
     ref = _refcat_path(o)
     ep = aa.epoch_of(path) if path else None
@@ -444,8 +599,44 @@ def stage4_offsets(o: Observation, sw):
         metrics.update(red_flag=True, red_flag_reason=reason, n_matched=int(nmatch), passed=False)
         return png, metrics
 
-    fig, ax = _fig(1, 2 if im else 1, 5.4, 5.0)
-    a0 = ax[0][0]
+    # Per-star offset SIGNIFICANCE (measured offset / its uncertainty).  The mosaic detection
+    # used above carries no per-star error, so re-match using the per-exposure DAOPHOT cats,
+    # which do: sig = (JWST-VIRAC offset) / (per-star position sigma).  |sig|~1 means the
+    # residual is consistent with measurement noise; |sig|>>1 means a real, resolved offset.
+    sig_panel = None
+    pooled = _pooled_daophot(o, sw)
+    vwe = _virac_with_errors(o, ep) if ep else None
+    if pooled is not None and vwe is not None:
+        psc, sig_ra, sig_de, pmag, _pf = pooled
+        vsc, vsr, vsd = vwe
+        # Anchor on the SPARSE, unique VIRAC catalog (with per-star errors) and take each VIRAC
+        # star's NEAREST pooled detection within a tight radius.  search_around_sky over the
+        # ~1e6-row pool would return mostly random crowd matches (median sep ~ area-weighted,
+        # not the real offset); nearest-unique keeps it honest.  The offset uncertainty
+        # COMBINES both catalogs: hypot(JWST single-exposure sigma, VIRAC position+PM error).
+        idx, jsep, _ = vsc.match_to_catalog_sky(psc)
+        keep = jsep < 0.08 * u.arcsec
+        if keep.sum() >= 30:
+            vk = vsc[keep]; jk = psc[idx[keep]]
+            oda = (vk.ra - jk.ra).to(u.arcsec).value * np.cos(np.radians(jk.dec.deg)) * 1000
+            odd = (vk.dec - jk.dec).to(u.arcsec).value * 1000
+            stot_ra = np.hypot(sig_ra[idx[keep]], vsr[keep])
+            stot_de = np.hypot(sig_de[idx[keep]], vsd[keep])
+            zra = oda / stot_ra; zde = odd / stot_de
+            gz = np.isfinite(zra) & np.isfinite(zde)
+            if gz.sum() >= 30:
+                sig_panel = dict(zra=zra[gz], zde=zde[gz],
+                                 off_med=float(np.median(np.hypot(oda[gz], odd[gz]))),
+                                 sig_med=float(np.median(np.hypot(zra[gz], zde[gz]))),
+                                 n=int(gz.sum()))
+                metrics.update(offset_med_mas=sig_panel["off_med"],
+                               offset_signif_med=sig_panel["sig_med"],
+                               n_signif=sig_panel["n"])
+
+    ncols = 1 + (1 if sig_panel else 0) + (1 if im else 0)
+    fig, ax = _fig(1, ncols, 5.4, 5.0)
+    col = 0
+    a0 = ax[0][col]; col += 1
     hb = a0.hexbin(dra, dde, gridsize=60, bins="log", cmap="cividis", mincnt=1)
     fig.colorbar(hb, ax=a0, label="log N pairs", shrink=0.85)
     a0.axhline(0, color="w", lw=0.5); a0.axvline(0, color="w", lw=0.5)
@@ -457,8 +648,22 @@ def stage4_offsets(o: Observation, sw):
                    bulk_dra=float(bulk["dra"]) if bulk else None,
                    bulk_ddec=float(bulk["ddec"]) if bulk else None,
                    n_matched=int(nmatch))
+    if sig_panel:
+        asig = ax[0][col]; col += 1
+        hs = asig.hexbin(sig_panel["zra"], sig_panel["zde"], gridsize=60, bins="log",
+                         cmap="magma", mincnt=1)
+        fig.colorbar(hs, ax=asig, label="log N pairs", shrink=0.85)
+        for r, c in [(1, "#33cc66"), (3, "#ffcc00"), (5, "#ff5555")]:
+            asig.add_patch(plt_circle(r, c))
+        asig.axhline(0, color="w", lw=0.4); asig.axvline(0, color="w", lw=0.4)
+        asig.set_aspect("equal")
+        slim = max(6.0, 1.3 * np.nanpercentile(np.hypot(sig_panel["zra"], sig_panel["zde"]), 98))
+        asig.set_xlim(-slim, slim); asig.set_ylim(-slim, slim)
+        asig.set_xlabel(r"dRA / $\sigma_{RA}$"); asig.set_ylabel(r"dDec / $\sigma_{Dec}$")
+        asig.set_title(f"offset significance  median={sig_panel['sig_med']:.1f}$\\sigma$\n"
+                       f"(offset {sig_panel['off_med']:.0f} mas, n={sig_panel['n']})", fontsize=9)
     if im:
-        a1 = ax[0][1]
+        a1 = ax[0][col]; col += 1
         a1.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
         a1.axhline(0, color="k", lw=0.5)
         a1.axhline(aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
@@ -701,6 +906,67 @@ def _build_stage5(o, sw, lw):
     return stage5_intermodule(o, sw)
 
 
+# --------------------------------------------------------------------------- STAGE 6
+def stage6_astrom_error(o: Observation, sw, lw):
+    """Astrometric precision curve: per-star position sigma (mas) vs Vega magnitude,
+    from the per-exposure PSF fits.  The bright-end floor is the astrometric systematic limit;
+    the faint-end rise tracks S/N.  One curve per available channel (SW / LW)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    metrics = dict(stage=6, sw=sw, lw=lw)
+    fig, ax = _fig(1, 1, 6.8, 5.2)
+    a = ax[0][0]
+    any_data = False
+    all_vega = True
+    for filt, color in [(sw, "#3366cc"), (lw, "#cc3311")]:
+        if not filt:
+            continue
+        pooled = _pooled_daophot(o, filt)
+        if pooled is None:
+            continue
+        _sc, sig_ra, sig_de, mag, _flux = pooled
+        # Vega-calibrate the instrumental mag (vega = instr + ZP) via the merged catalog; fall
+        # back to instrumental if there is no Vega catalog for this filter.
+        zp = _vega_zeropoint(o, filt, _sc, mag)
+        if zp is not None:
+            mag = mag + zp
+            metrics[f"vega_zp_{filt.lower()}"] = float(zp)
+        else:
+            all_vega = False
+        sig = np.hypot(sig_ra, sig_de) / np.sqrt(2.0)     # per-axis-equivalent astrometric error
+        # Drop failed fits: a formal sigma of hundreds-to-thousands of mas is a diverged PSF
+        # fit on a noise peak, not astrometry -- keeping it compresses the informative regime.
+        ok = sig < 500.0
+        med, lo, hi, ctr = _binned_stat(mag[ok], sig[ok])
+        if med is None:
+            continue
+        any_data = True
+        lbl = f"{filt}  (n={int(ok.sum())}" + ("" if zp is not None else ", instr") + ")"
+        a.plot(ctr, med, "-", color=color, lw=1.7, label=lbl)
+        a.fill_between(ctr, lo, hi, color=color, alpha=0.20)
+        metrics[f"floor_mas_{filt.lower()}"] = float(np.nanmin(med))
+        metrics[f"nstars_{filt.lower()}"] = int(ok.sum())
+    metrics["mag_kind"] = "vega" if all_vega else "mixed"
+    if not any_data:
+        reason = "no per-exposure DAOPHOT catalogs on disk for this obs/filter"
+        png = _red_flag_figure(o, "stage6", "ASTROMETRIC-ERROR CURVE UNAVAILABLE",
+                               f"Cannot build the precision-vs-magnitude curve: {reason}.")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        return png, metrics
+    a.set_yscale("log")
+    a.set_ylim(0.03, 100.0)          # 0.03-100 mas: floor through the S/N rise; junk lives above
+    xlbl = ("Vega magnitude" if all_vega else
+            "magnitude  (Vega where calibrated, else instrumental)")
+    a.set_xlabel(xlbl)
+    a.set_ylabel(r"astrometric error  $\sigma_{\rm pos}$ (mas)")
+    a.legend(fontsize=9, loc="upper left")
+    a.grid(alpha=0.25, which="both")
+    a.set_title(f"{o.target} {o.obsid} — astrometric precision vs magnitude", fontsize=10)
+    metrics["passed"] = True
+    return _save(fig, f"{o.obsid}_stage6.png"), metrics
+
+
 def build_stage(o, n, sw, lw):
     if n == 1:
         return stage1_mosaics(o, sw, lw)
@@ -712,6 +978,8 @@ def build_stage(o, n, sw, lw):
         return stage4_offsets(o, sw)
     if n == 5:
         return stage5_intermodule(o, sw)
+    if n == 6:
+        return stage6_astrom_error(o, sw, lw)
     raise ValueError(n)
 
 
@@ -723,12 +991,17 @@ CAPTIONS = {
     3: "**Stage 3 — photometric calibration.** JWST {sw} vs VIRAC Ks for {n_matched} matched "
        "stars: slope {slope:.2f}, zp {zeropoint:.2f}, scatter {scatter:.2f} mag. A tight locus "
        "means the right stars were matched.",
-    4: "**Stage 4 — positional offsets.** JWST−VIRAC ΔRA/ΔDec (bulk {bulk_off:.0f} mas) and the "
-       "reference-free inter-module offset. First-order frame-match / proper-motion precursor.",
+    4: "**Stage 4 — positional offsets.** JWST−VIRAC ΔRA/ΔDec (bulk {bulk_off:.0f} mas), the "
+       "per-star offset significance (median {offset_signif_med:.1f}σ = measured offset ÷ its "
+       "uncertainty), and the reference-free inter-module offset. Frame-match / PM precursor.",
     5: "**Stage 5 — inter-detector / inter-module tie.** Per-detector residual quiver "
        "(bulk-removed; A–B diff {intermodule_diff:.1f} mas), the reference-free NRCA–NRCB overlap "
        "(offset {intermodule_off:.1f} mas, RMS {intermodule_rms:.1f} mas over {n_overlap} shared "
        "stars), and overlap-zone star cutouts (a mis-tie doubles them).",
+    6: "**Stage 6 — astrometric precision.** Per-star position error σ_pos (mas) vs Vega "
+       "magnitude from the per-exposure PSF fits (instrumental mag Vega-calibrated against the "
+       "merged catalog), one curve per channel. The bright-end floor is the astrometric "
+       "systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percentile.",
 }
 
 
@@ -785,7 +1058,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4])
+    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
