@@ -620,6 +620,34 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
             record_triggered(state_path, key, mjd_to_iso(now_mjd()), state=state)
 
 
+def act_peppar(events, execute=False):
+    """Fan peppar PSF-photometry jobs out (per filter/detector) for each newly-arrived NIRCam
+    obs.  Reuses peppar_trigger.submit_all (which dedups in-flight by SLURM job name), so it is
+    safe to re-fire every poll.  Same NIRCam-only / released-data gates as act_trigger.
+
+    NOT wired into --auto: the peppar env needs repair (a dev photutils shadows the pinned
+    1.12.0) before these jobs can succeed; enable with --peppar once it imports."""
+    from .peppar_trigger import submit_all   # stdlib-only
+    for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
+        field = evs[0]["field"]
+        if not field:
+            print(f"--peppar: SKIP program {program} obs {obsnum}: no field mapping",
+                  file=sys.stderr)
+            continue
+        if instr != "NIRCam":
+            print(f"--peppar: SKIP program {program} obs {obsnum} ({instr or '?'}): "
+                  "peppar is NIRCam-only", file=sys.stderr)
+            continue
+        if not any(event_ready(ev) for ev in evs):
+            print(f"--peppar: SKIPPED(planned) program {program} obs {obsnum}: no released "
+                  "data yet", file=sys.stderr)
+            continue
+        try:
+            submit_all(program=program, obs=obsnum, field=field, execute=execute)
+        except SystemExit as e:                # no cal files on disk yet, etc.
+            print(f"--peppar: SKIP program {program} obs {obsnum}: {e}", file=sys.stderr)
+
+
 # All treasury deliveries report into ONE rolling issue: per-obs issues would
 # mean ~1668 title lookups/creations (rate-limit hazard + issue spam).
 TREASURY_ISSUE_TITLE = f"GC Treasury — program {TREASURY_PROGRAM} deliveries"
@@ -704,6 +732,10 @@ def main(argv=None):
     ap.add_argument("--repo", default=None, help="owner/name for --report")
     ap.add_argument("--execute", action="store_true",
                     help="really download/submit/post (default: dry-run actions)")
+    ap.add_argument("--peppar", action="store_true",
+                    help="also fan out peppar PSF-photometry jobs (per filter/detector) for each "
+                         "newly-arrived NIRCam obs. OPT-IN (not part of --auto): the peppar env "
+                         "must be repaired first. Honours --execute like the other actions.")
     args = ap.parse_args(argv)
 
     notice = None
@@ -841,6 +873,8 @@ def main(argv=None):
         if args.trigger:
             act_trigger(actionable, execute=args.execute, pipe_root=args.pipe_root,
                         state=state, state_path=args.state)
+        if args.peppar:
+            act_peppar(actionable, execute=args.execute)
         if args.report:
             # report EVERYTHING (incl. per-program-seed-suppressed events)
             act_report(all_events, execute=args.execute, repo=args.repo,
