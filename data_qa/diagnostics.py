@@ -854,7 +854,18 @@ def stage5_intermodule(o: Observation, sw):
                 data = sci.data.astype("float32"); w = WCS(sci.header)
             from astropy.coordinates import SkyCoord
             from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
-            picks = ov["pos"][:200]
+            # De-duplicate: search_around_sky returns MANY pairs per bright overlap star, so the
+            # raw list repeats the same few stars (e.g. one star shown 4x).  Greedily keep only
+            # spatially DISTINCT stars (>0.5") so the gallery is 6 DIFFERENT stars.
+            picks = []
+            for ra, dec in ov["pos"][:2000]:
+                if picks:
+                    prev = SkyCoord([p[0] for p in picks] * u.deg, [p[1] for p in picks] * u.deg)
+                    if SkyCoord(ra * u.deg, dec * u.deg).separation(prev).arcsec.min() < 0.5:
+                        continue
+                picks.append((ra, dec))
+                if len(picks) >= ncut * 3:      # gather extras; some cutouts fail the finite check
+                    break
             strip = fig.add_subplot(gs[1, :]); strip.axis("off")
             cut_axes = [strip.inset_axes([i / ncut + 0.01, 0.05, 0.92 / ncut, 0.85])
                         for i in range(ncut)]
@@ -875,8 +886,11 @@ def stage5_intermodule(o: Observation, sw):
                 a.set_xticks([]); a.set_yticks([])
                 a.set_title(f"{shown + 1}", fontsize=7)
                 shown += 1
-            fig.text(0.5, 0.02, "overlap-zone star cutouts from the merged mosaic "
-                     "(a mis-tie doubles/elongates these)", ha="center", fontsize=8)
+            fig.text(0.5, 0.02,
+                     f"6 stars from the NRCA∩NRCB overlap of the {filt} merged mosaic (each "
+                     f"detected in BOTH modules; 25 px ≈ {25 * 0.031:.1f}\").  A good A↔B tie "
+                     f"= one round PSF; a mis-tie doubles or elongates the star.",
+                     ha="center", fontsize=8)
         title_extra = ""
         suptitle_y = 0.98
     else:
@@ -997,7 +1011,9 @@ CAPTIONS = {
     5: "**Stage 5 — inter-detector / inter-module tie.** Per-detector residual quiver "
        "(bulk-removed; A–B diff {intermodule_diff:.1f} mas), the reference-free NRCA–NRCB overlap "
        "(offset {intermodule_off:.1f} mas, RMS {intermodule_rms:.1f} mas over {n_overlap} shared "
-       "stars), and overlap-zone star cutouts (a mis-tie doubles them).",
+       "stars), and a cutout gallery of 6 stars in the NRCA∩NRCB overlap — each cut from the SW "
+       "merged `i2d` mosaic and detected in BOTH modules. A good tie shows one round PSF; a "
+       "mis-tie doubles/elongates the star (the same source drizzled twice at offset positions).",
     6: "**Stage 6 — astrometric precision.** Per-star position error σ_pos (mas) vs Vega "
        "magnitude from the per-exposure PSF fits (instrumental mag Vega-calibrated against the "
        "merged catalog), one curve per channel. The bright-end floor is the astrometric "
