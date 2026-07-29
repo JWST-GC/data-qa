@@ -47,6 +47,10 @@ _SW_PREF = ["F212N", "F210M", "F200W", "F187N", "F182M", "F164N", "F162M", "F150
 _LW_PREF = ["F480M", "F470N", "F466N", "F444W", "F410M", "F405N", "F360M", "F356W", "F335M",
             "F323N", "F300M", "F277W", "F250M"]
 
+# VIRAC2 per-star PM-error floor (mas/yr): used for the offset-significance denominator when a
+# field's refcache lacks e_pmRA/e_pmDE (median of the columns where they are present).
+PM_ERR_FLOOR = 2.0
+
 
 def _channel(filt):
     return "SW" if int(filt[1:4]) <= 212 else "LW"
@@ -174,7 +178,7 @@ def _virac_with_errors(o: Observation, epoch):
     from astropy.coordinates import SkyCoord
     from astropy.table import Table
     t = Table.read(p)
-    need = {"RAJ2000", "DEJ2000", "e_RAJ2000", "e_DEJ2000", "pmRA", "pmDE", "e_pmRA", "e_pmDE"}
+    need = {"RAJ2000", "DEJ2000", "e_RAJ2000", "e_DEJ2000", "pmRA", "pmDE"}
     if not need.issubset(set(t.colnames)):
         return None
     ra = np.asarray(t["RAJ2000"], float); dec = np.asarray(t["DEJ2000"], float)
@@ -183,8 +187,15 @@ def _virac_with_errors(o: Observation, epoch):
     dt = epoch - 2014.0                                 # VIRAC2 base epoch
     ra = ra + (pmra * dt / 3.6e6) / np.cos(np.radians(dec))
     dec = dec + pmdec * dt / 3.6e6
-    sra = np.hypot(np.asarray(t["e_RAJ2000"], float), abs(dt) * np.asarray(t["e_pmRA"], float))
-    sde = np.hypot(np.asarray(t["e_DEJ2000"], float), abs(dt) * np.asarray(t["e_pmDE"], float))
+    # Some field caches carry position errors but not per-star PM errors; the PM-error term
+    # dominates at an 8.7 yr baseline, so fall back to VIRAC2's ~2 mas/yr median rather than
+    # dropping it (which would spuriously inflate the offset significance).
+    e_pmra = np.asarray(t["e_pmRA"], float) if "e_pmRA" in t.colnames else np.full(len(t), PM_ERR_FLOOR)
+    e_pmde = np.asarray(t["e_pmDE"], float) if "e_pmDE" in t.colnames else np.full(len(t), PM_ERR_FLOOR)
+    e_pmra = np.where(np.isfinite(e_pmra), e_pmra, PM_ERR_FLOOR)
+    e_pmde = np.where(np.isfinite(e_pmde), e_pmde, PM_ERR_FLOOR)
+    sra = np.hypot(np.asarray(t["e_RAJ2000"], float), abs(dt) * e_pmra)
+    sde = np.hypot(np.asarray(t["e_DEJ2000"], float), abs(dt) * e_pmde)
     g = (np.isfinite(ra) & np.isfinite(dec) & np.isfinite(sra) & np.isfinite(sde) &
          (sra > 0) & (sde > 0))
     if g.sum() < 30:
