@@ -766,6 +766,21 @@ def _obs_from_disk(program, obs, base=BASE):
     return None
 
 
+def _json_default(o):
+    """json.dump default: coerce numpy scalars/arrays (a stage metric like ``passed`` or
+    ``red_flag`` can be a ``np.bool_`` from an ndarray comparison, which stdlib json cannot
+    serialize -> the whole metrics write crashes AFTER every stage already posted)."""
+    if isinstance(o, np.bool_):
+        return bool(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
@@ -813,12 +828,12 @@ def main(argv=None):
             print(f"  stage {n}: FAILED to build: {type(e).__name__}: {e}", file=sys.stderr)
             all_metrics[f"stage{n}"] = dict(stage=n, error=f"{type(e).__name__}: {e}", passed=False)
             with open(mpath, "w") as fh:
-                json.dump(all_metrics, fh, indent=2)
+                json.dump(all_metrics, fh, indent=2, default=_json_default)
             continue
         all_metrics[f"stage{n}"] = metrics
         print(f"  stage {n}: {png}  passed={metrics.get('passed')}")
         with open(mpath, "w") as fh:          # persist before the (fallible) network post
-            json.dump(all_metrics, fh, indent=2)
+            json.dump(all_metrics, fh, indent=2, default=_json_default)
         if args.post:
             try:
                 from .post_diagnostics import post_stage, PostError
