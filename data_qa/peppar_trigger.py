@@ -31,8 +31,14 @@ import sys
 from typing import Dict, List, Optional
 
 BASE = os.environ.get("QA_BASE", "/orange/adamginsburg/jwst")
+# PEPPAR_REPO is the peppar PACKAGE checkout (for `from peppar import peppar`), imported via
+# PYTHONPATH in the sbatch.  The runner + sbatch themselves are OURS -- they live in this repo
+# (scripts/peppar), NOT in the peppar package.
 PEPPAR_REPO = os.environ.get("PEPPAR_REPO", "/blue/adamginsburg/adamginsburg/repos/peppar")
-SBATCH = os.path.join(PEPPAR_REPO, "run_peppar_generic.sbatch")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PEPPAR_SCRIPTS = os.path.join(_REPO_ROOT, "scripts", "peppar")
+SBATCH = os.path.join(_PEPPAR_SCRIPTS, "run_peppar_generic.sbatch")
+RUNNER = os.path.join(_PEPPAR_SCRIPTS, "run_peppar_generic.py")
 
 # a NIRCam detector token in a cal filename: nrca1..nrcb4 (SW) or nrcalong/nrcblong (LW)
 _DET_RE = re.compile(r"_(nrc[ab](?:[1-4]|long))_cal\.fits$", re.I)
@@ -112,7 +118,8 @@ def sbatch_argv(job: dict) -> List[str]:
         f"PEPPAR_STF_DIR={job['stf_dir']}",
         f"PEPPAR_FILT={job['filt']}",
         f"PEPPAR_DET={job['det']}",
-        f"PEPPAR_REPO={PEPPAR_REPO}",
+        f"PEPPAR_REPO={PEPPAR_REPO}",      # peppar package checkout (PYTHONPATH)
+        f"PEPPAR_RUNNER={RUNNER}",         # our runner (in this repo)
     ])
     return ["sbatch", "--parsable", f"--job-name={job['name']}", f"--export={exports}", SBATCH]
 
