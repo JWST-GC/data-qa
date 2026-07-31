@@ -1,20 +1,25 @@
 """Progressive QA diagnostic figures, posted as replies (comments) to a per-observation
 tracking issue.
 
-Four stages, each emitted as the corresponding data product becomes available while the
+Six stages, each emitted as the corresponding data product becomes available while the
 cataloging pipeline runs.  Each stage returns ``(png_path, metrics)``; the metrics drive
-the checkbox state in the issue body (see ``make_issues.render_body``), and the PNG is
-posted as an idempotent comment (one comment per stage, keyed on a hidden marker).
+the checkbox state in the issue body (see ``make_issues.render_body``, which reads stages
+1-5; stage 6 is display-only), and the PNG is posted as an idempotent comment (one comment
+per stage, keyed on a hidden marker).
 
     Stage 1  first i2d       one SW + one LW grayscale mosaic       "delivered", "mosaics present"
     Stage 2  CMD             LW vs SW-LW colour-magnitude + LF      "catalog vetted", "depth"
-    Stage 3  calibration     JWST (F212N-like) vs VIRAC Ks         "photometry zeropoints"
-    Stage 4  offsets         JWST-VIRAC dRA/dDec + inter-module    "absolute frame", "inter-module"
+    Stage 3  calibration     JWST catalog mag vs VIRAC Ks          "photometry zeropoints"
+    Stage 4  offsets         JWST-VIRAC dRA/dDec + significance + inter-module tie
+    Stage 5  inter-detector  per-detector quiver + A/B overlap + overlap-star cutouts
+    Stage 6  astrometry      per-star position sigma vs Vega mag (display-only)
 
-Images LIVE IN THE ISSUE (posted to the GitHub CDN as release assets on a single
-``qa-assets`` bucket release, then embedded in the comment) -- NOT committed to the repo
-source tree.  Reuses the reference-free / crowding-proof machinery in
-``astrometry_audit`` (detect / xcorr / direct_intermodule / load_reference).
+This is a QA of RELEASEABLE PRODUCTS: every stage READS the catalog (the release merged
+catalog, else the MAST-delivered per-i2d source catalog) and only bakes the crossmatch --
+it does NOT re-detect sources.  Images LIVE IN THE ISSUE (posted to the GitHub CDN as
+release assets on a single ``qa-assets`` bucket release, then embedded in the comment) --
+NOT committed to the repo source tree.  Crossmatch / frame machinery from ``astrometry_audit``
+(xcorr / load_reference).
 
 Usage:
     python -m data_qa.diagnostics --program 5365 --obs 001 --stage 1 2 3 4          # build only
@@ -46,6 +51,10 @@ DIAG_MARKER = "<!-- data-qa:diag:stage{n} -->"
 _SW_PREF = ["F212N", "F210M", "F200W", "F187N", "F182M", "F164N", "F162M", "F150W", "F140M", "F115W"]
 _LW_PREF = ["F480M", "F470N", "F466N", "F444W", "F410M", "F405N", "F360M", "F356W", "F335M",
             "F323N", "F300M", "F277W", "F250M"]
+
+# VIRAC2 per-star PM-error floor (mas/yr): used for the offset-significance denominator when a
+# field's refcache lacks e_pmRA/e_pmDE (median of the columns where they are present).
+PM_ERR_FLOOR = 2.0
 
 
 def _channel(filt):
@@ -104,18 +113,42 @@ def _catalog_priority(basename):
     return 0, "merged"       # un-tagged field merge: lowest tier, size breaks the tie
 
 
+_OBS_TOK_RE = re.compile(r"_o(\d{3})\b")
+_DATED_RE = re.compile(r"_(20\d{6})\b")          # _YYYYMMDD snapshot stamp
+
+
 def _catalog_candidates(o: Observation):
-    """All catalogs for the field, each tagged with its (priority-tier, kind).  Glob EVERY
-    catalog (naming is inconsistent across fields); the caller filters by column presence
-    and picks the highest tier, largest.  Skip residual/model/region sidecars."""
-    out = []
+    """Catalogs for THIS OBSERVATION, each tagged (path, kind, tier, mtime).  A field dir holds
+    catalogs for every obs in the field, so we must NOT hand another observation's catalog to
+    this obs's QA (that posts byte-identical, wrongly-green figures on multi-obs fields like
+    gc2211 / cloudef).  Rules:
+      * if any catalog is tokened for THIS obs (``_o<obs>``) -> use only those;
+      * else drop catalogs tokened for a DIFFERENT obs (keep only field-level / untokened);
+      * always drop ``_YYYYMMDD`` dated snapshots when a non-dated catalog remains (a later
+        dedup pass makes the live catalog SMALLER, so size-based tie-breaks would otherwise
+        prefer a stale pre-dedup snapshot -- a provenance violation).
+    Skips residual/model/region sidecars."""
+    cand = []
     for p in sorted(glob.glob(f"{BASE}/{o.field}/catalogs/*.fits")):
         low = os.path.basename(p).lower()
         if any(s in low for s in ("_residual", "_model", "_reproject", "region")):
             continue
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            mtime = 0.0
         tier, kind = _catalog_priority(low)
-        out.append((p, kind, tier))
-    return out
+        cand.append((p, kind, tier, mtime, low))
+    this = [c for c in cand
+            if (m := _OBS_TOK_RE.search(c[4])) and m.group(1) == o.obs]
+    if this:
+        cand = this
+    else:
+        cand = [c for c in cand if not _OBS_TOK_RE.search(c[4])]     # drop other-obs catalogs
+    nondated = [c for c in cand if not _DATED_RE.search(c[4])]
+    if nondated:
+        cand = nondated
+    return [(p, kind, tier, mtime) for (p, kind, tier, mtime, _low) in cand]
 
 
 def _catalog_for(o: Observation, sw, lw):
@@ -124,8 +157,8 @@ def _catalog_for(o: Observation, sw, lw):
     FITS-header probe (TTYPE/NAXIS2) avoids reading catalog data.
     Returns (path, kind, sw_col, lw_col) or (None,...)."""
     from astropy.io import fits
-    best = (None, None, None, None, (-1, -1))
-    for p, kind, tier in _catalog_candidates(o):
+    best = (None, None, None, None, (-1.0, -1.0))
+    for p, kind, tier, mtime in _catalog_candidates(o):
         try:
             hdr = fits.getheader(p, ext=1)             # header only -- cheap, no data read
         except (OSError, IndexError):
@@ -141,10 +174,144 @@ def _catalog_for(o: Observation, sw, lw):
         # single-filter obs (lw is None) needs only the SW column
         if not csw or (lw is not None and not clw):
             continue
-        rank = (tier, hdr.get("NAXIS2", 0))
+        rank = (tier, mtime)                       # highest tier, then NEWEST (not largest: dedup shrinks)
         if rank > best[-1]:
             best = (p, kind, csw, clw, rank)
     return best[:4]
+
+
+def _catalog_with_vega(o: Observation, filt):
+    """Highest-priority catalog carrying ``mag_vega_<filt>`` (+ its skycoord col), or
+    (None, None, None).  Used to Vega-calibrate the per-exposure instrumental mags."""
+    from astropy.io import fits
+    want_mag = f"mag_vega_{filt.lower()}"
+    want_sc = f"skycoord_{filt.lower()}"
+    best = (None, None, None, (-1.0, -1.0))
+    for p, kind, tier, mtime in _catalog_candidates(o):
+        try:
+            hdr = fits.getheader(p, ext=1)
+        except (OSError, IndexError):
+            continue
+        ncol = hdr.get("TFIELDS", 0)
+        low = {str(hdr.get(f"TTYPE{i}", "")).lower() for i in range(1, ncol + 1)}
+        # skycoord mixin serializes as "<name>.ra"/".dec" in TTYPE
+        rank = (tier, mtime)                       # highest tier, then newest (skip stale snapshots)
+        if want_mag in low and f"{want_sc}.ra" in low and rank > best[-1]:
+            best = (p, want_mag, want_sc, rank)
+    return best[:3]
+
+
+def _vega_zeropoint(o: Observation, filt, sc, instr):
+    """Robust instrumental->Vega zeropoint ZP (vega = instr + ZP) for one filter, from matching
+    the pooled per-exposure detections to the merged catalog's ``mag_vega_<filt>``.  Uses the
+    bright 40% (where the instrumental mag is well-measured) for the median.  Returns ZP or
+    None when there is no Vega catalog / too few matches."""
+    import astropy.units as u
+    from astropy.table import Table
+    cat, magcol, sccol = _catalog_with_vega(o, filt)
+    if not cat:
+        return None
+    m = Table.read(cat)
+    if sccol not in m.colnames or magcol not in m.colnames:
+        return None
+    vg = np.asarray(m[magcol], float)
+    idx, sep, _ = sc.match_to_catalog_sky(m[sccol])
+    good = (sep < 0.05 * u.arcsec) & np.isfinite(instr) & np.isfinite(vg[idx])
+    if good.sum() < 50:
+        return None
+    ii = instr[good]
+    zz = vg[idx][good] - ii
+    bright = ii <= np.percentile(ii, 40)     # bright end: cleanest instrumental mags
+    return float(np.median(zz[bright])) if bright.sum() >= 20 else float(np.median(zz))
+
+
+def _mast_source_catalog(o: Observation, filt):
+    """MAST-delivered per-i2d source catalog for one filter (single-band), or None.  Named
+    ``<obsid>_t001_nircam_clear-<filt>_cat.fits`` next to the i2d -- NOT the per-detector
+    ``*_nrcaN_destreak_cat.fits`` intermediates."""
+    for d in (f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/*/pipeline",
+              f"{BASE}/{o.field}/images-merged"):
+        hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_*{filt.lower()}*_cat.fits")
+                if not any(t in os.path.basename(p).lower() for t in ("nrca", "nrcb", "destreak"))]
+        if hits:
+            return sorted(hits)[-1]
+    return None
+
+
+def _jwst_sources(o: Observation, filt):
+    """JWST source positions + magnitude for one filter, READ FROM THE CATALOG -- never
+    re-detected.  This is a QA of releaseable products: show what the catalog contains, don't
+    bake our own detection.  Priority: the RELEASE merged catalog (mag_vega_<filt> +
+    skycoord_<filt>); else the MAST-delivered per-i2d source catalog (sky_centroid +
+    aper abmag).  Returns (SkyCoord, mag, source_label) or (None, None, None) -> caller red-flags.
+    The only thing baked downstream is the crossmatch (to VIRAC / across filters)."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    # 1) release merged catalog
+    cat, magcol, sccol = _catalog_with_vega(o, filt)
+    if cat:
+        m = Table.read(cat)
+        if sccol in m.colnames and magcol in m.colnames:
+            sc = m[sccol]
+            mag = np.asarray(m[magcol], float)
+            g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(mag)
+            if g.sum() >= 30:
+                return sc[g], mag[g], f"release:{os.path.basename(cat)}"
+    # 2) MAST-delivered per-i2d source catalog
+    mp = _mast_source_catalog(o, filt)
+    if mp:
+        m = Table.read(mp)
+        magc = next((c for c in ("aper_total_abmag", "aper50_abmag", "aper70_abmag",
+                                 "aper30_abmag") if c in m.colnames), None)
+        if "sky_centroid" in m.colnames and magc:
+            sc = m["sky_centroid"]
+            mag = np.asarray(m[magc], float)
+            g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(mag)
+            if g.sum() >= 30:
+                return sc[g], mag[g], f"MAST:{os.path.basename(mp)}"
+        else:
+            # sky_centroid stored as split float columns rather than a mixin; find the actual
+            # (case-preserving) column names, and require a magnitude -- an all-NaN mag would
+            # blank the CMD / fail stage 3 instead of cleanly red-flagging.
+            low = {c.lower(): c for c in m.colnames}
+            if "sky_centroid.ra" in low and "sky_centroid.dec" in low and magc:
+                ra = np.asarray(m[low["sky_centroid.ra"]], float)
+                dec = np.asarray(m[low["sky_centroid.dec"]], float)
+                mag = np.asarray(m[magc], float)
+                g = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(mag)
+                if g.sum() >= 30:
+                    return SkyCoord(ra[g] * u.deg, dec[g] * u.deg), mag[g], f"MAST:{os.path.basename(mp)}"
+    return None, None, None
+
+
+def _crossmatch_cmd_arrays(o: Observation, sw, lw):
+    """Build CMD (color, mag) by crossmatching the two SINGLE-BAND source catalogs -- MAST
+    per-i2d, or per-filter RELEASE catalogs -- when no single MERGED catalog carries both bands.
+    The color is the only baking allowed.  Uses a MUTUAL nearest match at a tight radius (so no
+    LW source is reused by many SW sources -> the CMD width is the catalog's, not the crossmatch's)
+    and REFUSES to mix magnitude systems (release=Vega, MAST=AB).  Returns
+    (color, mag, n, label, magsys) or None."""
+    import astropy.units as u
+    if not lw:
+        return None
+    sc_sw, m_sw, lab_sw = _jwst_sources(o, sw)
+    sc_lw, m_lw, lab_lw = _jwst_sources(o, lw)
+    if sc_sw is None or sc_lw is None:
+        return None
+    sys_sw = "Vega" if str(lab_sw).startswith("release") else "AB"
+    sys_lw = "Vega" if str(lab_lw).startswith("release") else "AB"
+    if sys_sw != sys_lw:
+        return None                      # never plot a Vega-minus-AB colour
+    i_swlw, sep1, _ = sc_sw.match_to_catalog_sky(sc_lw)
+    i_lwsw, _, _ = sc_lw.match_to_catalog_sky(sc_sw)
+    mutual = (sep1 < 0.05 * u.arcsec) & (i_lwsw[i_swlw] == np.arange(len(sc_sw)))
+    if mutual.sum() < 100:
+        return None
+    color = m_sw[mutual] - m_lw[i_swlw[mutual]]
+    mag = m_lw[i_swlw[mutual]]
+    kind = "MAST" if sys_sw == "AB" else "release"
+    return color, mag, int(mutual.sum()), f"{kind} positional crossmatch", sys_sw
 
 
 def _refcat_path(o: Observation):
@@ -153,11 +320,72 @@ def _refcat_path(o: Observation):
     return hits[-1] if hits else None
 
 
+def _obs_epoch(o: Observation, mosaic_path):
+    """Observation epoch (jyear) for PM-propagating the VIRAC reference.  Prefer the mosaic
+    DATE-OBS, but fall back to the epoch baked into the refcat filename
+    (gaia_virac2_refcat_epoch<YYYY.dd>.fits) so the catalog-based stages don't hard-depend on a
+    mosaic being on disk."""
+    if mosaic_path:
+        ep = aa.epoch_of(mosaic_path)
+        if ep:
+            return ep
+    rp = _refcat_path(o)
+    if rp:
+        m = re.search(r"epoch(\d{4}\.\d+)", os.path.basename(rp))
+        if m:
+            return float(m.group(1))
+    return None
+
+
 def _viraccache_path(o: Observation):
     """Raw VIRAC2 cache (has a real Ksmag column) for the photometric-calibration check.
     The gaia_virac2 refcat carries only a blended 'refmag', unusable for a Ks zeropoint."""
     p = f"{BASE}/{o.field}/astrometry_diag/refcache/virac2.fits"
     return p if os.path.exists(p) else None
+
+
+def _virac_with_errors(o: Observation, epoch):
+    """VIRAC2 cache PM-propagated to ``epoch`` WITH per-star position sigma at that epoch:
+    sigma = hypot(base position error, |baseline| * PM error).  The gaia_virac2 refcat used
+    elsewhere carries no per-star error, so offset SIGNIFICANCE needs the raw cache
+    (e_RAJ2000/e_pmRA...).  Returns (SkyCoord, sig_ra_mas, sig_de_mas) or None.  At an ~8.7 yr
+    baseline the PM-error term (~2 mas/yr) dominates -- so it is the right denominator for
+    'is the measured offset significant?', not the JWST single-exposure sigma alone.
+
+    Prefer ``virac2_full.fits`` (carries per-star e_pmRA/e_pmDE) over ``virac2.fits`` -- several
+    fields' virac2.fits lacks the PM-error columns, and using the real per-star PM errors beats
+    a constant floor (which collapses the significance to a fixed unit conversion)."""
+    full = f"{BASE}/{o.field}/astrometry_diag/refcache/virac2_full.fits"
+    p = full if os.path.exists(full) else _viraccache_path(o)
+    if not p:
+        return None
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    t = Table.read(p)
+    need = {"RAJ2000", "DEJ2000", "e_RAJ2000", "e_DEJ2000", "pmRA", "pmDE"}
+    if not need.issubset(set(t.colnames)):
+        return None
+    ra = np.asarray(t["RAJ2000"], float); dec = np.asarray(t["DEJ2000"], float)
+    pmra = np.nan_to_num(np.asarray(t["pmRA"], float))
+    pmdec = np.nan_to_num(np.asarray(t["pmDE"], float))
+    dt = epoch - 2014.0                                 # VIRAC2 base epoch
+    ra = ra + (pmra * dt / 3.6e6) / np.cos(np.radians(dec))
+    dec = dec + pmdec * dt / 3.6e6
+    # Some field caches carry position errors but not per-star PM errors; the PM-error term
+    # dominates at an 8.7 yr baseline, so fall back to VIRAC2's ~2 mas/yr median rather than
+    # dropping it (which would spuriously inflate the offset significance).
+    e_pmra = np.asarray(t["e_pmRA"], float) if "e_pmRA" in t.colnames else np.full(len(t), PM_ERR_FLOOR)
+    e_pmde = np.asarray(t["e_pmDE"], float) if "e_pmDE" in t.colnames else np.full(len(t), PM_ERR_FLOOR)
+    e_pmra = np.where(np.isfinite(e_pmra), e_pmra, PM_ERR_FLOOR)
+    e_pmde = np.where(np.isfinite(e_pmde), e_pmde, PM_ERR_FLOOR)
+    sra = np.hypot(np.asarray(t["e_RAJ2000"], float), abs(dt) * e_pmra)
+    sde = np.hypot(np.asarray(t["e_DEJ2000"], float), abs(dt) * e_pmde)
+    g = (np.isfinite(ra) & np.isfinite(dec) & np.isfinite(sra) & np.isfinite(sde) &
+         (sra > 0) & (sde > 0))
+    if g.sum() < 30:
+        return None
+    return SkyCoord(ra[g] * u.deg, dec[g] * u.deg), sra[g], sde[g]
 
 
 # --------------------------------------------------------------------------- figure helpers
@@ -190,6 +418,12 @@ def _save(fig, name):
     import matplotlib.pyplot as plt
     plt.close(fig)
     return out
+
+
+def plt_circle(r, color):
+    """Dashed origin-centred circle patch (used to mark n-sigma contours)."""
+    from matplotlib.patches import Circle
+    return Circle((0, 0), r, fill=False, ec=color, lw=1.0, ls="--")
 
 
 def _red_flag_figure(o, stage_name, title, reason):
@@ -286,10 +520,27 @@ def stage2_cmd(o: Observation, sw, lw):
     metrics = dict(stage=2, catalog=os.path.basename(cat) if cat else None, kind=kind)
     want = f"{sw}+{lw}" if lw else f"{sw}"
     if not cat:
-        fig, ax = _fig(1, 1, 5.5, 6.0)
-        ax[0][0].text(0.5, 0.5, f"no catalog with {want} mags yet", ha="center", va="center")
-        metrics["passed"] = False
-        return _save(fig, f"{o.obsid}_stage2.png"), metrics
+        # No single merged catalog with both bands -> build the CMD by crossmatching the two
+        # single-band catalogs (release or MAST; the only baking allowed).  Absent too -> red flag.
+        mc = _crossmatch_cmd_arrays(o, sw, lw)
+        if mc is not None:
+            color, mag, nkeep, mlabel, magsys = mc
+            fig, ax = _fig(1, 1, 6.2, 6.0)
+            a = ax[0][0]
+            hb = a.hexbin(color, mag, gridsize=100, bins="log", cmap="viridis", mincnt=1)
+            fig.colorbar(hb, ax=a, label="log N stars")
+            a.set_xlim(np.nanpercentile(color, [1, 99]))
+            ylo, yhi = np.nanpercentile(mag, [0.5, 99.5]); a.set_ylim(yhi, ylo)
+            a.set_xlabel(f"{sw} - {lw} [{magsys}]"); a.set_ylabel(f"{lw} [{magsys}]")
+            a.set_title(f"{o.target} {o.obsid} — CMD ({mlabel}, n={nkeep})\n"
+                        f"width is positional-crossmatch limited, not the catalog's colour precision",
+                        fontsize=8)
+            metrics.update(n_stars=nkeep, kind="crossmatch", mag_system=magsys, passed=nkeep > 500)
+            return _save(fig, f"{o.obsid}_stage2.png"), metrics
+        png = _red_flag_figure(o, "stage2", "NO CATALOG FOR CMD",
+                               f"No release catalog and no MAST source catalog for {want} yet.")
+        metrics.update(red_flag=True, red_flag_reason=f"no catalog for {want}", passed=False)
+        return png, metrics
     t = Table.read(cat)
 
     # LF-only fallback ONLY for a genuine single-channel obs (no LW filter at all).  If lw is
@@ -363,80 +614,192 @@ def stage3_calibration(o: Observation, sw):
     metrics = dict(stage=3, sw=sw)
     path = _mosaic_path(o, sw)
     ref = _viraccache_path(o) or _refcat_path(o)   # cache has real Ksmag
-    ep = aa.epoch_of(path) if path else None
+    ep = _obs_epoch(o, path)
     ref_sc, ref_mag = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
-    jsc, jmag = aa.detect(path) if path else (None, None)
+    # Read the JWST catalog (release -> MAST) -- do NOT re-detect on the mosaic.
+    jsc, jmag, src = _jwst_sources(o, sw)
+    metrics["source"] = src
     a = ax[0][0]
-    if jsc is None or ref_sc is None or ref_mag is None:
-        a.text(0.5, 0.5, "need mosaic + VIRAC refcat", ha="center", va="center")
+    if jsc is None:
+        import matplotlib.pyplot as plt
+        plt.close(fig)          # close the empty fig before the red-flag builds its own
+        png = _red_flag_figure(o, "stage3", "NO CATALOG TO CALIBRATE",
+                               f"No release or MAST source catalog for {sw} yet — nothing to QA.")
+        metrics.update(red_flag=True, red_flag_reason=f"no catalog for {sw}", passed=False)
+        return png, metrics
+    if ref_sc is None or ref_mag is None:
+        a.text(0.5, 0.5, "need VIRAC refcat", ha="center", va="center")
         metrics["passed"] = False
         return _save(fig, f"{o.obsid}_stage3.png"), metrics
-    ia, ib, sep, _ = search_around_sky(jsc, ref_sc, 0.2 * u.arcsec)
-    if len(ia) < 30:
-        a.text(0.5, 0.5, f"only {len(ia)} matches", ha="center", va="center")
+    # Anchor on VIRAC (sparse, Ks-bright) -> nearest JWST catalog source.  The release catalog
+    # goes far deeper than VIRAC, so an all-pairs match would pair faint JWST sources with the
+    # wrong VIRAC star and blow up the scatter; nearest-from-VIRAC keeps the locus clean.
+    idx, sep, _ = ref_sc.match_to_catalog_sky(jsc)
+    keep = sep < 0.1 * u.arcsec
+    if keep.sum() < 30:
+        a.text(0.5, 0.5, f"only {int(keep.sum())} matches", ha="center", va="center")
         metrics["passed"] = False
         return _save(fig, f"{o.obsid}_stage3.png"), metrics
-    x = ref_mag[ib]; y = jmag[ia]
+    x = ref_mag[keep]; y = jmag[idx[keep]]
     g = np.isfinite(x) & np.isfinite(y)
     x, y = x[g], y[g]
-    # robust linear fit y = slope*x + zp
-    slope, zp = np.polyfit(x, y, 1)
-    resid = y - (slope * x + zp)
-    scat = float(aa.mad_std(resid))
+    # robust linear fit y = slope*x + zp, sigma-clipped to the locus.  The deep release catalog
+    # matched to VIRAC has a red/mismatch cloud above the locus (Ks-bright, F212N-faint stars);
+    # one clip pass measures the CALIBRATION scatter (is the zeropoint sane) rather than the
+    # astrophysical colour spread.
+    # Iterate the 3-sigma locus clip to CONVERGENCE (a single pass is not converged -- the
+    # reported slope/scatter otherwise depend on stopping after one step at k=3).
+    xf, yf = x, y
+    slope, zp = np.polyfit(xf, yf, 1)
+    for _ in range(5):
+        resid = yf - (slope * xf + zp)
+        loc = np.abs(resid) < 3 * aa.mad_std(resid)
+        if loc.all() or loc.sum() < 30:
+            break
+        xf, yf = xf[loc], yf[loc]
+        slope, zp = np.polyfit(xf, yf, 1)
+    scat = float(aa.mad_std(yf - (slope * xf + zp)))
+    n_locus = int(len(xf))
     hb = a.hexbin(x, y, gridsize=80, bins="log", cmap="magma", mincnt=1)
     fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
     xs = np.array([np.nanmin(x), np.nanmax(x)])
     a.plot(xs, slope * xs + zp, "c-", lw=1, label=f"slope={slope:.2f} zp={zp:.2f}")
-    a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} instr mag")
+    a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
     a.legend(fontsize=8, loc="upper left")
-    a.set_title(f"{o.obsid} calibration  n={g.sum()} scatter={scat:.2f}", fontsize=10)
-    metrics.update(n_matched=int(g.sum()), slope=float(slope), zeropoint=float(zp),
-                   scatter=scat, passed=(0.7 < slope < 1.3 and scat < 0.5))
+    a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus})  "
+                f"scatter={scat:.2f}", fontsize=10)
+    # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen
+    # only the SCATTER for the real narrow-vs-broad (F212N vs Ks) colour/extinction spread.
+    metrics.update(n_matched=int(g.sum()), n_locus=n_locus, slope=float(slope),
+                   zeropoint=float(zp), scatter=scat,
+                   passed=(0.8 < slope < 1.2 and scat < 0.8))
     return _save(fig, f"{o.obsid}_stage3.png"), metrics
 
 
 # --------------------------------------------------------------------------- STAGE 4
+def _pooled_daophot(o: Observation, filt, max_files=64):
+    """Pool the per-exposure DAOPHOT cats for one filter into (position, per-star astrometric
+    sigma, instrumental mag, flux).  Unlike the merged science catalog, the per-exposure cats
+    carry the formal PSF-fit position uncertainty: ``dra``/``ddec`` are the RA/Dec 1-sigma
+    errors in arcsec (== x_err/y_err * pixel scale, so no pixel-scale assumption is needed).
+    Returns (SkyCoord, sig_ra_mas, sig_de_mas, instr_mag, flux) or None."""
+    import astropy.units as u
+    from astropy.table import vstack, Table
+    cats = sorted(glob.glob(
+        f"{BASE}/{o.field}/{filt}/{filt.lower()}_*_visit*_*_m3_daophot_basic.fits"))
+    if not cats:
+        return None
+    if len(cats) > max_files:
+        # Cap the pool, but sample ROUND-ROBIN across detectors: a plain alphabetical head takes
+        # nrca1..nrca3 and drops nrca4 + all of NRCB, so the significance panel / stage-6 curve
+        # would describe module A only -- exactly the module the inter-module tie compares.
+        by_det = {}
+        for c in cats:
+            m = re.search(r"_(nrc[ab](?:[1-4]|long))_", os.path.basename(c))
+            by_det.setdefault(m.group(1) if m else "z", []).append(c)
+        dets, picked = sorted(by_det), []
+        while len(picked) < max_files and any(by_det.values()):
+            for d in dets:
+                if by_det[d]:
+                    picked.append(by_det[d].pop(0))
+                    if len(picked) >= max_files:
+                        break
+        cats = picked
+    need = {"skycoord_centroid", "dra", "ddec", "flux_fit"}
+    tabs = []
+    for c in cats:
+        try:
+            t = Table.read(c)
+        except (OSError, ValueError):
+            continue
+        if need.issubset(set(t.colnames)):
+            tabs.append(t["skycoord_centroid", "dra", "ddec", "flux_fit"])
+    if not tabs:
+        return None
+    T = vstack(tabs, metadata_conflicts="silent")
+    sc = T["skycoord_centroid"]
+    sig_ra = np.asarray(T["dra"], float) * 1000.0     # arcsec -> mas
+    sig_de = np.asarray(T["ddec"], float) * 1000.0
+    flux = np.asarray(T["flux_fit"], float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mag = -2.5 * np.log10(flux)
+    good = (np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(sig_ra) &
+            np.isfinite(sig_de) & (sig_ra > 0) & (sig_de > 0) & np.isfinite(mag) & (flux > 0))
+    if good.sum() < 50:
+        return None
+    return sc[good], sig_ra[good], sig_de[good], mag[good], flux[good]
+
+
+def _binned_stat(x, y, width=0.5, minn=15):
+    """Median + 16/84 percentile band of ``y`` in fixed-width bins of ``x``.  Bins with fewer
+    than ``minn`` points are dropped.  Returns (med, p16, p84, centre) arrays or (None,)*4."""
+    g = np.isfinite(x) & np.isfinite(y) & (y > 0)
+    x, y = x[g], y[g]
+    if x.size < minn:
+        return None, None, None, None
+    edges = np.arange(np.floor(x.min() / width) * width,
+                      np.ceil(x.max() / width) * width + width, width)
+    idx = np.digitize(x, edges)
+    ctr, med, p16, p84 = [], [], [], []
+    for b in range(1, len(edges)):
+        m = idx == b
+        if m.sum() < minn:
+            continue
+        ctr.append(0.5 * (edges[b - 1] + edges[b]))
+        med.append(np.median(y[m]))
+        p16.append(np.percentile(y[m], 16)); p84.append(np.percentile(y[m], 84))
+    if len(ctr) < 3:
+        return None, None, None, None
+    return np.array(med), np.array(p16), np.array(p84), np.array(ctr)
+
+
 def stage4_offsets(o: Observation, sw):
-    """JWST-VIRAC per-star dRA/dDec across the field (frame tie / PM precursor) + the
-    reference-free inter-module (NRCA vs NRCB) offset."""
+    """JWST-VIRAC per-star dRA/dDec across the field (frame tie / PM precursor), the per-star
+    offset SIGNIFICANCE (measured offset / its uncertainty), and the reference-free
+    inter-module (NRCA vs NRCB) offset."""
     import astropy.units as u
     from astropy.coordinates import search_around_sky
-    metrics = dict(stage=4, sw=sw)
+    metrics = dict(stage=4, sw=sw, offset_signif_med=None, offset_med_mas=None)
     path = _mosaic_path(o, sw)
     ref = _refcat_path(o)
-    ep = aa.epoch_of(path) if path else None
+    ep = _obs_epoch(o, path)
     ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
-    jsc, _ = aa.detect(path) if path else (None, None)
+    # JWST positions from the catalog (release -> MAST), NOT re-detected on the mosaic.
+    jsc, _jmag, src = _jwst_sources(o, sw)
+    metrics["source"] = src
 
-    # inter-module offset -- ONLY when the release actually ships per-module (NRCA/NRCB)
-    # mosaics for some filter.  Most releases are 'merged' only, so we simply omit the panel
-    # rather than drawing an empty "no per-module mosaics" frame.
-    mos = aa.find_mosaics(o.field)
+    # inter-module offset from the per-detector daophot cats (module-split), NOT by re-detecting
+    # on per-module mosaics.  Use the xcorr histogram PEAK (recovers offsets up to 1.5"), not
+    # direct_intermodule's 0.1" nearest-match: a badly-tied field (>~100 mas) has no real pairs
+    # inside 0.1", so its median -> ~0 and the gate would FALSELY pass the exact case it exists
+    # to catch.  Omitted when the per-detector cats for both modules aren't present.
+    a_sc, b_sc = _module_positions(o, sw)
     im = None
-    for filt in (sw, o.filters[0] if o.filters else sw):
-        mods = mos.get(filt.upper(), {})
-        A = aa.detect(mods["nrca"])[0] if "nrca" in mods else (aa.detect(mods["nrcalong"])[0] if "nrcalong" in mods else None)
-        B = aa.detect(mods["nrcb"])[0] if "nrcb" in mods else (aa.detect(mods["nrcblong"])[0] if "nrcblong" in mods else None)
-        if A is not None and B is not None:
-            im = aa.direct_intermodule(A, B)
-            if im:
-                metrics.update(intermodule_off=float(im["off"]), intermodule_filt=filt)
-            break
+    if a_sc is not None and b_sc is not None and len(a_sc) >= 50 and len(b_sc) >= 50:
+        xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
+        if xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= 100:
+            im = dict(dra=xc["dra"], ddec=xc["ddec"], off=xc["off"])
+    if im:
+        metrics.update(intermodule_off=float(im["off"]), intermodule_filt=sw)
 
     # Measure the JWST-VIRAC pairs BEFORE building the figure so an empty result becomes a
     # red flag, not an empty scatter that reads as "nothing wrong".
     bulk = None; dra = dde = None; nmatch = 0
     if jsc is not None and ref_sc is not None:
         bulk = aa.xcorr(jsc, ref_sc)
-        ia, ib, sep, _ = search_around_sky(jsc, ref_sc, 0.3 * u.arcsec)
-        nmatch = len(ia)
+        # VIRAC-anchored nearest match (release catalog is deeper than VIRAC -> all-pairs would
+        # add wrong-star crowd noise to the offset cloud).
+        idx, sep, _ = ref_sc.match_to_catalog_sky(jsc)
+        keep = sep < 0.3 * u.arcsec
+        nmatch = int(keep.sum())
         if nmatch >= 30:
-            dra = (ref_sc[ib].ra - jsc[ia].ra).to(u.arcsec).value * np.cos(np.radians(jsc[ia].dec.value)) * 1000
-            dde = (ref_sc[ib].dec - jsc[ia].dec).to(u.arcsec).value * 1000
+            rk = ref_sc[keep]; jk = jsc[idx[keep]]
+            dra = (rk.ra - jk.ra).to(u.arcsec).value * np.cos(np.radians(jk.dec.value)) * 1000
+            dde = (rk.dec - jk.dec).to(u.arcsec).value * 1000
 
     if dra is None:
         # nothing to plot -> RED FLAG (not an empty panel).  https://github.com/JWST-GC/data-qa/issues/27#issuecomment-5055329892
-        reason = ("no JWST mosaic on disk" if jsc is None else
+        reason = ("no release or MAST JWST catalog for this filter yet" if jsc is None else
                   "no VIRAC reference for this field/epoch" if ref_sc is None else
                   f"only {nmatch} JWST-VIRAC matches (<30) — frame likely far off-tie")
         png = _red_flag_figure(o, "stage4", "JWST↔VIRAC OFFSET UNMEASURABLE",
@@ -444,8 +807,52 @@ def stage4_offsets(o: Observation, sw):
         metrics.update(red_flag=True, red_flag_reason=reason, n_matched=int(nmatch), passed=False)
         return png, metrics
 
-    fig, ax = _fig(1, 2 if im else 1, 5.4, 5.0)
-    a0 = ax[0][0]
+    # Per-star offset SIGNIFICANCE (measured offset / its uncertainty).  The mosaic detection
+    # used above carries no per-star error, so re-match using the per-exposure DAOPHOT cats,
+    # which do: sig = (JWST-VIRAC offset) / (per-star position sigma).  |sig|~1 means the
+    # residual is consistent with measurement noise; |sig|>>1 means a real, resolved offset.
+    sig_panel = None
+    pooled = _pooled_daophot(o, sw)
+    vwe = _virac_with_errors(o, ep) if ep else None
+    if pooled is not None and vwe is not None and jsc is not None:
+        psc, sig_ra, sig_de, pmag, _pf = pooled
+        vsc, vsr, vsd = vwe
+        # OFFSET from the MERGED catalog (one position per star -> unbiased), same as the main
+        # panel.  Taking the nearest of a star's many per-exposure pool detections would pick the
+        # noise realization closest to VIRAC and bias the offset toward zero.  The per-star
+        # position SIGMA (only the per-exposure cats carry it) is then borrowed from the nearest
+        # daophot detection to that catalog star.  Uncertainty COMBINES both catalogs:
+        # hypot(JWST per-exposure sigma, VIRAC position+PM error).
+        jidx, jsep, _ = vsc.match_to_catalog_sky(jsc)          # VIRAC -> merged catalog
+        keep = jsep < 0.15 * u.arcsec
+        if keep.sum() >= 30:
+            vk = vsc[keep]; jk = jsc[jidx[keep]]
+            oda = (vk.ra - jk.ra).to(u.arcsec).value * np.cos(np.radians(jk.dec.deg)) * 1000
+            odd = (vk.dec - jk.dec).to(u.arcsec).value * 1000
+            didx, dsep, _ = jk.match_to_catalog_sky(psc)        # catalog star -> its daophot sigma
+            near = dsep.arcsec < 0.05
+            sjr = np.where(near, sig_ra[didx], np.nan)
+            sjd = np.where(near, sig_de[didx], np.nan)
+            stot_ra = np.hypot(sjr, vsr[keep])
+            stot_de = np.hypot(sjd, vsd[keep])
+            zra = oda / stot_ra; zde = odd / stot_de
+            gz = np.isfinite(zra) & np.isfinite(zde)
+            if gz.sum() >= 30:
+                # the OFFSET is the bulk tie = hypot of the per-axis MEDIANS.  (median(|d|) is a
+                # scatter statistic bounded below by the per-star spread -- it never approaches
+                # zero even for a perfect tie, so it must NOT be labelled "offset".)
+                off = float(np.hypot(np.median(oda[gz]), np.median(odd[gz])))
+                scat = float(np.hypot(aa.mad_std(oda[gz]), aa.mad_std(odd[gz])))
+                sig_panel = dict(zra=zra[gz], zde=zde[gz], off_med=off, scatter_mas=scat,
+                                 sig_med=float(np.median(np.hypot(zra[gz], zde[gz]))),
+                                 n=int(gz.sum()))
+                metrics.update(offset_med_mas=off, offset_scatter_mas=scat,
+                               offset_signif_med=sig_panel["sig_med"], n_signif=sig_panel["n"])
+
+    ncols = 1 + (1 if sig_panel else 0) + (1 if im else 0)
+    fig, ax = _fig(1, ncols, 5.4, 5.0)
+    col = 0
+    a0 = ax[0][col]; col += 1
     hb = a0.hexbin(dra, dde, gridsize=60, bins="log", cmap="cividis", mincnt=1)
     fig.colorbar(hb, ax=a0, label="log N pairs", shrink=0.85)
     a0.axhline(0, color="w", lw=0.5); a0.axvline(0, color="w", lw=0.5)
@@ -457,8 +864,23 @@ def stage4_offsets(o: Observation, sw):
                    bulk_dra=float(bulk["dra"]) if bulk else None,
                    bulk_ddec=float(bulk["ddec"]) if bulk else None,
                    n_matched=int(nmatch))
+    if sig_panel:
+        asig = ax[0][col]; col += 1
+        hs = asig.hexbin(sig_panel["zra"], sig_panel["zde"], gridsize=60, bins="log",
+                         cmap="magma", mincnt=1)
+        fig.colorbar(hs, ax=asig, label="log N pairs", shrink=0.85)
+        for r, c in [(1, "#33cc66"), (3, "#ffcc00"), (5, "#ff5555")]:
+            asig.add_patch(plt_circle(r, c))
+        asig.axhline(0, color="w", lw=0.4); asig.axvline(0, color="w", lw=0.4)
+        asig.set_aspect("equal")
+        slim = max(6.0, 1.3 * np.nanpercentile(np.hypot(sig_panel["zra"], sig_panel["zde"]), 98))
+        asig.set_xlim(-slim, slim); asig.set_ylim(-slim, slim)
+        asig.set_xlabel(r"dRA / $\sigma_{RA}$"); asig.set_ylabel(r"dDec / $\sigma_{Dec}$")
+        asig.set_title(f"offset significance  median={sig_panel['sig_med']:.1f}$\\sigma$\n"
+                       f"(tie {sig_panel['off_med']:.0f} mas, scatter {sig_panel['scatter_mas']:.0f} "
+                       f"mas, n={sig_panel['n']}; $\\sigma$ from per-exposure cats)", fontsize=8)
     if im:
-        a1 = ax[0][1]
+        a1 = ax[0][col]; col += 1
         a1.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
         a1.axhline(0, color="k", lw=0.5)
         a1.axhline(aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
@@ -649,7 +1071,18 @@ def stage5_intermodule(o: Observation, sw):
                 data = sci.data.astype("float32"); w = WCS(sci.header)
             from astropy.coordinates import SkyCoord
             from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
-            picks = ov["pos"][:200]
+            # De-duplicate: search_around_sky returns MANY pairs per bright overlap star, so the
+            # raw list repeats the same few stars (e.g. one star shown 4x).  Greedily keep only
+            # spatially DISTINCT stars (>0.5") so the gallery is 6 DIFFERENT stars.
+            picks = []
+            for ra, dec in ov["pos"][:2000]:
+                if picks:
+                    prev = SkyCoord([p[0] for p in picks] * u.deg, [p[1] for p in picks] * u.deg)
+                    if SkyCoord(ra * u.deg, dec * u.deg).separation(prev).arcsec.min() < 0.5:
+                        continue
+                picks.append((ra, dec))
+                if len(picks) >= ncut * 3:      # gather extras; some cutouts fail the finite check
+                    break
             strip = fig.add_subplot(gs[1, :]); strip.axis("off")
             cut_axes = [strip.inset_axes([i / ncut + 0.01, 0.05, 0.92 / ncut, 0.85])
                         for i in range(ncut)]
@@ -670,8 +1103,14 @@ def stage5_intermodule(o: Observation, sw):
                 a.set_xticks([]); a.set_yticks([])
                 a.set_title(f"{shown + 1}", fontsize=7)
                 shown += 1
-            fig.text(0.5, 0.02, "overlap-zone star cutouts from the merged mosaic "
-                     "(a mis-tie doubles/elongates these)", ha="center", fontsize=8)
+            from astropy.wcs.utils import proj_plane_pixel_scales
+            pscale = float(np.mean(proj_plane_pixel_scales(w))) * 3600.0     # arcsec/pix from WCS
+            fig.text(0.5, 0.02,
+                     f"{shown} star{'s' if shown != 1 else ''} from the NRCA∩NRCB overlap of the "
+                     f"{filt} merged mosaic (each detected in BOTH modules; 25 px ≈ "
+                     f"{25 * pscale:.1f}\").  A good A↔B tie = one round PSF; a mis-tie doubles or "
+                     f"elongates the star.",
+                     ha="center", fontsize=8)
         title_extra = ""
         suptitle_y = 0.98
     else:
@@ -701,6 +1140,69 @@ def _build_stage5(o, sw, lw):
     return stage5_intermodule(o, sw)
 
 
+# --------------------------------------------------------------------------- STAGE 6
+def stage6_astrom_error(o: Observation, sw, lw):
+    """Astrometric precision curve: per-star position sigma (mas) vs Vega magnitude,
+    from the per-exposure PSF fits.  The bright-end floor is the astrometric systematic limit;
+    the faint-end rise tracks S/N.  One curve per available channel (SW / LW)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    metrics = dict(stage=6, sw=sw, lw=lw)
+    fig, ax = _fig(1, 1, 6.8, 5.2)
+    a = ax[0][0]
+    any_data = False
+    all_vega = True
+    for filt, color in [(sw, "#3366cc"), (lw, "#cc3311")]:
+        if not filt:
+            continue
+        pooled = _pooled_daophot(o, filt)
+        if pooled is None:
+            continue
+        _sc, sig_ra, sig_de, mag, _flux = pooled
+        # Vega-calibrate the instrumental mag (vega = instr + ZP) via the merged catalog; fall
+        # back to instrumental if there is no Vega catalog for this filter.
+        zp = _vega_zeropoint(o, filt, _sc, mag)
+        if zp is not None:
+            mag = mag + zp
+            metrics[f"vega_zp_{filt.lower()}"] = float(zp)
+        else:
+            all_vega = False
+        sig = np.hypot(sig_ra, sig_de) / np.sqrt(2.0)     # per-axis-equivalent astrometric error
+        # Drop failed fits: a formal sigma of hundreds-to-thousands of mas is a diverged PSF
+        # fit on a noise peak, not astrometry -- keeping it compresses the informative regime.
+        ok = sig < 500.0
+        med, lo, hi, ctr = _binned_stat(mag[ok], sig[ok])
+        if med is None:
+            continue
+        any_data = True
+        lbl = f"{filt}  (n={int(ok.sum())}" + ("" if zp is not None else ", instr") + ")"
+        a.plot(ctr, med, "-", color=color, lw=1.7, label=lbl)
+        a.fill_between(ctr, lo, hi, color=color, alpha=0.20)
+        metrics[f"floor_mas_{filt.lower()}"] = float(np.nanmin(med))
+        metrics[f"nstars_{filt.lower()}"] = int(ok.sum())
+    metrics["mag_kind"] = "vega" if all_vega else "mixed"
+    if not any_data:
+        plt.close(fig)          # close the empty curve fig before the red-flag builds its own
+        reason = "no per-exposure DAOPHOT catalogs on disk for this obs/filter"
+        png = _red_flag_figure(o, "stage6", "ASTROMETRIC-ERROR CURVE UNAVAILABLE",
+                               f"Cannot build the precision-vs-magnitude curve: {reason}.")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        return png, metrics
+    a.set_yscale("log")
+    a.set_ylim(0.03, 100.0)          # 0.03-100 mas: floor through the S/N rise; junk lives above
+    xlbl = ("Vega magnitude" if all_vega else
+            "magnitude  (Vega where calibrated, else instrumental)")
+    a.set_xlabel(xlbl)
+    a.set_ylabel(r"astrometric error  $\sigma_{\rm pos}$ (mas)")
+    a.legend(fontsize=9, loc="upper left")
+    a.grid(alpha=0.25, which="both")
+    a.set_title(f"{o.target} {o.obsid} — astrometric precision vs magnitude\n"
+                r"($\sigma$ from per-exposure daophot cats, not the release catalog)", fontsize=9)
+    metrics["passed"] = True
+    return _save(fig, f"{o.obsid}_stage6.png"), metrics
+
+
 def build_stage(o, n, sw, lw):
     if n == 1:
         return stage1_mosaics(o, sw, lw)
@@ -712,6 +1214,8 @@ def build_stage(o, n, sw, lw):
         return stage4_offsets(o, sw)
     if n == 5:
         return stage5_intermodule(o, sw)
+    if n == 6:
+        return stage6_astrom_error(o, sw, lw)
     raise ValueError(n)
 
 
@@ -723,12 +1227,19 @@ CAPTIONS = {
     3: "**Stage 3 — photometric calibration.** JWST {sw} vs VIRAC Ks for {n_matched} matched "
        "stars: slope {slope:.2f}, zp {zeropoint:.2f}, scatter {scatter:.2f} mag. A tight locus "
        "means the right stars were matched.",
-    4: "**Stage 4 — positional offsets.** JWST−VIRAC ΔRA/ΔDec (bulk {bulk_off:.0f} mas) and the "
-       "reference-free inter-module offset. First-order frame-match / proper-motion precursor.",
+    4: "**Stage 4 — positional offsets.** JWST−VIRAC ΔRA/ΔDec (bulk {bulk_off:.0f} mas), the "
+       "per-star offset significance (median {offset_signif_med:.1f}σ = measured offset ÷ its "
+       "uncertainty), and the reference-free inter-module offset. Frame-match / PM precursor.",
     5: "**Stage 5 — inter-detector / inter-module tie.** Per-detector residual quiver "
        "(bulk-removed; A–B diff {intermodule_diff:.1f} mas), the reference-free NRCA–NRCB overlap "
        "(offset {intermodule_off:.1f} mas, RMS {intermodule_rms:.1f} mas over {n_overlap} shared "
-       "stars), and overlap-zone star cutouts (a mis-tie doubles them).",
+       "stars), and a cutout gallery of 6 stars in the NRCA∩NRCB overlap — each cut from the SW "
+       "merged `i2d` mosaic and detected in BOTH modules. A good tie shows one round PSF; a "
+       "mis-tie doubles/elongates the star (the same source drizzled twice at offset positions).",
+    6: "**Stage 6 — astrometric precision.** Per-star position error σ_pos (mas) vs Vega "
+       "magnitude from the per-exposure PSF fits (instrumental mag Vega-calibrated against the "
+       "merged catalog), one curve per channel. The bright-end floor is the astrometric "
+       "systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percentile.",
 }
 
 
@@ -737,6 +1248,14 @@ def caption_for(n, metrics):
         return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate.")
+    if n == 4 and metrics.get("offset_signif_med") is None:
+        # significance panel omitted (no per-exposure cats / VIRAC errors) -> don't assert a
+        # third panel exists or print "nanσ".
+        return ("**Stage 4 — positional offsets.** JWST−VIRAC ΔRA/ΔDec (bulk "
+                f"{metrics.get('bulk_off') or float('nan'):.0f} mas) and the reference-free "
+                "inter-module offset (the per-star significance panel is omitted — no "
+                "per-exposure catalogs or VIRAC per-star errors for this field). "
+                "Frame-match / PM precursor.")
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
@@ -785,7 +1304,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4])
+    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
