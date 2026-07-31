@@ -344,6 +344,28 @@ def _viraccache_path(o: Observation):
     return p if os.path.exists(p) else None
 
 
+_DAO_OBS_RE = re.compile(r"_o(\d{3})_")     # per-exposure token is underscore-bounded: _o023_visit
+
+
+def _daophot_glob(o: Observation, filt, det="*"):
+    """Obs-scoped per-exposure daophot cats for filt (+ detector).  Fields name these either
+    untokened (brick: ``f212n_nrca1_visit*``) or per-obs (gc2211: ``f200w_nrca1_o023_visit*``,
+    with an older untokened generation possibly alongside).  Never hand one observation's
+    per-exposure cats to another's QA (stage 5 / 6 / significance):
+      * prefer THIS obs's tokened files;
+      * if a per-obs generation exists but not for this obs -> return [] (don't fall back to a
+        different obs or a stale untokened generation);
+      * else use the untokened files (single-obs-per-field layout)."""
+    base = f"{BASE}/{o.field}/{filt}/{filt.lower()}_{det}"
+    tok = sorted(glob.glob(f"{base}_o{o.obs}_visit*_*_m3_daophot_basic.fits"))
+    if tok:
+        return tok
+    if glob.glob(f"{base}_o[0-9][0-9][0-9]_visit*_*_m3_daophot_basic.fits"):
+        return []
+    return [c for c in sorted(glob.glob(f"{base}_visit*_*_m3_daophot_basic.fits"))
+            if not _DAO_OBS_RE.search(os.path.basename(c))]
+
+
 def _virac_with_errors(o: Observation, epoch):
     """VIRAC2 cache PM-propagated to ``epoch`` WITH per-star position sigma at that epoch:
     sigma = hypot(base position error, |baseline| * PM error).  The gaia_virac2 refcat used
@@ -685,8 +707,7 @@ def _pooled_daophot(o: Observation, filt, max_files=64):
     Returns (SkyCoord, sig_ra_mas, sig_de_mas, instr_mag, flux) or None."""
     import astropy.units as u
     from astropy.table import vstack, Table
-    cats = sorted(glob.glob(
-        f"{BASE}/{o.field}/{filt}/{filt.lower()}_*_visit*_*_m3_daophot_basic.fits"))
+    cats = _daophot_glob(o, filt)          # obs-scoped
     if not cats:
         return None
     if len(cats) > max_files:
@@ -908,7 +929,7 @@ def _per_detector_offsets(o, filt, ref_sc):
     from astropy.table import Table
     out = {}
     for d in _SW_DETS:
-        cats = glob.glob(f"{BASE}/{o.field}/{filt}/{filt.lower()}_{d}_visit*_*_m3_daophot_basic.fits")
+        cats = _daophot_glob(o, filt, d)          # obs-scoped
         if not cats:
             continue
         try:
@@ -956,7 +977,7 @@ def _module_positions(o, filt):
     def pool(dets):
         cats = []
         for d in dets:
-            cats += glob.glob(f"{BASE}/{o.field}/{filt}/{filt.lower()}_{d}_visit*_*_m3_daophot_basic.fits")
+            cats += _daophot_glob(o, filt, d)          # obs-scoped
         if not cats:
             return None
         try:
