@@ -939,6 +939,9 @@ def _per_detector_offsets(o, filt, ref_sc):
         if "skycoord_centroid" not in T.colnames:
             continue
         sc = T["skycoord_centroid"]
+        sc = sc[np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)]      # NaN centroids crash the match
+        if not len(sc):
+            continue
         ia, ib, sep, _ = search_around_sky(sc, ref_sc, 0.15 * u.arcsec)
         if len(ia) < 50:
             continue
@@ -984,7 +987,14 @@ def _module_positions(o, filt):
             T = vstack([Table.read(c) for c in cats], metadata_conflicts="silent")
         except (OSError, ValueError):
             return None
-        return T["skycoord_centroid"] if "skycoord_centroid" in T.colnames else None
+        if "skycoord_centroid" not in T.colnames:
+            return None
+        sc = T["skycoord_centroid"]
+        # drop NaN coordinates -- some per-exposure cats carry NaN centroids, which crash
+        # xcorr / match_to_catalog_sky ("Catalog coordinates cannot contain NaN entries").
+        finite = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)
+        sc = sc[finite]
+        return sc if len(sc) else None
 
     return pool(["nrca1", "nrca2", "nrca3", "nrca4"]), pool(["nrcb1", "nrcb2", "nrcb3", "nrcb4"])
 
