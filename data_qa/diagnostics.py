@@ -56,6 +56,10 @@ _LW_PREF = ["F480M", "F470N", "F466N", "F444W", "F410M", "F405N", "F360M", "F356
 # field's refcache lacks e_pmRA/e_pmDE (median of the columns where they are present).
 PM_ERR_FLOOR = 2.0
 
+# A module with more than this fraction of NaN daophot centroids is an astrometry DEFECT to
+# surface, not a few diverged fits to silently drop (real fields sit at ~0.01%).
+_NAN_FRAC_FLAG = 0.05
+
 
 def _channel(filt):
     return "SW" if int(filt[1:4]) <= 212 else "LW"
@@ -794,7 +798,7 @@ def stage4_offsets(o: Observation, sw):
     # direct_intermodule's 0.1" nearest-match: a badly-tied field (>~100 mas) has no real pairs
     # inside 0.1", so its median -> ~0 and the gate would FALSELY pass the exact case it exists
     # to catch.  Omitted when the per-detector cats for both modules aren't present.
-    a_sc, b_sc = _module_positions(o, sw)
+    a_sc, b_sc, _minfo = _module_positions(o, sw)
     im = None
     if a_sc is not None and b_sc is not None and len(a_sc) >= 50 and len(b_sc) >= 50:
         xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
@@ -939,6 +943,9 @@ def _per_detector_offsets(o, filt, ref_sc):
         if "skycoord_centroid" not in T.colnames:
             continue
         sc = T["skycoord_centroid"]
+        sc = sc[np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)]      # NaN centroids crash the match
+        if not len(sc):
+            continue
         ia, ib, sep, _ = search_around_sky(sc, ref_sc, 0.15 * u.arcsec)
         if len(ia) < 50:
             continue
@@ -967,11 +974,23 @@ def _cutout_mosaic(o, filt):
     return pick("merged") or pick("nrcb") or pick("nrca") or _mosaic_path(o, filt)
 
 
+def _finite_sc(sc):
+    """SkyCoord subset with finite RA/Dec.  NaN centroids crash astropy's KDTree matchers
+    (xcorr / search_around_sky / match_to_catalog_sky reject ANY NaN), so every per-detector
+    daophot position list must pass through this before a match."""
+    return sc[np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)]
+
+
 def _module_positions(o, filt):
-    """(NRCA, NRCB) SkyCoords for the A/B tie, pooled from the per-detector daophot cats.
-    The PIPELINE emits no merged-per-module mosaics (any on disk are stale, out-of-date
-    artifacts), so the per-detector cats are the PRIMARY and only source.  Either module may
-    be None for a single-module observation (e.g. sickle = NRCB only)."""
+    """(NRCA, NRCB) finite SkyCoords for the A/B tie, pooled from the per-detector daophot cats,
+    plus per-module ``meta``.  The per-detector cats are the PRIMARY source.  A module is None
+    either because it is genuinely ABSENT (single-module obs, e.g. sickle = NRCB only) or because
+    its centroids are unusable -- the caller MUST distinguish these (an all-NaN module is an
+    astrometry FAILURE to red-flag, not a legitimate single-module pass).
+
+    Returns ``(a_sc, b_sc, meta)`` where meta[module] = dict(present, n_raw, n_nan, nan_frac,
+    dead): ``present`` = cats exist on disk; ``dead`` = cats exist but too few finite centroids
+    to tie (astrometry failed); ``nan_frac`` = dropped fraction (flagged when high even if usable)."""
     from astropy.table import vstack, Table
 
     def pool(dets):
@@ -979,14 +998,24 @@ def _module_positions(o, filt):
         for d in dets:
             cats += _daophot_glob(o, filt, d)          # obs-scoped
         if not cats:
-            return None
+            return None, dict(present=False, n_raw=0, n_nan=0, nan_frac=0.0, dead=False)
         try:
             T = vstack([Table.read(c) for c in cats], metadata_conflicts="silent")
         except (OSError, ValueError):
-            return None
-        return T["skycoord_centroid"] if "skycoord_centroid" in T.colnames else None
+            return None, dict(present=True, n_raw=0, n_nan=0, nan_frac=0.0, dead=True)
+        if "skycoord_centroid" not in T.colnames:
+            return None, dict(present=True, n_raw=0, n_nan=0, nan_frac=0.0, dead=True)
+        sc = T["skycoord_centroid"]
+        scf = _finite_sc(sc)
+        n_raw, n_kept = len(sc), len(scf)
+        n_nan = n_raw - n_kept
+        info = dict(present=True, n_raw=n_raw, n_nan=n_nan,
+                    nan_frac=(n_nan / n_raw if n_raw else 0.0), dead=(n_kept < 50))
+        return (scf if n_kept else None), info
 
-    return pool(["nrca1", "nrca2", "nrca3", "nrca4"]), pool(["nrcb1", "nrcb2", "nrcb3", "nrcb4"])
+    a_sc, a_info = pool(["nrca1", "nrca2", "nrca3", "nrca4"])
+    b_sc, b_info = pool(["nrcb1", "nrcb2", "nrcb3", "nrcb4"])
+    return a_sc, b_sc, dict(a=a_info, b=b_info)
 
 
 def stage5_intermodule(o: Observation, sw):
@@ -1013,7 +1042,23 @@ def stage5_intermodule(o: Observation, sw):
     # residual scatter of the SAME stars: align A onto B by the peak, keep the tight matches.
     ov = None
     single_module = None
-    a_sc, b_sc = _module_positions(o, filt)
+    a_sc, b_sc, minfo = _module_positions(o, filt)
+    metrics["nan_frac"] = round(max(minfo["a"]["nan_frac"], minfo["b"]["nan_frac"]), 4)
+    # A module that is None because its cats exist on disk but have too few finite centroids is
+    # an astrometry FAILURE (dead) -- NOT a legitimate single-module obs.  Surface it loudly
+    # instead of letting it masquerade as a single-module pass.
+    dead_module = next((mod for mod, sc, k in (("NRCA", a_sc, "a"), ("NRCB", b_sc, "b"))
+                        if sc is None and minfo[k]["present"] and minfo[k]["dead"]), None)
+    if dead_module:
+        k = "a" if dead_module == "NRCA" else "b"
+        png = _red_flag_figure(o, "stage5", f"{dead_module} ASTROMETRY FAILED",
+                               f"{dead_module} has per-exposure catalogs but "
+                               f"{minfo[k]['nan_frac'] * 100:.0f}% NaN centroids (<50 usable) — the "
+                               f"A/B tie cannot be measured. This is an astrometry failure, not a "
+                               f"single-module observation.")
+        metrics.update(red_flag=True, red_flag_reason=f"{dead_module} centroids unusable (NaN)",
+                       dead_module=dead_module, passed=False)
+        return png, metrics
     if (a_sc is None) ^ (b_sc is None):
         single_module = "NRCA" if a_sc is not None else "NRCB"
     if a_sc is not None and b_sc is not None and len(a_sc) >= 50 and len(b_sc) >= 50:
@@ -1147,7 +1192,12 @@ def stage5_intermodule(o: Observation, sw):
     # single-module obs (sickle = NRCB only) has no A/B tie to fail -> N/A passes.
     if single_module:
         metrics["single_module"] = single_module
-    metrics["passed"] = bool(single_module or (ov and ov["off"] < aa.THRESH["intermodule"]))
+    nan_frac = metrics.get("nan_frac", 0.0)
+    high_nan = nan_frac > _NAN_FRAC_FLAG        # usable but degraded -> surface + don't pass
+    if high_nan:
+        title_extra += f"  ·  ⚠ {nan_frac * 100:.0f}% NaN centroids"
+    metrics["passed"] = bool((single_module or (ov and ov["off"] < aa.THRESH["intermodule"]))
+                             and not high_nan)
     fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module tie ({filt}){title_extra}",
                  fontsize=11, y=suptitle_y)
     return _save(fig, f"{o.obsid}_stage5.png"), metrics
