@@ -90,3 +90,46 @@ def test_daophot_glob_untokened_excludes_stray_tokened(tmp_path, monkeypatch):
     _touch(d, "f212n_nrca1_visit001_exp1_m3_daophot_basic.fits")           # legacy untokened
     _touch(d, "f212n_nrca1_o007_visit001_exp1_m3_daophot_basic.fits")      # a per-obs generation
     assert D._daophot_glob(_obs(field="brick", obs="001", filt="F212N"), "F212N") == []
+
+
+# --------------------------------------------------------------------------- NaN centroid guards
+def test_finite_sc_drops_nan():
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    sc = SkyCoord([1.0, 2.0, np.nan] * u.deg, [1.0, np.nan, 3.0] * u.deg)
+    assert len(D._finite_sc(sc)) == 1     # only row 0 is finite in both axes
+
+
+def _write_daophot(path, ras, decs):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    n = len(ras)
+    t = Table()
+    t["skycoord_centroid"] = SkyCoord(np.asarray(ras) * u.deg, np.asarray(decs) * u.deg)
+    t["dra"] = np.full(n, 0.003); t["ddec"] = np.full(n, 0.003); t["flux_fit"] = np.full(n, 100.0)
+    t.write(path, overwrite=True)
+
+
+def test_module_positions_dead_vs_absent(tmp_path, monkeypatch):
+    # NRCA present but ALL-NaN centroids (astrometry failure); NRCB genuinely absent.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "gc2211" / "F200W"; d.mkdir(parents=True)
+    nan = np.full(80, np.nan)
+    for det in ("nrca1", "nrca2", "nrca3", "nrca4"):
+        _write_daophot(d / f"f200w_{det}_o023_visit001_exp1_m3_daophot_basic.fits", nan, nan)
+    a_sc, b_sc, meta = D._module_positions(_obs(obs="023"), "F200W")
+    assert a_sc is None and meta["a"]["present"] and meta["a"]["dead"]      # dead, NOT absent
+    assert b_sc is None and not meta["b"]["present"]                        # genuinely absent
+
+
+def test_module_positions_normal(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "gc2211" / "F200W"; d.mkdir(parents=True)
+    ra = np.linspace(266.4, 266.5, 200); dec = np.linspace(-28.9, -28.8, 200)
+    for det in ("nrca1", "nrcb1"):
+        _write_daophot(d / f"f200w_{det}_o023_visit001_exp1_m3_daophot_basic.fits", ra, dec)
+    a_sc, b_sc, meta = D._module_positions(_obs(obs="023"), "F200W")
+    assert a_sc is not None and b_sc is not None
+    assert not meta["a"]["dead"] and not meta["b"]["dead"]
+    assert meta["a"]["nan_frac"] == 0.0
