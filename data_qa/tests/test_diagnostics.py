@@ -49,6 +49,27 @@ def test_caption_redflag():
     assert "RED FLAG" in cap and "no catalog" in cap
 
 
+def test_caption_stage5_no_overlap_two_modules():
+    # both modules present but no shared stars -> overlap keys absent; must NOT truncate to a
+    # bare fragment and must say the tie is unverified.
+    cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, passed=False))
+    assert "nan" not in cap.lower()
+    assert "could not be measured" in cap and "unverified" in cap
+    assert "3.0 mas" in cap
+
+
+def test_caption_stage5_single_module():
+    cap = D.caption_for(5, dict(stage=5, single_module="NRCA", passed=True))
+    assert "Single module" in cap and "NRCA" in cap
+    assert "nan" not in cap.lower()
+
+
+def test_caption_stage5_full_when_overlap_present():
+    cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1,
+                                intermodule_rms=6.2, n_overlap=137))
+    assert "137 shared" in cap and "4.1 mas" in cap
+
+
 # --------------------------------------------------------------------------- _daophot_glob
 def _touch(d, name):
     (d / name).write_text("")

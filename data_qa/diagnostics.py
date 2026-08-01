@@ -1327,6 +1327,23 @@ def caption_for(n, metrics):
                 "inter-module offset (the per-star significance panel is omitted — no "
                 "per-exposure catalogs or VIRAC per-star errors for this field). "
                 "Frame-match / PM precursor.")
+    if n == 5 and metrics.get("intermodule_off") is None:
+        # No reference-free NRCA-NRCB overlap measurement -> the full template's overlap clause
+        # ({intermodule_off}/{intermodule_rms}/{n_overlap}) would KeyError and drop the whole
+        # caption to a bare fragment.  Say WHICH case this is instead (>half the fields hit it):
+        # a legitimate single-module obs, or two modules with no shared stars to tie them.
+        diff = metrics.get("intermodule_diff")
+        diff_clause = (f" Per-detector residual quiver shows an A–B diff of {diff:.1f} mas."
+                       if diff is not None else "")
+        if metrics.get("single_module"):
+            return (f"**Stage 5 — inter-detector tie.** Single module "
+                    f"({metrics['single_module']}) for this observation, so there is no "
+                    f"NRCA–NRCB tie to check — the reference-free overlap panel is omitted."
+                    f"{diff_clause}")
+        return ("**Stage 5 — inter-detector / inter-module tie.** The reference-free NRCA–NRCB "
+                "overlap could not be measured (no shared stars in the NRCA∩NRCB dither overlap "
+                "after alignment), so that panel and the cutout gallery are omitted."
+                f"{diff_clause} The inter-module tie is unverified for this observation.")
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
