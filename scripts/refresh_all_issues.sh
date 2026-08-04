@@ -106,5 +106,13 @@ for spec in "${SPECS[@]}"; do
   echo "$sout" | grep -iE "created|updated|status comment|no issue|FAILED" | tail -1 || true
   note_failure "$sout" "$src" && rc_any=1
 done
+
+# Optionally push the per-field status onto the GitHub Projects board (opt-in: needs a token with
+# org Projects read+write, so it is OFF by default and never fails the refresh).
+if [ "${QA_SYNC_BOARD:-0}" = "1" ]; then
+  echo "===== syncing project board ====="
+  python3 scripts/sync_project_board.py 2>&1 | tail -3 || echo "board sync skipped (non-fatal)"
+fi
+
 echo "refresh_all_issues: done (rc_any=$rc_any)"
 exit "$rc_any"
