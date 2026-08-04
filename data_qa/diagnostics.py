@@ -81,6 +81,18 @@ def pick_filters(available, sw=None, lw=None):
     return sw, lw
 
 
+def _available_filters(o: Observation):
+    """The obs's filters that actually have a product on disk (mosaic, or a catalog/DAO catalog
+    with usable positions) -- as opposed to the program's nominal filter list from the portal.
+    Restricting pick_filters to these avoids choosing a filter (e.g. F444W) that was proposed but
+    whose data are not present, which would spuriously red-flag the CMD/calibration (issue #39)."""
+    out = []
+    for f in o.filters:
+        if _mosaic_path(o, f) or _catalog_with_vega(o, f)[0] or _dao_position_catalog(o, f):
+            out.append(f)
+    return out
+
+
 # --------------------------------------------------------------------------- product lookup
 def _mosaic_path(o: Observation, filt):
     """Released merged i2d for this obs+filter, or None."""
@@ -287,6 +299,39 @@ def _jwst_sources(o: Observation, filt):
                 if g.sum() >= 30:
                     return SkyCoord(ra[g] * u.deg, dec[g] * u.deg), mag[g], f"MAST:{os.path.basename(mp)}"
     return None, None, None
+
+
+def _dao_position_catalog(o: Observation, filt):
+    """Per-filter RELEASE DAO catalog (positions only, no calibrated magnitude), obs-scoped, as a
+    LAST-RESORT position source for the frame-tie check.  A field that has been DETECTED but not
+    yet merged/calibrated (gc2211 o046: per-filter ``f200w_..._dao_basic_o046_vetted.fits`` exist,
+    but no merged photometry table and no MAST ``_cat.fits``) still has real positions -> we can
+    still measure the frame offset the user cares about, rather than red-flagging.  Prefers the
+    vetted science catalog at the highest pipeline stage; excludes carta/seed helper files."""
+    pats = [p for p in glob.glob(f"{BASE}/{o.field}/catalogs/{filt.lower()}_*dao_basic*_o{o.obs}_vetted.fits")
+            if "carta" not in p and "seed" not in p]
+    if not pats:
+        return None
+    return max(pats, key=lambda p: (_catalog_priority(os.path.basename(p))[0], os.path.getmtime(p)))
+
+
+def _jwst_positions(o: Observation, filt):
+    """Positions (+source label) for the frame-tie check ONLY (stage 4 needs no magnitude).
+    Prefers a catalog WITH photometry (``_jwst_sources``: release merged -> MAST); falls back to a
+    per-filter release DAO catalog (positions only) so a detected-but-not-yet-merged obs still gets
+    a real offset measurement.  Returns (SkyCoord, label) or (None, None)."""
+    from astropy.table import Table
+    sc, _mag, src = _jwst_sources(o, filt)
+    if sc is not None:
+        return sc, src
+    dp = _dao_position_catalog(o, filt)
+    if dp:
+        m = Table.read(dp)
+        if "skycoord" in m.colnames:
+            sc = _finite_sc(m["skycoord"])
+            if len(sc) >= 30:
+                return sc, f"release-dao(positions):{os.path.basename(dp)}"
+    return None, None
 
 
 def _crossmatch_cmd_arrays(o: Observation, sw, lw):
@@ -583,9 +628,16 @@ def stage2_cmd(o: Observation, sw, lw):
                         fontsize=8)
             metrics.update(n_stars=nkeep, kind="crossmatch", mag_system=magsys, passed=nkeep > 500)
             return _save(fig, f"{o.obsid}_stage2.png"), metrics
+        # Distinguish "not catalogued at all" from "detected but not yet calibrated": a CMD needs
+        # magnitudes, and the per-filter DAO catalogs carry positions only.  Say which it is.
+        dao_only = bool(_dao_position_catalog(o, sw) and (not lw or _dao_position_catalog(o, lw)))
+        reason = (f"per-filter DAO catalogues exist for {want} but carry positions only (no "
+                  f"calibrated photometry) — a CMD needs magnitudes; the merged/MAST catalogue is "
+                  f"not built yet" if dao_only else
+                  f"no release catalogue and no MAST source catalogue for {want} yet")
         png = _red_flag_figure(o, "stage2", "NO CATALOG FOR CMD",
-                               f"No release catalog and no MAST source catalog for {want} yet.")
-        metrics.update(red_flag=True, red_flag_reason=f"no catalog for {want}", passed=False)
+                               f"The CMD is empty: {reason}.")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
         return png, metrics
     t = Table.read(cat)
 
@@ -669,9 +721,15 @@ def stage3_calibration(o: Observation, sw):
     if jsc is None:
         import matplotlib.pyplot as plt
         plt.close(fig)          # close the empty fig before the red-flag builds its own
-        png = _red_flag_figure(o, "stage3", "NO CATALOG TO CALIBRATE",
-                               f"No release or MAST source catalog for {sw} yet — nothing to QA.")
-        metrics.update(red_flag=True, red_flag_reason=f"no catalog for {sw}", passed=False)
+        # Calibration needs magnitudes; a positions-only DAO catalogue can't be calibrated.  Say
+        # so, and point at stage 4 (which CAN measure the frame offset from those positions).
+        dao_only = bool(_dao_position_catalog(o, sw))
+        reason = (f"per-filter DAO catalogue exists for {sw} but carries positions only (no "
+                  f"calibrated photometry) — calibration needs magnitudes; see stage 4 for the "
+                  f"frame offset" if dao_only else
+                  f"no release or MAST source catalogue for {sw} yet")
+        png = _red_flag_figure(o, "stage3", "NO PHOTOMETRY TO CALIBRATE", reason + ".")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
         return png, metrics
     if ref_sc is None or ref_mag is None:
         a.text(0.5, 0.5, "need VIRAC refcat", ha="center", va="center")
@@ -798,19 +856,50 @@ def _binned_stat(x, y, width=0.5, minn=15):
     return np.array(med), np.array(p16), np.array(p84), np.array(ctr)
 
 
+def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk, nmatch):
+    """Explain WHY the JWST<->VIRAC offset is unmeasurable, as specifically as the data allow --
+    the user's ask: not a bare "FAILURE" but the actual cause (issue #7).  Order: no catalog, no
+    reference, disjoint footprints, then (both overlap, still no peak) a magnitude-range check
+    against our own deeper catalog."""
+    if jsc is None:
+        # _jwst_positions already tried release-merged -> MAST -> per-filter DAO, so nothing usable
+        # exists on disk for this obs+filter.
+        return (f"no release, MAST, or per-filter DAO catalog with usable positions for {filt} "
+                f"yet — this observation is not catalogued")
+    if ref_sc is None:
+        return "no VIRAC reference catalogue for this field/epoch"
+    # Both catalogues exist but produced no matches: is it a footprint or a content problem?
+    jr = (float(np.nanmin(jsc.ra.deg)), float(np.nanmax(jsc.ra.deg)))
+    jd = (float(np.nanmin(jsc.dec.deg)), float(np.nanmax(jsc.dec.deg)))
+    rr = (float(np.nanmin(ref_sc.ra.deg)), float(np.nanmax(ref_sc.ra.deg)))
+    rd = (float(np.nanmin(ref_sc.dec.deg)), float(np.nanmax(ref_sc.dec.deg)))
+    dec_overlap = min(jd[1], rd[1]) - max(jd[0], rd[0])
+    ra_overlap = min(jr[1], rr[1]) - max(jr[0], rr[0])
+    if dec_overlap <= 0 or ra_overlap <= 0:
+        return (f"the JWST footprint (RA {jr[0]:.3f}–{jr[1]:.3f}, Dec {jd[0]:.3f}–{jd[1]:.3f}) and the "
+                f"VIRAC reference (RA {rr[0]:.3f}–{rr[1]:.3f}, Dec {rd[0]:.3f}–{rd[1]:.3f}) do not "
+                f"overlap on the sky — the reference covers a different region")
+    pr = (bulk or {}).get("peak_ratio", 0.0)
+    return (f"footprints overlap but no common-star histogram peak (peak_ratio {pr:.2f} < "
+            f"{aa.MIN_PEAK_RATIO}) — the JWST and VIRAC magnitude ranges likely do not overlap "
+            f"(too few stars bright enough for VIRAC), so there are no shared sources to tie on")
+
+
 def stage4_offsets(o: Observation, sw):
     """JWST-VIRAC per-star dRA/dDec across the field (frame tie / PM precursor), the per-star
     offset SIGNIFICANCE (measured offset / its uncertainty), and the reference-free
     inter-module (NRCA vs NRCB) offset."""
     import astropy.units as u
-    from astropy.coordinates import search_around_sky
+    from astropy.coordinates import search_around_sky, SkyCoord
     metrics = dict(stage=4, sw=sw, offset_signif_med=None, offset_med_mas=None)
     path = _mosaic_path(o, sw)
     ref = _refcat_path(o)
     ep = _obs_epoch(o, path)
     ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
-    # JWST positions from the catalog (release -> MAST), NOT re-detected on the mosaic.
-    jsc, _jmag, src = _jwst_sources(o, sw)
+    # JWST positions from the catalog (release -> MAST -> per-filter DAO), NOT re-detected on the
+    # mosaic.  Stage 4 needs only positions, so a detected-but-not-yet-merged obs (gc2211 o046)
+    # falls back to its per-filter DAO catalog and is still measurable.
+    jsc, src = _jwst_positions(o, sw)
     metrics["source"] = src
 
     # inter-module offset from the per-detector daophot cats (module-split), NOT by re-detecting
@@ -829,28 +918,44 @@ def stage4_offsets(o: Observation, sw):
 
     # Measure the JWST-VIRAC pairs BEFORE building the figure so an empty result becomes a
     # red flag, not an empty scatter that reads as "nothing wrong".
-    bulk = None; dra = dde = None; nmatch = 0
+    bulk = None; dra = dde = None; nmatch = 0; bulk_off_mas = None
     if jsc is not None and ref_sc is not None:
-        bulk = aa.xcorr(jsc, ref_sc)
+        bulk = aa.xcorr(jsc, ref_sc)                            # histogram peak: recovers LARGE offsets
         # VIRAC-anchored nearest match (release catalog is deeper than VIRAC -> all-pairs would
         # add wrong-star crowd noise to the offset cloud).
         idx, sep, _ = ref_sc.match_to_catalog_sky(jsc)
         keep = sep < 0.3 * u.arcsec
         nmatch = int(keep.sum())
+        _bulk_ok = bool(bulk and bulk.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO
+                        and bulk.get("npairs", 0) >= 1000)
+        if nmatch < 30 and _bulk_ok:
+            # Frame too far off for a blind 0.3" nearest match, but the xcorr histogram found a
+            # clear peak: the offset IS measurable.  Show HOW FAR off instead of a "FAILURE" sign
+            # (issues #7/#8/#28).  Shift JWST onto VIRAC by the measured bulk offset, re-match to
+            # recover the per-star cloud, and report the offset prominently.
+            cosd = float(np.cos(np.radians(np.median(jsc.dec.deg))))
+            jsh = SkyCoord((jsc.ra.deg + bulk["dra"] / 3.6e6 / cosd) * u.deg,
+                           (jsc.dec.deg + bulk["ddec"] / 3.6e6) * u.deg)
+            idx, sep, _ = ref_sc.match_to_catalog_sky(jsh)
+            keep = sep < 0.3 * u.arcsec
+            nmatch = int(keep.sum())
+            if nmatch >= 30:
+                bulk_off_mas = float(bulk["off"])
         if nmatch >= 30:
             rk = ref_sc[keep]; jk = jsc[idx[keep]]
             dra = (rk.ra - jk.ra).to(u.arcsec).value * np.cos(np.radians(jk.dec.value)) * 1000
             dde = (rk.dec - jk.dec).to(u.arcsec).value * 1000
 
     if dra is None:
-        # nothing to plot -> RED FLAG (not an empty panel).  https://github.com/JWST-GC/data-qa/issues/27#issuecomment-5055329892
-        reason = ("no release or MAST JWST catalog for this filter yet" if jsc is None else
-                  "no VIRAC reference for this field/epoch" if ref_sc is None else
-                  f"only {nmatch} JWST-VIRAC matches (<30) — frame likely far off-tie")
+        # No per-star cloud AND no recoverable bulk peak -> the offset is genuinely unmeasurable.
+        # Say WHY as specifically as the data allow (footprint disjoint / no reference / no
+        # catalog) rather than a bare "FAILURE" (issue #27).
+        reason = _offset_failure_reason(o, sw, jsc, ref_sc, bulk, nmatch)
         png = _red_flag_figure(o, "stage4", "JWST↔VIRAC OFFSET UNMEASURABLE",
                                f"The positional-offset plot is empty: {reason}.")
         metrics.update(red_flag=True, red_flag_reason=reason, n_matched=int(nmatch), passed=False)
         return png, metrics
+    metrics["far_off_recovered"] = bulk_off_mas is not None   # cloud recovered via xcorr shift
 
     # Per-star offset SIGNIFICANCE (measured offset / its uncertainty).  The mosaic detection
     # used above carries no per-star error, so re-match using the per-exposure DAOPHOT cats,
@@ -1431,8 +1536,12 @@ def main(argv=None):
         return 1
     if args.target:
         o = replace(o, target=args.target)
-    sw, lw = pick_filters(o.filters, args.sw, args.lw)
-    print(f"{o.obsid}: SW={sw} LW={lw} filters={o.filters}")
+    # Pick the CMD/QA filters from those that actually HAVE data on disk, not the program's nominal
+    # filter list.  The portal lists all six Sgr A* filters, but only F212N+F405N have mosaics and
+    # catalogs; picking blindly gave F212N+F444W -> a false "no catalog" red flag (issue #39).
+    avail = _available_filters(o) or o.filters
+    sw, lw = pick_filters(avail, args.sw, args.lw)
+    print(f"{o.obsid}: SW={sw} LW={lw} filters={o.filters} (with data: {avail})")
     # metrics json where make_issues.render_body reads checkbox state; write INCREMENTALLY
     # and isolate each stage so a corrupt FITS / photutils failure / GitHub 5xx on one stage
     # doesn't drop the metrics of the stages that succeeded or stop later stages.

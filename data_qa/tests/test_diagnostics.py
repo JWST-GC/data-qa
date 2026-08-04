@@ -101,6 +101,34 @@ def test_refcat_path_refuses_only_other_obs_tokened(tmp_path, monkeypatch):
     assert D._refcat_path(_obs(obs="023")) is None
 
 
+# --------------------------------------------------------------------------- _offset_failure_reason
+def test_offset_reason_no_catalog():
+    r = D._offset_failure_reason(_obs(), "F200W", None, object(), None, 0)
+    assert "not catalogued" in r and "F200W" in r
+
+
+def test_offset_reason_no_reference():
+    r = D._offset_failure_reason(_obs(), "F200W", object(), None, None, 0)
+    assert "no virac reference" in r.lower()
+
+
+def test_offset_reason_disjoint_footprint():
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    j = SkyCoord([266.40, 266.41] * u.deg, [-28.90, -28.89] * u.deg)   # north patch
+    r = SkyCoord([266.40, 266.41] * u.deg, [-29.20, -29.19] * u.deg)   # south patch, disjoint
+    msg = D._offset_failure_reason(_obs(), "F200W", j, r, {"peak_ratio": 0.0}, 0)
+    assert "do not" in msg and "overlap" in msg
+
+
+def test_offset_reason_overlap_but_no_peak():
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    sc = SkyCoord([266.40, 266.41, 266.42] * u.deg, [-28.90, -28.89, -28.88] * u.deg)
+    msg = D._offset_failure_reason(_obs(), "F200W", sc, sc, {"peak_ratio": 0.3}, 0)
+    assert "magnitude ranges" in msg
+
+
 # --------------------------------------------------------------------------- _daophot_glob
 
 
