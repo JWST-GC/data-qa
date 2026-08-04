@@ -79,7 +79,11 @@ def render_body(o: Observation) -> str:
     from . import astrometry_audit as aa
     THRESH_ABS, THRESH_IM = aa.THRESH["absolute"], aa.THRESH["intermodule"]
     delivered = bool(s1.get("passed"))
-    frame_ok = s4.get("bulk_off") is not None and s4["bulk_off"] < THRESH_ABS
+    # Frame tie: use stage 4's own PASS flag, which requires a small median offset AND cells that
+    # AGREE.  A bare `bulk_off < THRESH` would tick the box for a bimodal frame (gc2211 o050:
+    # median 57 mas but cell-to-cell spread 58 mas) -- exactly the "within survey noise" claim
+    # that must not be ticked for an internally-inconsistent mosaic (PR #54 review).
+    frame_ok = bool(s4.get("passed"))
     # inter-module: prefer stage 5's reference-free overlap offset, else stage 4's.  Absent =
     # 'not yet measured' -> left unchecked (the sticky-merge won't downgrade a prior check).
     im = s5.get("intermodule_off", s4.get("intermodule_off"))

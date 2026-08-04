@@ -85,10 +85,17 @@ def _available_filters(o: Observation):
     """The obs's filters that actually have a product on disk (mosaic, or a catalog/DAO catalog
     with usable positions) -- as opposed to the program's nominal filter list from the portal.
     Restricting pick_filters to these avoids choosing a filter (e.g. F444W) that was proposed but
-    whose data are not present, which would spuriously red-flag the CMD/calibration (issue #39)."""
+    whose data are not present, which would spuriously red-flag the CMD/calibration (issue #39).
+
+    A single unreadable catalog header must not sink the whole obs's QA, so a per-filter FITS error
+    is treated as 'no usable catalog for that filter' rather than propagating."""
     out = []
     for f in o.filters:
-        if _mosaic_path(o, f) or _catalog_with_vega(o, f)[0] or _dao_position_catalog(o, f):
+        try:
+            has = bool(_mosaic_path(o, f) or _catalog_with_vega(o, f)[0] or _dao_position_catalog(o, f))
+        except (OSError, ValueError):
+            has = bool(_mosaic_path(o, f))     # header unreadable -> fall back to mosaic presence
+        if has:
             out.append(f)
     return out
 
@@ -312,7 +319,13 @@ def _dao_position_catalog(o: Observation, filt):
             if "carta" not in p and "seed" not in p]
     if not pats:
         return None
-    return max(pats, key=lambda p: (_catalog_priority(os.path.basename(p))[0], os.path.getmtime(p)))
+
+    def _mtime(p):
+        try:
+            return os.path.getmtime(p)
+        except OSError:                       # racing deletion / stale glob entry -> deprioritise
+            return 0.0
+    return max(pats, key=lambda p: (_catalog_priority(os.path.basename(p))[0], _mtime(p)))
 
 
 def _jwst_positions(o: Observation, filt):
@@ -575,10 +588,18 @@ def stage1_mosaics(o: Observation, sw, lw):
         else:
             a.text(0.5, 0.5, f"{filt}\n(no i2d)", ha="center", va="center")
             a.set_xticks([]); a.set_yticks([])
+    # Record which NOMINAL (portal) filters have NO product on disk: pick_filters selects only
+    # from filters that are present, so a filter that WAS observed but is not yet reduced would
+    # otherwise vanish from QA with no trace (issue: F444W/F322W2 on Sgr A*).  Leaving the list
+    # here keeps that visible.
+    avail = _available_filters(o)
+    dropped = [f for f in o.filters if f not in avail]
     png = _save(fig, f"{o.obsid}_stage1.png")
     metrics = dict(stage=1, sw=sw, lw=lw,
                    sw_present=bool(psw), lw_present=bool(plw),
                    finite_fraction=fracs,
+                   nominal_filters=list(o.filters), available_filters=avail,
+                   dropped_filters=dropped,
                    # pass on SW alone ONLY when the obs genuinely has no LW-channel filter;
                    # if an LW filter exists but its mosaic/pick is missing, that is NOT a pass.
                    passed=bool(psw and (plw or not _has_lw(o))))
@@ -859,8 +880,8 @@ def _binned_stat(x, y, width=0.5, minn=15):
 def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk, nmatch):
     """Explain WHY the JWST<->VIRAC offset is unmeasurable, as specifically as the data allow --
     the user's ask: not a bare "FAILURE" but the actual cause (issue #7).  Order: no catalog, no
-    reference, disjoint footprints, then (both overlap, still no peak) a magnitude-range check
-    against our own deeper catalog."""
+    reference, disjoint footprints, then (both overlap, still no peak) report what IS known and say
+    the cause is undetermined.  It does NOT assert a magnitude-range mismatch it never measured."""
     if jsc is None:
         # _jwst_positions already tried release-merged -> MAST -> per-filter DAO, so nothing usable
         # exists on disk for this obs+filter.
@@ -868,29 +889,99 @@ def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk, nmatch):
                 f"yet — this observation is not catalogued")
     if ref_sc is None:
         return "no VIRAC reference catalogue for this field/epoch"
-    # Both catalogues exist but produced no matches: is it a footprint or a content problem?
-    jr = (float(np.nanmin(jsc.ra.deg)), float(np.nanmax(jsc.ra.deg)))
+    # Both catalogues exist but produced no matches: is it a footprint or a content problem?  The
+    # footprint boxes below assume no RA wrap; every GC/registry field is far from RA=0, but a
+    # wrap-straddling field would give a bogus box -- guard it rather than emit a wrong verdict.
+    jra = jsc.ra.deg; rra = ref_sc.ra.deg
+    ra_wrap = (float(np.nanmax(jra)) - float(np.nanmin(jra)) > 180.0 or
+               float(np.nanmax(rra)) - float(np.nanmin(rra)) > 180.0)
     jd = (float(np.nanmin(jsc.dec.deg)), float(np.nanmax(jsc.dec.deg)))
-    rr = (float(np.nanmin(ref_sc.ra.deg)), float(np.nanmax(ref_sc.ra.deg)))
     rd = (float(np.nanmin(ref_sc.dec.deg)), float(np.nanmax(ref_sc.dec.deg)))
-    dec_overlap = min(jd[1], rd[1]) - max(jd[0], rd[0])
-    ra_overlap = min(jr[1], rr[1]) - max(jr[0], rr[0])
-    if dec_overlap <= 0 or ra_overlap <= 0:
-        return (f"the JWST footprint (RA {jr[0]:.3f}–{jr[1]:.3f}, Dec {jd[0]:.3f}–{jd[1]:.3f}) and the "
-                f"VIRAC reference (RA {rr[0]:.3f}–{rr[1]:.3f}, Dec {rd[0]:.3f}–{rd[1]:.3f}) do not "
-                f"overlap on the sky — the reference covers a different region")
+    if not ra_wrap:
+        jr = (float(np.nanmin(jra)), float(np.nanmax(jra)))
+        rr = (float(np.nanmin(rra)), float(np.nanmax(rra)))
+        if (min(jd[1], rd[1]) - max(jd[0], rd[0]) <= 0) or (min(jr[1], rr[1]) - max(jr[0], rr[0]) <= 0):
+            return (f"the JWST footprint (RA {jr[0]:.3f}–{jr[1]:.3f}, Dec {jd[0]:.3f}–{jd[1]:.3f}) and the "
+                    f"VIRAC reference (RA {rr[0]:.3f}–{rr[1]:.3f}, Dec {rd[0]:.3f}–{rd[1]:.3f}) do not "
+                    f"overlap on the sky — the reference covers a different region")
     pr = (bulk or {}).get("peak_ratio", 0.0)
+    # Report the JWST magnitude range if we have it; do NOT claim a VIRAC comparison that was not run.
+    jmag = _jwst_sources(o, filt)[1]
+    mag_note = ""
+    if jmag is not None and np.isfinite(jmag).any():
+        mag_note = (f"  (JWST {filt} spans {np.nanpercentile(jmag, 1):.1f}–{np.nanpercentile(jmag, 99):.1f} "
+                    f"mag; no VIRAC magnitude comparison was made.)")
     return (f"footprints overlap but no common-star histogram peak (peak_ratio {pr:.2f} < "
-            f"{aa.MIN_PEAK_RATIO}) — the JWST and VIRAC magnitude ranges likely do not overlap "
-            f"(too few stars bright enough for VIRAC), so there are no shared sources to tie on")
+            f"{aa.MIN_PEAK_RATIO}); cause not determined — plausibly a magnitude-range mismatch "
+            f"(too few VIRAC-bright stars) or crowding, but that was not measured here.{mag_note}")
+
+
+# Max cell-to-cell spread (robust) for a frame to count as internally consistent enough to PASS.
+# Tied to the ~15-30 mas release tolerances, not the looser 75 mas absolute-offset gate: a field
+# whose tie varies by more than this across the mosaic is not "within survey noise" no matter how
+# small its median.
+_CELL_SPREAD_MAX = 30.0
+
+
+def _cell_stats(cdra, cdde):
+    """Robust summary of per-cell offset vectors (arrays of dRA, dDec in mas): returns
+    (offset_median_mas, cell_spread_mas, standard_error_mas, significance).  The offset is the
+    hypot of the per-axis medians; the spread is the mad_std across cells (its uncertainty), robust
+    to a lone mis-peaked cell; SE = spread/sqrt(N); significance = offset/SE.  spread/SE/signif are
+    None when there are fewer than 2 cells or the spread is zero (no uncertainty to quote)."""
+    n = len(cdra)
+    off_med = float(np.hypot(np.median(cdra), np.median(cdde)))
+    spread = float(np.hypot(aa.mad_std(cdra), aa.mad_std(cdde))) if n >= 2 else None
+    se = (spread / np.sqrt(n)) if (spread is not None and spread > 0) else None
+    signif = float(off_med / se) if se else None
+    return off_med, spread, se, signif
+
+
+def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
+    """Measure the JWST<->VIRAC offset in an ``ncell`` x ``ncell`` spatial grid over the JWST
+    footprint, each cell by the xcorr HISTOGRAM PEAK against the local reference (cropped to the
+    cell + a 2" margin, so it stays fast and matches like-with-like).
+
+    This replaces the field-wide nearest-neighbour median, which at Galactic-Centre density reads
+    SMALLER the further the frame is displaced (chance matches average toward zero -- ~1.8 mas at a
+    2" injected shift; see PR #54 review).  The xcorr peak does not have that failure mode, and a
+    per-cell map turns a single scalar into a spatial-consistency check: a mosaic with an internal
+    discontinuity (a sub-region tied differently) shows disagreeing cells instead of one number
+    that hides it.
+
+    Returns a list of dicts (ra, dec cell centre; dra, dde, off in mas; peak_ratio; n) for cells
+    with a solid peak, or []."""
+    import astropy.units as u
+    ra = jsc.ra.deg; dec = jsc.dec.deg
+    rra = ref_sc.ra.deg; rde = ref_sc.dec.deg
+    re_ = np.linspace(ra.min(), ra.max(), ncell + 1)
+    de_ = np.linspace(dec.min(), dec.max(), ncell + 1)
+    mrg = 2.0 / 3600.0
+    cells = []
+    for i in range(ncell):
+        for j in range(ncell):
+            m = (ra >= re_[i]) & (ra <= re_[i + 1]) & (dec >= de_[j]) & (dec <= de_[j + 1])
+            if int(m.sum()) < min_per_cell:
+                continue
+            rm = ((rra >= re_[i] - mrg) & (rra <= re_[i + 1] + mrg) &
+                  (rde >= de_[j] - mrg) & (rde <= de_[j + 1] + mrg))
+            if int(rm.sum()) < min_per_cell:
+                continue
+            xc = aa.xcorr(jsc[m], ref_sc[rm])
+            if xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= min_per_cell:
+                cells.append(dict(ra=0.5 * (re_[i] + re_[i + 1]), dec=0.5 * (de_[j] + de_[j + 1]),
+                                  dra=float(xc["dra"]), dde=float(xc["ddec"]), off=float(xc["off"]),
+                                  peak_ratio=float(xc["peak_ratio"]), n=int(m.sum())))
+    return cells
 
 
 def stage4_offsets(o: Observation, sw):
-    """JWST-VIRAC per-star dRA/dDec across the field (frame tie / PM precursor), the per-star
-    offset SIGNIFICANCE (measured offset / its uncertainty), and the reference-free
-    inter-module (NRCA vs NRCB) offset."""
+    """JWST-VIRAC frame tie measured PER SPATIAL CELL (xcorr histogram peak), reported as the
+    median cell offset with its cell-to-cell spread (the offset's uncertainty), plus the
+    reference-free inter-module (NRCA vs NRCB) offset.  A PASS requires both a small median offset
+    AND cells that agree -- a single scalar cannot represent a frame with an internal
+    discontinuity, and a nearest-neighbour median collapses toward zero at GC density (PR #54)."""
     import astropy.units as u
-    from astropy.coordinates import search_around_sky, SkyCoord
     metrics = dict(stage=4, sw=sw, offset_signif_med=None, offset_med_mas=None)
     path = _mosaic_path(o, sw)
     ref = _refcat_path(o)
@@ -916,130 +1007,83 @@ def stage4_offsets(o: Observation, sw):
     if im:
         metrics.update(intermodule_off=float(im["off"]), intermodule_filt=sw)
 
-    # Measure the JWST-VIRAC pairs BEFORE building the figure so an empty result becomes a
-    # red flag, not an empty scatter that reads as "nothing wrong".
-    bulk = None; dra = dde = None; nmatch = 0; bulk_off_mas = None
-    if jsc is not None and ref_sc is not None:
-        bulk = aa.xcorr(jsc, ref_sc)                            # histogram peak: recovers LARGE offsets
-        # VIRAC-anchored nearest match (release catalog is deeper than VIRAC -> all-pairs would
-        # add wrong-star crowd noise to the offset cloud).
-        idx, sep, _ = ref_sc.match_to_catalog_sky(jsc)
-        keep = sep < 0.3 * u.arcsec
-        nmatch = int(keep.sum())
-        _bulk_ok = bool(bulk and bulk.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO
-                        and bulk.get("npairs", 0) >= 1000)
-        if nmatch < 30 and _bulk_ok:
-            # Frame too far off for a blind 0.3" nearest match, but the xcorr histogram found a
-            # clear peak: the offset IS measurable.  Show HOW FAR off instead of a "FAILURE" sign
-            # (issues #7/#8/#28).  Shift JWST onto VIRAC by the measured bulk offset, re-match to
-            # recover the per-star cloud, and report the offset prominently.
-            cosd = float(np.cos(np.radians(np.median(jsc.dec.deg))))
-            jsh = SkyCoord((jsc.ra.deg + bulk["dra"] / 3.6e6 / cosd) * u.deg,
-                           (jsc.dec.deg + bulk["ddec"] / 3.6e6) * u.deg)
-            idx, sep, _ = ref_sc.match_to_catalog_sky(jsh)
-            keep = sep < 0.3 * u.arcsec
-            nmatch = int(keep.sum())
-            if nmatch >= 30:
-                bulk_off_mas = float(bulk["off"])
-        if nmatch >= 30:
-            rk = ref_sc[keep]; jk = jsc[idx[keep]]
-            dra = (rk.ra - jk.ra).to(u.arcsec).value * np.cos(np.radians(jk.dec.value)) * 1000
-            dde = (rk.dec - jk.dec).to(u.arcsec).value * 1000
+    # Measure the offset PER SPATIAL CELL (robust at density) before building the figure, so an
+    # unmeasurable result becomes a red flag rather than an empty panel.  The field-wide xcorr is
+    # NOT used for the reported offset -- its single argmax can lock onto a secondary peak (gc2211
+    # o049 reads 32 mas field-wide while every cell reads ~132) -- so it is computed only on the
+    # failure path, where its peak_ratio informs the reason.
+    cells = _cell_offsets(jsc, ref_sc) if (jsc is not None and ref_sc is not None) else []
 
-    if dra is None:
-        # No per-star cloud AND no recoverable bulk peak -> the offset is genuinely unmeasurable.
-        # Say WHY as specifically as the data allow (footprint disjoint / no reference / no
-        # catalog) rather than a bare "FAILURE" (issue #27).
-        reason = _offset_failure_reason(o, sw, jsc, ref_sc, bulk, nmatch)
+    if not cells:
+        bulk = aa.xcorr(jsc, ref_sc) if (jsc is not None and ref_sc is not None) else None
+        reason = _offset_failure_reason(o, sw, jsc, ref_sc, bulk, 0)
         png = _red_flag_figure(o, "stage4", "JWST↔VIRAC OFFSET UNMEASURABLE",
                                f"The positional-offset plot is empty: {reason}.")
-        metrics.update(red_flag=True, red_flag_reason=reason, n_matched=int(nmatch), passed=False)
+        metrics.update(red_flag=True, red_flag_reason=reason, n_cells=0, passed=False)
         return png, metrics
-    metrics["far_off_recovered"] = bulk_off_mas is not None   # cloud recovered via xcorr shift
 
-    # Per-star offset SIGNIFICANCE (measured offset / its uncertainty).  The mosaic detection
-    # used above carries no per-star error, so re-match using the per-exposure DAOPHOT cats,
-    # which do: sig = (JWST-VIRAC offset) / (per-star position sigma).  |sig|~1 means the
-    # residual is consistent with measurement noise; |sig|>>1 means a real, resolved offset.
-    sig_panel = None
-    pooled = _pooled_daophot(o, sw)
-    vwe = _virac_with_errors(o, ep) if ep else None
-    if pooled is not None and vwe is not None and jsc is not None:
-        psc, sig_ra, sig_de, pmag, _pf = pooled
-        vsc, vsr, vsd = vwe
-        # OFFSET from the MERGED catalog (one position per star -> unbiased), same as the main
-        # panel.  Taking the nearest of a star's many per-exposure pool detections would pick the
-        # noise realization closest to VIRAC and bias the offset toward zero.  The per-star
-        # position SIGMA (only the per-exposure cats carry it) is then borrowed from the nearest
-        # daophot detection to that catalog star.  Uncertainty COMBINES both catalogs:
-        # hypot(JWST per-exposure sigma, VIRAC position+PM error).
-        jidx, jsep, _ = vsc.match_to_catalog_sky(jsc)          # VIRAC -> merged catalog
-        keep = jsep < 0.15 * u.arcsec
-        if keep.sum() >= 30:
-            vk = vsc[keep]; jk = jsc[jidx[keep]]
-            oda = (vk.ra - jk.ra).to(u.arcsec).value * np.cos(np.radians(jk.dec.deg)) * 1000
-            odd = (vk.dec - jk.dec).to(u.arcsec).value * 1000
-            didx, dsep, _ = jk.match_to_catalog_sky(psc)        # catalog star -> its daophot sigma
-            near = dsep.arcsec < 0.05
-            sjr = np.where(near, sig_ra[didx], np.nan)
-            sjd = np.where(near, sig_de[didx], np.nan)
-            stot_ra = np.hypot(sjr, vsr[keep])
-            stot_de = np.hypot(sjd, vsd[keep])
-            zra = oda / stot_ra; zde = odd / stot_de
-            gz = np.isfinite(zra) & np.isfinite(zde)
-            if gz.sum() >= 30:
-                # the OFFSET is the bulk tie = hypot of the per-axis MEDIANS.  (median(|d|) is a
-                # scatter statistic bounded below by the per-star spread -- it never approaches
-                # zero even for a perfect tie, so it must NOT be labelled "offset".)
-                off = float(np.hypot(np.median(oda[gz]), np.median(odd[gz])))
-                scat = float(np.hypot(aa.mad_std(oda[gz]), aa.mad_std(odd[gz])))
-                sig_panel = dict(zra=zra[gz], zde=zde[gz], off_med=off, scatter_mas=scat,
-                                 sig_med=float(np.median(np.hypot(zra[gz], zde[gz]))),
-                                 n=int(gz.sum()))
-                metrics.update(offset_med_mas=off, offset_scatter_mas=scat,
-                               offset_signif_med=sig_panel["sig_med"], n_signif=sig_panel["n"])
+    cdra = np.array([c["dra"] for c in cells]); cdde = np.array([c["dde"] for c in cells])
+    cra = np.array([c["ra"] for c in cells]); cdec = np.array([c["dec"] for c in cells])
+    coff = np.array([c["off"] for c in cells]); cpr = np.array([c["peak_ratio"] for c in cells])
+    n_cells = len(cells)
+    # OFFSET = robust median of the per-cell ties; UNCERTAINTY = cell-to-cell spread (mad_std);
+    # significance = offset / SE (see _cell_stats).
+    off_med, spread, se, signif = _cell_stats(cdra, cdde)
+    # PASS needs a small median tie AND cells that agree (no internal discontinuity) AND enough
+    # cells to judge agreement.  A single scalar + threshold cannot represent a bimodal frame
+    # (gc2211 o050: median 57, spread 58 -> fails on both) -- the spread gate is what catches it.
+    consistent = bool(n_cells >= 4 and spread is not None and spread < _CELL_SPREAD_MAX)
+    io = metrics.get("intermodule_off")
+    passed = bool(off_med < aa.THRESH["absolute"] and consistent and
+                  (io is None or io < aa.THRESH["intermodule"]))
+    metrics.update(offset_med_mas=off_med, n_cells=n_cells,
+                   offset_scatter_mas=spread,
+                   offset_signif_med=signif,
+                   bulk_off=off_med,                                    # primary offset humans read
+                   cells_consistent=consistent, passed=passed)
+    if n_cells < 4:
+        metrics["offset_note"] = f"only {n_cells} usable cells — consistency not assessed; not passed"
 
-    ncols = 1 + (1 if sig_panel else 0) + (1 if im else 0)
+    from matplotlib.patches import Circle
+    ncols = 2 + (1 if im else 0)
     fig, ax = _fig(1, ncols, 5.4, 5.0)
     col = 0
+    # panel 1: spatial map of the per-cell tie -- an internal discontinuity shows as cells that
+    # differ in colour instead of a single number that hides it.
     a0 = ax[0][col]; col += 1
-    hb = a0.hexbin(dra, dde, gridsize=60, bins="log", cmap="cividis", mincnt=1)
-    fig.colorbar(hb, ax=a0, label="log N pairs", shrink=0.85)
-    a0.axhline(0, color="w", lw=0.5); a0.axvline(0, color="w", lw=0.5)
-    a0.set_xlabel("dRA [mas]"); a0.set_ylabel("dDec [mas]")
-    lim = max(100.0, 1.4 * (abs(bulk["off"]) if bulk else 0.0))
-    a0.set_xlim(-lim, lim); a0.set_ylim(-lim, lim)
-    a0.set_title(f"JWST-VIRAC  bulk={bulk['off']:.0f} mas" if bulk else "JWST-VIRAC", fontsize=9)
-    metrics.update(bulk_off=float(bulk["off"]) if bulk else None,
-                   bulk_dra=float(bulk["dra"]) if bulk else None,
-                   bulk_ddec=float(bulk["ddec"]) if bulk else None,
-                   n_matched=int(nmatch))
-    if sig_panel:
-        asig = ax[0][col]; col += 1
-        hs = asig.hexbin(sig_panel["zra"], sig_panel["zde"], gridsize=60, bins="log",
-                         cmap="magma", mincnt=1)
-        fig.colorbar(hs, ax=asig, label="log N pairs", shrink=0.85)
-        for r, c in [(1, "#33cc66"), (3, "#ffcc00"), (5, "#ff5555")]:
-            asig.add_patch(plt_circle(r, c))
-        asig.axhline(0, color="w", lw=0.4); asig.axvline(0, color="w", lw=0.4)
-        asig.set_aspect("equal")
-        slim = max(6.0, 1.3 * np.nanpercentile(np.hypot(sig_panel["zra"], sig_panel["zde"]), 98))
-        asig.set_xlim(-slim, slim); asig.set_ylim(-slim, slim)
-        asig.set_xlabel(r"dRA / $\sigma_{RA}$"); asig.set_ylabel(r"dDec / $\sigma_{Dec}$")
-        asig.set_title(f"offset significance  median={sig_panel['sig_med']:.1f}$\\sigma$\n"
-                       f"(tie {sig_panel['off_med']:.0f} mas, scatter {sig_panel['scatter_mas']:.0f} "
-                       f"mas, n={sig_panel['n']}; $\\sigma$ from per-exposure cats)", fontsize=8)
+    vmax = max(aa.THRESH["absolute"], float(np.max(coff)))
+    sc0 = a0.scatter(cra, cdec, c=coff, s=300, marker="s", cmap="inferno", vmin=0, vmax=vmax,
+                     edgecolor="w", linewidth=0.4)
+    fig.colorbar(sc0, ax=a0, label="cell tie [mas]", shrink=0.85)
+    a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
+    spread_str = f", spread {spread:.0f} mas" if spread is not None else ""
+    a0.set_title(f"per-cell tie ({n_cells} cells)\nmedian {off_med:.0f} mas{spread_str}", fontsize=8)
+    # panel 2: the per-cell offsets in (dRA, dDec) with the median tie, its spread, and the 75 mas
+    # absolute-offset gate -- this is the offset AND its uncertainty in one view.
+    a1 = ax[0][col]; col += 1
+    scp = a1.scatter(cdra, cdde, c=cpr, s=90, cmap="viridis", edgecolor="k", linewidth=0.3)
+    fig.colorbar(scp, ax=a1, label="cell peak ratio", shrink=0.85)
+    mdra, mdde = float(np.median(cdra)), float(np.median(cdde))
+    a1.plot(mdra, mdde, "r+", ms=15, mew=2)
+    a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
+    if spread is not None and spread > 0:
+        a1.add_patch(Circle((mdra, mdde), spread, fill=False, ec="0.5", ls="--", lw=0.9))
+    a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
+    lim = max(aa.THRESH["absolute"] * 1.2, 1.4 * float(np.max(np.hypot(cdra, cdde))))
+    a1.set_xlim(-lim, lim); a1.set_ylim(-lim, lim)
+    a1.set_xlabel("dRA [mas]"); a1.set_ylabel("dDec [mas]")
+    se_str = f"±{se:.0f}" if se is not None else ""
+    sig_str = f", {signif:.0f}σ" if signif is not None else ""
+    a1.set_title(f"tie {off_med:.0f}{se_str} mas{sig_str}\n(dotted = 75 mas gate; dashed = cell spread)",
+                 fontsize=8)
     if im:
-        a1 = ax[0][col]; col += 1
-        a1.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
-        a1.axhline(0, color="k", lw=0.5)
-        a1.axhline(aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
-        a1.axhline(-aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
-        a1.set_ylabel("NRCA-NRCB [mas]")
-        a1.set_title(f"inter-module {metrics['intermodule_filt']}  off={im['off']:.0f} mas", fontsize=9)
-    bo = metrics.get("bulk_off"); io = metrics.get("intermodule_off")
-    metrics["passed"] = bool((bo is not None and bo < aa.THRESH["absolute"]) and
-                             (io is None or io < aa.THRESH["intermodule"]))
+        a2 = ax[0][col]; col += 1
+        a2.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
+        a2.axhline(0, color="k", lw=0.5)
+        a2.axhline(aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
+        a2.axhline(-aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
+        a2.set_ylabel("NRCA-NRCB [mas]")
+        a2.set_title(f"inter-module {metrics['intermodule_filt']}  off={im['off']:.0f} mas", fontsize=9)
     fig.suptitle(f"{o.target} {o.obsid} — positional offsets", fontsize=11)
     return _save(fig, f"{o.obsid}_stage4.png"), metrics
 
@@ -1423,9 +1467,12 @@ CAPTIONS = {
     3: "**Stage 3 — photometric calibration.** JWST {sw} vs VIRAC Ks for {n_matched} matched "
        "stars: slope {slope:.2f}, zp {zeropoint:.2f}, scatter {scatter:.2f} mag. A tight locus "
        "means the right stars were matched.",
-    4: "**Stage 4 — positional offsets.** JWST−VIRAC ΔRA/ΔDec (bulk {bulk_off:.0f} mas), the "
-       "per-star offset significance (median {offset_signif_med:.1f}σ = measured offset ÷ its "
-       "uncertainty), and the reference-free inter-module offset. Frame-match / PM precursor.",
+    4: "**Stage 4 — positional offsets.** JWST−VIRAC frame tie measured per spatial cell (xcorr "
+       "histogram peak): median {offset_med_mas:.0f} mas over {n_cells} cells, cell-to-cell spread "
+       "{offset_scatter_mas:.0f} mas (= the offset's uncertainty; significance "
+       "{offset_signif_med:.0f}σ), plus the reference-free inter-module offset. A PASS needs a small "
+       "median AND agreeing cells — a lone scalar hides an internal discontinuity, and a "
+       "nearest-neighbour median collapses toward zero at GC density. Frame-match / PM precursor.",
     5: "**Stage 5 — inter-detector / inter-module tie.** Per-detector residual quiver "
        "(bulk-removed; A–B diff {intermodule_diff:.1f} mas), the reference-free NRCA–NRCB overlap "
        "(offset {intermodule_off:.1f} mas, RMS {intermodule_rms:.1f} mas over {n_overlap} shared "
@@ -1445,13 +1492,15 @@ def caption_for(n, metrics):
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate.")
     if n == 4 and metrics.get("offset_signif_med") is None:
-        # significance panel omitted (no per-exposure cats / VIRAC errors) -> don't assert a
-        # third panel exists or print "nanσ".
-        return ("**Stage 4 — positional offsets.** JWST−VIRAC ΔRA/ΔDec (bulk "
-                f"{metrics.get('bulk_off') or float('nan'):.0f} mas) and the reference-free "
-                "inter-module offset (the per-star significance panel is omitted — no "
-                "per-exposure catalogs or VIRAC per-star errors for this field). "
-                "Frame-match / PM precursor.")
+        # too few cells to estimate a cell-to-cell uncertainty -> report the median tie and say the
+        # spread/significance could not be estimated, rather than printing "nanσ".
+        om = metrics.get("offset_med_mas")
+        nc = metrics.get("n_cells")
+        return ("**Stage 4 — positional offsets.** JWST−VIRAC frame tie "
+                f"{('%.0f mas' % om) if om is not None else 'unmeasured'} from "
+                f"{nc if nc is not None else 0} spatial cell(s); too few cells to estimate the "
+                "cell-to-cell spread, so the offset's uncertainty and consistency are not assessed "
+                "(not passed). Plus the reference-free inter-module offset.")
     if n == 5 and metrics.get("intermodule_off") is None:
         # No reference-free NRCA-NRCB overlap measurement -> the full template's overlap clause
         # ({intermodule_off}/{intermodule_rms}/{n_overlap}) would KeyError and drop the whole

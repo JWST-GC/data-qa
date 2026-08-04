@@ -38,10 +38,13 @@ def test_binned_stat_drops_sparse_bins_to_none():
 
 
 # --------------------------------------------------------------------------- caption_for
-def test_caption_stage4_omitted_significance_no_nan():
-    cap = D.caption_for(4, dict(stage=4, sw="F212N", offset_signif_med=None, bulk_off=7.1))
+def test_caption_stage4_no_significance_no_nan():
+    # too few cells to estimate an uncertainty -> report the median tie, say consistency not
+    # assessed, and never print "nanσ".
+    cap = D.caption_for(4, dict(stage=4, sw="F212N", offset_signif_med=None,
+                                offset_med_mas=7.1, n_cells=1))
     assert "nan" not in cap.lower()
-    assert "omitted" in cap
+    assert "not assessed" in cap and "7 mas" in cap
 
 
 def test_caption_redflag():
@@ -121,12 +124,85 @@ def test_offset_reason_disjoint_footprint():
     assert "do not" in msg and "overlap" in msg
 
 
-def test_offset_reason_overlap_but_no_peak():
+def test_offset_reason_overlap_but_no_peak(monkeypatch):
     import astropy.units as u
     from astropy.coordinates import SkyCoord
+    # no I/O: the reason may quote the JWST mag range, so stub the catalog read out
+    monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))
     sc = SkyCoord([266.40, 266.41, 266.42] * u.deg, [-28.90, -28.89, -28.88] * u.deg)
     msg = D._offset_failure_reason(_obs(), "F200W", sc, sc, {"peak_ratio": 0.3}, 0)
-    assert "magnitude ranges" in msg
+    # must NOT assert an unmeasured cause -- says it's undetermined, and that no VIRAC comparison ran
+    assert "cause not determined" in msg
+    assert "not measured" in msg
+
+
+# --------------------------------------------------------------------------- cell-based stage-4
+def test_cell_stats_uniform_small_spread():
+    # cells all near the same offset -> small spread, high significance
+    dra = np.array([100.0, 101.0, 99.0, 100.5, 98.5, 101.5])
+    dde = np.array([50.0, 49.0, 51.0, 50.5, 49.5, 50.0])
+    off, spread, se, sig = D._cell_stats(dra, dde)
+    assert abs(off - np.hypot(100.0, 50.0)) < 2
+    assert spread < 5 and se is not None and sig is not None and sig > 10
+
+
+def test_cell_stats_bimodal_large_spread():
+    # half the cells at ~0, half at ~130 -> large spread (catches an internal discontinuity)
+    dra = np.array([0.0, 2.0, 1.0, 128.0, 130.0, 129.0])
+    dde = np.zeros(6)
+    off, spread, se, sig = D._cell_stats(dra, dde)
+    assert spread > 30            # would fail the _CELL_SPREAD_MAX consistency gate
+
+
+def test_cell_stats_single_cell_no_uncertainty():
+    off, spread, se, sig = D._cell_stats(np.array([40.0]), np.array([10.0]))
+    assert spread is None and se is None and sig is None
+
+
+def test_cell_offsets_recovers_uniform_shift():
+    # synthetic field + reference shifted by a KNOWN 100 mas in RA; every cell must recover it
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(0)
+    ra = 266.40 + rng.uniform(0, 0.02, 1200)
+    dec = -28.90 + rng.uniform(0, 0.02, 1200)
+    jsc = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.9))
+    ref = SkyCoord((ra + 100.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # ref is +100 mas E of jsc
+    cells = D._cell_offsets(jsc, ref, ncell=2, min_per_cell=50)
+    assert len(cells) >= 3
+    dra = np.array([c["dra"] for c in cells])
+    assert np.all(np.abs(dra - 100.0) < 15)      # each cell recovers ~+100 mas
+
+
+def test_available_filters_only_present(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "sgra" / "F212N" / "pipeline"; d.mkdir(parents=True)
+    _touch(d, "jw01939-o001_t001_nircam_clear-f212n-merged_i2d.fits")   # only F212N has a mosaic
+    o = Observation(program="1939", obs="001", target="Sgr A*", release_field="sgra",
+                    instrument="NIRCam", filters=["F212N", "F444W"], visits=[], epoch="", notes="")
+    assert D._available_filters(o) == ["F212N"]                          # F444W (no data) dropped
+
+
+def _write_skycoord_cat(path, ra, dec):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    t = Table()
+    t["skycoord"] = SkyCoord(np.asarray(ra) * u.deg, np.asarray(dec) * u.deg)
+    t.write(path, overwrite=True)
+
+
+def test_jwst_positions_falls_back_to_dao(tmp_path, monkeypatch):
+    # no merged/MAST catalog, only a per-filter DAO position catalog -> positions still returned
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))   # no merged/MAST
+    d = tmp_path / "gc2211" / "catalogs"; d.mkdir(parents=True)
+    ra = np.linspace(266.4, 266.45, 60); dec = np.linspace(-29.0, -28.95, 60)
+    _write_skycoord_cat(d / "f200w_merged_indivexp_merged_m6_dao_basic_o046_vetted.fits", ra, dec)
+    sc, src = D._jwst_positions(_obs(field="gc2211", obs="046", filt="F200W"), "F200W")
+    assert sc is not None and len(sc) == 60
+    assert "release-dao(positions)" in src
 
 
 # --------------------------------------------------------------------------- _daophot_glob
