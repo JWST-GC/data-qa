@@ -70,7 +70,8 @@ def test_caption_stage5_single_module():
 def test_caption_stage5_full_when_overlap_present():
     cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1,
                                 intermodule_rms=6.2, n_overlap=137))
-    assert "137 shared" in cap and "4.1 mas" in cap
+    assert "137 stars" in cap and "4.1 mas" in cap
+    assert "TOP-LEFT" in cap and "Reference-free" in cap    # panels labelled + term defined
 
 
 # --------------------------------------------------------------------------- _refcat_path obs-scope

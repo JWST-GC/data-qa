@@ -787,12 +787,21 @@ def stage3_calibration(o: Observation, sw):
     n_locus = int(len(xf))
     hb = a.hexbin(x, y, gridsize=80, bins="log", cmap="magma", mincnt=1)
     fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
+    # Draw ONLY the ideal UNIT-SLOPE (1:1) reference line -- the relation a well-calibrated
+    # zeropoint should follow.  Anchor it on the DENSE stellar locus via the MODE of (y-x): the
+    # sigma-clipped fit does not cleanly separate the bright locus from the red mismatch cloud, so
+    # a median of the clipped set lands between the two populations and the line misses the locus.
+    # The mode picks the densest ridge.  The free-slope fit is NOT drawn (its slope wanders with
+    # the cloud and reads as a bad fit); the slope is still measured and gated below.
+    dy = y - x
+    hcnt, hedge = np.histogram(dy, bins=60)
+    zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus zp
     xs = np.array([np.nanmin(x), np.nanmax(x)])
-    a.plot(xs, slope * xs + zp, "c-", lw=1, label=f"slope={slope:.2f} zp={zp:.2f}")
+    a.plot(xs, xs + zp1, "c-", lw=1, label=f"1:1 (unit slope, locus zp={zp1:.2f})")
     a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
     a.legend(fontsize=8, loc="upper left")
     a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus})  "
-                f"scatter={scat:.2f}", fontsize=10)
+                f"fitted slope={slope:.2f}  scatter={scat:.2f}", fontsize=10)
     # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen
     # only the SCATTER for the real narrow-vs-broad (F212N vs Ks) colour/extinction spread.
     metrics.update(n_matched=int(g.sum()), n_locus=n_locus, slope=float(slope),
@@ -1318,12 +1327,12 @@ def stage5_intermodule(o: Observation, sw):
                 picks.append((ra, dec))
                 if len(picks) >= ncut * 3:      # gather extras; some cutouts fail the finite check
                     break
-            strip = fig.add_subplot(gs[1, :]); strip.axis("off")
-            cut_axes = [strip.inset_axes([i / ncut + 0.01, 0.05, 0.92 / ncut, 0.85])
-                        for i in range(ncut)]
-            shown = 0
+            # Collect the VALID cutouts FIRST, then lay out exactly as many axes as we can draw.
+            # (Pre-creating ncut inset axes and filling only some left blank white boxes on any
+            # field with fewer than ncut usable cutouts -- a real bug seen on issue #38.)
+            cuts = []
             for ra, dec in picks:
-                if shown >= ncut:
+                if len(cuts) >= ncut:
                     break
                 try:
                     x, y = w.world_to_pixel(SkyCoord(ra * u.deg, dec * u.deg))
@@ -1332,12 +1341,19 @@ def stage5_intermodule(o: Observation, sw):
                     continue
                 if not np.isfinite(cut.data).any() or np.nanmax(cut.data) <= 0:
                     continue
-                a = cut_axes[shown]
-                norm = ImageNormalize(cut.data, interval=ZScaleInterval(), stretch=AsinhStretch())
-                a.imshow(cut.data, origin="lower", cmap="gray", norm=norm)
-                a.set_xticks([]); a.set_yticks([])
-                a.set_title(f"{shown + 1}", fontsize=7)
-                shown += 1
+                cuts.append(cut.data)
+            shown = len(cuts)
+            strip = fig.add_subplot(gs[1, :]); strip.axis("off")
+            if shown:
+                n = shown
+                for i, cdata in enumerate(cuts):
+                    a = strip.inset_axes([i / n + 0.01, 0.05, 0.92 / n, 0.85])
+                    norm = ImageNormalize(cdata, interval=ZScaleInterval(), stretch=AsinhStretch())
+                    a.imshow(cdata, origin="lower", cmap="gray", norm=norm)
+                    a.set_xticks([]); a.set_yticks([]); a.set_title(f"{i + 1}", fontsize=7)
+            else:
+                strip.text(0.5, 0.5, "no usable overlap-star cutouts on the mosaic",
+                           ha="center", va="center", fontsize=9, style="italic")
             from astropy.wcs.utils import proj_plane_pixel_scales
             pscale = float(np.mean(proj_plane_pixel_scales(w))) * 3600.0     # arcsec/pix from WCS
             fig.text(0.5, 0.02,
@@ -1464,21 +1480,32 @@ CAPTIONS = {
        "observation was delivered and the mosaics are present and not obviously corrupt.",
     2: "**Stage 2 — colour-magnitude diagram** from the `{kind}` catalog ({n_stars} stars). "
        "LF-inset turnover ≈ {lf_turnover:.1f} tracks depth; regenerated as the catalog deepens.",
-    3: "**Stage 3 — photometric calibration.** JWST {sw} vs VIRAC Ks for {n_matched} matched "
-       "stars: slope {slope:.2f}, zp {zeropoint:.2f}, scatter {scatter:.2f} mag. A tight locus "
-       "means the right stars were matched.",
-    4: "**Stage 4 — positional offsets.** JWST−VIRAC frame tie measured per spatial cell (xcorr "
-       "histogram peak): median {offset_med_mas:.0f} mas over {n_cells} cells, cell-to-cell spread "
-       "{offset_scatter_mas:.0f} mas (= the offset's uncertainty; significance "
-       "{offset_signif_med:.0f}σ), plus the reference-free inter-module offset. A PASS needs a small "
-       "median AND agreeing cells — a lone scalar hides an internal discontinuity, and a "
-       "nearest-neighbour median collapses toward zero at GC density. Frame-match / PM precursor.",
-    5: "**Stage 5 — inter-detector / inter-module tie.** Per-detector residual quiver "
-       "(bulk-removed; A–B diff {intermodule_diff:.1f} mas), the reference-free NRCA–NRCB overlap "
-       "(offset {intermodule_off:.1f} mas, RMS {intermodule_rms:.1f} mas over {n_overlap} shared "
-       "stars), and a cutout gallery of 6 stars in the NRCA∩NRCB overlap — each cut from the SW "
-       "merged `i2d` mosaic and detected in BOTH modules. A good tie shows one round PSF; a "
-       "mis-tie doubles/elongates the star (the same source drizzled twice at offset positions).",
+    3: "**Stage 3 — photometric calibration.** The panel is a 2-D histogram (colour = number of "
+       "stars) of JWST {sw} catalogue magnitude against VIRAC Ks for {n_matched} cross-matched "
+       "stars. The cyan line is the ideal 1:1 (unit-slope) relation — NOT a fit — so a "
+       "well-calibrated catalogue should lie along it. The free-slope fit is {slope:.2f} and the "
+       "scatter about the locus is {scatter:.2f} mag; a tight locus hugging the 1:1 line means the "
+       "right stars were matched and the zeropoint is sane.",
+    4: "**Stage 4 — positional offsets (JWST vs VIRAC frame tie).** The offset is measured per "
+       "spatial cell — each cell's value is an xcorr histogram-peak match of that patch of JWST "
+       "sources to the local VIRAC reference. The LEFT panel maps the tie across the mosaic (one "
+       "square per cell, coloured by offset): a uniform colour is a consistent frame, a patch of a "
+       "different colour flags an internal discontinuity. The MIDDLE panel plots the same per-cell "
+       "offsets as (dRA, dDec) points (colour = match quality); the red cross is the median tie, "
+       "the dashed circle its cell-to-cell spread, and the dotted circle the 75 mas pass "
+       "threshold. Here the tie is {offset_med_mas:.0f} mas over {n_cells} cells with a "
+       "{offset_scatter_mas:.0f} mas spread (the offset's uncertainty; {offset_signif_med:.0f}σ). "
+       "The RIGHT panel, when present, is the NRCA-vs-NRCB inter-module offset. A pass needs a "
+       "small median AND cells that agree. Precursor to proper-motion work.",
+    5: "**Stage 5 — inter-detector / inter-module tie.** \"Reference-free\" means the offsets are "
+       "measured by matching JWST against itself (NRCA against NRCB directly), using no external "
+       "catalogue. The TOP-LEFT panel is a per-detector residual quiver (the field-wide bulk "
+       "offset removed) showing each detector's leftover shift; the NRCA-vs-NRCB difference is "
+       "{intermodule_diff:.1f} mas. The TOP-RIGHT panel is the direct NRCA∩NRCB overlap tie: "
+       "{intermodule_off:.1f} mas offset, {intermodule_rms:.1f} mas RMS, over {n_overlap} stars "
+       "detected in both modules. The BOTTOM STRIP shows cutouts of those overlap stars from the "
+       "SW merged `i2d` mosaic — a good tie shows one round PSF, a mis-tie doubles or elongates "
+       "the star (the same source drizzled twice at offset positions).",
     6: "**Stage 6 — astrometric precision.** Per-star position error σ_pos (mas) vs Vega "
        "magnitude from the per-exposure PSF fits (instrumental mag Vega-calibrated against the "
        "merged catalog), one curve per channel. The bright-end floor is the astrometric "
