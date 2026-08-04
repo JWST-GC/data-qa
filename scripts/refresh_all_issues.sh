@@ -108,10 +108,16 @@ for spec in "${SPECS[@]}"; do
 done
 
 # Optionally push the per-field status onto the GitHub Projects board (opt-in: needs a token with
-# org Projects read+write, so it is OFF by default and never fails the refresh).
+# org Projects read+write, so it is OFF by default and never fails the refresh).  Only when the
+# refresh SUCCEEDED (rc_any==0) -- syncing after a night of crashed diagnostics would repaint cards
+# from half-written metrics.  --apply is required (the script is dry-run by default).
 if [ "${QA_SYNC_BOARD:-0}" = "1" ]; then
-  echo "===== syncing project board ====="
-  python3 scripts/sync_project_board.py 2>&1 | tail -3 || echo "board sync skipped (non-fatal)"
+  if [ "$rc_any" -eq 0 ]; then
+    echo "===== syncing project board ====="
+    python3 scripts/sync_project_board.py --apply 2>&1 | tail -4 || echo "board sync skipped (non-fatal)"
+  else
+    echo "skipping project-board sync: refresh reported failures (rc_any=$rc_any)"
+  fi
 fi
 
 echo "refresh_all_issues: done (rc_any=$rc_any)"
