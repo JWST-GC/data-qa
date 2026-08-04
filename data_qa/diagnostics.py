@@ -886,7 +886,7 @@ def _binned_stat(x, y, width=0.5, minn=15):
     return np.array(med), np.array(p16), np.array(p84), np.array(ctr)
 
 
-def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk, nmatch):
+def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk):
     """Explain WHY the JWST<->VIRAC offset is unmeasurable, as specifically as the data allow --
     the user's ask: not a bare "FAILURE" but the actual cause (issue #7).  Order: no catalog, no
     reference, disjoint footprints, then (both overlap, still no peak) report what IS known and say
@@ -929,59 +929,112 @@ def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk, nmatch):
 # Tied to the ~15-30 mas release tolerances, not the looser 75 mas absolute-offset gate: a field
 # whose tie varies by more than this across the mosaic is not "within survey noise" no matter how
 # small its median.
+# A cell whose tie differs from the field median by more than this (mas) is "deviating".  Tied to
+# the 15-30 mas release tolerance, well below the 75 mas absolute gate.
 _CELL_SPREAD_MAX = 30.0
-
-
-def _cell_stats(cdra, cdde):
-    """Robust summary of per-cell offset vectors (arrays of dRA, dDec in mas): returns
-    (offset_median_mas, cell_spread_mas, standard_error_mas, significance).  The offset is the
-    hypot of the per-axis medians; the spread is the mad_std across cells (its uncertainty), robust
-    to a lone mis-peaked cell; SE = spread/sqrt(N); significance = offset/SE.  spread/SE/signif are
-    None when there are fewer than 2 cells or the spread is zero (no uncertainty to quote)."""
-    n = len(cdra)
-    off_med = float(np.hypot(np.median(cdra), np.median(cdde)))
-    spread = float(np.hypot(aa.mad_std(cdra), aa.mad_std(cdde))) if n >= 2 else None
-    se = (spread / np.sqrt(n)) if (spread is not None and spread > 0) else None
-    signif = float(off_med / se) if se else None
-    return off_med, spread, se, signif
+# A coherent (adjacency-confirmed) deviating region holding more than this FRACTION of the measured
+# sources fails the consistency gate.  Small: a real ~100 mas sub-region tie is a proper-motion
+# killer even at a few percent.
+_CELL_BAD_FRAC = 0.02
+# Require at least this fraction of the field's sources to sit in cells with a measurable peak,
+# else the tie is not adequately sampled to pass.
+_CELL_MIN_COVERAGE = 0.5
+# Low peak floor: enough that a cell has SOME peak above chance, not aa.MIN_PEAK_RATIO -- that
+# constant anti-correlates with source count (bg = median(H[H>0]) grows with chance pairs), so a
+# 4.0 cut keeps the SPARSE population and drops the dense one, making the verdict depend on which
+# side of a defect happens to be sparse (o046 vs o049; PR #54 review).  We instead accept any real
+# peak, weight cells by SOURCE COUNT, and judge consistency by adjacency (below), which does not
+# depend on the density-biased ratio.
+_CELL_PR_FLOOR = 1.5
 
 
 def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
     """Measure the JWST<->VIRAC offset in an ``ncell`` x ``ncell`` spatial grid over the JWST
     footprint, each cell by the xcorr HISTOGRAM PEAK against the local reference (cropped to the
-    cell + a 2" margin, so it stays fast and matches like-with-like).
+    cell + a 2" margin).  Replaces the field-wide nearest-neighbour median, which at GC density
+    reads SMALLER the further the frame is displaced (~1.8 mas at a 2" shift; PR #54 review).
 
-    This replaces the field-wide nearest-neighbour median, which at Galactic-Centre density reads
-    SMALLER the further the frame is displaced (chance matches average toward zero -- ~1.8 mas at a
-    2" injected shift; see PR #54 review).  The xcorr peak does not have that failure mode, and a
-    per-cell map turns a single scalar into a spatial-consistency check: a mosaic with an internal
-    discontinuity (a sub-region tied differently) shows disagreeing cells instead of one number
-    that hides it.
-
-    Returns a list of dicts (ra, dec cell centre; dra, dde, off in mas; peak_ratio; n) for cells
-    with a solid peak, or []."""
-    import astropy.units as u
+    Returns (cells, dropped): ``cells`` is a list of dicts (i, j grid index; ra, dec centre; dra,
+    dde, off in mas; peak_ratio; n sources) for cells with a peak above ``_CELL_PR_FLOOR``, and
+    ``dropped`` is (i, j, ra, dec, n) for cells with enough sources but NO clear peak -- recorded
+    so coverage is accounted and the map can show them, rather than silently vanishing."""
     ra = jsc.ra.deg; dec = jsc.dec.deg
     rra = ref_sc.ra.deg; rde = ref_sc.dec.deg
+    # RA-wrap guard: a footprint straddling RA=0 would give bogus linear bins (no GC field does).
+    if float(np.nanmax(ra) - np.nanmin(ra)) > 180.0:
+        ncell = 1
     re_ = np.linspace(ra.min(), ra.max(), ncell + 1)
     de_ = np.linspace(dec.min(), dec.max(), ncell + 1)
     mrg = 2.0 / 3600.0
-    cells = []
+    cells, dropped = [], []
     for i in range(ncell):
         for j in range(ncell):
             m = (ra >= re_[i]) & (ra <= re_[i + 1]) & (dec >= de_[j]) & (dec <= de_[j + 1])
-            if int(m.sum()) < min_per_cell:
+            n = int(m.sum())
+            if n < min_per_cell:
                 continue
+            cra, cdec = 0.5 * (re_[i] + re_[i + 1]), 0.5 * (de_[j] + de_[j + 1])
             rm = ((rra >= re_[i] - mrg) & (rra <= re_[i + 1] + mrg) &
                   (rde >= de_[j] - mrg) & (rde <= de_[j + 1] + mrg))
-            if int(rm.sum()) < min_per_cell:
-                continue
-            xc = aa.xcorr(jsc[m], ref_sc[rm])
-            if xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= min_per_cell:
-                cells.append(dict(ra=0.5 * (re_[i] + re_[i + 1]), dec=0.5 * (de_[j] + de_[j + 1]),
-                                  dra=float(xc["dra"]), dde=float(xc["ddec"]), off=float(xc["off"]),
-                                  peak_ratio=float(xc["peak_ratio"]), n=int(m.sum())))
-    return cells
+            xc = aa.xcorr(jsc[m], ref_sc[rm]) if int(rm.sum()) >= min_per_cell else None
+            if xc and xc.get("peak_ratio", 0) >= _CELL_PR_FLOOR and xc.get("npairs", 0) >= min_per_cell:
+                cells.append(dict(i=i, j=j, ra=cra, dec=cdec, dra=float(xc["dra"]),
+                                  dde=float(xc["ddec"]), off=float(xc["off"]),
+                                  peak_ratio=float(xc["peak_ratio"]), n=n))
+            else:
+                dropped.append(dict(i=i, j=j, ra=cra, dec=cdec, n=n))
+    return cells, dropped
+
+
+def _cell_consistency(cells, dropped):
+    """Aggregate per-cell ties into a SOURCE-WEIGHTED field tie plus a spatial-consistency verdict.
+
+    * offset = source-count-weighted median of the per-cell ties -> the offset the CATALOG actually
+      experiences, not the offset of whichever cells had the sharpest (density-biased) peaks.
+    * a cell is DEVIATING if its tie is >``_CELL_SPREAD_MAX`` from that median, and CONFIRMED only
+      if an orthogonally-adjacent cell also deviates -- a real sub-region discontinuity spans
+      several cells, whereas a lone mis-peaked cell (e.g. one 544 mas cell amid 9 mas neighbours)
+      does not and must not fail the frame.
+    * consistent = the confirmed-deviating cells hold < ``_CELL_BAD_FRAC`` of the measured sources
+      AND enough of the field was measurable (coverage >= ``_CELL_MIN_COVERAGE``).
+
+    Returns a dict of the numbers plus per-cell ``deviating``/``confirmed`` flags for plotting."""
+    if not cells:
+        return dict(n_cells=0, consistent=False)
+    dra = np.array([c["dra"] for c in cells]); dde = np.array([c["dde"] for c in cells])
+    ns = np.array([c["n"] for c in cells], float)
+
+    def _wmed(v, w):
+        o = np.argsort(v); vs, ws = v[o], w[o]; cw = np.cumsum(ws)
+        return float(vs[np.searchsorted(cw, 0.5 * cw[-1])])
+    mdra, mdde = _wmed(dra, ns), _wmed(dde, ns)
+    off_med = float(np.hypot(mdra, mdde))
+    dev = np.hypot(dra - mdra, dde - mdde)
+    deviating = dev > _CELL_SPREAD_MAX
+    ij = {(c["i"], c["j"]): k for k, c in enumerate(cells)}
+    confirmed = np.zeros(len(cells), bool)
+    for k, c in enumerate(cells):
+        if not deviating[k]:
+            continue
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nb = ij.get((c["i"] + di, c["j"] + dj))
+            if nb is not None and deviating[nb]:
+                confirmed[k] = True
+                break
+    meas_n = float(ns.sum())
+    drop_n = float(sum(d["n"] for d in dropped))
+    coverage = meas_n / (meas_n + drop_n) if (meas_n + drop_n) else 0.0
+    bad_frac = float(ns[confirmed].sum() / meas_n) if meas_n else 0.0
+    # uncertainty on the tie (kept as mad_std of the cell ties -- fine as a spread, NOT used for the
+    # consistency verdict, which needs the minority-sensitive test above)
+    spread = float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))) if len(cells) >= 2 else None
+    se = (spread / np.sqrt(len(cells))) if (spread is not None and spread > 0) else None
+    signif = float(off_med / se) if se else None
+    consistent = bool(len(cells) >= 4 and bad_frac < _CELL_BAD_FRAC and coverage >= _CELL_MIN_COVERAGE)
+    return dict(off_med=off_med, off_dra=mdra, off_dde=mdde, spread=spread, se=se, signif=signif,
+                n_cells=len(cells), n_dropped=len(dropped), n_deviating=int(deviating.sum()),
+                n_confirmed=int(confirmed.sum()), bad_src_frac=bad_frac, coverage=coverage,
+                consistent=consistent, deviating=deviating, confirmed=confirmed)
 
 
 def stage4_offsets(o: Observation, sw):
@@ -1017,74 +1070,82 @@ def stage4_offsets(o: Observation, sw):
         metrics.update(intermodule_off=float(im["off"]), intermodule_filt=sw)
 
     # Measure the offset PER SPATIAL CELL (robust at density) before building the figure, so an
-    # unmeasurable result becomes a red flag rather than an empty panel.  The field-wide xcorr is
-    # NOT used for the reported offset -- its single argmax can lock onto a secondary peak (gc2211
-    # o049 reads 32 mas field-wide while every cell reads ~132) -- so it is computed only on the
-    # failure path, where its peak_ratio informs the reason.
-    cells = _cell_offsets(jsc, ref_sc) if (jsc is not None and ref_sc is not None) else []
+    # unmeasurable result becomes a red flag rather than an empty panel.
+    cells, dropped = (_cell_offsets(jsc, ref_sc) if (jsc is not None and ref_sc is not None)
+                      else ([], []))
 
     if not cells:
         bulk = aa.xcorr(jsc, ref_sc) if (jsc is not None and ref_sc is not None) else None
-        reason = _offset_failure_reason(o, sw, jsc, ref_sc, bulk, 0)
+        reason = _offset_failure_reason(o, sw, jsc, ref_sc, bulk)
         png = _red_flag_figure(o, "stage4", "JWST↔VIRAC OFFSET UNMEASURABLE",
                                f"The positional-offset plot is empty: {reason}.")
         metrics.update(red_flag=True, red_flag_reason=reason, n_cells=0, passed=False)
         return png, metrics
 
-    cdra = np.array([c["dra"] for c in cells]); cdde = np.array([c["dde"] for c in cells])
-    cra = np.array([c["ra"] for c in cells]); cdec = np.array([c["dec"] for c in cells])
-    coff = np.array([c["off"] for c in cells]); cpr = np.array([c["peak_ratio"] for c in cells])
-    n_cells = len(cells)
-    # OFFSET = robust median of the per-cell ties; UNCERTAINTY = cell-to-cell spread (mad_std);
-    # significance = offset / SE (see _cell_stats).
-    off_med, spread, se, signif = _cell_stats(cdra, cdde)
-    # PASS needs a small median tie AND cells that agree (no internal discontinuity) AND enough
-    # cells to judge agreement.  A single scalar + threshold cannot represent a bimodal frame
-    # (gc2211 o050: median 57, spread 58 -> fails on both) -- the spread gate is what catches it.
-    consistent = bool(n_cells >= 4 and spread is not None and spread < _CELL_SPREAD_MAX)
+    cc = _cell_consistency(cells, dropped)
+    off_med, spread, se, signif = cc["off_med"], cc["spread"], cc["se"], cc["signif"]
     io = metrics.get("intermodule_off")
-    passed = bool(off_med < aa.THRESH["absolute"] and consistent and
+    # PASS needs a small SOURCE-WEIGHTED median tie, spatially CONSISTENT cells (no
+    # adjacency-confirmed sub-region off by >30 mas holding >2% of sources; catches a minority a
+    # mad_std cannot), enough coverage, and no inter-module offset.
+    passed = bool(off_med < aa.THRESH["absolute"] and cc["consistent"] and
                   (io is None or io < aa.THRESH["intermodule"]))
-    metrics.update(offset_med_mas=off_med, n_cells=n_cells,
-                   offset_scatter_mas=spread,
-                   offset_signif_med=signif,
-                   bulk_off=off_med,                                    # primary offset humans read
-                   cells_consistent=consistent, passed=passed)
-    if n_cells < 4:
-        metrics["offset_note"] = f"only {n_cells} usable cells — consistency not assessed; not passed"
+    metrics.update(offset_med_mas=off_med, offset_scatter_mas=spread, offset_signif_med=signif,
+                   bulk_off=off_med,                        # primary (source-weighted) offset
+                   n_cells=cc["n_cells"], n_cells_dropped=cc["n_dropped"],
+                   n_cells_deviating=cc["n_deviating"], n_cells_confirmed=cc["n_confirmed"],
+                   bad_src_frac=cc["bad_src_frac"], cell_coverage=cc["coverage"],
+                   cells_consistent=cc["consistent"], passed=passed)
 
     from matplotlib.patches import Circle
+    cdra = np.array([c["dra"] for c in cells]); cdde = np.array([c["dde"] for c in cells])
+    cra = np.array([c["ra"] for c in cells]); cdec = np.array([c["dec"] for c in cells])
+    coff = np.array([c["off"] for c in cells])
+    confirmed = cc["confirmed"]; deviating = cc["deviating"]
     ncols = 2 + (1 if im else 0)
     fig, ax = _fig(1, ncols, 5.4, 5.0)
     col = 0
-    # panel 1: spatial map of the per-cell tie -- an internal discontinuity shows as cells that
-    # differ in colour instead of a single number that hides it.
+    # panel 1: spatial map of the per-cell tie.  Measured cells = filled squares (colour = tie);
+    # confirmed-deviating cells get a red outline, and DROPPED cells (sources present, no clear
+    # peak) are shown as hollow grey squares -- so a discontinuity or missing coverage is visible,
+    # not inferable.
     a0 = ax[0][col]; col += 1
-    vmax = max(aa.THRESH["absolute"], float(np.max(coff)))
-    sc0 = a0.scatter(cra, cdec, c=coff, s=300, marker="s", cmap="inferno", vmin=0, vmax=vmax,
-                     edgecolor="w", linewidth=0.4)
+    # cap the colour scale near the field tie (a few wild cells would otherwise wash out the
+    # 30-vs-130 structure); over-scale cells saturate but are already flagged by the green outline.
+    vmax = max(2.0 * aa.THRESH["absolute"], 2.0 * off_med)
+    sc0 = a0.scatter(cra, cdec, c=coff, s=320, marker="s", cmap="inferno", vmin=0, vmax=vmax,
+                     edgecolor="w", linewidth=0.4, zorder=2)
+    if confirmed.any():
+        a0.scatter(cra[confirmed], cdec[confirmed], s=320, marker="s", facecolors="none",
+                   edgecolor="#39ff14", linewidth=1.6, zorder=3)
+    if dropped:
+        a0.scatter([d["ra"] for d in dropped], [d["dec"] for d in dropped], s=320, marker="s",
+                   facecolors="none", edgecolor="0.6", linewidth=0.8, zorder=1)
     fig.colorbar(sc0, ax=a0, label="cell tie [mas]", shrink=0.85)
     a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
-    spread_str = f", spread {spread:.0f} mas" if spread is not None else ""
-    a0.set_title(f"per-cell tie ({n_cells} cells)\nmedian {off_med:.0f} mas{spread_str}", fontsize=8)
-    # panel 2: the per-cell offsets in (dRA, dDec) with the median tie, its spread, and the 75 mas
-    # absolute-offset gate -- this is the offset AND its uncertainty in one view.
+    a0.set_title(f"per-cell tie: {cc['n_cells']} measured, {cc['n_dropped']} no-peak\n"
+                 f"median {off_med:.0f} mas; {cc['n_confirmed']} cells "
+                 f"({100 * cc['bad_src_frac']:.0f}% of sources) deviate", fontsize=8)
+    # panel 2: per-cell offsets in (dRA, dDec) sized by source count (big = more sources = more
+    # weight), the source-weighted median tie, and the 75 mas gate.
     a1 = ax[0][col]; col += 1
-    scp = a1.scatter(cdra, cdde, c=cpr, s=90, cmap="viridis", edgecolor="k", linewidth=0.3)
-    fig.colorbar(scp, ax=a1, label="cell peak ratio", shrink=0.85)
-    mdra, mdde = float(np.median(cdra)), float(np.median(cdde))
-    a1.plot(mdra, mdde, "r+", ms=15, mew=2)
+    sz = 40 + 200 * np.array([c["n"] for c in cells]) / max(c["n"] for c in cells)
+    a1.scatter(cdra[~deviating], cdde[~deviating], s=sz[~deviating], c="#4477aa",
+               edgecolor="k", linewidth=0.3, label="consistent")
+    if deviating.any():
+        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], c="#ee6677",
+                   edgecolor="k", linewidth=0.3, label="deviating")
+    a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2)
     a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
-    if spread is not None and spread > 0:
-        a1.add_patch(Circle((mdra, mdde), spread, fill=False, ec="0.5", ls="--", lw=0.9))
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
     lim = max(aa.THRESH["absolute"] * 1.2, 1.4 * float(np.max(np.hypot(cdra, cdde))))
     a1.set_xlim(-lim, lim); a1.set_ylim(-lim, lim)
     a1.set_xlabel("dRA [mas]"); a1.set_ylabel("dDec [mas]")
+    a1.legend(fontsize=7, loc="upper right")
     se_str = f"±{se:.0f}" if se is not None else ""
     sig_str = f", {signif:.0f}σ" if signif is not None else ""
-    a1.set_title(f"tie {off_med:.0f}{se_str} mas{sig_str}\n(dotted = 75 mas gate; dashed = cell spread)",
-                 fontsize=8)
+    a1.set_title(f"source-weighted tie {off_med:.0f}{se_str} mas{sig_str}\n"
+                 f"(point size ∝ sources; dotted = 75 mas gate)", fontsize=8)
     if im:
         a2 = ax[0][col]; col += 1
         a2.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
@@ -1518,16 +1579,42 @@ def caption_for(n, metrics):
         return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate.")
-    if n == 4 and metrics.get("offset_signif_med") is None:
-        # too few cells to estimate a cell-to-cell uncertainty -> report the median tie and say the
-        # spread/significance could not be estimated, rather than printing "nanσ".
-        om = metrics.get("offset_med_mas")
-        nc = metrics.get("n_cells")
-        return ("**Stage 4 — positional offsets.** JWST−VIRAC frame tie "
-                f"{('%.0f mas' % om) if om is not None else 'unmeasured'} from "
-                f"{nc if nc is not None else 0} spatial cell(s); too few cells to estimate the "
-                "cell-to-cell spread, so the offset's uncertainty and consistency are not assessed "
-                "(not passed). Plus the reference-free inter-module offset.")
+    if n == 1 and metrics.get("dropped_filters"):
+        # a nominal (proposed) filter with no product on disk must leave a trace, not vanish
+        df = ", ".join(metrics["dropped_filters"])
+        return (CAPTIONS[1].format(**{k: (v if v is not None else float("nan"))
+                                      for k, v in metrics.items() if k in ("sw", "lw")})
+                + f" NOTE: nominal filter(s) with no mosaic/catalogue on disk (observed but not "
+                  f"reduced, or not delivered): {df}.")
+    if n == 4:
+        # Built in code (not a template) so it renders cleanly whatever is/ isn't measured -- never
+        # "nanσ", and gated on the CELL COUNT, not on significance being None (a zero-spread field
+        # can be consistent and pass).
+        om = metrics.get("offset_med_mas"); nc = metrics.get("n_cells") or 0
+        if om is None or nc == 0:
+            return ("**Stage 4 — positional offsets.** JWST−VIRAC frame tie unmeasured "
+                    "(no usable spatial cells). Precursor to proper-motion work.")
+        sig = metrics.get("offset_signif_med"); sp = metrics.get("offset_scatter_mas")
+        nd = metrics.get("n_cells_dropped") or 0; ncf = metrics.get("n_cells_confirmed") or 0
+        badf = metrics.get("bad_src_frac")
+        unc = (f", spread {sp:.0f} mas" + (f" ({sig:.0f}σ)" if sig is not None else "")) if sp is not None else ""
+        base = (f"**Stage 4 — positional offsets (JWST vs VIRAC frame tie).** The offset is "
+                f"measured per spatial cell (xcorr histogram peak vs the local VIRAC reference). "
+                f"The LEFT panel maps the source-weighted tie across the mosaic — filled squares "
+                f"are measured cells (colour = offset), grey squares are cells with sources but no "
+                f"clear peak, and a green outline marks cells that coherently deviate. The MIDDLE "
+                f"panel plots the per-cell offsets as (dRA, dDec) points sized by source count, "
+                f"with the source-weighted median tie and the 75 mas gate. Here the tie is "
+                f"{om:.0f} mas over {nc} measured cells ({nd} without a peak){unc}. ")
+        if ncf:
+            base += (f"{ncf} adjacent cell(s) holding {100 * (badf or 0):.0f}% of the sources are "
+                     f"tied differently — an internal discontinuity, so it does NOT pass. ")
+        base += "The RIGHT panel, when present, is the NRCA-vs-NRCB inter-module offset. A pass " \
+                "needs a small source-weighted median AND spatially consistent cells."
+        if str(metrics.get("source", "")).startswith("release-dao"):
+            base += (" (Positions here come from a per-filter DAO catalogue, not a merged/calibrated "
+                     "one — this obs is not yet photometrically catalogued, so stage 3 red-flags it.)")
+        return base
     if n == 5 and metrics.get("intermodule_off") is None:
         # No reference-free NRCA-NRCB overlap measurement -> the full template's overlap clause
         # ({intermodule_off}/{intermodule_rms}/{n_overlap}) would KeyError and drop the whole

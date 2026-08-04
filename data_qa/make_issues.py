@@ -93,6 +93,11 @@ def render_body(o: Observation) -> str:
 
     filt_rows = "\n".join(f"  - [ ] `{f}` — mosaic reviewed; astrometry + photometry OK"
                           for f in o.filters) or "  - (filters TBD)"
+    # surface nominal filters with no product on disk (stage 1) so an unreduced filter is visible
+    dropped = s1.get("dropped_filters") or []
+    dropped_note = (f"\n> ⚠️ **No data on disk for nominal filter(s):** "
+                    f"{', '.join(f'`{f}`' for f in dropped)} — observed but not reduced, or not "
+                    f"delivered. These are excluded from the QA above.\n" if dropped else "")
     visits = ", ".join(o.visits) or "—"
     notes = f"\n> **Notes:** {o.notes}\n" if o.notes else ""
     guidestar = _guidestar_block(o)
@@ -119,7 +124,7 @@ def render_body(o: Observation) -> str:
 - MAST data search: {o.mast_search_url}
 - On-disk mosaics: `{o.product_glob()}`
 
-{guidestar}{notes}
+{dropped_note}{guidestar}{notes}
 ### QA checklist
 <sub>boxes with a ✓ are auto-set from the diagnostic replies below (`data_qa.diagnostics`); the rest are manual.</sub>
 - [{_ck(delivered)}] Observation delivered / retrieved
