@@ -70,9 +70,38 @@ def test_caption_stage5_full_when_overlap_present():
     assert "137 shared" in cap and "4.1 mas" in cap
 
 
-# --------------------------------------------------------------------------- _daophot_glob
+# --------------------------------------------------------------------------- _refcat_path obs-scope
 def _touch(d, name):
     (d / name).write_text("")
+
+
+def test_refcat_path_prefers_this_obs_tokened(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "gc2211" / "catalogs"; d.mkdir(parents=True)
+    _touch(d, "gaia_virac2_refcat_epoch2023.71.fits")            # untokened full-field
+    _touch(d, "gaia_virac2_refcat_epoch2023.71_o028.fits")       # o028-only footprint
+    assert D._refcat_path(_obs(obs="028")).endswith("_o028.fits")
+
+
+def test_refcat_path_falls_back_to_untokened_not_other_obs(tmp_path, monkeypatch):
+    # the o023/o050/o028 bug (#7/#8/#28): a plain sorted()[-1] handed o023 the o028 refcat (a
+    # disjoint patch of sky).  o023 has no tokened refcat -> must use the untokened full one.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "gc2211" / "catalogs"; d.mkdir(parents=True)
+    _touch(d, "gaia_virac2_refcat_epoch2023.71.fits")
+    _touch(d, "gaia_virac2_refcat_epoch2023.71_o028.fits")
+    got = D._refcat_path(_obs(obs="023"))
+    assert got.endswith("epoch2023.71.fits") and "_o0" not in os.path.basename(got)
+
+
+def test_refcat_path_refuses_only_other_obs_tokened(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "gc2211" / "catalogs"; d.mkdir(parents=True)
+    _touch(d, "gaia_virac2_refcat_epoch2023.71_o028.fits")       # ONLY a foreign-obs footprint
+    assert D._refcat_path(_obs(obs="023")) is None
+
+
+# --------------------------------------------------------------------------- _daophot_glob
 
 
 def test_daophot_glob_prefers_this_obs(tmp_path, monkeypatch):

@@ -319,9 +319,29 @@ def _crossmatch_cmd_arrays(o: Observation, sw, lw):
 
 
 def _refcat_path(o: Observation):
-    """VIRAC2-Gaia refcat (newest epoch) for the absolute-frame (position-only) check."""
+    """VIRAC2-Gaia refcat for the absolute-frame (position-only) check, OBS-SCOPED.  A field can
+    carry both an untokened full-field refcat (``..._epoch2023.71.fits``) and per-obs subsets
+    (``..._epoch2023.71_o028.fits``) that cover only ONE observation's footprint.  A plain
+    ``sorted(...)[-1]`` picks the lexically-last file, which for gc2211-o023 handed back o028's
+    refcat -- a DISJOINT patch of sky (measured min separation 281") -> 0 JWST-VIRAC matches -> a
+    false "frame far off-tie" red flag (issues #7/#8/#28).  Prefer this obs's own tokened refcat;
+    else the untokened full-field refcat; NEVER a different obs's tokened refcat (wrong footprint).
+
+    NOTE (epoch-blindness): when several EPOCHS coexist this still takes the lexically-newest, not
+    the one nearest the observation.  Only ngc6334 has multiple epochs today so nothing moves, but
+    the rule is epoch-blind and should be revisited if per-epoch refcats proliferate.  Related:
+    the untokened gc2211 refcat carries no pmRA/pmDE, so aa.load_reference does no PM propagation
+    and _obs_epoch has no effect on the reference here (the ~128 mas tie is flat in dt regardless)."""
     hits = sorted(glob.glob(f"{BASE}/{o.field}/catalogs/gaia_virac2_refcat_epoch*.fits"))
-    return hits[-1] if hits else None
+    if not hits:
+        return None
+    tok = [h for h in hits if (m := _OBS_TOK_RE.search(os.path.basename(h))) and m.group(1) == o.obs]
+    if tok:
+        return sorted(tok)[-1]
+    unt = [h for h in hits if not _OBS_TOK_RE.search(os.path.basename(h))]
+    if unt:
+        return sorted(unt)[-1]
+    return None                                  # only other-obs tokened refcats exist -> refuse
 
 
 def _obs_epoch(o: Observation, mosaic_path):
