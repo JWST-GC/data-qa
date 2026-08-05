@@ -82,8 +82,53 @@ def test_caption_stage5_single_module():
 def test_caption_stage5_full_when_overlap_present():
     cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1,
                                 intermodule_rms=6.2, n_overlap=137))
-    assert "137 stars" in cap and "4.1 mas" in cap
+    assert "137 shared stars" in cap and "4.1 mas" in cap
     assert "TOP-LEFT" in cap and "Reference-free" in cap    # panels labelled + term defined
+    assert "S/N > 10" in cap and "marginal" in cap          # the new S/N panel + marginals noted
+    # the NRCB2/no-overlap question is answered inline
+    assert "NRCB2" in cap and "VIRAC, not NRCA" in cap
+
+
+# --------------------------------------------------------------------------- doc links / clarity
+def test_caption_linkifies_docroot():
+    # no caption may leave the DOCROOT sentinel unresolved, and every one carries a doc link
+    for m in (dict(stage=3, sw="F212N", n_matched=100, slope=1.0, scatter=0.2),
+              dict(stage=5, single_module="NRCA", passed=True),
+              dict(red_flag=True, red_flag_reason="x")):
+        n = m.get("stage", 3)
+        cap = D.caption_for(n, m)
+        assert "DOCROOT" not in cap
+        assert "qa_methods.md#" in cap
+
+
+def test_caption_stage3_drops_false_claim_and_labels_line():
+    cap = D.caption_for(3, dict(stage=3, sw="F212N", n_matched=2603, slope=1.0, scatter=0.28))
+    # the untrue "a tight locus means the right stars were matched" claim is gone
+    assert "right stars were matched" not in cap
+    # the cyan line is defined as the 1:1, explicitly not a fit
+    assert "1:1" in cap and "NOT a fit" in cap
+
+
+def test_caption_stage2_spells_out_lf_and_drops_meaningless_clause():
+    cap = D.caption_for(2, dict(stage=2, kind="m7", n_stars=161196, lf_turnover=18.3,
+                                sw="F212N", lw="F405N"))
+    assert "luminosity function" in cap and "regenerated as the catalog deepens" not in cap
+    assert "m7" in cap and "qa_methods.md#glossary-mtier" in cap    # catalog term links out
+
+
+def test_caption_stage2_crossmatch_and_single_filter_variants():
+    xm = D.caption_for(2, dict(stage=2, kind="crossmatch", n_stars=800, sw="F212N", lw="F405N"))
+    assert "cross-match tolerance" in xm and "DOCROOT" not in xm    # no lf_turnover -> no crash
+    sf = D.caption_for(2, dict(stage=2, kind="m8_dedup", n_stars=500, lf_turnover=17.0,
+                               sw="F212N", single_filter=True))
+    assert "luminosity function" in sf and "single filter" in sf
+
+
+def test_provenance_footer_has_doc_and_source():
+    from data_qa import post_diagnostics as P
+    foot = P._provenance_footer("JWST-GC/data-qa", 4)
+    assert "docs/qa_methods.md#stage4" in foot
+    assert "stage4_offsets()" in foot and "data_qa/diagnostics.py" in foot
 
 
 # --------------------------------------------------------------------------- _refcat_path obs-scope
