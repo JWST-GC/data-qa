@@ -27,6 +27,25 @@ UPLOADS = "https://uploads.github.com"
 ASSET_RELEASE_TAG = os.environ.get("QA_ASSET_TAG", "qa-assets")
 DIAG_MARKER = "<!-- data-qa:diag:stage{n} -->"
 
+# The function in data_qa/diagnostics.py that builds each stage's figure + numbers, so every
+# posted comment can link straight to the source that produced it (the caption already links the
+# narrative method doc + glossary terms).
+STAGE_FUNC = {
+    1: "stage1_mosaics", 2: "stage2_cmd", 3: "stage3_calibration", 4: "stage4_offsets",
+    5: "stage5_intermodule", 6: "stage6_astrom_error",
+    # 7: stage7_mast_vs_pipeline -- added by the stage-7 follow-up PR
+}
+
+
+def _provenance_footer(repo, stage):
+    """One-line 'how this was made' footer: the narrative method doc + the exact source function."""
+    base = f"https://github.com/{repo}/blob/main"
+    doc = f"{base}/docs/qa_methods.md#stage{stage}"
+    func = STAGE_FUNC.get(stage)
+    src = (f"[`data_qa/diagnostics.py` → `{func}()`]({base}/data_qa/diagnostics.py)"
+           if func else f"[`data_qa/diagnostics.py`]({base}/data_qa/diagnostics.py)")
+    return f"📖 [how this plot & its numbers are made]({doc}) · 🛠 source: {src}"
+
 
 def _token():
     tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -157,6 +176,7 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None):
     body = (f"{marker}\n### QA diagnostic — stage {stage}\n\n"
             f"{caption}\n\n"
             f"![{asset_name}]({img_url})\n\n"
+            f"<sub>{_provenance_footer(repo, stage)}</sub>\n"
             f"<sub>auto-posted by `data_qa.diagnostics`; updates in place as the pipeline advances.</sub>")
     if existing:
         st, data = _req("PATCH", f"{API}/repos/{repo}/issues/comments/{existing['id']}", token,

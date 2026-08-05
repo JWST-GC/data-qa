@@ -690,43 +690,60 @@ def stage2_cmd(o: Observation, sw, lw):
         metrics["passed"] = False
         return _save(fig, f"{o.obsid}_stage2.png"), metrics
 
-    # CMD + shared-y marginal LF
+    # CMD + shared-y marginal LF.  TWO versions: all stars, and (when per-band flux errors exist)
+    # one limited to S/N > 10 in BOTH bands -- the cleaner locus.
     msw = np.asarray(t[csw], float); mlw = np.asarray(t[clw], float)
     g = np.isfinite(msw) & np.isfinite(mlw)
-    color = msw[g] - mlw[g]; mag = mlw[g]
-    fig = plt.figure(figsize=(8.2, 6.2))
-    # main CMD | marginal LF | dedicated colorbar column (so the bar doesn't steal marginal width)
-    gs = fig.add_gridspec(1, 3, width_ratios=[4.0, 1.15, 0.16], wspace=0.05)
-    a = fig.add_subplot(gs[0, 0])
-    amarg = fig.add_subplot(gs[0, 1], sharey=a)          # y-axis (mag) LOCKED to the CMD
-    cax = fig.add_subplot(gs[0, 2])
-    hb = a.hexbin(color, mag, gridsize=120, bins="log", cmap="viridis", mincnt=1)
-    a.set_xlabel(f"{sw} - {lw}"); a.set_ylabel(lw)
-    a.set_xlim(np.nanpercentile(color, [1, 99]))
-    # y-range from the mag percentiles (LF outliers otherwise leave ~1/3 of the panel empty);
-    # inverted so brighter is up.
-    ylo, yhi = np.nanpercentile(mag, [0.5, 99.5])
-    a.set_ylim(yhi, ylo)                                  # marginal follows via sharey
-    fig.colorbar(hb, cax=cax, label="log N stars (CMD)")
-    # marginal LF: counts vs magnitude, bars run horizontally so mag lines up with the CMD
-    hh, edges = np.histogram(mag, bins=50)
-    ctr = 0.5 * (edges[1:] + edges[:-1])
-    amarg.step(hh, ctr, where="mid", color="k", lw=0.9)
-    peak = ctr[int(np.argmax(hh))]
-    amarg.axhline(peak, color="r", lw=0.8)
-    amarg.set_xlabel(f"N stars\nturnover≈{peak:.1f}", fontsize=8)
-    amarg.tick_params(labelleft=False, labelsize=7)
-    amarg.margins(y=0)
-    metrics.update(n_stars=int(g.sum()), lf_turnover=float(peak),
-                   sw_col=csw, lw_col=clw, passed=int(g.sum()) > 500)
-    fig.suptitle(f"{o.target} {o.obsid} — CMD ({kind})", fontsize=11)
+
+    def _sn(band):
+        fc, ec = f"flux_{band.lower()}", f"flux_err_{band.lower()}"
+        if fc in t.colnames and ec in t.colnames:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                return np.asarray(t[fc], float) / np.asarray(t[ec], float)
+        return None
+    snsw, snlw = _sn(sw), _sn(lw)
+    have_sn = snsw is not None and snlw is not None
+    hi = (g & np.isfinite(snsw) & np.isfinite(snlw) & (snsw > 10) & (snlw > 10)) if have_sn else None
+
+    def _draw_cmd(gs, r, sel, tag):
+        a = fig.add_subplot(gs[r, 0]); amarg = fig.add_subplot(gs[r, 1], sharey=a)
+        cax = fig.add_subplot(gs[r, 2])
+        col = msw[sel] - mlw[sel]; mg = mlw[sel]
+        hb = a.hexbin(col, mg, gridsize=120, bins="log", cmap="viridis", mincnt=1)
+        a.set_xlabel(f"{sw} - {lw}"); a.set_ylabel(lw)
+        a.set_xlim(np.nanpercentile(col, [1, 99]))
+        ylo, yhi = np.nanpercentile(mg, [0.5, 99.5]); a.set_ylim(yhi, ylo)   # brighter up
+        fig.colorbar(hb, cax=cax, label="log N")
+        hh, edges = np.histogram(mg, bins=50); ctr = 0.5 * (edges[1:] + edges[:-1])
+        amarg.step(hh, ctr, where="mid", color="k", lw=0.9)
+        pk = ctr[int(np.argmax(hh))]
+        amarg.axhline(pk, color="r", lw=0.8)
+        amarg.set_xlabel(f"N\nturnover≈{pk:.1f}", fontsize=8)
+        amarg.tick_params(labelleft=False, labelsize=7); amarg.margins(y=0)
+        a.set_title(f"{tag} (n={int(np.sum(sel))})", fontsize=9)
+        return float(pk)
+
+    # only draw the S/N>10 row when it has enough stars -- an empty selection would make
+    # nanpercentile return NaN and crash set_xlim.
+    have_hi = bool(have_sn and int(np.sum(hi)) >= 50)
+    nrows = 2 if have_hi else 1
+    fig = plt.figure(figsize=(8.2, 5.6 * nrows))
+    gs = fig.add_gridspec(nrows, 3, width_ratios=[4.0, 1.15, 0.16], wspace=0.05, hspace=0.32)
+    peak = _draw_cmd(gs, 0, g, "all stars")
+    metrics.update(n_stars=int(g.sum()), lf_turnover=peak, sw_col=csw, lw_col=clw,
+                   passed=int(g.sum()) > 500)
+    if have_hi:
+        peak_hi = _draw_cmd(gs, 1, hi, "S/N > 10 in both bands")
+        metrics.update(n_stars_hi_sn=int(np.sum(hi)), lf_turnover_hi_sn=peak_hi)
+    fig.suptitle(f"{o.target} {o.obsid} — CMD ({kind.replace('_dedup', '')})", fontsize=11)
     return _save(fig, f"{o.obsid}_stage2.png"), metrics
 
 
 # --------------------------------------------------------------------------- STAGE 3
 def stage3_calibration(o: Observation, sw):
-    """JWST (SW ~ F212N) instrumental mag vs VIRAC Ks for matched stars: a tight linear
-    locus proves the RIGHT stars were matched and the photometric zeropoint is sane."""
+    """JWST (SW ~ F212N) catalogue mag vs VIRAC Ks for matched stars.  The cyan 1:1 line is the
+    ideal unit-slope relation (not a fit); the measured free slope and the scatter about the
+    locus gate whether the photometric zeropoint is sane."""
     import astropy.units as u
     from astropy.coordinates import search_around_sky
     fig, ax = _fig(1, 1, 5.5, 5.5)
@@ -797,11 +814,11 @@ def stage3_calibration(o: Observation, sw):
     hcnt, hedge = np.histogram(dy, bins=60)
     zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus zp
     xs = np.array([np.nanmin(x), np.nanmax(x)])
-    a.plot(xs, xs + zp1, "c-", lw=1, label=f"1:1 (unit slope, locus zp={zp1:.2f})")
+    a.plot(xs, xs + zp1, "c-", lw=1.4, label="1:1 line")
     a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
     a.legend(fontsize=8, loc="upper left")
     a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus})  "
-                f"fitted slope={slope:.2f}  scatter={scat:.2f}", fontsize=10)
+                f"slope={slope:.2f}  scatter={scat:.2f}  locus zp={zp1:.2f}", fontsize=9)
     # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen
     # only the SCATTER for the real narrow-vs-broad (F212N vs Ks) colour/extinction spread.
     metrics.update(n_matched=int(g.sum()), n_locus=n_locus, slope=float(slope),
@@ -884,6 +901,28 @@ def _binned_stat(x, y, width=0.5, minn=15):
     if len(ctr) < 3:
         return None, None, None, None
     return np.array(med), np.array(p16), np.array(p84), np.array(ctr)
+
+
+def _binned_rms(x, r, width=0.5, minn=15):
+    """RMS of ``r`` (per-star residual magnitude, mas) in fixed-width bins of ``x``.
+    Returns (rms, centre) arrays or (None, None)."""
+    g = np.isfinite(x) & np.isfinite(r)
+    x, r = x[g], r[g]
+    if x.size < minn:
+        return None, None
+    edges = np.arange(np.floor(x.min() / width) * width,
+                      np.ceil(x.max() / width) * width + width, width)
+    idx = np.digitize(x, edges)
+    ctr, rms = [], []
+    for b in range(1, len(edges)):
+        m = idx == b
+        if m.sum() < minn:
+            continue
+        ctr.append(0.5 * (edges[b - 1] + edges[b]))
+        rms.append(float(np.sqrt(np.mean(r[m] ** 2))))
+    if len(ctr) < 3:
+        return None, None
+    return np.array(rms), np.array(ctr)
 
 
 def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk):
@@ -1037,6 +1076,40 @@ def _cell_consistency(cells, dropped):
                 consistent=consistent, deviating=deviating, confirmed=confirmed)
 
 
+def _dataset_label(metrics):
+    """Short label naming WHICH catalogue a stage-4/5 plot is built from (jicama mN / DAO / MAST),
+    so the reader is never left guessing the data source."""
+    s = str(metrics.get("source", ""))
+    if "dao" in s.lower():
+        return "per-filter DAO positions"
+    if s.startswith("release"):
+        m = _MLEVEL_RE.search(s)
+        return f"jicama m{m.group(1)}" if m else ("jicama m8" if "m8" in s.lower() else "jicama")
+    if "mast" in s.lower():
+        return "MAST catalogue"
+    return "jicama catalogue"
+
+
+def _add_marginals(ax, x, y, color="#4477aa", bins=40, weights=None):
+    """Attach top (x) and right (y) marginal histograms to ``ax`` as inset axes locked to its
+    data limits, so the 1-D ΔRA / ΔDec distributions are shown alongside the 2-D scatter/hexbin
+    on the positional-offset panels.  The insets sit just outside the axes; the caller must leave
+    top/right room (wspace/hspace) so they do not collide with a neighbour or the panel title."""
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    w = np.asarray(weights, float) if weights is not None else None
+    gx = np.isfinite(x); gy = np.isfinite(y)
+    axt = ax.inset_axes([0.0, 1.02, 1.0, 0.16])
+    axr = ax.inset_axes([1.02, 0.0, 0.16, 1.0])
+    if gx.any():
+        axt.hist(x[gx], bins=bins, color=color, weights=(w[gx] if w is not None else None))
+    axt.set_xlim(ax.get_xlim()); axt.axis("off")
+    if gy.any():
+        axr.hist(y[gy], bins=bins, orientation="horizontal", color=color,
+                 weights=(w[gy] if w is not None else None))
+    axr.set_ylim(ax.get_ylim()); axr.axis("off")
+    return axt, axr
+
+
 def stage4_offsets(o: Observation, sw):
     """JWST-VIRAC frame tie measured PER SPATIAL CELL (xcorr histogram peak), reported as the
     median cell offset with its cell-to-cell spread (the offset's uncertainty), plus the
@@ -1103,58 +1176,93 @@ def stage4_offsets(o: Observation, sw):
     coff = np.array([c["off"] for c in cells])
     confirmed = cc["confirmed"]; deviating = cc["deviating"]
     ncols = 2 + (1 if im else 0)
-    fig, ax = _fig(1, ncols, 5.4, 5.0)
+    fig, ax = _fig(1, ncols, 6.2, 5.4)
+    # extra column gap + top room so the middle panel's marginal histograms (which hang above and
+    # to the right of the axes) don't overlap the neighbouring panel or the suptitle.
+    fig.subplots_adjust(wspace=0.62, top=0.80, bottom=0.12)
     col = 0
-    # panel 1: spatial map of the per-cell tie.  Measured cells = filled squares (colour = tie);
-    # confirmed-deviating cells get a red outline, and DROPPED cells (sources present, no clear
-    # peak) are shown as hollow grey squares -- so a discontinuity or missing coverage is visible,
-    # not inferable.
+    # panel 1: contiguous 4x4 map of the per-cell tie (colour = offset).  Confirmed-deviating cells
+    # get a RED outline (deviating = bad); DROPPED cells (sources present, no clear peak) render
+    # grey -- so a discontinuity or missing coverage is visible, not inferable.
     a0 = ax[0][col]; col += 1
     # cap the colour scale near the field tie (a few wild cells would otherwise wash out the
     # 30-vs-130 structure); over-scale cells saturate but are already flagged by the green outline.
     vmax = max(2.0 * aa.THRESH["absolute"], 2.0 * off_med)
-    sc0 = a0.scatter(cra, cdec, c=coff, s=320, marker="s", cmap="inferno", vmin=0, vmax=vmax,
-                     edgecolor="w", linewidth=0.4, zorder=2)
-    if confirmed.any():
-        a0.scatter(cra[confirmed], cdec[confirmed], s=320, marker="s", facecolors="none",
-                   edgecolor="#39ff14", linewidth=1.6, zorder=3)
-    if dropped:
-        a0.scatter([d["ra"] for d in dropped], [d["dec"] for d in dropped], s=320, marker="s",
-                   facecolors="none", edgecolor="0.6", linewidth=0.8, zorder=1)
-    fig.colorbar(sc0, ax=a0, label="cell tie [mas]", shrink=0.85)
+    # CONTIGUOUS grid (imshow), so the cells tile with no whitespace and a coherent patch is
+    # obvious.  Use the TRUE grid edges (same linspace as _cell_offsets), NOT reconstructed from
+    # surviving cell centres -- a skipped interior cell would otherwise mis-size the extent.
+    from matplotlib.patches import Rectangle
+    NCELL = 4
+    ra_all = jsc.ra.deg; dec_all = jsc.dec.deg
+    if float(np.nanmax(ra_all) - np.nanmin(ra_all)) > 180.0:        # RA-wrap guard (matches source)
+        NCELL = 1
+    re_ = np.linspace(np.nanmin(ra_all), np.nanmax(ra_all), NCELL + 1)
+    de_ = np.linspace(np.nanmin(dec_all), np.nanmax(dec_all), NCELL + 1)
+    grid = np.full((NCELL, NCELL), np.nan)          # NaN = cell never measured (dropped or skipped)
+    for c in cells:
+        grid[c["i"], c["j"]] = c["off"]
+    ext = [re_[0], re_[-1], de_[0], de_[-1]]
+    import matplotlib as mpl
+    cmap = mpl.colormaps["inferno"].copy(); cmap.set_bad("0.7")     # dropped/absent cells -> grey
+    im0 = a0.imshow(grid.T, origin="lower", extent=ext, aspect="auto", cmap=cmap,
+                    vmin=0, vmax=vmax)
+    fig.colorbar(im0, ax=a0, label="cell tie [mas]", shrink=0.85)
+    # RED outline on confirmed-deviating cells (deviating = bad), on the true grid edges
+    for k, c in enumerate(cells):
+        if confirmed[k]:
+            a0.add_patch(Rectangle((re_[c["i"]], de_[c["j"]]),
+                                   re_[c["i"] + 1] - re_[c["i"]], de_[c["j"] + 1] - de_[c["j"]],
+                                   fill=False, ec="#e41a1c", lw=2.0, zorder=3))
     a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
-    a0.set_title(f"per-cell tie: {cc['n_cells']} measured, {cc['n_dropped']} no-peak\n"
-                 f"median {off_med:.0f} mas; {cc['n_confirmed']} cells "
+    a0.set_title(f"per-cell tie ({_dataset_label(metrics)}): {cc['n_cells']} measured, "
+                 f"{cc['n_dropped']} no-peak\nmedian {off_med:.0f} mas; {cc['n_confirmed']} cells "
                  f"({100 * cc['bad_src_frac']:.0f}% of sources) deviate", fontsize=8)
     # panel 2: per-cell offsets in (dRA, dDec) sized by source count (big = more sources = more
     # weight), the source-weighted median tie, and the 75 mas gate.
     a1 = ax[0][col]; col += 1
-    sz = 40 + 200 * np.array([c["n"] for c in cells]) / max(c["n"] for c in cells)
-    a1.scatter(cdra[~deviating], cdde[~deviating], s=sz[~deviating], c="#4477aa",
-               edgecolor="k", linewidth=0.3, label="consistent")
+    # sized by source count; HOLLOW circles so overlapping cells at similar (ΔRA,ΔDec) are both
+    # visible instead of one hiding the other.
+    sz = 30 + 130 * np.array([c["n"] for c in cells]) / max(c["n"] for c in cells)
+    a1.scatter(cdra[~deviating], cdde[~deviating], s=sz[~deviating], facecolors="none",
+               edgecolors="#4477aa", linewidths=1.2, label="consistent")
     if deviating.any():
-        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], c="#ee6677",
-                   edgecolor="k", linewidth=0.3, label="deviating")
+        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], facecolors="none",
+                   edgecolors="#e41a1c", linewidths=1.4, label="deviating")
     a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2)
     a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
     lim = max(aa.THRESH["absolute"] * 1.2, 1.4 * float(np.max(np.hypot(cdra, cdde))))
     a1.set_xlim(-lim, lim); a1.set_ylim(-lim, lim)
-    a1.set_xlabel("dRA [mas]"); a1.set_ylabel("dDec [mas]")
+    a1.set_xlabel("ΔRA [mas]"); a1.set_ylabel("ΔDec [mas]")
     a1.legend(fontsize=7, loc="upper right")
+    # marginal ΔRA / ΔDec histograms of the per-cell ties, weighted by source count (so the
+    # marginals reflect the source-weighted tie, not raw cell counts).  Title goes on the top
+    # marginal so it clears the inset histograms.
+    a1t, _a1r = _add_marginals(a1, cdra, cdde, color="#4477aa", bins=12,
+                               weights=np.array([c["n"] for c in cells], float))
     se_str = f"±{se:.0f}" if se is not None else ""
     sig_str = f", {signif:.0f}σ" if signif is not None else ""
-    a1.set_title(f"source-weighted tie {off_med:.0f}{se_str} mas{sig_str}\n"
-                 f"(point size ∝ sources; dotted = 75 mas gate)", fontsize=8)
+    a1t.set_title(f"source-weighted tie {off_med:.0f}{se_str} mas{sig_str}\n"
+                  f"(point size ∝ sources; dotted = 75 mas gate; marginals source-weighted)",
+                  fontsize=8)
     if im:
+        # inter-module offset is just two numbers -- print them, don't histogram/bar them.
         a2 = ax[0][col]; col += 1
-        a2.bar(["dRA", "dDec"], [im["dra"], im["ddec"]], color=["#4477aa", "#ee6677"])
-        a2.axhline(0, color="k", lw=0.5)
-        a2.axhline(aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
-        a2.axhline(-aa.THRESH["intermodule"], color="r", ls=":", lw=0.8)
-        a2.set_ylabel("NRCA-NRCB [mas]")
-        a2.set_title(f"inter-module {metrics['intermodule_filt']}  off={im['off']:.0f} mas", fontsize=9)
-    fig.suptitle(f"{o.target} {o.obsid} — positional offsets", fontsize=11)
+        a2.axis("off")
+        ok = im["off"] < aa.THRESH["intermodule"]
+        a2.text(0.5, 0.62,
+                f"NRCA − NRCB\ninter-module offset\n({metrics['intermodule_filt']})",
+                ha="center", va="center", fontsize=10, transform=a2.transAxes)
+        a2.text(0.5, 0.36,
+                f"ΔRA = {im['dra']:+.1f} mas\nΔDec = {im['ddec']:+.1f} mas\n"
+                f"|offset| = {im['off']:.1f} mas",
+                ha="center", va="center", fontsize=12, transform=a2.transAxes,
+                family="monospace")
+        a2.text(0.5, 0.14, f"({'≤' if ok else '>'} {aa.THRESH['intermodule']:.0f} mas gate)",
+                ha="center", va="center", fontsize=9,
+                color=("#2a7" if ok else "#c33"), transform=a2.transAxes)
+    fig.suptitle(f"{o.target} {o.obsid} — positional offsets (JWST ↔ VIRAC frame tie)",
+                 fontsize=11, y=0.99)
     return _save(fig, f"{o.obsid}_stage4.png"), metrics
 
 
@@ -1257,13 +1365,90 @@ def _module_positions(o, filt):
     return a_sc, b_sc, dict(a=a_info, b=b_info)
 
 
+def _ab_overlap(a_sc, b_sc):
+    """Reference-free NRCA↔NRCB tie from two module position lists (no external catalogue).
+    Crowding-robust: the bulk A→B shift is the ``aa.xcorr`` histogram PEAK (a direct
+    search_around_sky median fabricates pairs in a dense field); the RMS (tie precision) is the
+    residual scatter of the SAME stars after aligning A onto B by that peak.  Returns a dict with
+    the offset/RMS/count, the per-star residual arrays (for the hexbin + marginals), and a list of
+    overlap-star positions (for the cutout gallery), or None if unmeasurable."""
+    import astropy.units as u
+    from astropy.coordinates import search_around_sky, SkyCoord
+    if a_sc is None or b_sc is None or len(a_sc) < 50 or len(b_sc) < 50:
+        return None
+    xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
+    if not (xc and xc["peak_ratio"] >= aa.MIN_PEAK_RATIO and xc["npairs"] >= 100):
+        return None
+    cosd = float(np.cos(np.radians(np.median(a_sc.dec.deg))))
+    a_al = SkyCoord((a_sc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
+                    (a_sc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
+    ia, ib, sep, _ = search_around_sky(a_al, b_sc, 0.08 * u.arcsec)   # same star after align
+    if len(ia) < 20:
+        return None
+    dra = (a_al[ia].ra - b_sc[ib].ra).to(u.mas).value * cosd
+    dde = (a_al[ia].dec - b_sc[ib].dec).to(u.mas).value
+    return dict(dra=float(xc["dra"]), dde=float(xc["ddec"]), off=float(xc["off"]),
+                rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
+                n=int(len(ia)), peak_ratio=float(xc["peak_ratio"]),
+                dra_arr=dra, dde_arr=dde,
+                pos=[(b_sc[i].ra.deg, b_sc[i].dec.deg) for i in ib[:200]])
+
+
+def _draw_ab_panel(ax, ovd, title):
+    """Draw one reference-free A↔B residual panel: a 2-D hexbin of the per-star ΔRA/ΔDec
+    residuals (same stars, aligned by the histogram peak) with ΔRA/ΔDec marginal histograms.
+    The numeric summary goes on the TOP marginal's title so it can't collide with the marginals."""
+    dra_a = np.asarray(ovd["dra_arr"], float); dde_a = np.asarray(ovd["dde_arr"], float)
+    ax.hexbin(dra_a, dde_a, gridsize=40, bins="log", cmap="cividis", mincnt=1)
+    ax.axhline(0, color="w", lw=0.5); ax.axvline(0, color="w", lw=0.5)
+    ax.set_xlabel("NRCA−NRCB residual ΔRA [mas]"); ax.set_ylabel("residual ΔDec [mas]")
+    lim = max(50.0, 4.0 * ovd["rms"])
+    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+    axt, _axr = _add_marginals(ax, dra_a, dde_a, color="#5566aa", bins=40)
+    axt.set_title(f"{title}  ({ovd['n']} stars)\n"
+                  f"offset = {ovd['off']:.1f} mas   RMS = {ovd['rms']:.1f} mas", fontsize=8)
+
+
+def _module_hi_sn(o, filt, snmin=10.0):
+    """(NRCA, NRCB) finite SkyCoords restricted to flux S/N > ``snmin`` (S/N = flux_fit/flux_err
+    from the per-exposure PSF fit), pooled from the per-detector daophot cats.  Used for the
+    stage-5 high-S/N overlap panel so the A↔B residual reflects the tie, not faint-source
+    centroiding.  Either module is None if its cats lack flux errors or have too few high-S/N
+    stars."""
+    from astropy.table import vstack, Table
+
+    def pool(dets):
+        cats = []
+        for d in dets:
+            cats += _daophot_glob(o, filt, d)          # obs-scoped
+        tabs = []
+        for c in cats:
+            try:
+                t = Table.read(c)
+            except (OSError, ValueError):
+                continue
+            if {"skycoord_centroid", "flux_fit", "flux_err"}.issubset(set(t.colnames)):
+                tabs.append(t["skycoord_centroid", "flux_fit", "flux_err"])
+        if not tabs:
+            return None
+        T = vstack(tabs, metadata_conflicts="silent")
+        sc = T["skycoord_centroid"]
+        f = np.asarray(T["flux_fit"], float); e = np.asarray(T["flux_err"], float)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            sn = f / e
+        good = (np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(sn) & (sn > snmin))
+        return sc[good] if int(good.sum()) >= 50 else None
+
+    return pool(["nrca1", "nrca2", "nrca3", "nrca4"]), pool(["nrcb1", "nrcb2", "nrcb3", "nrcb4"])
+
+
 def stage5_intermodule(o: Observation, sw):
     """Inter-detector / inter-module tie quality:
     (1) per-detector residual quiver vs VIRAC, bulk-subtracted (relative ties);
     (2) reference-free NRCA-vs-NRCB overlap: median offset + RMS of the SAME stars;
     (3) doubled-star cutout gallery on the module-overlap zone (mis-tie -> split PSF)."""
     import astropy.units as u
-    from astropy.coordinates import search_around_sky, SkyCoord
+    from astropy.coordinates import SkyCoord
     from astropy.io import fits
     from astropy.wcs import WCS
     from astropy.nddata import Cutout2D
@@ -1300,22 +1485,19 @@ def stage5_intermodule(o: Observation, sw):
         return png, metrics
     if (a_sc is None) ^ (b_sc is None):
         single_module = "NRCA" if a_sc is not None else "NRCB"
-    if a_sc is not None and b_sc is not None and len(a_sc) >= 50 and len(b_sc) >= 50:
-        xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
-        if xc and xc["peak_ratio"] >= aa.MIN_PEAK_RATIO and xc["npairs"] >= 100:
-            cosd = float(np.cos(np.radians(np.median(a_sc.dec.deg))))
-            a_al = SkyCoord((a_sc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
-                            (a_sc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
-            ia, ib, sep, _ = search_around_sky(a_al, b_sc, 0.08 * u.arcsec)  # same star after align
-            if len(ia) >= 20:
-                dra = (a_al[ia].ra - b_sc[ib].ra).to(u.mas).value * cosd
-                dde = (a_al[ia].dec - b_sc[ib].dec).to(u.mas).value
-                ov = dict(dra=float(xc["dra"]), dde=float(xc["ddec"]), off=float(xc["off"]),
-                          rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
-                          n=int(len(ia)), peak_ratio=float(xc["peak_ratio"]),
-                          pos=[(b_sc[i].ra.deg, b_sc[i].dec.deg) for i in ib[:200]])
-                metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"],
-                               n_overlap=ov["n"])
+    ov = _ab_overlap(a_sc, b_sc)
+    if ov:
+        metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"])
+    # Same tie restricted to flux S/N > 10 (best-measured stars): the residual scatter then
+    # reflects the A↔B tie rather than faint-source centroiding.  An ADDITIONAL panel, not a
+    # replacement -- the all-stars panel above stays.
+    ov_hi = None
+    if ov:
+        a_hi, b_hi = _module_hi_sn(o, filt, snmin=10.0)
+        ov_hi = _ab_overlap(a_hi, b_hi)
+        if ov_hi:
+            metrics.update(intermodule_off_hi=ov_hi["off"], intermodule_rms_hi=ov_hi["rms"],
+                           n_overlap_hi=ov_hi["n"], sn_cut=10.0)
 
     # (1) per-detector residuals vs VIRAC, bulk-subtracted
     det = _per_detector_offsets(o, filt, ref_sc) if ref_sc is not None else {}
@@ -1344,29 +1526,33 @@ def stage5_intermodule(o: Observation, sw):
             cols = ["#4477aa" if d.startswith("nrca") else "#ee6677" for d in det]
             q = axq.quiver(xs, ys, us, vs, color=cols, angles="xy", scale_units="xy",
                            scale=2000, width=0.007)
-            axq.quiverkey(q, 0.12, 1.03, 5, "5 mas", labelpos="E", fontproperties={"size": 8})
+            axq.quiverkey(q, 0.5, 0.10, 5, "5 mas", labelpos="E", coordinates="axes",
+                          fontproperties={"size": 8})
             for d, v in det.items():
-                axq.annotate(d, (v["ra"], v["dec"]), fontsize=6.5, ha="center", va="bottom")
-            axq.invert_xaxis(); axq.set_xlabel("RA"); axq.set_ylabel("Dec")
-            axq.set_title(f"per-detector residual (bulk-removed) — {filt}\n"
-                          f"A-B diff = {metrics.get('intermodule_diff', float('nan')):.1f} mas", fontsize=9)
+                # annotate each arrow with the number of VIRAC-matched stars behind it
+                axq.annotate(f"{d} (n={v['n']})", (v["ra"], v["dec"]), fontsize=5.8,
+                             ha="center", va="bottom")
+            axq.invert_xaxis(); axq.set_ylabel("Dec"); axq.set_xlabel("RA")
+            axq.set_title(f"per-detector residual vs VIRAC (bulk-removed) — {filt}\n"
+                          f"A−B diff = {metrics.get('intermodule_diff', float('nan')):.1f} mas  ·  "
+                          f"one arrow/detector (n = VIRAC matches)", fontsize=9, pad=12)
         else:
             axq.text(0.5, 0.5, "per-detector cats unavailable", ha="center", va="center", fontsize=8)
 
     if ov:
-        fig = plt.figure(figsize=(11, 8.5))
-        gs = fig.add_gridspec(2, 2, height_ratios=[1.15, 0.85])
-        axq, axo = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
-        _draw_quiver(axq)
-        # dra/dde are the same-star residuals after aligning A onto B by the histogram peak;
-        # they scatter about 0 (RMS = tie precision). The bulk offset is the title number.
-        axo.hexbin(dra, dde, gridsize=40, bins="log", cmap="cividis", mincnt=1)
-        axo.axhline(0, color="w", lw=0.5); axo.axvline(0, color="w", lw=0.5)
-        axo.set_xlabel("NRCA-NRCB residual dRA [mas]"); axo.set_ylabel("residual dDec [mas]")
-        lim = max(50, 4 * ov["rms"])
-        axo.set_xlim(-lim, lim); axo.set_ylim(-lim, lim)
-        axo.set_title(f"A-vs-B overlap ({ov['n']} matched stars)\n"
-                      f"offset={ov['off']:.1f} mas  RMS={ov['rms']:.1f} mas", fontsize=9)
+        # Top row: per-detector quiver | A↔B overlap (all stars, with marginals) | A↔B (S/N>10).
+        # Bottom row: overlap-star cutout gallery spanning the width.  The S/N>10 column is added
+        # only when measurable, so a field without flux errors just shows the two-panel top row.
+        ncols = 3 if ov_hi else 2
+        fig = plt.figure(figsize=(5.0 * ncols + 1.0, 9.2))
+        gs = fig.add_gridspec(2, ncols, height_ratios=[1.3, 0.75], hspace=0.62, wspace=0.62)
+        # top reserve so the A↔B panels' top-marginal titles clear the suptitle
+        fig.subplots_adjust(top=0.82, bottom=0.06, left=0.06, right=0.97)
+        axq = fig.add_subplot(gs[0, 0]); _draw_quiver(axq)
+        axo = fig.add_subplot(gs[0, 1]); _draw_ab_panel(axo, ov, "A↔B overlap — all stars")
+        if ov_hi:
+            axh = fig.add_subplot(gs[0, 2])
+            _draw_ab_panel(axh, ov_hi, "A↔B overlap — flux S/N > 10")
 
         # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
         ncut = 6
@@ -1458,6 +1644,48 @@ def _build_stage5(o, sw, lw):
 
 
 # --------------------------------------------------------------------------- STAGE 6
+def _internal_pos_rms(o, filt):
+    """(mag_vega, internal-position-rms in mas) per star from the highest-tier catalog carrying
+    ``std_ra_<filt>``/``std_dec_<filt>`` (the empirical scatter of a star's position ACROSS
+    exposures, in deg) + ``mag_vega_<filt>``.  This is rms(jwst) -- JWST internal repeatability.
+    Returns None if unavailable."""
+    from astropy.io import fits
+    from astropy.table import Table
+    sr = f"std_ra_{filt.lower()}"; sd = f"std_dec_{filt.lower()}"
+    mv = f"mag_vega_{filt.lower()}"; sccol = f"skycoord_{filt.lower()}"
+    best = None; rank = (-1.0, -1.0)
+    for p, kind, tier, mtime in _catalog_candidates(o):
+        if (tier, mtime) <= rank:
+            continue
+        try:
+            hdr = fits.getheader(p, ext=1)
+        except (OSError, IndexError):
+            continue
+        low = {str(hdr.get(f"TTYPE{i}", "")).lower() for i in range(1, hdr.get("TFIELDS", 0) + 1)}
+        if sr in low and sd in low and mv in low:
+            best = p; rank = (tier, mtime)
+    if best is None:
+        return None
+    try:
+        t = Table.read(best)
+    except (OSError, ValueError):
+        return None
+    ra_std = np.asarray(t[sr], float); de_std = np.asarray(t[sd], float)
+    m = np.asarray(t[mv], float)
+    cosd = (float(np.cos(np.radians(np.nanmedian(t[sccol].dec.deg))))
+            if sccol in t.colnames else 1.0)
+    rms = np.hypot(ra_std * cosd, de_std) * 3.6e6 / np.sqrt(2.0)   # deg -> mas, PER-AXIS (match σ_pos)
+    # a position scatter is only meaningful with several exposures; 1-2 detections give a
+    # degenerate std (0 or near-0).  Require >=3 detections AND drop unphysically-tiny values
+    # (< 0.1 mas, well below the real ~1 mas internal floor) so a degenerate tail can't drag the
+    # binned median toward zero at the faint end.
+    g = np.isfinite(rms) & np.isfinite(m) & (rms > 0.1)
+    nmcol = f"nmatch_{filt.lower()}"
+    if nmcol in t.colnames:
+        g &= np.asarray(t[nmcol], float) >= 3
+    return (m[g], rms[g]) if int(g.sum()) >= 50 else None
+
+
 def stage6_astrom_error(o: Observation, sw, lw):
     """Astrometric precision curve: per-star position sigma (mas) vs Vega magnitude,
     from the per-exposure PSF fits.  The bright-end floor is the astrometric systematic limit;
@@ -1494,10 +1722,44 @@ def stage6_astrom_error(o: Observation, sw, lw):
             continue
         any_data = True
         lbl = f"{filt}  (n={int(ok.sum())}" + ("" if zp is not None else ", instr") + ")"
-        a.plot(ctr, med, "-", color=color, lw=1.7, label=lbl)
+        a.plot(ctr, med, "-", color=color, lw=1.7, label=lbl + r"  $\sigma_{\rm pos}$")
         a.fill_between(ctr, lo, hi, color=color, alpha=0.20)
         metrics[f"floor_mas_{filt.lower()}"] = float(np.nanmin(med))
         metrics[f"nstars_{filt.lower()}"] = int(ok.sum())
+        # rms(offset): the EXTERNAL scatter vs VIRAC (includes the VIRAC error floor), dashed, same
+        # colour -- shown alongside sigma_pos so "how precisely measured" vs "how well it agrees
+        # with the external frame" are both visible.
+        import astropy.units as u
+        ref = _viraccache_path(o) or _refcat_path(o)
+        ep = _obs_epoch(o, _mosaic_path(o, filt))
+        ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+        if ref_sc is not None:
+            idx, sep, _ = ref_sc.match_to_catalog_sky(_sc)      # anchor on sparse VIRAC
+            keep = (sep < 0.15 * u.arcsec).nonzero()[0]
+            if keep.size >= 50:
+                cosd = float(np.cos(np.radians(np.median(_sc[idx[keep]].dec.deg))))
+                dra = (_sc[idx[keep]].ra - ref_sc[keep].ra).to(u.mas).value * cosd
+                dde = (_sc[idx[keep]].dec - ref_sc[keep].dec).to(u.mas).value
+                # PER-AXIS to match sigma_pos (which is hypot(sig_ra,sig_de)/sqrt2): the radial
+                # residual hypot(dra',dde') is divided by sqrt(2) so all three curves share one
+                # per-axis convention on the same axis.
+                resid = np.hypot(dra - np.median(dra), dde - np.median(dde)) / np.sqrt(2.0)
+                rms, rctr = _binned_rms(mag[idx[keep]], resid)
+                if rms is not None:
+                    a.plot(rctr, rms, "--", color=color, lw=1.5, alpha=0.9,
+                           label=f"{filt}  rms(offset−VIRAC)")
+                    metrics[f"rms_offset_floor_mas_{filt.lower()}"] = float(np.nanmin(rms))
+        # rms(jwst): the INTERNAL per-star position scatter across exposures (merged-catalog
+        # std_ra/std_dec, deg -> mas), median vs mag -- the empirical JWST repeatability, distinct
+        # from the formal sigma_pos and from the external rms(offset-VIRAC).
+        jr = _internal_pos_rms(o, filt)
+        if jr is not None:
+            jmag_v, jrms = jr
+            med_j, _, _, ctr_j = _binned_stat(jmag_v, jrms)
+            if med_j is not None:
+                a.plot(ctr_j, med_j, ":", color=color, lw=1.8, alpha=0.9,
+                       label=f"{filt}  rms(jwst) internal")
+                metrics[f"rms_jwst_floor_mas_{filt.lower()}"] = float(np.nanmin(med_j))
     metrics["mag_kind"] = "vega" if all_vega else "mixed"
     if not any_data:
         plt.close(fig)          # close the empty curve fig before the red-flag builds its own
@@ -1507,15 +1769,14 @@ def stage6_astrom_error(o: Observation, sw, lw):
         metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
         return png, metrics
     a.set_yscale("log")
-    a.set_ylim(0.03, 100.0)          # 0.03-100 mas: floor through the S/N rise; junk lives above
+    a.set_ylim(0.03, 300.0)          # 0.03-300 mas: floor through S/N rise incl. faint rms(offset)
     xlbl = ("Vega magnitude" if all_vega else
             "magnitude  (Vega where calibrated, else instrumental)")
     a.set_xlabel(xlbl)
     a.set_ylabel(r"astrometric error  $\sigma_{\rm pos}$ (mas)")
     a.legend(fontsize=9, loc="upper left")
     a.grid(alpha=0.25, which="both")
-    a.set_title(f"{o.target} {o.obsid} — astrometric precision vs magnitude\n"
-                r"($\sigma$ from per-exposure daophot cats, not the release catalog)", fontsize=9)
+    a.set_title(f"{o.target} {o.obsid} — astrometric precision vs magnitude", fontsize=10)
     metrics["passed"] = True
     return _save(fig, f"{o.obsid}_stage6.png"), metrics
 
@@ -1536,49 +1797,62 @@ def build_stage(o, n, sw, lw):
     raise ValueError(n)
 
 
+# Every posted caption links its shorthand to docs/qa_methods.md so no term is left undefined.
+# Templates carry the sentinel ``DOCROOT`` (kept out of ``str.format`` so the metric braces stay
+# clean); ``_linkify`` swaps it for the live blob URL at the single return choke-point.
+_DOC_REPO = os.environ.get("QA_REPO", "JWST-GC/data-qa")
+_DOC_URL = f"https://github.com/{_DOC_REPO}/blob/main/docs/qa_methods.md"
+
+
+def _linkify(s):
+    return s.replace("DOCROOT", _DOC_URL)
+
+
+# Link-safe headline fallback (the generic .split('.') fallback would truncate a URL at '.md').
+_HEADLINE = {
+    1: "**Stage 1 — first mosaics.**",
+    2: "**Stage 2 — colour–magnitude diagram.**",
+    3: "**Stage 3 — photometric calibration.**",
+    4: "**Stage 4 — positional offsets (JWST ↔ VIRAC frame tie).**",
+    5: "**Stage 5 — inter-detector / inter-module tie.**",
+    6: "**Stage 6 — astrometric precision.**",
+    7: "**Stage 7 — MAST vs pipeline.**",
+}
+
+# Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
+# stages whose caption is NOT built in code live here (1, 3, 6).  Stages 2/4/5/7 build their caption
+# in code (variant-dependent), so no template exists for them -- avoids a dead duplicate that drifts.
 CAPTIONS = {
     1: "**Stage 1 — first mosaics.** Grayscale {sw} (SW) and {lw} (LW) `i2d`. Confirms the "
-       "observation was delivered and the mosaics are present and not obviously corrupt.",
-    2: "**Stage 2 — colour-magnitude diagram** from the `{kind}` catalog ({n_stars} stars). "
-       "LF-inset turnover ≈ {lf_turnover:.1f} tracks depth; regenerated as the catalog deepens.",
-    3: "**Stage 3 — photometric calibration.** The panel is a 2-D histogram (colour = number of "
-       "stars) of JWST {sw} catalogue magnitude against VIRAC Ks for {n_matched} cross-matched "
-       "stars. The cyan line is the ideal 1:1 (unit-slope) relation — NOT a fit — so a "
-       "well-calibrated catalogue should lie along it. The free-slope fit is {slope:.2f} and the "
-       "scatter about the locus is {scatter:.2f} mag; a tight locus hugging the 1:1 line means the "
-       "right stars were matched and the zeropoint is sane.",
-    4: "**Stage 4 — positional offsets (JWST vs VIRAC frame tie).** The offset is measured per "
-       "spatial cell — each cell's value is an xcorr histogram-peak match of that patch of JWST "
-       "sources to the local VIRAC reference. The LEFT panel maps the tie across the mosaic (one "
-       "square per cell, coloured by offset): a uniform colour is a consistent frame, a patch of a "
-       "different colour flags an internal discontinuity. The MIDDLE panel plots the same per-cell "
-       "offsets as (dRA, dDec) points (colour = match quality); the red cross is the median tie, "
-       "the dashed circle its cell-to-cell spread, and the dotted circle the 75 mas pass "
-       "threshold. Here the tie is {offset_med_mas:.0f} mas over {n_cells} cells with a "
-       "{offset_scatter_mas:.0f} mas spread (the offset's uncertainty; {offset_signif_med:.0f}σ). "
-       "The RIGHT panel, when present, is the NRCA-vs-NRCB inter-module offset. A pass needs a "
-       "small median AND cells that agree. Precursor to proper-motion work.",
-    5: "**Stage 5 — inter-detector / inter-module tie.** \"Reference-free\" means the offsets are "
-       "measured by matching JWST against itself (NRCA against NRCB directly), using no external "
-       "catalogue. The TOP-LEFT panel is a per-detector residual quiver (the field-wide bulk "
-       "offset removed) showing each detector's leftover shift; the NRCA-vs-NRCB difference is "
-       "{intermodule_diff:.1f} mas. The TOP-RIGHT panel is the direct NRCA∩NRCB overlap tie: "
-       "{intermodule_off:.1f} mas offset, {intermodule_rms:.1f} mas RMS, over {n_overlap} stars "
-       "detected in both modules. The BOTTOM STRIP shows cutouts of those overlap stars from the "
-       "SW merged `i2d` mosaic — a good tie shows one round PSF, a mis-tie doubles or elongates "
-       "the star (the same source drizzled twice at offset positions).",
-    6: "**Stage 6 — astrometric precision.** Per-star position error σ_pos (mas) vs Vega "
-       "magnitude from the per-exposure PSF fits (instrumental mag Vega-calibrated against the "
-       "merged catalog), one curve per channel. The bright-end floor is the astrometric "
-       "systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percentile.",
+       "observation was delivered and the mosaics are present and not obviously corrupt. "
+       "([how this is made](DOCROOT#stage1))",
+    3: "**Stage 3 — photometric calibration (zeropoint).** 2-D histogram (colour = star counts) of "
+       "JWST {sw} catalogue magnitude vs [VIRAC Ks](DOCROOT#glossary-virac) for {n_matched} "
+       "[cross-matched](DOCROOT#glossary-crossmatch) stars. The **cyan 1:1 line** (in the legend) "
+       "is anchored on the densest stellar ridge; a well-calibrated catalogue lies along it. The "
+       "measured slope is {slope:.2f} and the scatter about the locus is {scatter:.2f} mag. "
+       "([how this is made](DOCROOT#stage3))",
+    6: "**Stage 6 — astrometric precision.** Three per-star error curves vs Vega magnitude per "
+       "channel: σ_pos (solid — the per-exposure PSF-fit position error `dra`/`ddec`, the predicted "
+       "precision), rms(jwst) (dotted — the empirical position scatter across exposures, the "
+       "internal repeatability), and rms(offset) (dashed — the RMS of the per-star "
+       "JWST−[VIRAC](DOCROOT#glossary-virac) offset, the external scatter incl. the VIRAC floor). "
+       "The σ_pos bright-end floor is the astrometric systematic limit; the faint-end rise tracks "
+       "S/N. Shaded band = 16–84th percentile. ([how this is made](DOCROOT#stage6))",
 }
 
 
 def caption_for(n, metrics):
+    """Public entry: build the stage caption and swap the DOCROOT sentinel for the live doc URL."""
+    return _linkify(_caption_for_impl(n, metrics))
+
+
+def _caption_for_impl(n, metrics):
     if metrics.get("red_flag"):
         return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
-                f"An empty result here means the measurement could not be made — investigate.")
+                f"An empty result here means the measurement could not be made — investigate. "
+                f"([how this stage works](DOCROOT#stage{n}))")
     if n == 1 and metrics.get("dropped_filters"):
         # a nominal (proposed) filter with no product on disk must leave a trace, not vanish
         df = ", ".join(metrics["dropped_filters"])
@@ -1586,57 +1860,122 @@ def caption_for(n, metrics):
                                       for k, v in metrics.items() if k in ("sw", "lw")})
                 + f" NOTE: nominal filter(s) with no mosaic/catalogue on disk (observed but not "
                   f"reduced, or not delivered): {df}.")
+    if n == 2:
+        # Built in code so the three CMD variants (full CMD / single-filter LF / crossmatch) each
+        # read correctly and a missing lf_turnover never drops the caption to a bare fragment.
+        kind = str(metrics.get("kind", "catalog")).replace("_dedup", ""); ns = metrics.get("n_stars")
+        nstr = f"{ns} stars" if ns is not None else "the catalogue"
+        lf = metrics.get("lf_turnover")
+        cat = f"the `{kind}` [catalog](DOCROOT#glossary-mtier)"
+        if metrics.get("single_filter"):
+            body = (f"**Stage 2 — {metrics.get('sw','SW')} luminosity function** from {cat} "
+                    f"({nstr}): star counts vs magnitude (no colour — single filter). ")
+        else:
+            body = (f"**Stage 2 — colour–magnitude diagram (CMD)** from {cat} ({nstr}): "
+                    f"LW magnitude vs (SW−LW) colour, with the "
+                    f"[luminosity function](DOCROOT#glossary-lf) (star counts vs magnitude) as the "
+                    f"right-side marginal. ")
+        if lf is not None:
+            body += (f"Turnover ≈ {lf:.1f} mag is a rough depth indicator "
+                     f"(fainter turnover = deeper catalogue). ")
+        if metrics.get("n_stars_hi_sn") is not None:
+            body += (f"A second CMD below is limited to [S/N > 10](DOCROOT#glossary-snr) in both "
+                     f"bands ({metrics['n_stars_hi_sn']} stars, turnover ≈ "
+                     f"{metrics.get('lf_turnover_hi_sn', float('nan')):.1f} mag) — a cleaner locus. ")
+        if kind == "crossmatch":
+            body += ("The colour width is set by the positional cross-match tolerance, not the "
+                     "catalogue's colour precision. ")
+        return body + "([how this is made](DOCROOT#stage2))"
     if n == 4:
         # Built in code (not a template) so it renders cleanly whatever is/ isn't measured -- never
         # "nanσ", and gated on the CELL COUNT, not on significance being None (a zero-spread field
         # can be consistent and pass).
         om = metrics.get("offset_med_mas"); nc = metrics.get("n_cells") or 0
         if om is None or nc == 0:
-            return ("**Stage 4 — positional offsets.** JWST−VIRAC frame tie unmeasured "
-                    "(no usable spatial cells). Precursor to proper-motion work.")
+            return ("**Stage 4 — positional offsets.** JWST↔VIRAC frame tie unmeasured "
+                    "(no usable spatial cells). ([how this is made](DOCROOT#stage4))")
         sig = metrics.get("offset_signif_med"); sp = metrics.get("offset_scatter_mas")
         nd = metrics.get("n_cells_dropped") or 0; ncf = metrics.get("n_cells_confirmed") or 0
         badf = metrics.get("bad_src_frac")
-        unc = (f", spread {sp:.0f} mas" + (f" ({sig:.0f}σ)" if sig is not None else "")) if sp is not None else ""
-        base = (f"**Stage 4 — positional offsets (JWST vs VIRAC frame tie).** The offset is "
-                f"measured per spatial cell (xcorr histogram peak vs the local VIRAC reference). "
-                f"The LEFT panel maps the source-weighted tie across the mosaic — filled squares "
-                f"are measured cells (colour = offset), grey squares are cells with sources but no "
-                f"clear peak, and a green outline marks cells that coherently deviate. The MIDDLE "
-                f"panel plots the per-cell offsets as (dRA, dDec) points sized by source count, "
-                f"with the source-weighted median tie and the 75 mas gate. Here the tie is "
-                f"{om:.0f} mas over {nc} measured cells ({nd} without a peak){unc}. ")
+        unc = (f", cell-to-cell spread {sp:.0f} mas"
+               + (f" → {sig:.0f}σ from zero" if sig is not None else "")) if sp is not None else ""
+        base = (f"**Stage 4 — positional offsets (JWST ↔ VIRAC frame tie).** The "
+                f"[**bulk** offset](DOCROOT#glossary-bulk) is the JWST catalogue "
+                f"[cross-matched to VIRAC](DOCROOT#glossary-crossmatch) and registered onto the "
+                f"Gaia/VIRAC frame, measured per spatial cell by the "
+                f"[xcorr histogram peak](DOCROOT#glossary-xcorr) (crowding-robust; a plain "
+                f"nearest-neighbour median collapses toward zero at GC density). The LEFT panel "
+                f"maps the source-weighted tie across the mosaic — filled squares are measured "
+                f"cells (colour = offset), grey squares are cells with sources but no clear peak, "
+                f"and a green outline marks cells that coherently deviate. The MIDDLE panel plots "
+                f"the per-cell offsets as (ΔRA, ΔDec) points sized by source count, with the "
+                f"source-weighted median tie, the 75 mas gate, and ΔRA/ΔDec marginal histograms. "
+                f"Here the tie is {om:.0f} mas over {nc} measured cells ({nd} without a peak){unc}; "
+                f"the [uncertainty](DOCROOT#glossary-tie-uncertainty) is the cell-to-cell standard "
+                f"error (not a per-star RMS or per-star error). ")
         if ncf:
             base += (f"{ncf} adjacent cell(s) holding {100 * (badf or 0):.0f}% of the sources are "
                      f"tied differently — an internal discontinuity, so it does NOT pass. ")
-        base += "The RIGHT panel, when present, is the NRCA-vs-NRCB inter-module offset. A pass " \
-                "needs a small source-weighted median AND spatially consistent cells."
+        base += ("The RIGHT panel, when present, is the "
+                 "[reference-free](DOCROOT#glossary-reffree) NRCA-vs-NRCB inter-module offset. A "
+                 "pass needs a small source-weighted median AND spatially consistent cells. "
+                 "([how this is made](DOCROOT#stage4))")
         if str(metrics.get("source", "")).startswith("release-dao"):
             base += (" (Positions here come from a per-filter DAO catalogue, not a merged/calibrated "
                      "one — this obs is not yet photometrically catalogued, so stage 3 red-flags it.)")
         return base
-    if n == 5 and metrics.get("intermodule_off") is None:
-        # No reference-free NRCA-NRCB overlap measurement -> the full template's overlap clause
-        # ({intermodule_off}/{intermodule_rms}/{n_overlap}) would KeyError and drop the whole
-        # caption to a bare fragment.  Say WHICH case this is instead (>half the fields hit it):
-        # a legitimate single-module obs, or two modules with no shared stars to tie them.
+    if n == 5:
+        # Built entirely in code (not the CAPTIONS[5] template) so: (a) the S/N>10 clause is gated
+        # on the panel actually being present (ov_hi), (b) the panel POSITION wording is correct
+        # ("to its right", it is gs[0,2]), and (c) a missing intermodule_diff can never KeyError.
         diff = metrics.get("intermodule_diff")
-        diff_clause = (f" Per-detector residual quiver shows an A–B diff of {diff:.1f} mas."
-                       if diff is not None else "")
-        if metrics.get("single_module"):
-            return (f"**Stage 5 — inter-detector tie.** Single module "
-                    f"({metrics['single_module']}) for this observation, so there is no "
-                    f"NRCA–NRCB tie to check — the reference-free overlap panel is omitted."
-                    f"{diff_clause}")
-        return ("**Stage 5 — inter-detector / inter-module tie.** The reference-free NRCA–NRCB "
-                "overlap could not be measured (no shared stars in the NRCA∩NRCB dither overlap "
-                "after alignment), so that panel and the cutout gallery are omitted."
-                f"{diff_clause} The inter-module tie is unverified for this observation.")
+        diff_clause = (f" The [per-detector quiver](DOCROOT#glossary-quiver) shows an A–B diff of "
+                       f"{diff:.1f} mas." if diff is not None else "")
+        if metrics.get("intermodule_off") is None:
+            # a legitimate single-module obs, or two modules with no shared stars to tie them
+            if metrics.get("single_module"):
+                return (f"**Stage 5 — inter-detector tie.** Single module "
+                        f"({metrics['single_module']}) for this observation, so there is no "
+                        f"NRCA–NRCB tie to check — the [reference-free](DOCROOT#glossary-reffree) "
+                        f"overlap panel is omitted.{diff_clause} "
+                        f"([how this is made](DOCROOT#stage5))")
+            return ("**Stage 5 — inter-detector / inter-module tie.** The "
+                    "[reference-free](DOCROOT#glossary-reffree) NRCA–NRCB overlap could not be "
+                    "measured (no shared stars in the NRCA∩NRCB dither overlap after alignment), so "
+                    "that panel and the cutout gallery are omitted."
+                    f"{diff_clause} The inter-module tie is unverified for this observation. "
+                    "([how this is made](DOCROOT#stage5))")
+        # overlap measured -> full caption; the S/N>10 panel is only present when ov_hi succeeded
+        off = metrics.get("intermodule_off"); rms = metrics.get("intermodule_rms")
+        no = metrics.get("n_overlap")
+        # the all-stars overlap panel is TOP-MIDDLE when the S/N>10 panel is also drawn (3 cols),
+        # otherwise TOP-RIGHT (2 cols)
+        ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
+        base = ("**Stage 5 — inter-detector / inter-module tie.** "
+                "[\"Reference-free\"](DOCROOT#glossary-reffree) means JWST is matched against itself "
+                "(NRCA vs NRCB), using no external catalogue. The TOP-LEFT "
+                "[per-detector quiver](DOCROOT#glossary-quiver) shows each detector's median "
+                "residual **against VIRAC** (field bulk offset removed), each arrow annotated with "
+                "its matched-star count — every detector gets a vector because the shared reference "
+                "is VIRAC, not NRCA, so e.g. NRCB2 (which never overlaps NRCA on the sky) is still "
+                f"measured; the NRCA−NRCB difference is {(diff if diff is not None else float('nan')):.1f} "
+                f"mas. The {ov_pos} panel is the reference-free NRCA∩NRCB overlap tie — {off:.1f} "
+                f"mas offset, {rms:.1f} mas RMS over {no} shared stars — with ΔRA/ΔDec marginal "
+                f"histograms.")
+        if metrics.get("n_overlap_hi"):
+            base += (f" The panel to its right repeats the tie for [S/N > 10](DOCROOT#glossary-snr) "
+                     f"stars ({metrics['n_overlap_hi']} stars, "
+                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas RMS), where the "
+                     f"scatter reflects the tie rather than faint-source centroiding.")
+        base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`: a good tie "
+                 "shows one round PSF, a mis-tie doubles or elongates the star. "
+                 "([how this is made](DOCROOT#stage5))")
+        return base
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
     except (KeyError, ValueError):
-        return CAPTIONS[n].split(".")[0] + "."
+        return _HEADLINE.get(n, f"**Stage {n}.**") + f" ([how this is made](DOCROOT#stage{n}))"
 
 
 def _obs_from_disk(program, obs, base=BASE):
