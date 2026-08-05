@@ -310,6 +310,33 @@ def test_ab_overlap_returns_matched_positions():
     assert np.all(np.isfinite(ov["ra_arr"])) and np.all(np.isfinite(ov["dec_arr"]))
 
 
+def test_ab_overlap_one_to_one_no_pair_inflation():
+    # Guards the count fix: several A sources clustered inside 80 mas of ONE B source must collapse
+    # to a SINGLE match (one-to-one), not one pair each -- the search_around_sky many-to-many ball
+    # match counted PAIRS and inflated the star count ~10x.
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(3)
+    ra = 266.40 + rng.uniform(0, 0.02, 1000); dec = -28.90 + rng.uniform(0, 0.02, 1000)
+    b = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.9))
+    a_ra = ra + 8.0 / 3.6e6 / cosd                                    # 1:1 base, A 8 mas E of B
+    a_base = SkyCoord(a_ra * u.deg, dec * u.deg)
+    ov_base = D._ab_overlap(a_base, b)
+    assert ov_base is not None
+    # add 4 extra A sources all within 80 mas of b[0]; the ball match would emit 4 more pairs on b[0]
+    ex_ra = list(a_ra) + [ra[0] + off / 3.6e6 / cosd for off in (10.0, 20.0, 30.0, 40.0)]
+    ex_dec = list(dec) + [dec[0]] * 4
+    ov_plus = D._ab_overlap(SkyCoord(np.asarray(ex_ra) * u.deg, np.asarray(ex_dec) * u.deg), b)
+    assert ov_plus is not None
+    # the clustered extras add ZERO: b[0] is already matched, so one-to-one keeps the count the same
+    assert ov_plus["n"] == ov_base["n"]
+    # one-to-one: every matched B position is distinct (no B counted twice), and n cannot exceed |B|
+    for ov in (ov_base, ov_plus):
+        seen = set(zip(np.round(ov["ra_arr"], 10), np.round(ov["dec_arr"], 10)))
+        assert len(seen) == ov["n"] <= len(b)
+
+
 def test_available_filters_only_present(tmp_path, monkeypatch):
     monkeypatch.setattr(D, "BASE", str(tmp_path))
     d = tmp_path / "sgra" / "F212N" / "pipeline"; d.mkdir(parents=True)
