@@ -277,17 +277,19 @@ filtered, in `_module_positions`).
 <a id="stage6"></a>
 ## Stage 6 — astrometric precision
 
-Stage 6 shows two per-star error curves versus Vega magnitude, one set per channel:
+Stage 6 shows three per-star error curves versus Vega magnitude, one set per channel:
 
-1. **σ_pos** — the formal per-star PSF-fit position error (`dra`/`ddec` from the per-exposure
-   daophot fit, pooled). This is the internal precision of the JWST measurement itself.
-2. **rms(offset)** — the RMS of the per-star JWST−VIRAC position offset in each magnitude bin. This
-   is the *external* scatter against the reference and includes the VIRAC error floor, so it sits
-   above σ_pos.
+1. **σ_pos** (solid) — the formal per-star PSF-fit position error (`dra`/`ddec` from the
+   per-exposure daophot fit, pooled). The *predicted* precision of a single measurement.
+2. **rms(jwst)** (dotted) — the empirical scatter of a star's position **across its exposures**
+   (`std_ra`/`std_dec` from the merged catalog). The JWST *internal repeatability* — what σ_pos
+   predicts, actually measured.
+3. **rms(offset)** (dashed) — the RMS of the per-star JWST−VIRAC offset per magnitude bin. The
+   *external* scatter against the reference; it includes the VIRAC error floor, so it sits highest.
 
-Showing both separates "how precisely did we measure each star" (σ_pos) from "how well do those
-positions agree with an external frame" (rms(offset)). The bright-end floor of σ_pos is the
-astrometric systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percentile.
+The three separate "predicted precision" (σ_pos) from "internal repeatability" (rms(jwst)) from
+"agreement with an external frame" (rms(offset)). The bright-end σ_pos floor is the astrometric
+systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percentile.
 
 Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnostics.py).
 

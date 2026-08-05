@@ -1179,8 +1179,8 @@ def stage4_offsets(o: Observation, sw):
     fig.subplots_adjust(wspace=0.62, top=0.80, bottom=0.12)
     col = 0
     # panel 1: contiguous 4x4 map of the per-cell tie (colour = offset).  Confirmed-deviating cells
-    # get a GREEN outline; DROPPED cells (sources present, no clear peak) render grey -- so a
-    # discontinuity or missing coverage is visible, not inferable.
+    # get a RED outline (deviating = bad); DROPPED cells (sources present, no clear peak) render
+    # grey -- so a discontinuity or missing coverage is visible, not inferable.
     a0 = ax[0][col]; col += 1
     # cap the colour scale near the field tie (a few wild cells would otherwise wash out the
     # 30-vs-130 structure); over-scale cells saturate but are already flagged by the green outline.
@@ -1208,7 +1208,7 @@ def stage4_offsets(o: Observation, sw):
     for k, c in enumerate(cells):
         if confirmed[k]:
             a0.add_patch(Rectangle((c["ra"] - dra_c / 2, c["dec"] - dde_c / 2), dra_c, dde_c,
-                                   fill=False, ec="#39ff14", lw=1.8, zorder=3))
+                                   fill=False, ec="#e41a1c", lw=2.0, zorder=3))   # red = deviating
     a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
     a0.set_title(f"per-cell tie ({_dataset_label(metrics)}): {cc['n_cells']} measured, "
                  f"{cc['n_dropped']} no-peak\nmedian {off_med:.0f} mas; {cc['n_confirmed']} cells "
@@ -1216,12 +1216,14 @@ def stage4_offsets(o: Observation, sw):
     # panel 2: per-cell offsets in (dRA, dDec) sized by source count (big = more sources = more
     # weight), the source-weighted median tie, and the 75 mas gate.
     a1 = ax[0][col]; col += 1
-    sz = 40 + 200 * np.array([c["n"] for c in cells]) / max(c["n"] for c in cells)
+    # sized by source count; semi-transparent so overlapping cells at similar (ΔRA,ΔDec) are both
+    # visible instead of one hiding the other.
+    sz = 30 + 130 * np.array([c["n"] for c in cells]) / max(c["n"] for c in cells)
     a1.scatter(cdra[~deviating], cdde[~deviating], s=sz[~deviating], c="#4477aa",
-               edgecolor="k", linewidth=0.3, label="consistent")
+               edgecolor="k", linewidth=0.3, alpha=0.6, label="consistent")
     if deviating.any():
-        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], c="#ee6677",
-                   edgecolor="k", linewidth=0.3, label="deviating")
+        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], c="#e41a1c",
+                   edgecolor="k", linewidth=0.3, alpha=0.6, label="deviating")
     a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2)
     a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
@@ -1638,6 +1640,48 @@ def _build_stage5(o, sw, lw):
 
 
 # --------------------------------------------------------------------------- STAGE 6
+def _internal_pos_rms(o, filt):
+    """(mag_vega, internal-position-rms in mas) per star from the highest-tier catalog carrying
+    ``std_ra_<filt>``/``std_dec_<filt>`` (the empirical scatter of a star's position ACROSS
+    exposures, in deg) + ``mag_vega_<filt>``.  This is rms(jwst) -- JWST internal repeatability.
+    Returns None if unavailable."""
+    from astropy.io import fits
+    from astropy.table import Table
+    sr = f"std_ra_{filt.lower()}"; sd = f"std_dec_{filt.lower()}"
+    mv = f"mag_vega_{filt.lower()}"; sccol = f"skycoord_{filt.lower()}"
+    best = None; rank = (-1.0, -1.0)
+    for p, kind, tier, mtime in _catalog_candidates(o):
+        if (tier, mtime) <= rank:
+            continue
+        try:
+            hdr = fits.getheader(p, ext=1)
+        except (OSError, IndexError):
+            continue
+        low = {str(hdr.get(f"TTYPE{i}", "")).lower() for i in range(1, hdr.get("TFIELDS", 0) + 1)}
+        if sr in low and sd in low and mv in low:
+            best = p; rank = (tier, mtime)
+    if best is None:
+        return None
+    try:
+        t = Table.read(best)
+    except (OSError, ValueError):
+        return None
+    ra_std = np.asarray(t[sr], float); de_std = np.asarray(t[sd], float)
+    m = np.asarray(t[mv], float)
+    cosd = (float(np.cos(np.radians(np.nanmedian(t[sccol].dec.deg))))
+            if sccol in t.colnames else 1.0)
+    rms = np.hypot(ra_std * cosd, de_std) * 3.6e6           # deg -> mas
+    # a position scatter is only meaningful with several exposures; 1-2 detections give a
+    # degenerate std (0 or near-0).  Require >=3 detections AND drop unphysically-tiny values
+    # (< 0.1 mas, well below the real ~1 mas internal floor) so a degenerate tail can't drag the
+    # binned median toward zero at the faint end.
+    g = np.isfinite(rms) & np.isfinite(m) & (rms > 0.1)
+    nmcol = f"nmatch_{filt.lower()}"
+    if nmcol in t.colnames:
+        g &= np.asarray(t[nmcol], float) >= 3
+    return (m[g], rms[g]) if int(g.sum()) >= 50 else None
+
+
 def stage6_astrom_error(o: Observation, sw, lw):
     """Astrometric precision curve: per-star position sigma (mas) vs Vega magnitude,
     from the per-exposure PSF fits.  The bright-end floor is the astrometric systematic limit;
@@ -1698,6 +1742,17 @@ def stage6_astrom_error(o: Observation, sw, lw):
                     a.plot(rctr, rms, "--", color=color, lw=1.5, alpha=0.9,
                            label=f"{filt}  rms(offset−VIRAC)")
                     metrics[f"rms_offset_floor_mas_{filt.lower()}"] = float(np.nanmin(rms))
+        # rms(jwst): the INTERNAL per-star position scatter across exposures (merged-catalog
+        # std_ra/std_dec, deg -> mas), median vs mag -- the empirical JWST repeatability, distinct
+        # from the formal sigma_pos and from the external rms(offset-VIRAC).
+        jr = _internal_pos_rms(o, filt)
+        if jr is not None:
+            jmag_v, jrms = jr
+            med_j, _, _, ctr_j = _binned_stat(jmag_v, jrms)
+            if med_j is not None:
+                a.plot(ctr_j, med_j, ":", color=color, lw=1.8, alpha=0.9,
+                       label=f"{filt}  rms(jwst) internal")
+                metrics[f"rms_jwst_floor_mas_{filt.lower()}"] = float(np.nanmin(med_j))
     metrics["mag_kind"] = "vega" if all_vega else "mixed"
     if not any_data:
         plt.close(fig)          # close the empty curve fig before the red-flag builds its own
@@ -1714,8 +1769,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
     a.set_ylabel(r"astrometric error  $\sigma_{\rm pos}$ (mas)")
     a.legend(fontsize=9, loc="upper left")
     a.grid(alpha=0.25, which="both")
-    a.set_title(f"{o.target} {o.obsid} — astrometric precision vs magnitude\n"
-                r"($\sigma$ from per-exposure daophot cats, not the release catalog)", fontsize=9)
+    a.set_title(f"{o.target} {o.obsid} — astrometric precision vs magnitude", fontsize=10)
     metrics["passed"] = True
     return _save(fig, f"{o.obsid}_stage6.png"), metrics
 
@@ -1771,10 +1825,11 @@ CAPTIONS = {
        "is anchored on the densest stellar ridge; a well-calibrated catalogue lies along it. The "
        "measured slope is {slope:.2f} and the scatter about the locus is {scatter:.2f} mag. "
        "([how this is made](DOCROOT#stage3))",
-    6: "**Stage 6 — astrometric precision.** Two per-star error curves vs Vega magnitude per "
-       "channel: σ_pos (the per-exposure PSF-fit position error `dra`/`ddec` — the JWST internal "
-       "precision) and rms(offset) (the RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) "
-       "offset per magnitude bin — the external scatter, which includes the VIRAC error floor). "
+    6: "**Stage 6 — astrometric precision.** Three per-star error curves vs Vega magnitude per "
+       "channel: σ_pos (solid — the per-exposure PSF-fit position error `dra`/`ddec`, the predicted "
+       "precision), rms(jwst) (dotted — the empirical position scatter across exposures, the "
+       "internal repeatability), and rms(offset) (dashed — the RMS of the per-star "
+       "JWST−[VIRAC](DOCROOT#glossary-virac) offset, the external scatter incl. the VIRAC floor). "
        "The σ_pos bright-end floor is the astrometric systematic limit; the faint-end rise tracks "
        "S/N. Shaded band = 16–84th percentile. ([how this is made](DOCROOT#stage6))",
 }
