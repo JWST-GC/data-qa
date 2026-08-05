@@ -1178,10 +1178,9 @@ def stage4_offsets(o: Observation, sw):
     # to the right of the axes) don't overlap the neighbouring panel or the suptitle.
     fig.subplots_adjust(wspace=0.62, top=0.80, bottom=0.12)
     col = 0
-    # panel 1: spatial map of the per-cell tie.  Measured cells = filled squares (colour = tie);
-    # confirmed-deviating cells get a red outline, and DROPPED cells (sources present, no clear
-    # peak) are shown as hollow grey squares -- so a discontinuity or missing coverage is visible,
-    # not inferable.
+    # panel 1: contiguous 4x4 map of the per-cell tie (colour = offset).  Confirmed-deviating cells
+    # get a GREEN outline; DROPPED cells (sources present, no clear peak) render grey -- so a
+    # discontinuity or missing coverage is visible, not inferable.
     a0 = ax[0][col]; col += 1
     # cap the colour scale near the field tie (a few wild cells would otherwise wash out the
     # 30-vs-130 structure); over-scale cells saturate but are already flagged by the green outline.
