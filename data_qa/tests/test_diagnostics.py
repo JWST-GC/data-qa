@@ -94,12 +94,13 @@ def test_caption_stage5_full_when_overlap_present():
 
 
 def test_caption_stage5_overlap_without_hi_sn_panel():
-    # overlap present but no S/N>10 panel (field lacks flux errors) -> no S/N promise, all-stars
-    # panel is TOP-RIGHT (2-column figure)
+    # overlap present but no S/N>10 panel (field lacks flux errors) -> no S/N promise; the all-stars
+    # panel is TOP-RIGHT (2-column top row), and the footprint is its own full-width row below
     cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1,
-                                intermodule_rms=6.2, n_overlap=137))
+                                intermodule_rms=6.2, n_overlap=137, n_overlap_footprint=137))
     assert "S/N > 10" not in cap and "to its right" not in cap
     assert "TOP-RIGHT" in cap and "137 shared stars" in cap
+    assert "full-width row" in cap and "dither-overlap strip" in cap   # footprint described
 
 
 # --------------------------------------------------------------------------- doc links / clarity
@@ -291,6 +292,22 @@ def test_cell_offsets_recovers_uniform_shift():
     assert len(cells) >= 3
     dra = np.array([c["dra"] for c in cells])
     assert np.all(np.abs(dra - 100.0) < 15)      # each cell recovers ~+100 mas
+
+
+def test_ab_overlap_returns_matched_positions():
+    # _ab_overlap must return per-star matched sky positions (for the A↔B footprint map), aligned
+    # in length with the residual arrays
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(3)
+    ra = 266.40 + rng.uniform(0, 0.02, 1000); dec = -28.90 + rng.uniform(0, 0.02, 1000)
+    b = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.9))
+    a = SkyCoord((ra + 8.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # A is 8 mas E of B
+    ov = D._ab_overlap(a, b)
+    assert ov is not None
+    assert len(ov["ra_arr"]) == ov["n"] == len(ov["dra_arr"]) == len(ov["dec_arr"])
+    assert np.all(np.isfinite(ov["ra_arr"])) and np.all(np.isfinite(ov["dec_arr"]))
 
 
 def test_available_filters_only_present(tmp_path, monkeypatch):
