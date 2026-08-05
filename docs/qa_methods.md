@@ -106,11 +106,11 @@ you would apply to the whole frame to register it onto the Gaia/VIRAC frame. Bec
 have an **internal discontinuity** (one sub-region tied differently — e.g. a stale visit block),
 QA does not report a single scalar. Instead ([`_cell_offsets`](../data_qa/diagnostics.py)):
 
-1. Split the JWST footprint into a **4×4 grid (16 cells)**.
+1. Split the JWST footprint into a **4×4 grid (up to 16 cells)**.
 2. In each cell, measure the JWST↔VIRAC offset by the [xcorr peak](#glossary-xcorr) against the
    local VIRAC reference (that cell + a 2″ margin). Cells with enough sources but **no clear peak**
-   are recorded as *dropped* (shown hollow grey).
-3. The reported field offset is the **source-count-weighted median of the 16 cell offsets** — the
+   are recorded as *dropped* (drawn as a solid grey cell).
+3. The reported field offset is the **source-count-weighted median of the measured cell offsets** (up to 16 — a sparse cell that never reaches the minimum source count is skipped, so the count can be lower) — the
    offset the catalog as a whole experiences, not the offset of whichever cell had the sharpest
    peak.
 
@@ -168,7 +168,7 @@ magnitude axis is locked to the CMD.
 ### S/N and the S/N > 10 cut
 
 Where a plot is restricted to **S/N > 10**, "S/N" is the flux measurement signal-to-noise of each
-star, `flux_fit / flux_err` from the per-exposure PSF fit. It is computed **per detection** (one
+star. In stage 5 (per-exposure daophot) it is `flux_fit / flux_err` of a single detection, computed **per detection** (one
 value per star per exposure, using that exposure's fitted flux and its formal flux error) — not a
 mean flux over exposures divided by a mean error. The high-S/N cut keeps the best-measured stars,
 so a residual scatter reflects the astrometric tie rather than photon-noise centroiding.
@@ -191,7 +191,7 @@ Source: [`data_qa/diagnostics.py` → `stage1_mosaics`](../data_qa/diagnostics.p
 Stage 2 shows a 2-D density (hexbin) colour–magnitude diagram — LW magnitude versus (SW − LW)
 colour — from the highest-tier [catalog](#glossary-mtier) on disk, with the
 [luminosity function](#glossary-lf) drawn as a right-side marginal on a shared magnitude axis. Two
-versions are produced: **all stars**, and one **limited to S/N > 10 in both bands** (the cleaner
+versions are produced: **all stars**, and one **limited to [S/N > 10](#glossary-snr) in both bands** (the cleaner
 locus).
 
 `stage2_cmd` reads the jicama [`mN`](#glossary-mtier) catalog (or, if no single catalog holds both
@@ -224,15 +224,15 @@ Source: [`data_qa/diagnostics.py` → `stage3_calibration`](../data_qa/diagnosti
 
 Stage 4 checks how well the JWST catalog — the **jicama `mN` catalog**, the same one stages 2/3
 use, not the MAST products — is registered onto the [VIRAC/Gaia frame](#glossary-virac). The
-offset is measured in each cell of a **4×4 grid (16 cells)** over the footprint by the
+offset is measured in each cell of a **4×4 grid (up to 16 cells)** over the footprint by the
 [xcorr histogram peak](#glossary-xcorr) against the local VIRAC reference, and the reported field
 offset is the source-count-weighted median across those cells (see [bulk offset](#glossary-bulk)).
 
 - **LEFT** — the 4×4 grid, each cell filled with its offset colour (a contiguous map, so a coherent
-  patch stands out). Cells with sources but no clear [xcorr peak](#glossary-xcorr) are hollow grey;
-  a **green outline** marks cells that coherently deviate (an adjacency-confirmed sub-region tied
+  patch stands out). Cells with sources but no clear [xcorr peak](#glossary-xcorr) are a solid grey fill;
+  a **red outline** marks cells that coherently deviate (an adjacency-confirmed sub-region tied
   differently from the rest of the field).
-- **MIDDLE** — the same 16 cell offsets as (ΔRA, ΔDec) points sized by source count, with the
+- **MIDDLE** — the same per-cell offsets (up to 16) as (ΔRA, ΔDec) hollow-circle points sized by source count, with the
   source-weighted median tie (black +), the 75 mas gate (dotted circle), and ΔRA/ΔDec marginal
   histograms.
 - **RIGHT** (when both modules are present) — the [reference-free](#glossary-reffree) NRCA-vs-NRCB

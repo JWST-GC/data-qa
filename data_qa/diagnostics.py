@@ -723,15 +723,18 @@ def stage2_cmd(o: Observation, sw, lw):
         a.set_title(f"{tag} (n={int(np.sum(sel))})", fontsize=9)
         return float(pk)
 
-    nrows = 2 if have_sn else 1
+    # only draw the S/N>10 row when it has enough stars -- an empty selection would make
+    # nanpercentile return NaN and crash set_xlim.
+    have_hi = bool(have_sn and int(np.sum(hi)) >= 50)
+    nrows = 2 if have_hi else 1
     fig = plt.figure(figsize=(8.2, 5.6 * nrows))
     gs = fig.add_gridspec(nrows, 3, width_ratios=[4.0, 1.15, 0.16], wspace=0.05, hspace=0.32)
     peak = _draw_cmd(gs, 0, g, "all stars")
     metrics.update(n_stars=int(g.sum()), lf_turnover=peak, sw_col=csw, lw_col=clw,
                    passed=int(g.sum()) > 500)
-    if have_sn:
+    if have_hi:
         peak_hi = _draw_cmd(gs, 1, hi, "S/N > 10 in both bands")
-        metrics.update(n_stars_hi_sn=int(hi.sum()), lf_turnover_hi_sn=peak_hi)
+        metrics.update(n_stars_hi_sn=int(np.sum(hi)), lf_turnover_hi_sn=peak_hi)
     fig.suptitle(f"{o.target} {o.obsid} — CMD ({kind.replace('_dedup', '')})", fontsize=11)
     return _save(fig, f"{o.obsid}_stage2.png"), metrics
 
@@ -815,7 +818,7 @@ def stage3_calibration(o: Observation, sw):
     a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
     a.legend(fontsize=8, loc="upper left")
     a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus})  "
-                f"fitted slope={slope:.2f}  scatter={scat:.2f}", fontsize=10)
+                f"slope={slope:.2f}  scatter={scat:.2f}  locus zp={zp1:.2f}", fontsize=9)
     # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen
     # only the SCATTER for the real narrow-vs-broad (F212N vs Ks) colour/extinction spread.
     metrics.update(n_matched=int(g.sum()), n_locus=n_locus, slope=float(slope),
@@ -1185,30 +1188,31 @@ def stage4_offsets(o: Observation, sw):
     # cap the colour scale near the field tie (a few wild cells would otherwise wash out the
     # 30-vs-130 structure); over-scale cells saturate but are already flagged by the green outline.
     vmax = max(2.0 * aa.THRESH["absolute"], 2.0 * off_med)
-    # CONTIGUOUS 4x4 grid (imshow), so the cells tile with no whitespace and a coherent patch is
-    # obvious.  Build an [i(RA), j(Dec)] grid of offsets; dropped/absent cells are NaN -> grey.
+    # CONTIGUOUS grid (imshow), so the cells tile with no whitespace and a coherent patch is
+    # obvious.  Use the TRUE grid edges (same linspace as _cell_offsets), NOT reconstructed from
+    # surviving cell centres -- a skipped interior cell would otherwise mis-size the extent.
     from matplotlib.patches import Rectangle
-    ncell = 1 + max([c["i"] for c in cells] + [c["j"] for c in cells]
-                    + [d["i"] for d in dropped] + [d["j"] for d in dropped] + [0])
-    grid = np.full((ncell, ncell), np.nan)
+    NCELL = 4
+    ra_all = jsc.ra.deg; dec_all = jsc.dec.deg
+    if float(np.nanmax(ra_all) - np.nanmin(ra_all)) > 180.0:        # RA-wrap guard (matches source)
+        NCELL = 1
+    re_ = np.linspace(np.nanmin(ra_all), np.nanmax(ra_all), NCELL + 1)
+    de_ = np.linspace(np.nanmin(dec_all), np.nanmax(dec_all), NCELL + 1)
+    grid = np.full((NCELL, NCELL), np.nan)          # NaN = cell never measured (dropped or skipped)
     for c in cells:
         grid[c["i"], c["j"]] = c["off"]
-    # RA/Dec edges from the cell centres (uniform grid) so the axes read in sky coords
-    raC = sorted({round(c["ra"], 8) for c in cells} | {round(d["ra"], 8) for d in dropped})
-    deC = sorted({round(c["dec"], 8) for c in cells} | {round(d["dec"], 8) for d in dropped})
-    dra_c = (raC[1] - raC[0]) if len(raC) > 1 else 1e-3
-    dde_c = (deC[1] - deC[0]) if len(deC) > 1 else 1e-3
-    ext = [raC[0] - dra_c / 2, raC[-1] + dra_c / 2, deC[0] - dde_c / 2, deC[-1] + dde_c / 2]
+    ext = [re_[0], re_[-1], de_[0], de_[-1]]
     import matplotlib as mpl
     cmap = mpl.colormaps["inferno"].copy(); cmap.set_bad("0.7")     # dropped/absent cells -> grey
     im0 = a0.imshow(grid.T, origin="lower", extent=ext, aspect="auto", cmap=cmap,
                     vmin=0, vmax=vmax)
     fig.colorbar(im0, ax=a0, label="cell tie [mas]", shrink=0.85)
-    # green outline on confirmed-deviating cells (drawn as rectangles on the same grid)
+    # RED outline on confirmed-deviating cells (deviating = bad), on the true grid edges
     for k, c in enumerate(cells):
         if confirmed[k]:
-            a0.add_patch(Rectangle((c["ra"] - dra_c / 2, c["dec"] - dde_c / 2), dra_c, dde_c,
-                                   fill=False, ec="#e41a1c", lw=2.0, zorder=3))   # red = deviating
+            a0.add_patch(Rectangle((re_[c["i"]], de_[c["j"]]),
+                                   re_[c["i"] + 1] - re_[c["i"]], de_[c["j"] + 1] - de_[c["j"]],
+                                   fill=False, ec="#e41a1c", lw=2.0, zorder=3))
     a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
     a0.set_title(f"per-cell tie ({_dataset_label(metrics)}): {cc['n_cells']} measured, "
                  f"{cc['n_dropped']} no-peak\nmedian {off_med:.0f} mas; {cc['n_confirmed']} cells "
@@ -1216,14 +1220,14 @@ def stage4_offsets(o: Observation, sw):
     # panel 2: per-cell offsets in (dRA, dDec) sized by source count (big = more sources = more
     # weight), the source-weighted median tie, and the 75 mas gate.
     a1 = ax[0][col]; col += 1
-    # sized by source count; semi-transparent so overlapping cells at similar (ΔRA,ΔDec) are both
+    # sized by source count; HOLLOW circles so overlapping cells at similar (ΔRA,ΔDec) are both
     # visible instead of one hiding the other.
     sz = 30 + 130 * np.array([c["n"] for c in cells]) / max(c["n"] for c in cells)
-    a1.scatter(cdra[~deviating], cdde[~deviating], s=sz[~deviating], c="#4477aa",
-               edgecolor="k", linewidth=0.3, alpha=0.6, label="consistent")
+    a1.scatter(cdra[~deviating], cdde[~deviating], s=sz[~deviating], facecolors="none",
+               edgecolors="#4477aa", linewidths=1.2, label="consistent")
     if deviating.any():
-        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], c="#e41a1c",
-                   edgecolor="k", linewidth=0.3, alpha=0.6, label="deviating")
+        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], facecolors="none",
+                   edgecolors="#e41a1c", linewidths=1.4, label="deviating")
     a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2)
     a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
@@ -1670,7 +1674,7 @@ def _internal_pos_rms(o, filt):
     m = np.asarray(t[mv], float)
     cosd = (float(np.cos(np.radians(np.nanmedian(t[sccol].dec.deg))))
             if sccol in t.colnames else 1.0)
-    rms = np.hypot(ra_std * cosd, de_std) * 3.6e6           # deg -> mas
+    rms = np.hypot(ra_std * cosd, de_std) * 3.6e6 / np.sqrt(2.0)   # deg -> mas, PER-AXIS (match σ_pos)
     # a position scatter is only meaningful with several exposures; 1-2 detections give a
     # degenerate std (0 or near-0).  Require >=3 detections AND drop unphysically-tiny values
     # (< 0.1 mas, well below the real ~1 mas internal floor) so a degenerate tail can't drag the
@@ -1736,7 +1740,10 @@ def stage6_astrom_error(o: Observation, sw, lw):
                 cosd = float(np.cos(np.radians(np.median(_sc[idx[keep]].dec.deg))))
                 dra = (_sc[idx[keep]].ra - ref_sc[keep].ra).to(u.mas).value * cosd
                 dde = (_sc[idx[keep]].dec - ref_sc[keep].dec).to(u.mas).value
-                resid = np.hypot(dra - np.median(dra), dde - np.median(dde))   # bulk-removed
+                # PER-AXIS to match sigma_pos (which is hypot(sig_ra,sig_de)/sqrt2): the radial
+                # residual hypot(dra',dde') is divided by sqrt(2) so all three curves share one
+                # per-axis convention on the same axis.
+                resid = np.hypot(dra - np.median(dra), dde - np.median(dde)) / np.sqrt(2.0)
                 rms, rctr = _binned_rms(mag[idx[keep]], resid)
                 if rms is not None:
                     a.plot(rctr, rms, "--", color=color, lw=1.5, alpha=0.9,
@@ -1762,7 +1769,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
         metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
         return png, metrics
     a.set_yscale("log")
-    a.set_ylim(0.03, 100.0)          # 0.03-100 mas: floor through the S/N rise; junk lives above
+    a.set_ylim(0.03, 300.0)          # 0.03-300 mas: floor through S/N rise incl. faint rms(offset)
     xlbl = ("Vega magnitude" if all_vega else
             "magnitude  (Vega where calibrated, else instrumental)")
     a.set_xlabel(xlbl)
@@ -1871,6 +1878,10 @@ def _caption_for_impl(n, metrics):
         if lf is not None:
             body += (f"Turnover ≈ {lf:.1f} mag is a rough depth indicator "
                      f"(fainter turnover = deeper catalogue). ")
+        if metrics.get("n_stars_hi_sn") is not None:
+            body += (f"A second CMD below is limited to [S/N > 10](DOCROOT#glossary-snr) in both "
+                     f"bands ({metrics['n_stars_hi_sn']} stars, turnover ≈ "
+                     f"{metrics.get('lf_turnover_hi_sn', float('nan')):.1f} mag) — a cleaner locus. ")
         if kind == "crossmatch":
             body += ("The colour width is set by the positional cross-match tolerance, not the "
                      "catalogue's colour precision. ")
