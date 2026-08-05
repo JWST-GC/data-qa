@@ -1244,9 +1244,12 @@ def stage4_offsets(o: Observation, sw):
     # get a RED outline (deviating = bad); DROPPED cells (sources present, no clear peak) render
     # grey -- so a discontinuity or missing coverage is visible, not inferable.
     a0 = ax[0][col]; col += 1
-    # cap the colour scale near the field tie (a few wild cells would otherwise wash out the
-    # 30-vs-130 structure); over-scale cells saturate but are already flagged by the green outline.
-    vmax = max(2.0 * aa.THRESH["absolute"], 2.0 * cell_off_med)
+    # Scale the colour to the DATA, not to the gate.  The old floor of 2*THRESH (=150 mas) meant a
+    # well-tied field with 0-20 mas cells was drawn against a 0-140 ramp: every cell rendered
+    # near-black and the real structure was invisible.  Stretch to the largest measured cell
+    # (+10% headroom), floored so an essentially-perfect field still gets a usable ramp and capped
+    # so one wild cell cannot flatten the rest; the 75 mas gate is drawn ON the colourbar instead,
+    # which is where it is legible without costing dynamic range.
     # CONTIGUOUS grid (imshow), so the cells tile with no whitespace and a coherent patch is
     # obvious.  Use the TRUE grid edges (same linspace as _cell_offsets), NOT reconstructed from
     # surviving cell centres -- a skipped interior cell would otherwise mis-size the extent.
@@ -1263,9 +1266,18 @@ def stage4_offsets(o: Observation, sw):
     ext = [re_[0], re_[-1], de_[0], de_[-1]]
     import matplotlib as mpl
     cmap = mpl.colormaps["inferno"].copy(); cmap.set_bad("0.7")     # dropped/absent cells -> grey
+    gmax = float(np.nanmax(grid)) if np.isfinite(grid).any() else 0.0
+    vmax = min(2.0 * aa.THRESH["absolute"], max(10.0, 1.1 * gmax))
     im0 = a0.imshow(grid.T, origin="lower", extent=ext, aspect="auto", cmap=cmap,
                     vmin=0, vmax=vmax)
-    fig.colorbar(im0, ax=a0, label="cell tie [mas]", shrink=0.85)
+    cb0 = fig.colorbar(im0, ax=a0, label="cell tie [mas]", shrink=0.85)
+    if aa.THRESH["absolute"] <= vmax:
+        cb0.ax.axhline(aa.THRESH["absolute"], color="#39ff14", lw=1.6)
+        cb0.ax.text(1.6, aa.THRESH["absolute"], " 75 mas gate", color="#2a7d0f", fontsize=6,
+                    va="center", transform=cb0.ax.get_yaxis_transform())
+    else:
+        cb0.ax.set_title(f"gate 75\n({aa.THRESH['absolute'] / max(vmax, 1e-9):.0f}× top)",
+                         fontsize=5.5, color="0.35", pad=3)
     # RED outline on confirmed-deviating cells (deviating = bad), on the true grid edges
     for k, c in enumerate(cells):
         if confirmed[k]:
@@ -1282,18 +1294,50 @@ def stage4_offsets(o: Observation, sw):
     # sized by source count; HOLLOW circles so overlapping cells at similar (ΔRA,ΔDec) are both
     # visible instead of one hiding the other.
     sz = 30 + 130 * np.array([c["n"] for c in cells]) / max(c["n"] for c in cells)
-    a1.scatter(cdra[~deviating], cdde[~deviating], s=sz[~deviating], facecolors="none",
-               edgecolors="#4477aa", linewidths=1.2, label="consistent")
+    # Colour each point by WHERE ON THE SKY its cell sits, so a coherent sub-region reads as a
+    # colour clump here instead of being an anonymous dot: the question this panel has to answer
+    # is "is the spread random, or is one part of the mosaic pulled?".  Quadrant of the 4x4 grid,
+    # named on sky (RA above the field centre = East, Dec above = North) and oriented to match
+    # panel 1, which has RA inverted.
+    QCOL = {"NE": "#4477aa", "NW": "#228833", "SE": "#ccbb44", "SW": "#aa3377"}
+    ci = np.array([c["i"] for c in cells]); cj = np.array([c["j"] for c in cells])
+    quad = np.array([("N" if j >= NCELL / 2 else "S") + ("E" if i >= NCELL / 2 else "W")
+                     for i, j in zip(ci, cj)])
+    for q in ["NE", "NW", "SE", "SW"]:
+        m = (quad == q) & ~deviating
+        if m.any():
+            a1.scatter(cdra[m], cdde[m], s=sz[m], facecolors="none", edgecolors=QCOL[q],
+                       linewidths=1.3, label=q)
     if deviating.any():
-        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], facecolors="none",
-                   edgecolors="#e41a1c", linewidths=1.4, label="deviating")
+        # deviating keeps the red ring (deviating = bad) but stays quadrant-filled, so it is
+        # still readable which part of the sky is the one that deviates.
+        for q in ["NE", "NW", "SE", "SW"]:
+            m = (quad == q) & deviating
+            if m.any():
+                a1.scatter(cdra[m], cdde[m], s=sz[m], facecolors=QCOL[q], alpha=0.55,
+                           edgecolors="#e41a1c", linewidths=1.8,
+                           label=f"{q} (deviating)")
     a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2)
-    a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
-    lim = max(aa.THRESH["absolute"] * 1.2, 1.4 * float(np.max(np.hypot(cdra, cdde))))
+    # Frame the DATA.  The old limit floored at 1.2*THRESH (=90 mas), so a field whose cells all
+    # sit inside 20 mas was drawn as a few dots lost inside a 75 mas gate circle that dominated
+    # the panel and conveyed nothing.  Zoom to the cells; draw the gate ring only when it is
+    # actually near them, and otherwise say how far outside it is.
+    dmax = float(np.max(np.hypot(cdra, cdde))) if len(cells) else 0.0
+    lim = max(5.0, 1.5 * dmax)
+    if aa.THRESH["absolute"] <= 1.05 * lim:
+        a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
+        gate_note = "dotted = 75 mas gate"
+    else:
+        gate_note = f"75 mas gate is {aa.THRESH['absolute'] / max(lim, 1e-9):.0f}× outside this view"
+    # a circle at the cell-to-cell spread IS at the data's scale, so it gives the eye something
+    # to judge the scatter against now that the gate ring is usually off-view.
+    if spread is not None and spread > 0 and spread <= lim:
+        a1.add_patch(Circle((cc["off_dra"], cc["off_dde"]), spread, fill=False, ec="0.45",
+                            ls="--", lw=0.8))
     a1.set_xlim(-lim, lim); a1.set_ylim(-lim, lim)
     a1.set_xlabel("ΔRA [mas]"); a1.set_ylabel("ΔDec [mas]")
-    a1.legend(fontsize=7, loc="upper right")
+    a1.legend(fontsize=6, loc="upper right", ncols=2, handletextpad=0.3, columnspacing=0.6)
     # marginal ΔRA / ΔDec histograms of the per-cell ties, weighted by source count (so the
     # marginals reflect the source-weighted tie, not raw cell counts).  Title goes on the top
     # marginal so it clears the inset histograms.
@@ -1306,7 +1350,8 @@ def stage4_offsets(o: Observation, sw):
     ss_str = (f"\nsame-star bulk {ss['off']:.1f} mas (n={ss['npairs']})" if ss else
               "\nsame-star bulk unavailable — histogram value stands")
     a1t.set_title(f"source-weighted cell tie {cell_off_med:.0f}{se_str} mas{sig_str}{ss_str}\n"
-                  f"(point size ∝ sources; dotted = 75 mas gate; marginals source-weighted)",
+                  f"(colour = sky quadrant; point size ∝ sources; dashed = cell-to-cell "
+                  f"spread; {gate_note}; marginals source-weighted)",
                   fontsize=7)
     if im:
         # inter-module offset is just two numbers -- print them, don't histogram/bar them.
