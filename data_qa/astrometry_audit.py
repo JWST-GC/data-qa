@@ -89,6 +89,47 @@ def xcorr(a: SkyCoord, b: SkyCoord, maxsep=XMAXSEP, binarc=XBIN):
                 npairs=int(len(ia)), peak_ratio=float(H.max() / bg) if bg else float("inf"))
 
 
+# The offset-histogram peak is density-immune to nearest-neighbour collapse but NOT to a
+# dense-reference bias: two catalogs tracing the same clustered field make a correlated,
+# non-uniform wrong-pair background that pulls the peak by several mas.  On brick 2221-o001 the
+# histogram reads 9-17 mas against dense VIRAC2 while the SAME-STAR tie is 0.4-1.6 mas; the
+# per-tile map (12x12) is median 5.2 / max 14.7 mas, i.e. there is no real offset.  So: use the
+# histogram to DETECT that the tie is small, then refine SAME-STAR.  See the "Histogram-stacking
+# is density-immune to NN-collapse but NOT to a dense-reference bias" rule in the pipeline's
+# CLAUDE.md, and JWST-GC/data-qa#1.
+SAME_STAR_MAX_BULK_MAS = 100.0   # above this the nearest pair is not the right star -> refuse
+
+
+def same_star_tie(a: SkyCoord, b: SkyCoord, bulk=None, radius=0.05 * u.arcsec, minpairs=30):
+    """Bulk offset (mas) to move ``a`` onto ``b`` from MUTUAL nearest pairs -- the same star seen
+    in both catalogs.
+
+    REFUSES (returns None) unless a verified SMALL global tie already exists, because that is the
+    only condition under which the nearest pair is the RIGHT star; without it this would be the
+    dense nearest-neighbour median that collapses toward zero and fabricates false agreement.
+    Pass the ``xcorr`` result as ``bulk`` (it is measured first anyway); ``bulk=None`` measures it.
+
+    Mutual (not one-way) nearest: a one-way match lets many ``a`` rows claim one ``b`` row, which
+    is exactly the many-to-one pollution this is meant to avoid.
+    """
+    if bulk is None:
+        bulk = xcorr(a, b)
+    if not bulk or bulk.get("off", np.inf) > SAME_STAR_MAX_BULK_MAS:
+        return None
+    i_ab, sep, _ = a.match_to_catalog_sky(b)
+    i_ba, _, _ = b.match_to_catalog_sky(a)
+    mutual = (sep < radius) & (i_ba[i_ab] == np.arange(len(a)))
+    if mutual.sum() < minpairs:
+        return None
+    bm = b[i_ab[mutual]]; am = a[mutual]
+    dra = (bm.ra - am.ra).to(u.arcsec).value * np.cos(np.radians(am.dec.value)) * 1000
+    ddec = (bm.dec - am.dec).to(u.arcsec).value * 1000
+    mdra, mddec = float(np.median(dra)), float(np.median(ddec))
+    return dict(dra=mdra, ddec=mddec, off=float(np.hypot(mdra, mddec)),
+                npairs=int(mutual.sum()),
+                scatter=float(np.hypot(mad_std(dra), mad_std(ddec))))
+
+
 def direct_intermodule(sc_a: SkyCoord, sc_b: SkyCoord, radius=0.1 * u.arcsec):
     """Median offset between the SAME stars seen in module A and module B (their overlap).
     Reference-free; a non-zero value is a real inter-module frame offset."""
