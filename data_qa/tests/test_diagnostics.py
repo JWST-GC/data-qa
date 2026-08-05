@@ -38,10 +38,25 @@ def test_binned_stat_drops_sparse_bins_to_none():
 
 
 # --------------------------------------------------------------------------- caption_for
-def test_caption_stage4_omitted_significance_no_nan():
-    cap = D.caption_for(4, dict(stage=4, sw="F212N", offset_signif_med=None, bulk_off=7.1))
+def test_caption_stage4_no_significance_no_nan():
+    # zero-spread / no significance -> still report the median tie over its cells, never "nanσ"
+    cap = D.caption_for(4, dict(stage=4, sw="F212N", offset_signif_med=None,
+                                offset_med_mas=7.1, n_cells=6, offset_scatter_mas=None))
     assert "nan" not in cap.lower()
-    assert "omitted" in cap
+    assert "7 mas" in cap and "6 measured cells" in cap
+
+
+def test_caption_stage4_flags_discontinuity():
+    # an adjacency-confirmed deviating region is called out in the caption
+    cap = D.caption_for(4, dict(stage=4, offset_med_mas=31, n_cells=12, offset_scatter_mas=8.0,
+                                offset_signif_med=4.0, n_cells_confirmed=3, bad_src_frac=0.08,
+                                n_cells_dropped=0))
+    assert "internal discontinuity" in cap and "8%" in cap
+
+
+def test_caption_stage1_dropped_filters_noted():
+    cap = D.caption_for(1, dict(stage=1, sw="F212N", lw="F405N", dropped_filters=["F444W", "F322W2"]))
+    assert "F444W" in cap and "F322W2" in cap and "not reduced" in cap
 
 
 def test_caption_redflag():
@@ -67,7 +82,8 @@ def test_caption_stage5_single_module():
 def test_caption_stage5_full_when_overlap_present():
     cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1,
                                 intermodule_rms=6.2, n_overlap=137))
-    assert "137 shared" in cap and "4.1 mas" in cap
+    assert "137 stars" in cap and "4.1 mas" in cap
+    assert "TOP-LEFT" in cap and "Reference-free" in cap    # panels labelled + term defined
 
 
 # --------------------------------------------------------------------------- _refcat_path obs-scope
@@ -99,6 +115,132 @@ def test_refcat_path_refuses_only_other_obs_tokened(tmp_path, monkeypatch):
     d = tmp_path / "gc2211" / "catalogs"; d.mkdir(parents=True)
     _touch(d, "gaia_virac2_refcat_epoch2023.71_o028.fits")       # ONLY a foreign-obs footprint
     assert D._refcat_path(_obs(obs="023")) is None
+
+
+# --------------------------------------------------------------------------- _offset_failure_reason
+def test_offset_reason_no_catalog():
+    r = D._offset_failure_reason(_obs(), "F200W", None, object(), None)
+    assert "not catalogued" in r and "F200W" in r
+
+
+def test_offset_reason_no_reference():
+    r = D._offset_failure_reason(_obs(), "F200W", object(), None, None)
+    assert "no virac reference" in r.lower()
+
+
+def test_offset_reason_disjoint_footprint():
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    j = SkyCoord([266.40, 266.41] * u.deg, [-28.90, -28.89] * u.deg)   # north patch
+    r = SkyCoord([266.40, 266.41] * u.deg, [-29.20, -29.19] * u.deg)   # south patch, disjoint
+    msg = D._offset_failure_reason(_obs(), "F200W", j, r, {"peak_ratio": 0.0})
+    assert "do not" in msg and "overlap" in msg
+
+
+def test_offset_reason_overlap_but_no_peak(monkeypatch):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    # no I/O: the reason may quote the JWST mag range, so stub the catalog read out
+    monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))
+    sc = SkyCoord([266.40, 266.41, 266.42] * u.deg, [-28.90, -28.89, -28.88] * u.deg)
+    msg = D._offset_failure_reason(_obs(), "F200W", sc, sc, {"peak_ratio": 0.3})
+    # must NOT assert an unmeasured cause -- says it's undetermined, and that no VIRAC comparison ran
+    assert "cause not determined" in msg
+    assert "not measured" in msg
+
+
+# --------------------------------------------------------------------------- cell-based stage-4
+def _grid_cells(spec):
+    """Build cells from {(i,j): (dra, dde, n)} for _cell_consistency tests."""
+    return [dict(i=i, j=j, ra=0.0, dec=0.0, dra=d[0], dde=d[1], off=float(np.hypot(*d[:2])),
+                 peak_ratio=5.0, n=d[2]) for (i, j), d in spec.items()]
+
+
+def test_cell_consistency_uniform_passes():
+    cells = _grid_cells({(i, j): (9.0 + i, 3.0 + j, 40000) for i in range(4) for j in range(4)})
+    cc = D._cell_consistency(cells, [])
+    assert cc["off_med"] < 20 and cc["consistent"] and cc["n_confirmed"] == 0
+
+
+def test_cell_consistency_source_weighted_offset():
+    # 99% of sources in cells tied at ~130, 1% at ~28 -> the CATALOG tie is ~130, not 28
+    # (the density-biased peak-ratio cut used to keep the sparse 28 mas side; #54 review 🔴1).
+    cells = _grid_cells({**{(i, j): (130.0, 0.0, 40000) for i in range(4) for j in range(4) if not (i == 0 and j == 0)},
+                         (0, 0): (28.0, 0.0, 400)})
+    cc = D._cell_consistency(cells, [])
+    assert cc["off_med"] > 100            # source-weighted, not the sparse minority
+
+
+def test_cell_consistency_adjacent_deviation_fails():
+    # a coherent block of adjacent cells 130 mas off (holding real sources) -> inconsistent
+    base = {(i, j): (9.0, 0.0, 40000) for i in range(4) for j in range(4)}
+    for ij in [(3, 2), (3, 3), (2, 3)]:       # an adjacent corner block, ~130 mas off
+        base[ij] = (130.0, 0.0, 40000)
+    cc = D._cell_consistency(_grid_cells(base), [])
+    assert cc["off_med"] < 75 and not cc["consistent"] and cc["n_confirmed"] >= 3
+
+
+def test_cell_consistency_isolated_outlier_ignored():
+    # one lone 544 mas cell amid 9 mas neighbours (no adjacent deviator) -> NOT failed (#54 review 🔴2)
+    base = {(i, j): (9.0, 0.0, 20000) for i in range(4) for j in range(4)}
+    base[(1, 2)] = (544.0, 0.0, 19000)        # isolated
+    cc = D._cell_consistency(_grid_cells(base), [])
+    assert cc["n_deviating"] == 1 and cc["n_confirmed"] == 0 and cc["consistent"]
+
+
+def test_cell_consistency_low_coverage_not_consistent():
+    # most sources sit in DROPPED (no-peak) cells -> not adequately sampled to pass
+    cells = _grid_cells({(0, 0): (9.0, 0.0, 500), (0, 1): (9.0, 0.0, 500),
+                         (1, 0): (9.0, 0.0, 500), (1, 1): (9.0, 0.0, 500)})
+    dropped = [dict(i=2, j=2, ra=0.0, dec=0.0, n=100000)]
+    cc = D._cell_consistency(cells, dropped)
+    assert cc["coverage"] < 0.5 and not cc["consistent"]
+
+
+def test_cell_offsets_recovers_uniform_shift():
+    # synthetic field + reference shifted by a KNOWN 100 mas in RA; every cell must recover it
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(0)
+    ra = 266.40 + rng.uniform(0, 0.02, 1200)
+    dec = -28.90 + rng.uniform(0, 0.02, 1200)
+    jsc = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.9))
+    ref = SkyCoord((ra + 100.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # ref is +100 mas E of jsc
+    cells, dropped = D._cell_offsets(jsc, ref, ncell=2, min_per_cell=50)
+    assert len(cells) >= 3
+    dra = np.array([c["dra"] for c in cells])
+    assert np.all(np.abs(dra - 100.0) < 15)      # each cell recovers ~+100 mas
+
+
+def test_available_filters_only_present(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "sgra" / "F212N" / "pipeline"; d.mkdir(parents=True)
+    _touch(d, "jw01939-o001_t001_nircam_clear-f212n-merged_i2d.fits")   # only F212N has a mosaic
+    o = Observation(program="1939", obs="001", target="Sgr A*", release_field="sgra",
+                    instrument="NIRCam", filters=["F212N", "F444W"], visits=[], epoch="", notes="")
+    assert D._available_filters(o) == ["F212N"]                          # F444W (no data) dropped
+
+
+def _write_skycoord_cat(path, ra, dec):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    t = Table()
+    t["skycoord"] = SkyCoord(np.asarray(ra) * u.deg, np.asarray(dec) * u.deg)
+    t.write(path, overwrite=True)
+
+
+def test_jwst_positions_falls_back_to_dao(tmp_path, monkeypatch):
+    # no merged/MAST catalog, only a per-filter DAO position catalog -> positions still returned
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))   # no merged/MAST
+    d = tmp_path / "gc2211" / "catalogs"; d.mkdir(parents=True)
+    ra = np.linspace(266.4, 266.45, 60); dec = np.linspace(-29.0, -28.95, 60)
+    _write_skycoord_cat(d / "f200w_merged_indivexp_merged_m6_dao_basic_o046_vetted.fits", ra, dec)
+    sc, src = D._jwst_positions(_obs(field="gc2211", obs="046", filt="F200W"), "F200W")
+    assert sc is not None and len(sc) == 60
+    assert "release-dao(positions)" in src
 
 
 # --------------------------------------------------------------------------- _daophot_glob
