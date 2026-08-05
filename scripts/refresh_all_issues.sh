@@ -24,7 +24,7 @@
 set -uo pipefail
 
 REPO="${QA_REPO:-JWST-GC/data-qa}"
-STAGES="${REFRESH_STAGES:-1 2 3 4 5 6}"
+STAGES="${REFRESH_STAGES:-1 2 3 4 5 6 9}"
 
 # Token: exported env, else a 600-perm PAT file, else gh's stored creds.
 if [ -z "${GITHUB_TOKEN:-}" ]; then

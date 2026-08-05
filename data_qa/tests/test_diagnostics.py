@@ -152,11 +152,52 @@ def test_caption_anchors_exist_in_docs():
         5: dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1, intermodule_rms=6.0,
                 n_overlap=100, n_overlap_hi=50, intermodule_rms_hi=4.0),
         6: dict(red_flag=True, red_flag_reason="x"),
+        9: dict(stage=9, n_isolated=19812, aper_corr_med=0.45, aper_psf_scatter=0.07),
     }
     for n, m in samples.items():
         cap = D.caption_for(n, m)
         for anc in re.findall(r"qa_methods\.md#([A-Za-z0-9\-]+)", cap):
             assert anc in ids, f"stage {n} caption links #{anc} but no <a id> exists in the doc"
+
+
+def test_caption_stage9_psf_vs_aper():
+    cap = D.caption_for(9, dict(stage=9, n_isolated=19812, aper_corr_med=0.45,
+                                aper_psf_scatter=0.073, frac_gt_0p3mag=0.01))
+    assert "DOCROOT" not in cap and "qa_methods.md#stage9" in cap
+    assert "PSF vs aperture" in cap and "isolated" in cap
+    assert "19812 isolated stars" in cap and "+0.45 mag" in cap
+
+
+def test_stage9_end_to_end_synthetic(tmp_path, monkeypatch):
+    pytest.importorskip("photutils"); pytest.importorskip("scipy")
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    # a 520x520 frame with a 10x10 grid (100) of well-separated Gaussians of KNOWN total flux
+    ny = nx = 520
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    gx = np.linspace(40, nx - 40, 10); gy = np.linspace(40, ny - 40, 10)
+    XX, YY = np.meshgrid(gx, gy)
+    xs = XX.ravel(); ys = YY.ravel()             # 100 stars, ~48 px apart -> all isolated
+    flux = np.full(len(xs), 1.0e4); sig = 1.5
+    img = np.zeros((ny, nx), "float32")
+    for xi, yi, f in zip(xs, ys, flux):
+        img += (f / (2 * np.pi * sig ** 2)) * np.exp(-((xx - xi) ** 2 + (yy - yi) ** 2) / (2 * sig ** 2))
+    w = WCS(naxis=2)
+    w.wcs.crpix = [nx / 2, ny / 2]; w.wcs.cdelt = [-1 / 3600.0, 1 / 3600.0]
+    w.wcs.crval = [266.4, -28.7]; w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    mp = str(tmp_path / "m.fits")
+    fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(img, header=w.to_header(), name="SCI")]).writeto(mp)
+    sc = w.pixel_to_world(xs, ys); sc = SkyCoord(sc.ra, sc.dec)
+    monkeypatch.setattr(D, "_psf_flux_positions", lambda o, f: (sc, flux.copy(), "synth.fits"))
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: mp)
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    png, m = D.stage9_psf_vs_aper(o, "F212N")
+    assert not m.get("red_flag") and m["n_isolated"] >= 30
+    # PSF flux is the TOTAL; a 3px aperture misses the wings -> aperture fainter -> apcorr > 0
+    assert m["aper_corr_med"] > 0 and m["aper_psf_scatter"] < 0.1
 
 
 def test_provenance_footer_has_doc_and_source():
