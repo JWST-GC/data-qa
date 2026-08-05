@@ -7,8 +7,9 @@ value fields and never touches a third:
 * **Measured** (single-select, SCRIPT-OWNED): the current measured state of the observation, from
   what ``data_qa.diagnostics`` last wrote — 🚩 Red flag / 🟥 Error / ⚠️ Attention / ◻️ Incomplete /
   ✅ Clean / ❔ No metrics / 🔭 MIRI-other / 📋 Meta.  Rewritten every run.  Group the board by this.
-* **Triage** (single-select, HUMAN-ONLY): the script NEVER writes it, so a human's placement
-  (Needs review / Investigating / Accepted / Resolved) is never clobbered.
+* **Workflow** (single-select, HUMAN-ONLY): the script NEVER writes it, so a human's placement is
+  never clobbered.  Lifecycle: Data taken -> QA assigned / under examination -> Needs discussion /
+  Needs attention -> Done.
 * plus read-only detail fields: **Stages 1-6** (glyph line), **Red flags** (count),
   **Offset (mas)** (stage-4 median tie).
 
@@ -51,7 +52,10 @@ _CAT_TO_OPTION = {
     "MIRI": "🔭 MIRI/other", "meta": "📋 Meta",
 }
 _MEASURED_OPTIONS = list(_CAT_TO_OPTION.values())
-_TRIAGE_OPTIONS = ["Needs review", "Investigating", "Accepted", "Resolved"]   # human-only
+# Human-owned workflow lifecycle (the script NEVER writes it): data taken -> QA assigned ->
+# needs discussion / needs attention -> done.
+_WORKFLOW_OPTIONS = ["Data taken", "QA assigned / under examination", "Needs discussion",
+                     "Needs attention", "Done"]
 _METRICS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "data_qa", "metrics"))
 
 
@@ -233,7 +237,7 @@ def main(argv=None):
     pid, pnum = proj["id"], proj["number"]
     fields = _fields(args.owner, pnum)
     fmeas = _ensure_single_select(args.owner, pnum, "Measured", _MEASURED_OPTIONS, fields, apply)
-    _ensure_single_select(args.owner, pnum, "Triage", _TRIAGE_OPTIONS, fields, apply)   # human-only
+    _ensure_single_select(args.owner, pnum, "Workflow", _WORKFLOW_OPTIONS, fields, apply)  # human-only
     fstages = _ensure_field(args.owner, pnum, "Stages 1-6", "TEXT", fields, apply)
     fnrf = _ensure_field(args.owner, pnum, "Red flags", "NUMBER", fields, apply)
     foff = _ensure_field(args.owner, pnum, "Offset (mas)", "NUMBER", fields, apply)
