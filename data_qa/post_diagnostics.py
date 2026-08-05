@@ -32,7 +32,8 @@ DIAG_MARKER = "<!-- data-qa:diag:stage{n} -->"
 # narrative method doc + glossary terms).
 STAGE_FUNC = {
     1: "stage1_mosaics", 2: "stage2_cmd", 3: "stage3_calibration", 4: "stage4_offsets",
-    5: "stage5_intermodule", 6: "stage6_astrom_error", 7: "stage7_mast_vs_pipeline",
+    5: "stage5_intermodule", 6: "stage6_astrom_error",
+    # 7: stage7_mast_vs_pipeline -- added by the stage-7 follow-up PR
 }
 
 

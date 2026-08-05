@@ -80,13 +80,26 @@ def test_caption_stage5_single_module():
 
 
 def test_caption_stage5_full_when_overlap_present():
+    # overlap + a high-S/N panel present -> the S/N clause appears and the all-stars panel is
+    # TOP-MIDDLE (3-column figure)
     cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1,
-                                intermodule_rms=6.2, n_overlap=137))
+                                intermodule_rms=6.2, n_overlap=137,
+                                intermodule_off_hi=4.0, intermodule_rms_hi=4.4, n_overlap_hi=34355))
     assert "137 shared stars" in cap and "4.1 mas" in cap
     assert "TOP-LEFT" in cap and "Reference-free" in cap    # panels labelled + term defined
     assert "S/N > 10" in cap and "marginal" in cap          # the new S/N panel + marginals noted
+    assert "TOP-MIDDLE" in cap and "to its right" in cap    # correct panel positions
     # the NRCB2/no-overlap question is answered inline
     assert "NRCB2" in cap and "VIRAC, not NRCA" in cap
+
+
+def test_caption_stage5_overlap_without_hi_sn_panel():
+    # overlap present but no S/N>10 panel (field lacks flux errors) -> no S/N promise, all-stars
+    # panel is TOP-RIGHT (2-column figure)
+    cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1,
+                                intermodule_rms=6.2, n_overlap=137))
+    assert "S/N > 10" not in cap and "to its right" not in cap
+    assert "TOP-RIGHT" in cap and "137 shared stars" in cap
 
 
 # --------------------------------------------------------------------------- doc links / clarity

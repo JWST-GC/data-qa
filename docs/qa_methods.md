@@ -262,6 +262,9 @@ formal PSF-fit `dra`/`ddec`.
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 
+> 🚧 **Planned — implemented in the stage-7 follow-up PR** (not yet in this branch). Documented
+> here so the glossary/stage cross-references resolve; the source function below lands with that PR.
+
 **What it shows.** The gain of the pipeline over the raw **MAST-delivered** products, side by
 side:
 - **i2d before/after** — the STScI/MAST merged `i2d` mosaic next to our pipeline mosaic (same

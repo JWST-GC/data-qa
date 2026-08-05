@@ -1787,26 +1787,53 @@ def _caption_for_impl(n, metrics):
             base += (" (Positions here come from a per-filter DAO catalogue, not a merged/calibrated "
                      "one — this obs is not yet photometrically catalogued, so stage 3 red-flags it.)")
         return base
-    if n == 5 and metrics.get("intermodule_off") is None:
-        # No reference-free NRCA-NRCB overlap measurement -> the full template's overlap clause
-        # ({intermodule_off}/{intermodule_rms}/{n_overlap}) would KeyError and drop the whole
-        # caption to a bare fragment.  Say WHICH case this is instead (>half the fields hit it):
-        # a legitimate single-module obs, or two modules with no shared stars to tie them.
+    if n == 5:
+        # Built entirely in code (not the CAPTIONS[5] template) so: (a) the S/N>10 clause is gated
+        # on the panel actually being present (ov_hi), (b) the panel POSITION wording is correct
+        # ("to its right", it is gs[0,2]), and (c) a missing intermodule_diff can never KeyError.
         diff = metrics.get("intermodule_diff")
         diff_clause = (f" The [per-detector quiver](DOCROOT#glossary-quiver) shows an A–B diff of "
                        f"{diff:.1f} mas." if diff is not None else "")
-        if metrics.get("single_module"):
-            return (f"**Stage 5 — inter-detector tie.** Single module "
-                    f"({metrics['single_module']}) for this observation, so there is no "
-                    f"NRCA–NRCB tie to check — the [reference-free](DOCROOT#glossary-reffree) "
-                    f"overlap panel is omitted.{diff_clause} "
-                    f"([how this is made](DOCROOT#stage5))")
-        return ("**Stage 5 — inter-detector / inter-module tie.** The "
-                "[reference-free](DOCROOT#glossary-reffree) NRCA–NRCB overlap could not be measured "
-                "(no shared stars in the NRCA∩NRCB dither overlap after alignment), so that panel "
-                "and the cutout gallery are omitted."
-                f"{diff_clause} The inter-module tie is unverified for this observation. "
-                "([how this is made](DOCROOT#stage5))")
+        if metrics.get("intermodule_off") is None:
+            # a legitimate single-module obs, or two modules with no shared stars to tie them
+            if metrics.get("single_module"):
+                return (f"**Stage 5 — inter-detector tie.** Single module "
+                        f"({metrics['single_module']}) for this observation, so there is no "
+                        f"NRCA–NRCB tie to check — the [reference-free](DOCROOT#glossary-reffree) "
+                        f"overlap panel is omitted.{diff_clause} "
+                        f"([how this is made](DOCROOT#stage5))")
+            return ("**Stage 5 — inter-detector / inter-module tie.** The "
+                    "[reference-free](DOCROOT#glossary-reffree) NRCA–NRCB overlap could not be "
+                    "measured (no shared stars in the NRCA∩NRCB dither overlap after alignment), so "
+                    "that panel and the cutout gallery are omitted."
+                    f"{diff_clause} The inter-module tie is unverified for this observation. "
+                    "([how this is made](DOCROOT#stage5))")
+        # overlap measured -> full caption; the S/N>10 panel is only present when ov_hi succeeded
+        off = metrics.get("intermodule_off"); rms = metrics.get("intermodule_rms")
+        no = metrics.get("n_overlap")
+        # the all-stars overlap panel is TOP-MIDDLE when the S/N>10 panel is also drawn (3 cols),
+        # otherwise TOP-RIGHT (2 cols)
+        ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
+        base = ("**Stage 5 — inter-detector / inter-module tie.** "
+                "[\"Reference-free\"](DOCROOT#glossary-reffree) means JWST is matched against itself "
+                "(NRCA vs NRCB), using no external catalogue. The TOP-LEFT "
+                "[per-detector quiver](DOCROOT#glossary-quiver) shows each detector's median "
+                "residual **against VIRAC** (field bulk offset removed), each arrow annotated with "
+                "its matched-star count — every detector gets a vector because the shared reference "
+                "is VIRAC, not NRCA, so e.g. NRCB2 (which never overlaps NRCA on the sky) is still "
+                f"measured; the NRCA−NRCB difference is {(diff if diff is not None else float('nan')):.1f} "
+                f"mas. The {ov_pos} panel is the reference-free NRCA∩NRCB overlap tie — {off:.1f} "
+                f"mas offset, {rms:.1f} mas RMS over {no} shared stars — with ΔRA/ΔDec marginal "
+                f"histograms.")
+        if metrics.get("n_overlap_hi"):
+            base += (f" The panel to its right repeats the tie for [S/N > 10](DOCROOT#glossary-snr) "
+                     f"stars ({metrics['n_overlap_hi']} stars, "
+                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas RMS), where the "
+                     f"scatter reflects the tie rather than faint-source centroiding.")
+        base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`: a good tie "
+                 "shows one round PSF, a mis-tie doubles or elongates the star. "
+                 "([how this is made](DOCROOT#stage5))")
+        return base
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
