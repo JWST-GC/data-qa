@@ -1639,21 +1639,28 @@ def stage5_intermodule(o: Observation, sw):
 def _psf_flux_positions(o, filt):
     """(SkyCoord, PSF flux_fit, catalog basename) from the highest-tier jicama catalog carrying
     ``flux_<filt>`` + ``skycoord_<filt>``, or (None, None, None)."""
+    from astropy.io import fits
     from astropy.table import Table
     fcol = f"flux_{filt.lower()}"; sccol = f"skycoord_{filt.lower()}"
-    best = None; best_rank = (-1.0, -1.0)
+    best_path = None; best_rank = (-1.0, -1.0)
     for p, kind, tier, mtime in _catalog_candidates(o):
         if (tier, mtime) <= best_rank:
             continue
+        # cheap TTYPE header probe before the (large) full read -- match _catalog_for's pattern
         try:
-            t = Table.read(p)
-        except (OSError, ValueError):
+            hdr = fits.getheader(p, ext=1)
+        except (OSError, IndexError):
             continue
-        if fcol in t.colnames and sccol in t.colnames:
-            best = (t[sccol], np.asarray(t[fcol], float), os.path.basename(p)); best_rank = (tier, mtime)
-    if best is None:
+        low = {str(hdr.get(f"TTYPE{i}", "")).lower() for i in range(1, hdr.get("TFIELDS", 0) + 1)}
+        if fcol in low and f"{sccol}.ra" in low:      # skycoord mixin serializes as "<name>.ra"
+            best_path = p; best_rank = (tier, mtime)
+    if best_path is None:
         return None, None, None
-    sc, flux, name = best
+    try:
+        t = Table.read(best_path)
+    except (OSError, ValueError):
+        return None, None, None
+    sc = t[sccol]; flux = np.asarray(t[fcol], float); name = os.path.basename(best_path)
     g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(flux) & (flux > 0)
     return (sc[g], flux[g], name) if int(g.sum()) >= 50 else (None, None, None)
 
@@ -1668,7 +1675,6 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     crowding problems."""
     import matplotlib
     matplotlib.use("Agg")
-    import astropy.units as u
     from astropy.io import fits
     from astropy.wcs import WCS
     from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry, ApertureStats
@@ -1711,9 +1717,11 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     pos = np.c_[x[idx], y[idx]]
     ap = CircularAperture(pos, r=r_ap)
     ann = CircularAnnulus(pos, r_in=r_in, r_out=r_out)
-    d = np.nan_to_num(data, nan=0.0)
-    bkg = ApertureStats(d, ann).median                       # local background per pixel
-    raw = aperture_photometry(d, ap)["aperture_sum"]
+    # ApertureStats is NaN-aware -- feed it the RAW data so a coverage-gap NaN in the annulus is
+    # ignored (nan_to_num(0) would bias the median low).  The aperture SUM needs finite pixels, so
+    # zero-fill only there; the `good` mask below drops any star whose aperture still went bad.
+    bkg = ApertureStats(data, ann).median                    # local background per pixel (NaN-aware)
+    raw = aperture_photometry(np.nan_to_num(data, nan=0.0), ap)["aperture_sum"]
     aper_flux = np.asarray(raw, float) - np.asarray(bkg, float) * ap.area
     pf = psf_flux[idx]
     good = np.isfinite(aper_flux) & (aper_flux > 0) & np.isfinite(pf) & (pf > 0)
