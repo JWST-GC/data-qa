@@ -152,11 +152,20 @@ def test_caption_anchors_exist_in_docs():
         5: dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1, intermodule_rms=6.0,
                 n_overlap=100, n_overlap_hi=50, intermodule_rms_hi=4.0),
         6: dict(red_flag=True, red_flag_reason="x"),
+        9: dict(stage=9, n_isolated=19812, aper_corr_med=0.45, aper_psf_scatter=0.07),
     }
     for n, m in samples.items():
         cap = D.caption_for(n, m)
         for anc in re.findall(r"qa_methods\.md#([A-Za-z0-9\-]+)", cap):
             assert anc in ids, f"stage {n} caption links #{anc} but no <a id> exists in the doc"
+
+
+def test_caption_stage9_psf_vs_aper():
+    cap = D.caption_for(9, dict(stage=9, n_isolated=19812, aper_corr_med=0.45,
+                                aper_psf_scatter=0.073))
+    assert "DOCROOT" not in cap and "qa_methods.md#stage9" in cap
+    assert "PSF vs aperture" in cap and "isolated" in cap
+    assert "19812 isolated stars" in cap and "+0.45 mag" in cap
 
 
 def test_provenance_footer_has_doc_and_source():

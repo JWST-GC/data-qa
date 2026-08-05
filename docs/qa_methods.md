@@ -293,6 +293,26 @@ systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percent
 
 Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnostics.py).
 
+<a id="stage9"></a>
+## Stage 9 — PSF vs aperture photometry
+
+The jicama catalog reports **PSF-fit** fluxes. Stage 9 **re-measures** simple **aperture**
+photometry on the mosaic at the catalog positions (a 3 px circular aperture with a 6–9 px annulus
+for local background) and compares the two, so a PSF-model or crowding problem shows up as a
+disagreement. (This is a stand-in until the jwst-gc-pipeline emits aperture catalogs of its own;
+aperture photometry is cheap to re-measure.)
+
+To keep a neighbour's light out of the aperture, the comparison is restricted to **isolated**
+stars — nearest catalog neighbour more than **8 px** away. The LEFT panel plots aperture vs PSF
+instrumental magnitude with the 1:1 + aperture-correction line; the RIGHT panel plots
+(aperture − PSF) vs PSF magnitude. `n_isolated`, `aper_corr_med` (the median offset = the aperture
+correction), `aper_psf_scatter`. Consider it passing if the (aperture − PSF) locus is flat at a
+constant offset with small scatter (< ~0.15 mag); curvature or large scatter flags a PSF-model or
+crowding problem.
+
+Source: [`data_qa/diagnostics.py` → `stage9_psf_vs_aper`](../data_qa/diagnostics.py)
+(`_psf_flux_positions`).
+
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 
