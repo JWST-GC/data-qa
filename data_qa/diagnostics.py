@@ -1665,7 +1665,7 @@ def _psf_flux_positions(o, filt):
     return (sc[g], flux[g], name) if int(g.sum()) >= 50 else (None, None, None)
 
 
-def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px=8.0, maxn=20000):
+def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px=12.0, maxn=20000):
     """PSF vs aperture photometry check.  The jicama catalog reports PSF-fit fluxes; here we
     RE-MEASURE simple aperture photometry (local-annulus background) on the mosaic at the catalog
     positions and compare.  Restricted to ISOLATED stars (nearest catalog neighbour > ``iso_px``
@@ -1723,13 +1723,22 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     bkg = ApertureStats(data, ann).median                    # local background per pixel (NaN-aware)
     raw = aperture_photometry(np.nan_to_num(data, nan=0.0), ap)["aperture_sum"]
     aper_flux = np.asarray(raw, float) - np.asarray(bkg, float) * ap.area
+    # DROP apertures that contain a NaN pixel (usually a saturated core or coverage gap): zero-fill
+    # would read them too faint by ~0.15 mag with no flag.  Better excluded than silently biased.
+    nanmask = (~np.isfinite(data)).astype("float32")
+    nan_in_ap = np.asarray(aperture_photometry(nanmask, ap)["aperture_sum"], float) > 0.5
+    metrics["n_aper_with_nan"] = int(nan_in_ap.sum())
     pf = psf_flux[idx]
-    good = np.isfinite(aper_flux) & (aper_flux > 0) & np.isfinite(pf) & (pf > 0)
+    good = np.isfinite(aper_flux) & (aper_flux > 0) & np.isfinite(pf) & (pf > 0) & (~nan_in_ap)
     m_psf = -2.5 * np.log10(pf[good]); m_aper = -2.5 * np.log10(aper_flux[good])
     dmag = m_aper - m_psf
     apcorr = float(np.median(dmag)); scat = float(aa.mad_std(dmag))
+    # tail fraction: the disagreement population mad_std is blind to.  Gate on BOTH the core
+    # scatter and this tail so a PSF-model failure in a minority can't read green.
+    tail_frac = float(np.mean(np.abs(dmag - apcorr) > 0.3)) if len(dmag) else 1.0
     metrics.update(n_isolated=int(good.sum()), aper_corr_med=apcorr, aper_psf_scatter=scat,
-                   passed=bool(scat < 0.15))
+                   frac_gt_0p3mag=tail_frac, n_capped=bool(idx.size >= maxn),
+                   passed=bool(scat < 0.15 and tail_frac < 0.05))
     import matplotlib.pyplot as plt
     fig, ax = _fig(1, 2, 5.6, 5.0)
     fig.subplots_adjust(wspace=0.32, top=0.86, bottom=0.12)
@@ -1747,11 +1756,15 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     hb2 = a1.hexbin(m_psf, dmag, gridsize=60, bins="log", cmap="magma", mincnt=1)
     fig.colorbar(hb2, ax=a1, label="log N", shrink=0.85)
     a1.axhline(apcorr, color="c", lw=1.2, label=f"median {apcorr:+.2f}")
-    a1.set_ylim(apcorr - 1.0, apcorr + 1.0)
+    # show the FULL residual range (don't crop the disagreement tail out of the plot that exists to
+    # surface it); pad the data range a little.
+    dlo, dhi = np.nanpercentile(dmag, [0.2, 99.8])
+    a1.set_ylim(min(dlo, apcorr - 0.3), max(dhi, apcorr + 0.3))
     a1.set_xlabel("PSF instrumental mag"); a1.set_ylabel("aperture − PSF [mag]")
     a1.legend(fontsize=8, loc="upper right")
-    a1.set_title(f"{int(good.sum())} isolated stars (>{iso_px:.0f} px)\n"
-                 f"scatter {scat:.3f} mag (r_ap={r_ap:.0f}px)", fontsize=9)
+    a1.set_title(f"{int(good.sum())} isolated stars (>{iso_px:.0f} px)  "
+                 f"scatter {scat:.3f} mag\n{100 * tail_frac:.1f}% beyond ±0.3 mag "
+                 f"(r_ap={r_ap:.0f}px)", fontsize=9)
     fig.suptitle(f"{o.target} {o.obsid} — PSF vs aperture photometry ({sw})", fontsize=11, y=0.98)
     return _save(fig, f"{o.obsid}_stage9.png"), metrics
 
@@ -2101,14 +2114,20 @@ def _caption_for_impl(n, metrics):
         base = ("**Stage 9 — PSF vs aperture photometry.** The jicama catalogue reports PSF-fit "
                 "fluxes; QA **re-measures** simple aperture photometry (local-annulus background) on "
                 "the mosaic at the catalogue positions and compares them, restricted to **isolated** "
-                "stars (nearest catalogue neighbour > 8 px) so a neighbour's light doesn't "
-                "contaminate the aperture. LEFT: aperture vs PSF instrumental mag with the "
-                "1:1 + aperture-correction line. RIGHT: (aperture − PSF) vs PSF mag. ")
+                "stars (nearest catalogue neighbour beyond the sky annulus) so a neighbour's light "
+                "doesn't contaminate the aperture or its background. LEFT: aperture vs PSF "
+                "instrumental mag with the 1:1 + aperture-correction line. RIGHT: (aperture − PSF) "
+                "vs PSF mag, showing the full range. ")
         if ni is not None and ac is not None and sct is not None:
-            base += (f"Here: {ni} isolated stars, aperture correction {ac:+.2f} mag, scatter "
-                     f"{sct:.3f} mag. ")
-        base += ("A tight locus at a constant offset means the two photometries agree; curvature or "
-                 "large scatter flags PSF-model or crowding problems. "
+            base += (f"Here: {ni} isolated stars"
+                     + (" (capped)" if metrics.get("n_capped") else "")
+                     + f", aperture correction {ac:+.2f} mag, scatter {sct:.3f} mag")
+            tf = metrics.get("frac_gt_0p3mag")
+            if tf is not None:
+                base += f", {100 * tf:.1f}% beyond ±0.3 mag"
+            base += ". "
+        base += ("A tight locus at a constant offset with a small tail means the two photometries "
+                 "agree; large scatter or a heavy tail flags PSF-model or crowding problems. "
                  "([how this is made](DOCROOT#stage9))")
         return base
     try:
