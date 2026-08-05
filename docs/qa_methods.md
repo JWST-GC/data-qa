@@ -261,7 +261,10 @@ three panels; when a field lacks flux errors the S/N>10 panel is omitted (two-pa
   VIRAC, not NRCA. See [the quiver note](#glossary-quiver).)
 - **TOP-MIDDLE** — the [reference-free](#glossary-reffree) NRCA∩NRCB overlap tie: the offset and
   RMS of the **same stars** seen in both modules (matched JWST-to-JWST, no external catalog), with
-  **marginal histograms** of the residual ΔRA/ΔDec.
+  **marginal histograms** of the residual ΔRA/ΔDec. Matching is **one-to-one**: after the bulk A→B
+  shift (the xcorr histogram peak) the nearest B source within 80 mas is taken for each A source and
+  duplicate B are dropped (closest A kept), so the reported count is distinct overlap stars — NOT the
+  many-to-many pair count a fixed-radius ball match would return in a crowded field.
 - **TOP-RIGHT** — the same overlap tie restricted to [S/N > 10](#glossary-snr) stars (when the
   field has flux errors), so the scatter reflects the tie rather than faint-source centroiding.
 - **FULL-WIDTH ROW (below the top panels)** — the A↔B overlap **footprint**: the overlap stars

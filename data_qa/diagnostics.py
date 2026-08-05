@@ -1373,7 +1373,7 @@ def _ab_overlap(a_sc, b_sc):
     the offset/RMS/count, the per-star residual arrays (for the hexbin + marginals), and a list of
     overlap-star positions (for the cutout gallery), or None if unmeasurable."""
     import astropy.units as u
-    from astropy.coordinates import search_around_sky, SkyCoord
+    from astropy.coordinates import SkyCoord
     if a_sc is None or b_sc is None or len(a_sc) < 50 or len(b_sc) < 50:
         return None
     xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
@@ -1382,7 +1382,21 @@ def _ab_overlap(a_sc, b_sc):
     cosd = float(np.cos(np.radians(np.median(a_sc.dec.deg))))
     a_al = SkyCoord((a_sc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
                     (a_sc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
-    ia, ib, sep, _ = search_around_sky(a_al, b_sc, 0.08 * u.arcsec)   # same star after align
+    # One-to-one match, NOT search_around_sky: in a crowded GC field an 80-mas ball match is
+    # many-to-many (one bright B star pairs with every nearby A star), so len(pairs) counts PAIRS,
+    # not distinct overlap stars -- that is the bogus ~34k count.  Take the nearest B for each A,
+    # keep those within 80 mas, then drop duplicate B (keep the closest A) so every physical star
+    # is counted once and fabricated pairs no longer bias the RMS.
+    idx, sep2d, _ = a_al.match_to_catalog_sky(b_sc)
+    keep = sep2d < 0.08 * u.arcsec
+    ia = np.where(keep)[0]
+    ib = np.asarray(idx)[keep]
+    if len(ia) < 20:
+        return None
+    order = np.argsort(sep2d[ia].arcsec)                 # smallest separation first
+    ia, ib = ia[order], ib[order]
+    _, first = np.unique(ib, return_index=True)          # one A per B: the closest
+    ia, ib = ia[first], ib[first]
     if len(ia) < 20:
         return None
     dra = (a_al[ia].ra - b_sc[ib].ra).to(u.mas).value * cosd
@@ -1591,9 +1605,9 @@ def stage5_intermodule(o: Observation, sw):
                 data = sci.data.astype("float32"); w = WCS(sci.header)
             from astropy.coordinates import SkyCoord
             from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
-            # De-duplicate: search_around_sky returns MANY pairs per bright overlap star, so the
-            # raw list repeats the same few stars (e.g. one star shown 4x).  Greedily keep only
-            # spatially DISTINCT stars (>0.5") so the gallery is 6 DIFFERENT stars.
+            # Space the gallery out: pos is already one entry per distinct overlap star, but greedily
+            # keep only stars >0.5" apart so the 6 cutouts sample different parts of the strip rather
+            # than clustering on one bright clump.
             picks = []
             for ra, dec in ov["pos"][:2000]:
                 if picks:
