@@ -337,6 +337,44 @@ def test_cell_offsets_recovers_uniform_shift():
     assert np.all(np.abs(dra - 100.0) < 15)      # each cell recovers ~+100 mas
 
 
+def test_cell_offsets_adaptive_small_field():
+    # issue #13: a small/sparse field (sickle sub640) has a clean WHOLE-FIELD peak but too few
+    # sources to fill a 4x4 cell (min 300).  The fine grid alone finds nothing -> the old code
+    # red-flagged a measurable tie.  The adaptive fallback must still measure it on a coarser grid.
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(7)
+    n = 700                                        # ~44 per 4x4 cell (< 300) -> fine grid empty
+    ra = 266.40 + rng.uniform(0, 0.02, n)
+    dec = -28.90 + rng.uniform(0, 0.02, n)
+    jsc = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.9))
+    ref = SkyCoord((ra + 90.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # ref is +90 mas E
+    assert D._cell_grid(jsc, ref, 4, 300) == ([], []) or D._cell_grid(jsc, ref, 4, 300)[0] == []
+    cells, _ = D._cell_offsets(jsc, ref)           # adaptive entry point
+    assert cells, "adaptive fallback should measure a whole-field/coarse tie, not red-flag"
+    off = float(np.hypot(np.median([c["dra"] for c in cells]),
+                         np.median([c["dde"] for c in cells])))
+    assert abs(off - 90.0) < 20
+
+
+def test_mosaic_path_single_module_nrcb(tmp_path, monkeypatch):
+    # issue #13: a single-module (NRCB-only) obs names its mosaic '-nrcb', not '-merged'.
+    # _mosaic_path must find it (else stage 1 blanks and stage 7 shows "no pipeline mosaic").
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "sickle" / "F210M" / "pipeline"; d.mkdir(parents=True)
+    (d / "jw03958-o007_t001_nircam_clear-f210m-nrcb_i2d.fits").write_text("")
+    # a residual sidecar with the same module tag must NOT be picked
+    (d / "jw03958-o007_t001_nircam_clear-f210m-nrcb_m2_daophot_basic_mergedcat_residual_i2d.fits").write_text("")
+    o = Observation(program="3958", obs="007", target="Sickle", release_field="sickle",
+                    instrument="NIRCam", filters=["F210M"], visits=[], epoch="", notes="")
+    hit = D._mosaic_path(o, "F210M")
+    assert hit is not None and hit.endswith("clear-f210m-nrcb_i2d.fits")
+    # 'merged', when present, is PREFERRED over the single-module mosaic
+    (d / "jw03958-o007_t001_nircam_clear-f210m-merged_i2d.fits").write_text("")
+    assert D._mosaic_path(o, "F210M").endswith("clear-f210m-merged_i2d.fits")
+
+
 def test_ab_overlap_returns_matched_positions():
     # _ab_overlap must return per-star matched sky positions (for the A↔B footprint map), aligned
     # in length with the residual arrays
