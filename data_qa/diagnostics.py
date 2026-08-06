@@ -1820,6 +1820,462 @@ def _build_stage5(o, sw, lw):
     return stage5_intermodule(o, sw)
 
 
+# --------------------------------------------------------------------------- STAGE 7
+def _mast_i2d(o, filt):
+    """The MAST-delivered STScI level-3 mosaic (``mastDownload/…_<filt>_i2d.fits``), the "raw"
+    product the pipeline improves on.  None if not downloaded for this obs/filter."""
+    if not filt:
+        return None
+    fl = filt.lower()
+
+    def _raw(p):
+        # keep only the MAST-delivered raw i2d: drop per-detector products and any of our own
+        # reprocessed mosaics (merged/residual/destreak/reproject/segm) the recursive+cross-field
+        # globs can otherwise reach under a mastDownload tree.
+        b = os.path.basename(p).lower()
+        return not any(s in b for s in ("nrca", "nrcb", "segm", "merged", "residual",
+                                        "destreak", "reproject", "_data_"))
+    # t* wildcard (the target index is not always t001) and, as a fallback, a cross-field search:
+    # a (program,obs) filed under one field's registry can have its MAST i2d staged in a sibling
+    # field's tree (e.g. jw02221-o002 belongs to cloudc but its i2d sits in brick/mastDownload).
+    for pat in (f"{BASE}/{o.field}/mastDownload/**/{o.obsid}_t*_nircam_clear-{fl}_i2d.fits",
+                f"{BASE}/{o.field}/mastDownload/**/{o.obsid}_t*_nircam_*{fl}*_i2d.fits",
+                f"{BASE}/*/mastDownload/**/{o.obsid}_t*_nircam_clear-{fl}_i2d.fits",
+                f"{BASE}/*/mastDownload/**/{o.obsid}_t*_nircam_*{fl}*_i2d.fits"):
+        hits = [p for p in glob.glob(pat, recursive=True) if _raw(p)]
+        if hits:
+            return sorted(hits)[0]
+    return None
+
+
+def _detect_on_mosaic(path, crop=5000, fwhm_pix=2.5, nsigma=5.0, maxn=500000):
+    """Detect point sources on a mosaic's central ``crop`` x ``crop`` window and return
+    (SkyCoord, instrumental_mag, wcs, cutout_data).  This APPROXIMATES a MAST L3 source list by
+    running DAOStarFinder at ``nsigma``σ over a photutils Background2D -- MAST does not archive the
+    merged catalogue locally, only the i2d.  It is an approximation of, not a match to, the STScI
+    ``SourceCatalogStep`` (which uses image segmentation with deblending), so the two source lists
+    differ; the count is a depth indicator, not a reproduction of the STScI catalogue.  Central crop
+    bounds the cost and gives a common sky region for the MAST-vs-pipeline comparison.  Returns None
+    on failure."""
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.nddata import Cutout2D
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    from photutils.background import Background2D, MMMBackground, MADStdBackgroundRMS
+    from photutils.detection import DAOStarFinder
+    from astropy.stats import SigmaClip
+    try:
+        with fits.open(path) as hdul:
+            sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
+            data = sci.data.astype("float32"); w = WCS(sci.header)
+    except (OSError, ValueError, KeyError):
+        return None
+    ny, nx = data.shape
+    cy, cx = ny // 2, nx // 2
+    size = (min(crop, ny), min(crop, nx))
+    try:
+        cut = Cutout2D(data, (cx, cy), size, wcs=w)
+    except (ValueError, IndexError):
+        return None
+    img = np.nan_to_num(cut.data, nan=np.nanmedian(cut.data))
+    try:
+        bkg = Background2D(img, box_size=128, filter_size=3,
+                           sigma_clip=SigmaClip(sigma=3, maxiters=5),
+                           bkgrms_estimator=MADStdBackgroundRMS(), bkg_estimator=MMMBackground(),
+                           exclude_percentile=90)
+        sub = img - bkg.background
+        rms = float(np.median(bkg.background_rms))
+        found = DAOStarFinder(threshold=nsigma * rms, fwhm=fwhm_pix, peakmax=None)(sub)
+    except (ValueError, RuntimeError):
+        return None
+    if found is None or not len(found):
+        return None
+    if len(found) > maxn:                                  # brightest maxn (bound the crossmatch)
+        found = found[np.argsort(np.asarray(found["flux"]))[::-1][:maxn]]
+    x = np.asarray(found["xcentroid"], float); y = np.asarray(found["ycentroid"], float)
+    flux = np.asarray(found["flux"], float)
+    sc = cut.wcs.pixel_to_world(x, y)
+    sc = SkyCoord(sc.ra, sc.dec)                           # ensure plain ICRS SkyCoord
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mag = -2.5 * np.log10(flux)
+    good = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(mag)
+    return sc[good], mag[good], cut.wcs, cut.data
+
+
+def _mast_l3_catalog(o, filt, allow_download=None):
+    """The MAST-delivered STScI level-3 source catalogue (``*_<filt>_cat.fits``) for this obs.
+    Prefer a local copy; if absent, download it from MAST *when it exists there* (best-effort,
+    guarded -- missing astroquery / no network / no such product all fall back to None, and the
+    caller then RECONSTRUCTS the list by detecting on the i2d).  Returns a path or None."""
+    for d in (f"{BASE}/{o.field}/mastDownload", f"{BASE}/{o.field}/mastDownload/**",
+              f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"):
+        hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_*{filt.lower()}*_cat.fits",
+                                     recursive=True)
+                if not any(s in os.path.basename(p).lower()
+                           for s in ("nrca", "nrcb", "destreak", "segm"))]
+        if hits:
+            return sorted(hits)[-1]
+    if allow_download is None:
+        # opt-in: default OFF so a QA refresh never reaches out over the network, and (below) any
+        # download lands in the scratch OUTDIR, never inside the read-only product tree.
+        allow_download = os.environ.get("QA_MAST_DOWNLOAD", "0") != "0"
+    if not allow_download:
+        return None
+    # Build a specific exception tuple (no bare except) covering astroquery/network failures.
+    excs = [ImportError, OSError, ValueError, KeyError, TimeoutError, ConnectionError]
+    try:
+        from astroquery.exceptions import RemoteServiceError
+        excs.append(RemoteServiceError)
+    except ImportError:
+        pass
+    try:
+        import requests
+        excs.append(requests.exceptions.RequestException)
+    except ImportError:
+        pass
+    # A network HANG is not an exception (the prior "Pipeline MAST hang" was exactly this), so cap
+    # every socket with a default timeout for the duration of the query, and SCOPE the query to
+    # this obsid (obs_id=jw<prog>-o<obs>*) so get_product_list can't pull the whole programme.
+    import socket
+    prev_to = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(float(os.environ.get("QA_MAST_TIMEOUT", "60")))
+    try:
+        from astroquery.mast import Observations
+        obs_t = Observations.query_criteria(
+            obs_collection="JWST", instrument_name="NIRCAM*",
+            obs_id=f"jw{int(o.program):05d}-o{o.obs}*", filters=filt.upper())
+        if obs_t is None or not len(obs_t):
+            return None
+        prod = Observations.get_product_list(obs_t)
+        want = np.array([("_cat.fits" in str(fn).lower() and o.obsid in str(fn)
+                          and filt.lower() in str(fn).lower()
+                          and not any(s in str(fn).lower()
+                                      for s in ("nrca", "nrcb", "destreak", "segm")))
+                         for fn in prod["productFilename"]])
+        if not want.any():
+            return None
+        dl = Observations.download_products(
+            prod[want],
+            download_dir=os.path.join(OUTDIR, "mastDownload"))   # scratch, never the product tree
+        good = [p for p in (dl["Local Path"] if dl is not None and len(dl) else [])
+                if p and os.path.exists(p)]
+        return good[0] if good else None
+    except tuple(excs):
+        return None
+    finally:
+        socket.setdefaulttimeout(prev_to)
+
+
+def _load_mast_catalog(path):
+    """(SkyCoord, abmag) from a MAST-delivered L3 source catalogue, or (None, None)."""
+    from astropy.table import Table
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    try:
+        t = Table.read(path)
+    except (OSError, ValueError):
+        return None, None
+    if "sky_centroid" in t.colnames:
+        sc = t["sky_centroid"]
+    elif {"ra", "dec"}.issubset(set(t.colnames)):
+        sc = SkyCoord(np.asarray(t["ra"], float) * u.deg, np.asarray(t["dec"], float) * u.deg)
+    else:
+        return None, None
+    magc = next((c for c in ("aper_total_abmag", "aper50_abmag", "aper70_abmag", "aper30_abmag",
+                             "abmag") if c in t.colnames), None)
+    mag = np.asarray(t[magc], float) if magc else np.full(len(sc), np.nan)
+    good = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)
+    if int(good.sum()) < 20:
+        return None, None
+    return sc[good], mag[good]
+
+
+def _tie_cloud(jsc, ref_sc):
+    """The per-star (JWST − VIRAC) offset VECTORS for genuinely-matched stars, crowding-robust.
+
+    A plain nearest-neighbour-to-VIRAC distance is USELESS here: VIRAC is sparse, so the nearest
+    reference to a random JWST source is ~its inter-source spacing (~250 mas at GC density) for ANY
+    frame, swamping the real tie.  Instead, coarse-align by the ``aa.xcorr`` histogram peak (finds
+    the bulk shift up to 1.5″), keep only pairs that then fall within 0.1″ (real matches), and
+    return their (ΔRA, ΔDec) in mas.  The cloud's CENTRE is the true bulk offset from VIRAC.
+    Returns (dra_arr, dde_arr, bulk_off_mas) or None."""
+    import astropy.units as u
+    from astropy.coordinates import search_around_sky, SkyCoord
+    if jsc is None or ref_sc is None or len(jsc) < 50:
+        return None
+    xc = aa.xcorr(jsc, ref_sc, maxsep=1.5 * u.arcsec)
+    if not (xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= 100):
+        return None
+    cosd = float(np.cos(np.radians(np.median(jsc.dec.deg))))
+    j_al = SkyCoord((jsc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
+                    (jsc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
+    ia, ib, sep, _ = search_around_sky(j_al, ref_sc, 0.1 * u.arcsec)
+    if len(ia) < 20:
+        return None
+    dra = (jsc[ia].ra - ref_sc[ib].ra).to(u.mas).value * cosd
+    dde = (jsc[ia].dec - ref_sc[ib].dec).to(u.mas).value
+    return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
+
+
+def _stage7_astrom_title(mast_tie, jic_tie):
+    """Astrometry sub-panel title, worded from the SIGN of (jicama tie − MAST tie): it asserts the
+    pipeline is 'tighter' ONLY when both ties are measured AND jicama < MAST; otherwise it reports
+    the number(s) without claiming an improvement.  ``mast_tie``/``jic_tie`` are ``_tie_cloud``
+    results (…, bulk_mas) or None."""
+    both = mast_tie is not None and jic_tie is not None
+    if both:
+        head = (f"astrometry vs VIRAC — jicama tie {jic_tie[2]:.0f} mas vs MAST "
+                f"{mast_tie[2]:.0f} mas")
+        return head + (" (pipeline tighter)" if jic_tie[2] < mast_tie[2] else "")
+    if jic_tie is not None:
+        return f"astrometry vs VIRAC — jicama tie {jic_tie[2]:.0f} mas (MAST tie not measured)"
+    if mast_tie is not None:
+        return f"astrometry vs VIRAC — MAST tie {mast_tie[2]:.0f} mas (pipeline tie not measured)"
+    return "astrometry vs VIRAC (bulk offset)"
+
+
+def _stage7_verdict(our_path, mast_tie, jic_tie, jic_unmeas):
+    """PASS / red-flag decision for stage 7, factored out so it can be pinned by tests.
+
+    An unmeasurable OWN (jicama) tie while VIRAC is present is OUR product failing -> fail AND
+    red-flag.  A missing VIRAC reference, or ONLY the MAST tie being unmeasurable, means the
+    comparison is 'not measured' / 'unavailable' -- not a fail on our side.  Returns
+    (passed: bool, red_flag: bool, red_flag_reason: str|None)."""
+    improved = (jic_tie is not None and mast_tie is not None and jic_tie[2] <= mast_tie[2] + 5)
+    passed = bool(our_path and not jic_unmeas
+                  and (improved or mast_tie is None or jic_tie is None))
+    if jic_unmeas:
+        return False, True, ("pipeline (jicama) frame tie to VIRAC unmeasurable — no xcorr peak "
+                             "within 1.5″ (possible gross mis-registration of our product)")
+    return passed, False, None
+
+
+def stage7_mast_vs_pipeline(o: Observation, sw):
+    """Show the pipeline's improvement over the raw MAST-delivered products:
+    (top) the MAST L3 i2d mosaic vs our pipeline mosaic over the SAME sky region;
+    (bottom-left) source-count / brightness histogram, MAST-i2d detections vs the jicama catalogue;
+    (bottom-right, MAIN) the per-star offset-to-VIRAC distribution for each -- the astrometric
+    tightening that is the pipeline's headline gain."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.nddata import Cutout2D
+    from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
+    metrics = dict(stage=7, sw=sw)
+    mast_path = _mast_i2d(o, sw)
+    our_path = _mosaic_path(o, sw)
+    if not mast_path:
+        png = _red_flag_figure(o, "stage7", "NO MAST i2d ON DISK",
+                               f"No MAST-delivered {sw} i2d in mastDownload/ for this obs, so the "
+                               f"before/after comparison can't be made. (Not a data defect — the "
+                               f"raw MAST product just isn't staged locally.)")
+        metrics.update(red_flag=True, red_flag_reason=f"no MAST {sw} i2d on disk", passed=False)
+        return png, metrics
+
+    # MAST source list: prefer the MAST-delivered L3 catalogue (download if it exists on MAST),
+    # else RECONSTRUCT it by detecting on the MAST i2d (what the STScI L3 step does).
+    mast_sc = mast_mag = None
+    mast_kind = None
+    mcat = _mast_l3_catalog(o, sw)
+    if mcat:
+        mast_sc, mast_mag = _load_mast_catalog(mcat)
+        if mast_sc is not None:
+            mast_kind = "MAST L3 catalogue"
+    if mast_sc is None:
+        det = _detect_on_mosaic(mast_path)
+        if det is not None:
+            mast_sc, mast_mag, _cutwcs, _cutdata = det
+            mast_kind = "MAST i2d (re-detected)"
+    if mast_sc is not None:
+        metrics["n_mast"] = int(len(mast_sc)); metrics["mast_kind"] = mast_kind
+
+    # jicama catalogue positions + mag (the pipeline product).  _jwst_sources falls back to the
+    # MAST per-i2d _cat.fits when no release/merged catalogue exists yet -- in that case the
+    # "pipeline" side is NOT actually the jicama product, so label it as such (else the panel
+    # silently becomes MAST-vs-MAST).
+    jsc, jmag, jsrc = _jwst_sources(o, sw)
+    metrics["jicama_source"] = jsrc
+    jic_is_release = str(jsrc).startswith("release")
+    metrics["jicama_is_release"] = bool(jic_is_release)
+    jic_label = "jicama catalogue" if jic_is_release else "pipeline (no merged catalogue yet)"
+    if jsc is not None:
+        metrics["n_jicama"] = int(len(jsc))
+
+    # display + count window: central crop of the MAST i2d (so both image panels show the SAME sky,
+    # and the source-count comparison is over one common region, not full-field vs a crop).
+    try:
+        with fits.open(mast_path) as h:
+            mh = (h["SCI"] if "SCI" in h else h[1]).header
+        mwcs = WCS(mh); mny, mnx = int(mh["NAXIS2"]), int(mh["NAXIS1"])
+    except (OSError, ValueError, KeyError):
+        mwcs = None; mny = mnx = 0
+    crop = min(5000, mny, mnx) if mwcs is not None else 0
+    cen = mwcs.pixel_to_world(mnx / 2, mny / 2) if mwcs is not None else None
+    if mwcs is not None:
+        cw = mwcs.pixel_to_world([mnx / 2 - crop / 2, mnx / 2 + crop / 2],
+                                 [mny / 2 - crop / 2, mny / 2 + crop / 2])
+        ra_lo, ra_hi = sorted(cw.ra.deg); de_lo, de_hi = sorted(cw.dec.deg)
+
+        def _inbox(sc):
+            return ((sc.ra.deg >= ra_lo) & (sc.ra.deg <= ra_hi) &
+                    (sc.dec.deg >= de_lo) & (sc.dec.deg <= de_hi))
+    else:
+        def _inbox(sc):
+            return np.ones(len(sc), bool)
+
+    # VIRAC reference (PM-propagated) for the crowding-robust bulk-offset comparison
+    ref = _viraccache_path(o) or _refcat_path(o)
+    ep = aa.epoch_of(mast_path) if mast_path else None
+    ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+    mast_tie = _tie_cloud(mast_sc, ref_sc) if mast_sc is not None else None
+    jic_tie = _tie_cloud(jsc, ref_sc) if jsc is not None else None
+    if mast_tie is not None:
+        metrics["mast_offset_med_mas"] = mast_tie[2]
+    if jic_tie is not None:
+        metrics["jicama_offset_med_mas"] = jic_tie[2]
+
+    # ---- figure: two image panels on top, two comparison panels below
+    fig = plt.figure(figsize=(12.5, 10.8))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 0.95], hspace=0.3, wspace=0.28)
+
+    def _show(ax, path, title):
+        try:
+            with fits.open(path) as hdul:
+                sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
+                d = sci.data.astype("float32"); wv = WCS(sci.header)
+        except (OSError, ValueError, KeyError):
+            ax.text(0.5, 0.5, "mosaic unreadable", ha="center", va="center"); ax.axis("off"); return
+        try:
+            if cen is not None:
+                px, py = wv.world_to_pixel(cen)
+                d = Cutout2D(d, (float(px), float(py)), min(5000, *d.shape), wcs=wv).data
+        except (ValueError, IndexError):
+            pass
+        norm = ImageNormalize(d, interval=ZScaleInterval(), stretch=AsinhStretch())
+        ax.imshow(d, origin="lower", cmap="gray", norm=norm)
+        ax.set_xticks([]); ax.set_yticks([]); ax.set_title(title, fontsize=10)
+
+    ax_m = fig.add_subplot(gs[0, 0]); _show(ax_m, mast_path, f"MAST L3 i2d — {sw} (before)")
+    ax_o = fig.add_subplot(gs[0, 1])
+    if our_path:
+        _show(ax_o, our_path, f"pipeline i2d — {sw} (after)")
+    else:
+        ax_o.text(0.5, 0.5, "no pipeline mosaic yet", ha="center", va="center"); ax_o.axis("off")
+
+    # bottom-left: source counts / brightness histogram in the common window (brief -- jicama is
+    # deeper by construction; the point is the count + depth, not the zeropoint).
+    axh = fig.add_subplot(gs[1, 0])
+    n_mast_win = n_jic_win = None
+    # put the two catalogues on the SAME zeropoint (jicama's) so the depth is directly comparable:
+    # shift the MAST mags by the median (jicama − MAST) of cross-matched stars.
+    mast_zp = None
+    if (mast_sc is not None and mast_mag is not None and jsc is not None and jmag is not None):
+        import astropy.units as u
+        idx, sep, _ = mast_sc.match_to_catalog_sky(jsc)
+        mm2 = sep < 0.2 * u.arcsec
+        if int(mm2.sum()) >= 30:
+            mast_zp = float(np.median(jmag[idx[mm2]] - mast_mag[mm2]))
+            metrics["mast_to_jicama_zp"] = mast_zp
+    if mast_sc is not None and mast_mag is not None:
+        mm = mast_mag[_inbox(mast_sc)] + (mast_zp or 0.0)      # on jicama ZP when calibrated
+        n_mast_win = int(len(mm))
+        zlab = "" if mast_zp is not None else " (own ZP)"
+        axh.hist(mm, bins=50, histtype="step", color="#ee6677", lw=1.4,
+                 label=f"{mast_kind}{zlab} (n={n_mast_win})")
+    if jsc is not None and jmag is not None:
+        jm = jmag[_inbox(jsc)]
+        n_jic_win = int(len(jm))
+        axh.hist(jm, bins=50, histtype="step", color="#4477aa", lw=1.4,
+                 label=f"{jic_label} (n={n_jic_win})")
+    if n_mast_win is not None:
+        metrics["n_mast_window"] = n_mast_win
+    if n_jic_win is not None:
+        metrics["n_jicama_window"] = n_jic_win
+    axh.set_yscale("log")
+    axh.set_xlabel("magnitude" + (" (jicama zeropoint)" if mast_zp is not None
+                                  else " (each in its own zeropoint)"))
+    axh.set_ylabel("N sources"); axh.legend(fontsize=7.5, loc="upper left")
+    axh.set_title("source counts in the common window — MAST vs pipeline", fontsize=9)
+
+    # bottom-right (MAIN): the crowding-robust bulk offset to VIRAC for each catalogue, as a 2-D
+    # (ΔRA, ΔDec) cloud with marginals.  A nearest-neighbour-to-VIRAC distance is USELESS here
+    # (VIRAC is sparse -> ~250 mas NN spacing swamps the tie), so this uses the xcorr histogram
+    # peak: the cloud CENTRE is the true bulk offset (MAST far from 0, jicama near 0).
+    axo = fig.add_subplot(gs[1, 1])
+    # Wording is DERIVED from the sign of (jicama tie − MAST tie): only claim the pipeline "tightens
+    # the tie" when BOTH ties are measured AND jicama < MAST.  When jicama is wider/equal, or one
+    # side is unmeasurable, report the numbers without asserting an improvement.
+    both_measured = mast_tie is not None and jic_tie is not None
+    jic_tighter = bool(both_measured and jic_tie[2] < mast_tie[2])
+    metrics["astrom_improved"] = jic_tighter
+    lim = 60.0
+    for tie, col, lab in ((mast_tie, "#ee6677", mast_kind or "MAST"),
+                          (jic_tie, "#4477aa", jic_label)):
+        if tie is not None:
+            dra, dde, bulk = tie
+            axo.scatter(dra, dde, s=3, alpha=0.25, color=col,
+                        label=f"{lab}  (bulk {bulk:.0f} mas)")
+            lim = max(lim, 1.3 * float(np.nanpercentile(np.hypot(dra, dde), 95)))
+    if mast_tie is not None or jic_tie is not None:
+        axo.axhline(0, color="k", lw=0.4); axo.axvline(0, color="k", lw=0.4)
+        axo.plot(0, 0, "k+", ms=12, mew=2, label="VIRAC (target)")
+        axo.set_xlim(-lim, lim); axo.set_ylim(-lim, lim); axo.set_aspect("equal")
+        axo.set_xlabel("ΔRA to VIRAC [mas]"); axo.set_ylabel("ΔDec to VIRAC [mas]")
+        axo.legend(fontsize=7.5, loc="upper right")
+        # combined marginals (both catalogues in ONE pair of inset axes, so they don't overplot);
+        # the panel title goes on the TOP marginal so it can't collide with the histograms.
+        axt = axo.inset_axes([0.0, 1.02, 1.0, 0.16]); axr = axo.inset_axes([1.02, 0.0, 0.16, 1.0])
+        for tie, col in ((mast_tie, "#ee6677"), (jic_tie, "#4477aa")):
+            if tie is not None:
+                axt.hist(tie[0], bins=40, range=(-lim, lim), histtype="step", color=col, lw=1.1)
+                axr.hist(tie[1], bins=40, range=(-lim, lim), orientation="horizontal",
+                         histtype="step", color=col, lw=1.1)
+        axt.set_xlim(-lim, lim); axt.axis("off"); axr.set_ylim(-lim, lim); axr.axis("off")
+        axt.set_title(_stage7_astrom_title(mast_tie, jic_tie), fontsize=8)
+    # UNMEASURABLE (data + VIRAC present but no xcorr peak within 1.5") must be distinguishable from
+    # measured-and-fine -- a grossly mis-registered product (e.g. the ~20" jw01182-v001 class) would
+    # otherwise render as a clean one-cloud pass.
+    mast_unmeas = mast_sc is not None and ref_sc is not None and mast_tie is None
+    jic_unmeas = jsc is not None and ref_sc is not None and jic_tie is None
+    metrics.update(mast_tie_unmeasurable=bool(mast_unmeas), jicama_tie_unmeasurable=bool(jic_unmeas))
+    if mast_tie is None and jic_tie is None:
+        axo.axis("off")
+        if ref_sc is None:
+            axo.text(0.5, 0.5, "no VIRAC reference for the offset comparison",
+                     ha="center", va="center", fontsize=9)
+        else:
+            axo.text(0.5, 0.5, "BOTH ties unmeasurable: no xcorr peak within 1.5″\n"
+                     "→ likely gross mis-registration; investigate",
+                     ha="center", va="center", fontsize=9, color="#c33", weight="bold")
+    elif jic_unmeas:
+        # OUR product cannot be tied to VIRAC -> a defect on our side (handled by passed/red_flag).
+        axo.text(0.5, -0.16, "⚠ pipeline (jicama) tie unmeasurable (>1.5″ or no xcorr peak) — "
+                 "possible gross mis-registration of our product; not a clean pass",
+                 transform=axo.transAxes, ha="center", va="top", fontsize=8, color="#c33")
+    elif mast_unmeas:
+        # only the MAST tie is unmeasurable: the COMPARISON is unavailable, which is not by itself a
+        # defect in OUR product -- so state that, do NOT say "not a clean pass", and (below) the
+        # stage does not fail solely on this.
+        axo.text(0.5, -0.16, "⚠ MAST comparison unavailable (MAST tie >1.5″ or no xcorr peak) — "
+                 "possible MAST mis-registration; the pipeline tie is measured",
+                 transform=axo.transAxes, ha="center", va="top", fontsize=8, color="#c33")
+
+    # PASS / red-flag decision (factored into _stage7_verdict so it is pinned by tests): the pipeline
+    # must be TIEABLE, a mosaic must exist, and where MAST is also measurable the pipeline tie must be
+    # no worse.  A missing VIRAC ref, or ONLY the MAST tie being unmeasurable, is "not measured" /
+    # "comparison unavailable" -> not a fail on our side; an unmeasurable OWN tie fails AND red-flags.
+    passed, red_flag, red_flag_reason = _stage7_verdict(our_path, mast_tie, jic_tie, jic_unmeas)
+    metrics["passed"] = passed
+    if red_flag:
+        metrics["red_flag"] = True
+        metrics["red_flag_reason"] = red_flag_reason
+    fig.suptitle(f"{o.target} {o.obsid} — MAST vs pipeline ({sw})", fontsize=12, y=0.98)
+    return _save(fig, f"{o.obsid}_stage7.png"), metrics
+
+
 # --------------------------------------------------------------------------- STAGE 6
 def _internal_pos_rms(o, filt):
     """(mag_vega, internal-position-rms in mas) per star from the highest-tier catalog carrying
@@ -1971,6 +2427,8 @@ def build_stage(o, n, sw, lw):
         return stage5_intermodule(o, sw)
     if n == 6:
         return stage6_astrom_error(o, sw, lw)
+    if n == 7:
+        return stage7_mast_vs_pipeline(o, sw)
     if n == 9:
         return stage9_psf_vs_aper(o, sw)
     raise ValueError(n)
@@ -2028,7 +2486,9 @@ def caption_for(n, metrics):
 
 
 def _caption_for_impl(n, metrics):
-    if metrics.get("red_flag"):
+    # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
+    # so the generic "the plot is empty" wording would not fit).
+    if metrics.get("red_flag") and n != 7:
         return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate. "
@@ -2179,6 +2639,51 @@ def _caption_for_impl(n, metrics):
                  "agree; large scatter or a heavy tail flags PSF-model or crowding problems. "
                  "([how this is made](DOCROOT#stage9))")
         return base
+    if n == 7:
+        if metrics.get("red_flag"):
+            return (f"🚩 **Stage 7 — RED FLAG.** "
+                    f"{metrics.get('red_flag_reason', 'MAST-vs-pipeline comparison unavailable')}. "
+                    f"([how this is made](DOCROOT#stage7))")
+        # counts in the COMMON WINDOW (fair), not the full-field totals
+        nj = metrics.get("n_jicama_window"); nm = metrics.get("n_mast_window")
+        mo = metrics.get("mast_offset_med_mas"); jo = metrics.get("jicama_offset_med_mas")
+        base = ("**Stage 7 — MAST vs pipeline.** A comparison of the pipeline against the raw "
+                "[MAST-delivered](DOCROOT#glossary-mtier) products. The TOP row shows the "
+                "MAST level-3 `i2d` mosaic (before) next to our pipeline mosaic (after) over the "
+                "same sky region. The BOTTOM-LEFT panel compares source counts — the "
+                "[jicama](DOCROOT#glossary-jicama) catalogue vs the MAST catalogue "
+                "(the MAST-delivered `_cat.fits` when archived, else approximated by running "
+                "DAOStarFinder at 5σ on the MAST i2d — an approximation of, not a match to, the "
+                "STScI L3 catalogue step, which uses segmentation with deblending). ")
+        if nj is not None and nm is not None:
+            base += f"jicama holds {nj} vs {nm} (MAST) in the compared window. "
+        if metrics.get("jicama_is_release") is False:
+            base += ("(NOTE: no merged/release jicama catalogue exists yet for this obs, so the "
+                     "pipeline side falls back to the per-i2d MAST catalogue — the comparison is "
+                     "MAST-vs-MAST here, not pipeline-vs-MAST.) ")
+        base += ("The BOTTOM-RIGHT panel (the main result) is the "
+                 "[bulk offset to VIRAC](DOCROOT#glossary-bulk) (xcorr histogram peak, "
+                 "crowding-robust) for each catalogue")
+        # Improvement clause is CONDITIONAL: assert tightening only when both ties are measured AND
+        # jicama < MAST.  Otherwise report the numbers (or state the comparison is unavailable)
+        # without claiming an improvement.
+        if mo is not None and jo is not None:
+            base += f" — {jo:.0f} mas (jicama) vs {mo:.0f} mas (MAST)"
+            if jo < mo:
+                base += ", the astrometric tightening the pipeline delivers over MAST. "
+            else:
+                base += " (the pipeline tie is not tighter than MAST here). "
+        elif jo is not None:
+            base += (f" — {jo:.0f} mas (jicama); the MAST comparison is unavailable "
+                     f"(MAST tie unmeasurable, possible MAST mis-registration). ")
+        elif mo is not None:
+            base += f" — {mo:.0f} mas (MAST); the pipeline tie is not measurable here. "
+        else:
+            base += ". "
+        base += ("The cloud's WIDTH is bounded by the 0.1″ cross-match radius, not the per-star "
+                 "astrometric RMS — see [stage 5](DOCROOT#stage5)/[stage 6](DOCROOT#stage6) for the "
+                 "actual per-star scatter. ([how this is made](DOCROOT#stage7))")
+        return base
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
@@ -2227,7 +2732,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 9])
+    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 9])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
