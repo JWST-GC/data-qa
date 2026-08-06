@@ -43,7 +43,9 @@ def test_caption_stage4_no_significance_no_nan():
     cap = D.caption_for(4, dict(stage=4, sw="F212N", offset_signif_med=None,
                                 offset_med_mas=7.1, n_cells=6, offset_scatter_mas=None))
     assert "nan" not in cap.lower()
-    assert "7 mas" in cap and "6 measured cells" in cap
+    # a small tie keeps a decimal: with the same-star refinement the bulk is routinely sub-mas,
+    # and "0 mas" hid the difference between 0.4 and 4.
+    assert "7.1 mas" in cap and "6 measured cells" in cap
 
 
 def test_caption_stage4_flags_discontinuity():
@@ -399,7 +401,8 @@ def _write_skycoord_cat(path, ra, dec):
 def test_jwst_positions_falls_back_to_dao(tmp_path, monkeypatch):
     # no merged/MAST catalog, only a per-filter DAO position catalog -> positions still returned
     monkeypatch.setattr(D, "BASE", str(tmp_path))
-    monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))   # no merged/MAST
+    monkeypatch.setattr(D, "_jwst_sources",
+                        lambda o, f, position_valid=False: (None, None, None))  # no merged/MAST
     d = tmp_path / "gc2211" / "catalogs"; d.mkdir(parents=True)
     ra = np.linspace(266.4, 266.45, 60); dec = np.linspace(-29.0, -28.95, 60)
     _write_skycoord_cat(d / "f200w_merged_indivexp_merged_m6_dao_basic_o046_vetted.fits", ra, dec)
@@ -490,6 +493,167 @@ def test_module_positions_normal(tmp_path, monkeypatch):
     assert a_sc is not None and b_sc is not None
     assert not meta["a"]["dead"] and not meta["b"]["dead"]
     assert meta["a"]["nan_frac"] == 0.0
+
+
+# --------------------------------------------------------------------------- position validity
+#
+# jicama's merge accepts a cross-filter match anywhere inside max_offset=0.10", which at GC
+# density also admits the NEIGHBOUR of a star undetected in that filter -- so skycoord_<filt>
+# can be a position ~one neighbour-spacing away.  On brick 2221-o001 F212N those rows were 43%
+# of the second lobe in the JWST-VIRAC offset cloud and 2% of its core (same magnitude, same
+# saturated fraction: match quality, not a bright-star centroid bias).  JWST-GC/data-qa#1.
+
+
+def _merged_table(n=200, sep_arcsec=None):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    ra = np.linspace(266.40, 266.45, n)
+    dec = np.linspace(-29.00, -28.95, n)
+    t = Table()
+    t["skycoord_f200w"] = SkyCoord(ra * u.deg, dec * u.deg)
+    t["mag_vega_f200w"] = np.linspace(14.0, 20.0, n)
+    if sep_arcsec is not None:
+        t["sep_f200w"] = (np.asarray(sep_arcsec, float) / 3600.0) * u.deg   # merge writes degrees
+    return t
+
+
+def test_position_valid_drops_loose_matches():
+    n = 200
+    sep = np.where(np.arange(n) < 60, 0.30, 0.004)      # 60 rows borrowed from a neighbour
+    t = _merged_table(n, sep)
+    finite = np.ones(n, dtype=bool)
+    ok, note = D._position_valid(t, "F200W", finite)
+    assert ok.sum() == n - 60
+    assert not ok[:60].any() and ok[60:].all()
+    assert "sep<=" in note
+
+
+def test_position_valid_noop_without_sep_column():
+    # MAST / per-filter DAO catalogs have no sep_<filt>: the position IS the detection's own,
+    # so the cut must pass everything through rather than emptying the source.
+    t = _merged_table(120, sep_arcsec=None)
+    finite = np.ones(120, dtype=bool)
+    ok, note = D._position_valid(t, "F200W", finite)
+    assert ok.all() and note is None
+
+
+def test_position_valid_keeps_uncut_when_too_few_survive():
+    # a field where almost nothing passes must NOT become "offset unmeasurable"; the cut backs
+    # off and labels itself instead.
+    n = 200
+    t = _merged_table(n, np.full(n, 0.40))
+    finite = np.ones(n, dtype=bool)
+    ok, note = D._position_valid(t, "F200W", finite)
+    assert ok.sum() == n
+    assert note == "sep-cut-skipped(too-few)"
+
+
+def test_position_valid_unitless_sep_column_treated_as_degrees():
+    # a Column with no unit must not raise (Column.to() exists but cannot convert) and must be
+    # read as degrees, matching what merge_catalogs writes.
+    from astropy.table import Table
+    t = _merged_table(200, np.where(np.arange(200) < 50, 0.30, 0.004))
+    t["sep_f200w"] = np.asarray(t["sep_f200w"], float)      # strip the unit
+    ok, note = D._position_valid(t, "F200W", np.ones(200, dtype=bool))
+    assert ok.sum() == 150 and "sep<=" in note
+
+
+def _uniform_sc(n, seed, ra0=266.4, dec0=-29.0, span=0.02):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.default_rng(seed)
+    ra = ra0 + rng.uniform(0, span, n); dec = dec0 + rng.uniform(0, span, n)
+    return SkyCoord(ra * u.deg, dec * u.deg)
+
+
+def test_same_star_tie_refuses_when_bulk_is_large():
+    # the guard that keeps this from becoming a dense nearest-neighbour median: without a verified
+    # SMALL global tie the nearest pair is not the right star, so it must refuse rather than
+    # return a number that collapses toward zero.
+    from data_qa import astrometry_audit as aa
+    a = _uniform_sc(400, 0)
+    assert aa.same_star_tie(a, a, bulk=dict(off=500.0)) is None
+    # an explicitly-supplied bulk with no peak_ratio is treated as vetted by the caller
+    out = aa.same_star_tie(a, a, bulk=dict(off=2.0))
+    assert out is not None and out["off"] < 1e-6 and out["npairs"] == 400
+
+
+def test_same_star_tie_refuses_ambiguous_peak_ratio():
+    # an ambiguous xcorr (peak_ratio below MIN_PEAK_RATIO) with a small off must NOT admit the
+    # same-star estimate -- otherwise a chance-small off silently fabricates agreement.
+    from data_qa import astrometry_audit as aa
+    a = _uniform_sc(400, 1)
+    assert aa.same_star_tie(a, a, bulk=dict(off=2.0, peak_ratio=1.0)) is None
+    assert aa.same_star_tie(a, a, bulk=dict(off=2.0, peak_ratio=aa.MIN_PEAK_RATIO)) is not None
+
+
+def test_same_star_tie_real_path_bulk_none():
+    # the path stage 4 actually uses: bulk=None, so xcorr is measured internally (incl. peak_ratio).
+    # A small real tie is recovered; a >100 mas mis-registration is refused (nearest pair is wrong).
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa import astrometry_audit as aa
+    a = _uniform_sc(3000, 2)
+    cosd = np.cos(np.radians(-29.0))
+    b_small = SkyCoord((a.ra.deg + 8.0 / 3.6e6 / cosd) * u.deg, a.dec.deg * u.deg)   # +8 mas
+    out = aa.same_star_tie(a, b_small)                       # bulk=None -> real xcorr path
+    assert out is not None and abs(out["off"] - 8.0) < 4.0
+    b_far = SkyCoord((a.ra.deg + 300.0 / 3.6e6 / cosd) * u.deg, a.dec.deg * u.deg)   # +300 mas
+    assert aa.same_star_tie(a, b_far) is None
+
+
+def test_xcorr_recentring_no_floor_at_zero():
+    # on a uniform, UNCLUSTERED synthetic the recentred xcorr must not carry the ~half-bin (~5 mas)
+    # quantization floor at truth 0, yet must still track a real 90 mas offset.
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa import astrometry_audit as aa
+    a = _uniform_sc(2000, 3)
+    cosd = np.cos(np.radians(-29.0))
+    z = aa.xcorr(a, a)
+    assert z is not None and z["off"] < 1.5                  # was ~5 mas with a single refinement
+    b90 = SkyCoord((a.ra.deg + 90.0 / 3.6e6 / cosd) * u.deg, a.dec.deg * u.deg)
+    f = aa.xcorr(a, b90)
+    assert f is not None and abs(f["off"] - 90.0) < 3.0
+
+
+def _stage4_injection(monkeypatch, shift_mas):
+    """Run stage4_offsets end-to-end on a dense uniform synthetic field whose JWST positions are
+    shifted ``shift_mas`` in RA from the reference, mocking only the I/O seams.  Returns metrics."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa import astrometry_audit as aa
+    rng = np.random.default_rng(11)
+    n = 12000
+    ra = 266.40 + rng.uniform(0, 0.02, n); dec = -29.00 + rng.uniform(0, 0.02, n)
+    ref_sc = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-29.0))
+    jsc = SkyCoord((ra + shift_mas / 3.6e6 / cosd) * u.deg, dec * u.deg)   # JWST shifted vs ref
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, sw: "/dev/null/mosaic_i2d.fits")
+    monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/refcat.fits")
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, path: 2022.5)
+    monkeypatch.setattr(aa, "load_reference", lambda ref, ep: (ref_sc, None))
+    monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
+    monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
+    _png, metrics = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
+    return metrics
+
+
+def test_stage4_passes_at_zero_offset(monkeypatch):
+    # a correctly-registered frame (0 mas) must PASS end-to-end.
+    m = _stage4_injection(monkeypatch, 0.0)
+    assert m["passed"] is True
+    assert m["cell_off_med"] < 10 and m["gate_off_mas"] < 10
+
+
+def test_stage4_fails_on_90mas_misregistration(monkeypatch):
+    # THE blocker: a 90 mas bulk mis-registration must FAIL, even though the same-star refinement
+    # (mutual NN inside 0.05") would report a small collapsed value.  The gate reads the cell
+    # histogram median, so the mis-registration cannot pass.
+    m = _stage4_injection(monkeypatch, 90.0)
+    assert m["passed"] is False
+    assert m["cell_off_med"] > 75 and m["gate_off_mas"] > 75
 
 
 # --------------------------------------------------------------------------- stage 7 (MAST vs pipeline)

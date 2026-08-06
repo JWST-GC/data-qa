@@ -81,12 +81,64 @@ def xcorr(a: SkyCoord, b: SkyCoord, maxsep=XMAXSEP, binarc=XBIN):
     bg = float(np.median(H[H > 0])) if (H > 0).any() else 0.0
     dra0 = (xe[i] + xe[i + 1]) / 2.0
     ddec0 = (ye[j] + ye[j + 1]) / 2.0
-    # refine: mean of pairs within one bin of the peak
-    near = (np.abs(dra - dra0) < binarc) & (np.abs(ddec - ddec0) < binarc)
-    if near.sum() >= 5:
+    # refine: median of pairs within one bin of the CURRENT centre, iterated so the estimate leaves
+    # the quantized bin centre and converges off the XBIN grid.  A single pass leaves a ~half-bin
+    # (~5 mas at XBIN=0.05") floor even at a true zero offset, because the +/-1-bin box around the
+    # peak bin is asymmetric about the true value; re-centring a few times removes that floor while
+    # a real offset stays put (truth 0 -> ~0.4 mas, truth 90 -> ~90 mas).
+    for _ in range(4):
+        near = (np.abs(dra - dra0) < binarc) & (np.abs(ddec - ddec0) < binarc)
+        if near.sum() < 5:
+            break
         dra0, ddec0 = float(np.median(dra[near])), float(np.median(ddec[near]))
     return dict(dra=dra0 * 1000, ddec=ddec0 * 1000, off=float(np.hypot(dra0, ddec0) * 1000),
                 npairs=int(len(ia)), peak_ratio=float(H.max() / bg) if bg else float("inf"))
+
+
+# The offset-histogram peak is density-immune to nearest-neighbour collapse but NOT to a
+# dense-reference bias: two catalogs tracing the same clustered field make a correlated,
+# non-uniform wrong-pair background that pulls the peak by several mas.  On brick 2221-o001 the
+# histogram reads 9-17 mas against dense VIRAC2 while the SAME-STAR tie is 0.4-1.6 mas; the
+# per-tile map (12x12) is median 5.2 / max 14.7 mas, i.e. there is no real offset.  So: use the
+# histogram to DETECT that the tie is small, then refine SAME-STAR.  See the "Histogram-stacking
+# is density-immune to NN-collapse but NOT to a dense-reference bias" rule in the pipeline's
+# CLAUDE.md, and JWST-GC/data-qa#1.
+SAME_STAR_MAX_BULK_MAS = 100.0   # above this the nearest pair is not the right star -> refuse
+
+
+def same_star_tie(a: SkyCoord, b: SkyCoord, bulk=None, radius=0.05 * u.arcsec, minpairs=30):
+    """Bulk offset (mas) to move ``a`` onto ``b`` from MUTUAL nearest pairs -- the same star seen
+    in both catalogs.
+
+    REFUSES (returns None) unless a verified SMALL global tie already exists, because that is the
+    only condition under which the nearest pair is the RIGHT star; without it this would be the
+    dense nearest-neighbour median that collapses toward zero and fabricates false agreement.
+    Pass the ``xcorr`` result as ``bulk`` (it is measured first anyway); ``bulk=None`` measures it.
+
+    Mutual (not one-way) nearest: a one-way match lets many ``a`` rows claim one ``b`` row, which
+    is exactly the many-to-one pollution this is meant to avoid.
+    """
+    if bulk is None:
+        bulk = xcorr(a, b)
+    # Refuse unless a verified SMALL global tie exists AND the xcorr peak that measured it was
+    # unambiguous (peak_ratio >= MIN_PEAK_RATIO).  An ambiguous xcorr can report a small ``off`` by
+    # chance; admitting the nearest-pair median on top of it would fabricate agreement.  An
+    # explicitly-supplied ``bulk`` with no peak_ratio is treated as already vetted by the caller.
+    if (not bulk or bulk.get("off", np.inf) > SAME_STAR_MAX_BULK_MAS
+            or bulk.get("peak_ratio", np.inf) < MIN_PEAK_RATIO):
+        return None
+    i_ab, sep, _ = a.match_to_catalog_sky(b)
+    i_ba, _, _ = b.match_to_catalog_sky(a)
+    mutual = (sep < radius) & (i_ba[i_ab] == np.arange(len(a)))
+    if mutual.sum() < minpairs:
+        return None
+    bm = b[i_ab[mutual]]; am = a[mutual]
+    dra = (bm.ra - am.ra).to(u.arcsec).value * np.cos(np.radians(am.dec.value)) * 1000
+    ddec = (bm.dec - am.dec).to(u.arcsec).value * 1000
+    mdra, mddec = float(np.median(dra)), float(np.median(ddec))
+    return dict(dra=mdra, ddec=mddec, off=float(np.hypot(mdra, mddec)),
+                npairs=int(mutual.sum()),
+                scatter=float(np.hypot(mad_std(dra), mad_std(ddec))))
 
 
 def direct_intermodule(sc_a: SkyCoord, sc_b: SkyCoord, radius=0.1 * u.arcsec):

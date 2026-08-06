@@ -261,13 +261,18 @@ def _mast_source_catalog(o: Observation, filt):
     return None
 
 
-def _jwst_sources(o: Observation, filt):
+def _jwst_sources(o: Observation, filt, position_valid=False):
     """JWST source positions + magnitude for one filter, READ FROM THE CATALOG -- never
     re-detected.  This is a QA of releaseable products: show what the catalog contains, don't
     bake our own detection.  Priority: the RELEASE merged catalog (mag_vega_<filt> +
     skycoord_<filt>); else the MAST-delivered per-i2d source catalog (sky_centroid +
     aper abmag).  Returns (SkyCoord, mag, source_label) or (None, None, None) -> caller red-flags.
-    The only thing baked downstream is the crossmatch (to VIRAC / across filters)."""
+    The only thing baked downstream is the crossmatch (to VIRAC / across filters).
+
+    ``position_valid`` additionally drops rows whose ``skycoord_<filt>`` is not that row's own
+    measured position (see ``_position_valid``).  Callers that need POSITIONS pass True; the
+    photometric stages leave it False, because a row's flux is its own even when the cross-filter
+    position match was loose."""
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     from astropy.table import Table
@@ -279,8 +284,12 @@ def _jwst_sources(o: Observation, filt):
             sc = m[sccol]
             mag = np.asarray(m[magcol], float)
             g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(mag)
+            note = None
+            if position_valid:
+                g, note = _position_valid(m, filt, g)
             if g.sum() >= 30:
-                return sc[g], mag[g], f"release:{os.path.basename(cat)}"
+                lbl = f"release:{os.path.basename(cat)}"
+                return sc[g], mag[g], (f"{lbl} [{note}]" if note else lbl)
     # 2) MAST-delivered per-i2d source catalog
     mp = _mast_source_catalog(o, filt)
     if mp:
@@ -328,13 +337,52 @@ def _dao_position_catalog(o: Observation, filt):
     return max(pats, key=lambda p: (_catalog_priority(os.path.basename(p))[0], _mtime(p)))
 
 
+# A merged catalog's ``skycoord_<filt>`` is only that ROW's own position when the cross-filter
+# match was tight.  jicama's merge accepts anything inside max_offset=0.10", which at GC density
+# (JWST NN spacing ~0.1-0.2") also admits the NEIGHBOUR of an undetected star, so the row carries
+# a position ~one neighbour-spacing away.  Measured on brick 2221-o001 F212N: rows with
+# sep_f212n in 0.05-0.10" are 43% of the second lobe in the JWST-VIRAC offset cloud and only 2%
+# of its core, at the SAME magnitude and the SAME saturated fraction (so it is match quality, not
+# a bright-star centroid bias).  Cutting at 0.05" (~1.6 SW pix) leaves a tie that is flat with
+# magnitude (-0.6 to +0.2 mas from Vega 8 to 18.5) and moves the cloud's median from -11.2 to
+# -0.9 mas.  Astrometry therefore uses a TIGHTER radius than the merge's photometric tolerance.
+# See JWST-GC/data-qa#1.
+POSITION_VALID_SEP_ARCSEC = 0.05
+
+
+def _position_valid(tbl, filt, finite):
+    """Rows of ``tbl`` whose ``skycoord_<filt>`` is that row's own measured position.
+
+    Requires ``sep_<filt>`` within POSITION_VALID_SEP_ARCSEC.  Returns ``finite`` unchanged when
+    the catalog has no ``sep_<filt>`` column (a MAST or per-filter DAO catalog, where the position
+    is the detection's own by construction), so this never silently empties a valid source."""
+    import astropy.units as u
+    col = f"sep_{filt.lower()}"
+    if col not in tbl.colnames:
+        return finite, None
+    sep = tbl[col]
+    # merge_catalogs writes sep_<filt> as a Quantity/Column in DEGREES.  A bare Column still has
+    # a .to() method, so dispatch on the UNIT, not on hasattr, and assume degrees when absent.
+    unit = getattr(sep, "unit", None)
+    sep = (u.Quantity(np.asarray(sep, float), unit).to(u.arcsec).value if unit is not None
+           else np.asarray(sep, float) * 3600.0)
+    ok = finite & np.isfinite(sep) & (sep <= POSITION_VALID_SEP_ARCSEC)
+    # never turn a measurable field into a red flag: if the cut leaves too little, keep the
+    # uncut selection and say so, rather than reporting "offset unmeasurable".
+    if ok.sum() < 30:
+        return finite, "sep-cut-skipped(too-few)"
+    return ok, f"sep<={POSITION_VALID_SEP_ARCSEC}\""
+
+
 def _jwst_positions(o: Observation, filt):
     """Positions (+source label) for the frame-tie check ONLY (stage 4 needs no magnitude).
     Prefers a catalog WITH photometry (``_jwst_sources``: release merged -> MAST); falls back to a
     per-filter release DAO catalog (positions only) so a detected-but-not-yet-merged obs still gets
-    a real offset measurement.  Returns (SkyCoord, label) or (None, None)."""
+    a real offset measurement.  Applies the positional-validity cut above -- stage 4 measures the
+    FRAME, so a row holding a neighbour's position is not admissible evidence about it.
+    Returns (SkyCoord, label) or (None, None)."""
     from astropy.table import Table
-    sc, _mag, src = _jwst_sources(o, filt)
+    sc, _mag, src = _jwst_sources(o, filt, position_valid=True)
     if sc is not None:
         return sc, src
     dp = _dao_position_catalog(o, filt)
@@ -1156,15 +1204,34 @@ def stage4_offsets(o: Observation, sw):
         return png, metrics
 
     cc = _cell_consistency(cells, dropped)
-    off_med, spread, se, signif = cc["off_med"], cc["spread"], cc["se"], cc["signif"]
+    cell_off_med, spread, se, signif = cc["off_med"], cc["spread"], cc["se"], cc["signif"]
     io = metrics.get("intermodule_off")
-    # PASS needs a small SOURCE-WEIGHTED median tie, spatially CONSISTENT cells (no
-    # adjacency-confirmed sub-region off by >30 mas holding >2% of sources; catches a minority a
-    # mad_std cannot), enough coverage, and no inter-module offset.
-    passed = bool(off_med < aa.THRESH["absolute"] and cc["consistent"] and
+    # The per-cell values are histogram peaks against a DENSE reference and carry the several-mas
+    # dense-reference bias (brick 2221-o001: 9-17 mas histogram vs 0.4-1.6 mas same-star).  Once
+    # the cells have shown the tie is SMALL, refine the reported bulk SAME-STAR; the per-cell map
+    # keeps doing the job it exists for, which is finding a spatial discontinuity a scalar hides.
+    ss = aa.same_star_tie(jsc, ref_sc)
+    off_med = ss["off"] if ss else cell_off_med
+    bulk_source = "same-star" if ss else "histogram"
+    # The MAGNITUDE gate is the per-cell xcorr histogram median (``cell_off_med``), which tracks a
+    # real bulk mis-registration up to XMAXSEP.  The same-star tie is a REFINEMENT reported when a
+    # small tie is confirmed, NOT the gate: every same-star pair is matched inside 0.05", so its
+    # median is necessarily < 50 mas < THRESH["absolute"] and cannot fail -- gating on it would let
+    # a real 90 mas offset (cell_off_med ~= 87, same-star ~= 13) pass.  Gate on the LARGER of the
+    # two so a genuine mis-registration the histogram sees cannot be masked by the refinement.
+    gate_off = max(cell_off_med, off_med)
+    # PASS needs a small tie, spatially CONSISTENT cells (no adjacency-confirmed sub-region off by
+    # >30 mas holding >2% of sources; catches a minority a mad_std cannot), enough coverage, and no
+    # inter-module offset.
+    passed = bool(gate_off < aa.THRESH["absolute"] and cc["consistent"] and
                   (io is None or io < aa.THRESH["intermodule"]))
     metrics.update(offset_med_mas=off_med, offset_scatter_mas=spread, offset_signif_med=signif,
-                   bulk_off=off_med,                        # primary (source-weighted) offset
+                   bulk_off=off_med,                        # reported offset (same-star when available)
+                   gate_off_mas=gate_off,                   # value the magnitude gate tests (cell histogram)
+                   bulk_source=bulk_source, cell_off_med=cell_off_med,
+                   same_star_off=(ss["off"] if ss else None),
+                   same_star_npairs=(ss["npairs"] if ss else None),
+                   same_star_scatter_mas=(ss["scatter"] if ss else None),
                    n_cells=cc["n_cells"], n_cells_dropped=cc["n_dropped"],
                    n_cells_deviating=cc["n_deviating"], n_cells_confirmed=cc["n_confirmed"],
                    bad_src_frac=cc["bad_src_frac"], cell_coverage=cc["coverage"],
@@ -1185,9 +1252,12 @@ def stage4_offsets(o: Observation, sw):
     # get a RED outline (deviating = bad); DROPPED cells (sources present, no clear peak) render
     # grey -- so a discontinuity or missing coverage is visible, not inferable.
     a0 = ax[0][col]; col += 1
-    # cap the colour scale near the field tie (a few wild cells would otherwise wash out the
-    # 30-vs-130 structure); over-scale cells saturate but are already flagged by the green outline.
-    vmax = max(2.0 * aa.THRESH["absolute"], 2.0 * off_med)
+    # Scale the colour to the DATA, not to the gate.  The old floor of 2*THRESH (=150 mas) meant a
+    # well-tied field with 0-20 mas cells was drawn against a 0-140 ramp: every cell rendered
+    # near-black and the real structure was invisible.  Stretch to the largest measured cell
+    # (+10% headroom), floored so an essentially-perfect field still gets a usable ramp and capped
+    # so one wild cell cannot flatten the rest; the 75 mas gate is drawn ON the colourbar instead,
+    # which is where it is legible without costing dynamic range.
     # CONTIGUOUS grid (imshow), so the cells tile with no whitespace and a coherent patch is
     # obvious.  Use the TRUE grid edges (same linspace as _cell_offsets), NOT reconstructed from
     # surviving cell centres -- a skipped interior cell would otherwise mis-size the extent.
@@ -1204,9 +1274,18 @@ def stage4_offsets(o: Observation, sw):
     ext = [re_[0], re_[-1], de_[0], de_[-1]]
     import matplotlib as mpl
     cmap = mpl.colormaps["inferno"].copy(); cmap.set_bad("0.7")     # dropped/absent cells -> grey
+    gmax = float(np.nanmax(grid)) if np.isfinite(grid).any() else 0.0
+    vmax = min(2.0 * aa.THRESH["absolute"], max(10.0, 1.1 * gmax))
     im0 = a0.imshow(grid.T, origin="lower", extent=ext, aspect="auto", cmap=cmap,
                     vmin=0, vmax=vmax)
-    fig.colorbar(im0, ax=a0, label="cell tie [mas]", shrink=0.85)
+    cb0 = fig.colorbar(im0, ax=a0, label="cell tie [mas]", shrink=0.85)
+    if aa.THRESH["absolute"] <= vmax:
+        cb0.ax.axhline(aa.THRESH["absolute"], color="#39ff14", lw=1.6)
+        cb0.ax.text(1.6, aa.THRESH["absolute"], " 75 mas gate", color="#2a7d0f", fontsize=6,
+                    va="center", transform=cb0.ax.get_yaxis_transform())
+    else:
+        cb0.ax.set_title(f"gate 75\n({aa.THRESH['absolute'] / max(vmax, 1e-9):.0f}× top)",
+                         fontsize=5.5, color="0.35", pad=3)
     # RED outline on confirmed-deviating cells (deviating = bad), on the true grid edges
     for k, c in enumerate(cells):
         if confirmed[k]:
@@ -1215,7 +1294,7 @@ def stage4_offsets(o: Observation, sw):
                                    fill=False, ec="#e41a1c", lw=2.0, zorder=3))
     a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
     a0.set_title(f"per-cell tie ({_dataset_label(metrics)}): {cc['n_cells']} measured, "
-                 f"{cc['n_dropped']} no-peak\nmedian {off_med:.0f} mas; {cc['n_confirmed']} cells "
+                 f"{cc['n_dropped']} no-peak\nmedian {cell_off_med:.0f} mas; {cc['n_confirmed']} cells "
                  f"({100 * cc['bad_src_frac']:.0f}% of sources) deviate", fontsize=8)
     # panel 2: per-cell offsets in (dRA, dDec) sized by source count (big = more sources = more
     # weight), the source-weighted median tie, and the 75 mas gate.
@@ -1223,18 +1302,50 @@ def stage4_offsets(o: Observation, sw):
     # sized by source count; HOLLOW circles so overlapping cells at similar (ΔRA,ΔDec) are both
     # visible instead of one hiding the other.
     sz = 30 + 130 * np.array([c["n"] for c in cells]) / max(c["n"] for c in cells)
-    a1.scatter(cdra[~deviating], cdde[~deviating], s=sz[~deviating], facecolors="none",
-               edgecolors="#4477aa", linewidths=1.2, label="consistent")
+    # Colour each point by WHERE ON THE SKY its cell sits, so a coherent sub-region reads as a
+    # colour clump here instead of being an anonymous dot: the question this panel has to answer
+    # is "is the spread random, or is one part of the mosaic pulled?".  Quadrant of the 4x4 grid,
+    # named on sky (RA above the field centre = East, Dec above = North) and oriented to match
+    # panel 1, which has RA inverted.
+    QCOL = {"NE": "#4477aa", "NW": "#228833", "SE": "#ccbb44", "SW": "#aa3377"}
+    ci = np.array([c["i"] for c in cells]); cj = np.array([c["j"] for c in cells])
+    quad = np.array([("N" if j >= NCELL / 2 else "S") + ("E" if i >= NCELL / 2 else "W")
+                     for i, j in zip(ci, cj)])
+    for q in ["NE", "NW", "SE", "SW"]:
+        m = (quad == q) & ~deviating
+        if m.any():
+            a1.scatter(cdra[m], cdde[m], s=sz[m], facecolors="none", edgecolors=QCOL[q],
+                       linewidths=1.3, label=q)
     if deviating.any():
-        a1.scatter(cdra[deviating], cdde[deviating], s=sz[deviating], facecolors="none",
-                   edgecolors="#e41a1c", linewidths=1.4, label="deviating")
+        # deviating keeps the red ring (deviating = bad) but stays quadrant-filled, so it is
+        # still readable which part of the sky is the one that deviates.
+        for q in ["NE", "NW", "SE", "SW"]:
+            m = (quad == q) & deviating
+            if m.any():
+                a1.scatter(cdra[m], cdde[m], s=sz[m], facecolors=QCOL[q], alpha=0.55,
+                           edgecolors="#e41a1c", linewidths=1.8,
+                           label=f"{q} (deviating)")
     a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2)
-    a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
-    lim = max(aa.THRESH["absolute"] * 1.2, 1.4 * float(np.max(np.hypot(cdra, cdde))))
+    # Frame the DATA.  The old limit floored at 1.2*THRESH (=90 mas), so a field whose cells all
+    # sit inside 20 mas was drawn as a few dots lost inside a 75 mas gate circle that dominated
+    # the panel and conveyed nothing.  Zoom to the cells; draw the gate ring only when it is
+    # actually near them, and otherwise say how far outside it is.
+    dmax = float(np.max(np.hypot(cdra, cdde))) if len(cells) else 0.0
+    lim = max(5.0, 1.5 * dmax)
+    if aa.THRESH["absolute"] <= 1.05 * lim:
+        a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
+        gate_note = "dotted = 75 mas gate"
+    else:
+        gate_note = f"75 mas gate is {aa.THRESH['absolute'] / max(lim, 1e-9):.0f}× outside this view"
+    # a circle at the cell-to-cell spread IS at the data's scale, so it gives the eye something
+    # to judge the scatter against now that the gate ring is usually off-view.
+    if spread is not None and spread > 0 and spread <= lim:
+        a1.add_patch(Circle((cc["off_dra"], cc["off_dde"]), spread, fill=False, ec="0.45",
+                            ls="--", lw=0.8))
     a1.set_xlim(-lim, lim); a1.set_ylim(-lim, lim)
     a1.set_xlabel("ΔRA [mas]"); a1.set_ylabel("ΔDec [mas]")
-    a1.legend(fontsize=7, loc="upper right")
+    a1.legend(fontsize=6, loc="upper right", ncols=2, handletextpad=0.3, columnspacing=0.6)
     # marginal ΔRA / ΔDec histograms of the per-cell ties, weighted by source count (so the
     # marginals reflect the source-weighted tie, not raw cell counts).  Title goes on the top
     # marginal so it clears the inset histograms.
@@ -1242,9 +1353,14 @@ def stage4_offsets(o: Observation, sw):
                                weights=np.array([c["n"] for c in cells], float))
     se_str = f"±{se:.0f}" if se is not None else ""
     sig_str = f", {signif:.0f}σ" if signif is not None else ""
-    a1t.set_title(f"source-weighted tie {off_med:.0f}{se_str} mas{sig_str}\n"
-                  f"(point size ∝ sources; dotted = 75 mas gate; marginals source-weighted)",
-                  fontsize=8)
+    # the panel shows the per-CELL histogram peaks, so its headline is the cell median; the
+    # same-star refinement of the field bulk is reported alongside it, not substituted for it.
+    ss_str = (f"\nsame-star bulk {ss['off']:.1f} mas (n={ss['npairs']})" if ss else
+              "\nsame-star bulk unavailable — histogram value stands")
+    a1t.set_title(f"source-weighted cell tie {cell_off_med:.0f}{se_str} mas{sig_str}{ss_str}\n"
+                  f"(colour = sky quadrant; point size ∝ sources; dashed = cell-to-cell "
+                  f"spread; {gate_note}; marginals source-weighted)",
+                  fontsize=7)
     if im:
         # inter-module offset is just two numbers -- print them, don't histogram/bar them.
         a2 = ax[0][col]; col += 1
@@ -2807,8 +2923,14 @@ def _caption_for_impl(n, metrics):
         sig = metrics.get("offset_signif_med"); sp = metrics.get("offset_scatter_mas")
         nd = metrics.get("n_cells_dropped") or 0; ncf = metrics.get("n_cells_confirmed") or 0
         badf = metrics.get("bad_src_frac")
+        # the significance is cell_off_med / cell-to-cell standard error, so it only belongs next
+        # to the CELL median.  Quoting it next to a same-star bulk produced "the tie is 0 mas ...
+        # 3σ from zero", which reads as a contradiction.
+        same_star = metrics.get("bulk_source") == "same-star"
         unc = (f", cell-to-cell spread {sp:.0f} mas"
-               + (f" → {sig:.0f}σ from zero" if sig is not None else "")) if sp is not None else ""
+               + (f" → {sig:.0f}σ from zero" if (sig is not None and not same_star) else "")
+               ) if sp is not None else ""
+        om_str = f"{om:.1f}" if abs(om) < 10 else f"{om:.0f}"
         base = (f"**Stage 4 — positional offsets (JWST ↔ VIRAC frame tie).** The "
                 f"[**bulk** offset](DOCROOT#glossary-bulk) is the JWST catalogue "
                 f"[cross-matched to VIRAC](DOCROOT#glossary-crossmatch) and registered onto the "
@@ -2820,9 +2942,22 @@ def _caption_for_impl(n, metrics):
                 f"and a green outline marks cells that coherently deviate. The MIDDLE panel plots "
                 f"the per-cell offsets as (ΔRA, ΔDec) points sized by source count, with the "
                 f"source-weighted median tie, the 75 mas gate, and ΔRA/ΔDec marginal histograms. "
-                f"Here the tie is {om:.0f} mas over {nc} measured cells ({nd} without a peak){unc}; "
+                f"Here the tie is {om_str} mas over {nc} measured cells ({nd} without a peak){unc}; "
                 f"the [uncertainty](DOCROOT#glossary-tie-uncertainty) is the cell-to-cell standard "
                 f"error (not a per-star RMS or per-star error). ")
+        # The histogram peak is density-immune to NN collapse but NOT to a dense-reference bias
+        # (it read 9-17 mas on a brick frame whose same-star tie is <2 mas), so the quoted bulk is
+        # refined SAME-STAR once the cells show the tie is small.  Say which one the number is.
+        if metrics.get("bulk_source") == "same-star":
+            ssn = metrics.get("same_star_npairs"); sss = metrics.get("same_star_scatter_mas")
+            cellm = metrics.get("cell_off_med")
+            base += (f"The quoted bulk is the **same-star** tie from {ssn} mutual nearest pairs"
+                     + (f" (per-star scatter {sss:.0f} mas)" if sss is not None else "")
+                     + (f", a REFINEMENT of the per-cell histogram median ({cellm:.0f} mas) once the "
+                        f"cells confirm the tie is small — an all-pairs peak against a DENSE "
+                        f"reference is pulled by the correlated wrong-pair background. The pass gate "
+                        f"tests the histogram median, not this refinement" if cellm is not None
+                        else "") + ". ")
         if ncf:
             base += (f"{ncf} adjacent cell(s) holding {100 * (badf or 0):.0f}% of the sources are "
                      f"tied differently — an internal discontinuity, so it does NOT pass. ")
