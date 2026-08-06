@@ -267,10 +267,10 @@ def test_offset_reason_overlap_but_no_peak(monkeypatch):
     # no I/O: the reason may quote the JWST mag range, so stub the catalog read out
     monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))
     sc = SkyCoord([266.40, 266.41, 266.42] * u.deg, [-28.90, -28.89, -28.88] * u.deg)
-    msg = D._offset_failure_reason(_obs(), "F200W", sc, sc, {"peak_ratio": 0.3})
-    # must NOT assert an unmeasured cause -- says it's undetermined, and that no VIRAC comparison ran
-    assert "cause not determined" in msg
-    assert "not measured" in msg
+    msg = D._offset_failure_reason(_obs(), "F200W", sc, sc, {"peak_ratio": 0.3, "npairs": 2})
+    # must NOT assert an unmeasured cause -- reports the measured counts and says it is undetermined
+    assert "was not determined" in msg
+    assert "3 JWST sources vs 3 VIRAC reference stars" in msg
 
 
 # --------------------------------------------------------------------------- cell-based stage-4
@@ -331,10 +331,204 @@ def test_cell_offsets_recovers_uniform_shift():
     jsc = SkyCoord(ra * u.deg, dec * u.deg)
     cosd = np.cos(np.radians(-28.9))
     ref = SkyCoord((ra + 100.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # ref is +100 mas E of jsc
-    cells, dropped = D._cell_offsets(jsc, ref, ncell=2, min_per_cell=50)
-    assert len(cells) >= 3
+    cells, dropped, grid = D._cell_offsets(jsc, ref, ncell=2, min_per_cell=50)
+    assert grid == 2 and len(cells) >= 3
     dra = np.array([c["dra"] for c in cells])
     assert np.all(np.abs(dra - 100.0) < 15)      # each cell recovers ~+100 mas
+
+
+def _uniform_shift(n, shift_mas, seed, span=0.02):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(seed)
+    ra = 266.40 + rng.uniform(0, span, n); dec = -28.90 + rng.uniform(0, span, n)
+    cosd = np.cos(np.radians(-28.9))
+    jsc = SkyCoord(ra * u.deg, dec * u.deg)
+    ref = SkyCoord((ra + shift_mas / 3.6e6 / cosd) * u.deg, dec * u.deg)
+    return jsc, ref
+
+
+def test_cell_offsets_adaptive_grid_fired_2x2():
+    # issue #13: a field too sparse to fill a 4x4 cell (min 300 stars) must FALL BACK to the 2x2
+    # grid -- and _cell_offsets must report grid_used == 2, not silently succeed via the 1x1 rung.
+    jsc, ref = _uniform_shift(700, 90.0, seed=7)   # ~44 per 4x4 cell (<300); ~175 per 2x2 cell
+    assert D._cell_grid(jsc, ref, 4, 300)[0] == []            # fine grid measures nothing
+    cells, _dropped, grid = D._cell_offsets(jsc, ref)
+    assert grid == 2, "the 2x2 rung must fire here; deleting it must break this test"
+    off = float(np.hypot(np.median([c["dra"] for c in cells]),
+                         np.median([c["dde"] for c in cells])))
+    assert abs(off - 90.0) < 20
+
+
+def test_cell_offsets_adaptive_grid_fired_1x1():
+    # even sparser: neither 4x4 nor 2x2 fills a cell, so the WHOLE-FIELD (1x1) fallback must fire.
+    jsc, ref = _uniform_shift(200, 90.0, seed=11)  # ~50 per 2x2 cell (<150) -> only 1x1 works
+    assert D._cell_grid(jsc, ref, 2, 150)[0] == []
+    cells, _dropped, grid = D._cell_offsets(jsc, ref)
+    assert grid == 1, "the 1x1 whole-field fallback must fire; deleting it must break this test"
+    assert len(cells) == 1
+
+
+def test_offset_failure_reason_reports_counts_not_cause(monkeypatch, tmp_path):
+    # the reason string must report measured counts (JWST / reference / pairs) and NOT assert a
+    # single cause; and a confident peak must never print "peak_ratio >=4 < 4".
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))
+    ra = 266.40 + np.linspace(0, 0.02, 300); dec = -28.90 + np.linspace(0, 0.02, 300)
+    jsc = SkyCoord(ra * u.deg, dec * u.deg); ref = SkyCoord(ra * u.deg, dec * u.deg)
+    hi = D._offset_failure_reason(_obs(), "F210M", jsc, ref, {"peak_ratio": 16.0, "npairs": 250})
+    assert "300 JWST sources" in hi and "matched pairs" in hi
+    assert "16.0" in hi and "< 4" not in hi and "≥" in hi
+    lo = D._offset_failure_reason(_obs(), "F210M", jsc, ref, {"peak_ratio": 1.2, "npairs": 5})
+    assert "300 JWST sources" in lo and "not determined" in lo
+
+
+def _stage4_seams(monkeypatch, cells, dropped, grid_used):
+    """Monkeypatch stage-4's I/O seams so stage4_offsets runs on a synthetic cell result, exercising
+    the REAL gate (not a re-implementation of it)."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    ra = 266.40 + np.linspace(0, 0.02, 300); dec = -28.90 + np.linspace(0, 0.02, 300)
+    jsc = SkyCoord(ra * u.deg, dec * u.deg)
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: "/dev/null/x_i2d.fits")
+    monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/ref")
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2024.0)
+    monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (jsc, None))
+    monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
+    monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
+    monkeypatch.setattr(D, "_cell_offsets", lambda j, r: (cells, dropped, grid_used))
+    monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: None)   # -> off_med = cell_off_med
+    monkeypatch.setattr(D, "_save", lambda fig, name: name)
+
+
+def test_stage4_whole_field_passes_but_flags_spatial_unassessed(monkeypatch):
+    # a genuine 1x1 whole-field tie (grid_used=1) with a SMALL offset PASSES: no per-cell spatial
+    # check is possible, so it is bypassed -- but spatial_assessed is False so make_issues will not
+    # auto-tick 'frame_ok'.  Reverting `spatial_ok = True if whole_field else cc["consistent"]`
+    # fails this (one cell is never 'consistent').
+    cells = [dict(i=0, j=0, ra=266.41, dec=-28.89, dra=5.0, dde=0.0, off=5.0, peak_ratio=20.0,
+                  n=5000, n_ref=5000, npairs=5000)]
+    _stage4_seams(monkeypatch, cells, [], grid_used=1)
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    assert m["passed"] is True and m["spatial_assessed"] is False and m["grid_used"] == 1
+
+
+def test_stage4_low_coverage_grid_does_not_pass(monkeypatch):
+    # A large field with only 3 of 16 cells measurable (grid_used=4) is 19% coverage -- NOT a small
+    # field.  It must FAIL on coverage; keying on cell count alone (the reverted heuristic) would
+    # wrongly pass it (#13 review).
+    cells = [dict(i=i, j=0, ra=266.41 + 0.001 * i, dec=-28.89, dra=5.0, dde=0.0, off=5.0,
+                  peak_ratio=8.0, n=400, n_ref=400, npairs=400) for i in range(3)]
+    dropped = [dict(i=i % 4, j=1 + i // 4, ra=266.41, dec=-28.89, n=400, n_ref=100,
+                    reason="too few reference stars") for i in range(13)]
+    _stage4_seams(monkeypatch, cells, dropped, grid_used=4)
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    assert m["cell_coverage"] < 0.5 and m["passed"] is False
+
+
+def test_mosaic_path_single_module_nrcb(tmp_path, monkeypatch):
+    # issue #13: a single-module (NRCB-only) obs names its mosaic '-nrcb', not '-merged'.
+    # _mosaic_path must find it (else stage 1 blanks and stage 7 shows "no pipeline mosaic").
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "sickle" / "F210M" / "pipeline"; d.mkdir(parents=True)
+    (d / "jw03958-o007_t001_nircam_clear-f210m-nrcb_i2d.fits").write_text("")
+    # a residual sidecar with the same module tag must NOT be picked
+    (d / "jw03958-o007_t001_nircam_clear-f210m-nrcb_m2_daophot_basic_mergedcat_residual_i2d.fits").write_text("")
+    o = Observation(program="3958", obs="007", target="Sickle", release_field="sickle",
+                    instrument="NIRCam", filters=["F210M"], visits=[], epoch="", notes="")
+    hit = D._mosaic_path(o, "F210M")
+    assert hit is not None and hit.endswith("clear-f210m-nrcb_i2d.fits")
+    assert D._mosaic_module(hit) == "NRCB"
+    # 'merged', when present, is PREFERRED over the single-module mosaic
+    (d / "jw03958-o007_t001_nircam_clear-f210m-merged_i2d.fits").write_text("")
+    assert D._mosaic_path(o, "F210M").endswith("clear-f210m-merged_i2d.fits")
+    assert D._mosaic_module(D._mosaic_path(o, "F210M")) == ""
+
+
+def test_stage4_2x2_three_of_four_fails_without_spatial_check(monkeypatch):
+    # A 2x2 grid with 3 of 4 cells measured (grid_used=2, coverage 0.75 -- ABOVE the 0.5 floor) must
+    # FAIL, because <4 cells is not 'consistent'.  Coverage cannot catch this (0.75 >= 0.5), so the
+    # grid-keyed spatial gate is the only thing holding it -- reverting to an `n_cells >= 4` heuristic
+    # would flip it green (#13 re-review).
+    ij3 = [(0, 0), (0, 1), (1, 0)]                 # 3 of the 4 cells in a 2x2 grid
+    cells = [dict(i=i, j=j, ra=266.41 + 0.001 * i, dec=-28.89 + 0.001 * j, dra=5.0, dde=0.0,
+                  off=5.0, peak_ratio=8.0, n=400, n_ref=400, npairs=400) for i, j in ij3]
+    dropped = [dict(i=1, j=1, ra=266.41, dec=-28.89, n=400, n_ref=100, reason="too few reference stars")]
+    _stage4_seams(monkeypatch, cells, dropped, grid_used=2)
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    assert m["grid_used"] == 2 and 0.5 <= m["cell_coverage"] < 1.0
+    assert m["spatial_assessed"] is True and m["passed"] is False
+
+
+def test_stage4_caption_states_when_spatial_check_skipped():
+    # ask 2 consumer: the caption must claim the spatial-consistency check only when it ran.
+    assessed = D.caption_for(4, dict(stage=4, offset_med_mas=5.0, n_cells=4,
+                                     offset_scatter_mas=2.0, spatial_assessed=True,
+                                     bulk_source="histogram"))
+    assert "spatially consistent cells" in assessed
+    whole = D.caption_for(4, dict(stage=4, offset_med_mas=5.0, n_cells=1,
+                                  offset_scatter_mas=None, spatial_assessed=False,
+                                  bulk_source="histogram"))
+    assert "WHOLE-FIELD" in whole and "NOT performed" in whole
+    assert "spatially consistent cells" not in whole
+
+
+def test_make_issues_frame_ok_untficked_when_spatial_unassessed(monkeypatch):
+    # ask 2 consumer: make_issues must NOT tick the astrometry box on a whole-field tie.
+    from data_qa import make_issues as MI
+    monkeypatch.setattr(MI, "_guidestar_json", lambda: {})
+    o = Observation(program="3958", obs="007", target="Sickle", release_field="sickle",
+                    instrument="NIRCam", filters=["F210M"], visits=[], epoch="", notes="")
+
+    def _M(spatial):
+        return {"stage1": {"passed": True}, "stage2": {"passed": True}, "stage3": {"passed": True},
+                "stage4": {"passed": True, "spatial_assessed": spatial}, "stage5": {}}
+
+    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: _M(False))
+    line = [l for l in MI.render_body(o).splitlines() if "Astrometry" in l][0]
+    assert "[ ]" in line and "[x]" not in line
+    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: _M(True))
+    line2 = [l for l in MI.render_body(o).splitlines() if "Astrometry" in l][0]
+    assert "[x]" in line2
+
+
+def test_mosaic_path_lone_module_incomplete_when_sibling_filter_two_module(tmp_path, monkeypatch):
+    # issue #13 re-review: the two-module guard must be OBSERVATION-scoped.  cloudef jw02092-o002
+    # F360M has only NRCA, but sibling filters have merged mosaics -> the obs is two-module, so the
+    # lone F360M half must read incomplete (None), while a genuine single-module obs (sickle, all
+    # NRCB, no merged/NRCA anywhere) still returns its nrcb mosaic.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "cloudef" / "F210M" / "pipeline"; d.mkdir(parents=True)
+    (d / "jw02092-o002_t001_nircam_clear-f210m-merged_i2d.fits").write_text("")   # sibling is complete
+    d2 = tmp_path / "cloudef" / "F360M" / "pipeline"; d2.mkdir(parents=True)
+    (d2 / "jw02092-o002_t001_nircam_clear-f360m-nrca_i2d.fits").write_text("")     # lone half
+    o = Observation(program="2092", obs="002", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F210M", "F360M"], visits=[], epoch="", notes="")
+    assert D._mosaic_path(o, "F360M") is None                    # incomplete: obs is two-module
+    assert D._mosaic_path(o, "F210M").endswith("f210m-merged_i2d.fits")
+    # a genuine single-module obs (all NRCB, no merged, no NRCA) still returns its mosaic
+    s = tmp_path / "sickle" / "F210M" / "pipeline"; s.mkdir(parents=True)
+    (s / "jw03958-o007_t001_nircam_clear-f210m-nrcb_i2d.fits").write_text("")
+    so = Observation(program="3958", obs="007", target="Sickle", release_field="sickle",
+                     instrument="NIRCam", filters=["F210M"], visits=[], epoch="", notes="")
+    assert D._mosaic_path(so, "F210M").endswith("f210m-nrcb_i2d.fits")
+
+
+def test_mosaic_path_two_module_no_merged_returns_none(tmp_path, monkeypatch):
+    # issue #13 review: a two-module obs that simply has not been merged (both -nrca and -nrcb over
+    # DIFFERENT sky, e.g. cloudc o002 F212N) must NOT return one half as 'the mosaic' -- that would
+    # flip 'delivered' green while NRCA/the merge is missing.  Return None (incomplete).
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "cloudc" / "F212N" / "pipeline"; d.mkdir(parents=True)
+    (d / "jw02221-o002_t001_nircam_clear-f212n-nrca_i2d.fits").write_text("")
+    (d / "jw02221-o002_t001_nircam_clear-f212n-nrcb_i2d.fits").write_text("")
+    o = Observation(program="2221", obs="002", target="Cloud C", release_field="cloudc",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    assert D._mosaic_path(o, "F212N") is None      # both modules, no merged -> incomplete
+    # once a merged exists, it is returned
+    (d / "jw02221-o002_t001_nircam_clear-f212n-merged_i2d.fits").write_text("")
+    assert D._mosaic_path(o, "F212N").endswith("clear-f212n-merged_i2d.fits")
 
 
 def test_ab_overlap_returns_matched_positions():

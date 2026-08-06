@@ -83,7 +83,10 @@ def render_body(o: Observation) -> str:
     # AGREE.  A bare `bulk_off < THRESH` would tick the box for a bimodal frame (gc2211 o050:
     # median 57 mas but cell-to-cell spread 58 mas) -- exactly the "within survey noise" claim
     # that must not be ticked for an internally-inconsistent mosaic (PR #54 review).
-    frame_ok = bool(s4.get("passed"))
+    # Require BOTH a passing tie AND that the per-cell spatial-consistency check actually ran: a
+    # small/sparse field measured WHOLE-FIELD (spatial_assessed False, issue #13) has no per-cell
+    # check, so a sub-region discontinuity could hide -- do not auto-tick "within survey noise".
+    frame_ok = bool(s4.get("passed")) and s4.get("spatial_assessed", True)
     # inter-module: prefer stage 5's reference-free overlap offset, else stage 4's.  Absent =
     # 'not yet measured' -> left unchecked (the sticky-merge won't downgrade a prior check).
     im = s5.get("intermodule_off", s4.get("intermodule_off"))

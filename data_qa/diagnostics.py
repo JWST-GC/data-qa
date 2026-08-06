@@ -102,20 +102,75 @@ def _available_filters(o: Observation):
 
 # --------------------------------------------------------------------------- product lookup
 def _mosaic_path(o: Observation, filt):
-    """Released merged i2d for this obs+filter, or None."""
+    """Released science mosaic for this obs+filter, or None.  Prefers the all-detector 'merged'
+    drizzle.  A genuinely single-module observation (e.g. sickle jw03958-o007, NRCB-only) names its
+    mosaic '-nrcb', never '-merged', so a merged-only glob would wrongly report 'no mosaic' and
+    blank stage 1 / the stage-7 pipeline panel (issue #13).
+
+    But a single-module mosaic is accepted ONLY when the OTHER module has no mosaic for this
+    obs+filter: a two-module observation that simply has not been merged yet (e.g. cloudc o002
+    F212N, which has both -nrca and -nrcb over DIFFERENT sky) must NOT silently return one half as
+    'the mosaic' -- that flips 'delivered' green and hides that NRCA/the merge is missing.  In that
+    case return None so the deliverable reads incomplete (#13 review)."""
     if not filt:                     # obs with no filter for this channel (e.g. a single-band obs)
         return None
-    stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_i2d.fits"
-    pats = [
-        f"{BASE}/{o.field}/{filt}/pipeline/{stem}",
-        f"{BASE}/{o.field}/*/pipeline/{stem}",
-        f"{BASE}/{o.field}/images-merged/{stem}",   # not-yet-released fields (e.g. gc2211) land mosaics here
+    dir_pats = [
+        f"{BASE}/{o.field}/{filt}/pipeline",
+        f"{BASE}/{o.field}/*/pipeline",
+        f"{BASE}/{o.field}/images-merged",   # not-yet-released fields (e.g. gc2211) land mosaics here
     ]
-    for pat in pats:
-        hits = sorted(glob.glob(pat))
-        if hits:
-            return hits[-1]
-    return None
+
+    def find(tag):
+        stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits"
+        for d in dir_pats:
+            hits = sorted(glob.glob(f"{d}/{stem}"))
+            if hits:
+                return hits[-1]
+        return None
+
+    merged = find("merged")
+    if merged:
+        return merged
+    nrcb, nrca = find("nrcb"), find("nrca")
+    present = [p for p in (nrcb, nrca) if p]
+    if len(present) == 1:                     # only one module has a mosaic for THIS filter
+        # OBSERVATION-level completeness: a lone nrcX is a genuine single-module deliverable only if
+        # the OBSERVATION is single-module.  If a SIBLING filter of the same obsid has a merged
+        # mosaic or both modules, the obs has two modules and this filter is a half-delivered filter
+        # (e.g. cloudef jw02092-o002 F360M has only NRCA while F162M/F210M/F480M have both + merged)
+        # -- return None so it reads incomplete rather than flipping 'delivered' green (#13 review).
+        if _obs_is_two_module(o, dir_pats):
+            return None
+        return present[0]
+    return None                               # both modules but no merged -> incomplete, not half
+
+
+def _obs_is_two_module(o: Observation, dir_pats):
+    """True if ANY filter of this obsid has a merged mosaic or BOTH NRCA and NRCB mosaics on disk --
+    evidence the observation is two-module, so a lone single-module mosaic for some other filter is
+    an incomplete half, not a single-module deliverable."""
+    a_filts, b_filts = set(), set()
+    for d in dir_pats:
+        for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-*_i2d.fits"):
+            m = re.search(r"clear-(f\d{3}[wnm])-(merged|nrca|nrcb)_i2d\.fits$", os.path.basename(p).lower())
+            if not m:
+                continue
+            filt, tag = m.group(1), m.group(2)
+            if tag == "merged":
+                return True
+            (a_filts if tag == "nrca" else b_filts).add(filt)
+    return bool(a_filts & b_filts)            # some filter has BOTH modules
+
+
+def _mosaic_module(path):
+    """'NRCA' / 'NRCB' if ``path`` is a single-module mosaic, else '' (merged / all-detector).  Used
+    to tag the stage-1 title + metrics so a single-module panel is never mistaken for the full obs."""
+    low = os.path.basename(path or "").lower()
+    if "-nrca_i2d" in low:
+        return "NRCA"
+    if "-nrcb_i2d" in low:
+        return "NRCB"
+    return ""
 
 
 _MLEVEL_RE = re.compile(r"_m([1-8])(?:_|\b)", re.I)
@@ -629,10 +684,15 @@ def stage1_mosaics(o: Observation, sw, lw):
     fig = plt.figure(figsize=(W, sum(heights) + 0.35 * len(panels)))
     gs = fig.add_gridspec(len(panels), 1, height_ratios=heights, hspace=0.18)
     fracs = {}
+    modules = {}                                   # filt -> 'NRCA'/'NRCB' when a single-module mosaic
     for i, (filt, p, _asp) in enumerate(panels):
         a = fig.add_subplot(gs[i, 0])
         if p:
-            fracs[filt] = _grayscale(a, p, f"{o.obsid}  {filt}")
+            mod = _mosaic_module(p)
+            if mod:
+                modules[filt] = mod
+            title = f"{o.obsid}  {filt}" + (f"  [{mod} only]" if mod else "")
+            fracs[filt] = _grayscale(a, p, title)
         else:
             a.text(0.5, 0.5, f"{filt}\n(no i2d)", ha="center", va="center")
             a.set_xticks([]); a.set_yticks([])
@@ -645,7 +705,7 @@ def stage1_mosaics(o: Observation, sw, lw):
     png = _save(fig, f"{o.obsid}_stage1.png")
     metrics = dict(stage=1, sw=sw, lw=lw,
                    sw_present=bool(psw), lw_present=bool(plw),
-                   finite_fraction=fracs,
+                   finite_fraction=fracs, single_module_filters=modules,
                    nominal_filters=list(o.filters), available_filters=avail,
                    dropped_filters=dropped,
                    # pass on SW alone ONLY when the obs genuinely has no LW-channel filter;
@@ -1001,15 +1061,25 @@ def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk):
                     f"VIRAC reference (RA {rr[0]:.3f}–{rr[1]:.3f}, Dec {rd[0]:.3f}–{rd[1]:.3f}) do not "
                     f"overlap on the sky — the reference covers a different region")
     pr = (bulk or {}).get("peak_ratio", 0.0)
+    npairs = (bulk or {}).get("npairs")
+    # Report the MEASURED counts (JWST sources, VIRAC reference stars, matched pairs) rather than
+    # naming one of several possible causes -- the failure could be too few reference stars, too few
+    # JWST sources, or a genuine no-peak, and this function did not distinguish them.
+    counts = (f"{len(jsc)} JWST sources vs {len(ref_sc)} VIRAC reference stars in the footprint"
+              + (f", {npairs} matched pairs at the best peak" if npairs is not None else ""))
     # Report the JWST magnitude range if we have it; do NOT claim a VIRAC comparison that was not run.
     jmag = _jwst_sources(o, filt)[1]
     mag_note = ""
     if jmag is not None and np.isfinite(jmag).any():
         mag_note = (f"  (JWST {filt} spans {np.nanpercentile(jmag, 1):.1f}–{np.nanpercentile(jmag, 99):.1f} "
                     f"mag; no VIRAC magnitude comparison was made.)")
+    if pr >= aa.MIN_PEAK_RATIO:
+        # A confident whole-field peak exists but the per-cell fallback still could not place a
+        # tie -- do NOT print the self-contradictory "peak_ratio {>=4} < 4".
+        return (f"a whole-field cross-correlation peak exists (peak_ratio {pr:.2f} ≥ "
+                f"{aa.MIN_PEAK_RATIO}) but no per-cell tie could be placed ({counts}).{mag_note}")
     return (f"footprints overlap but no common-star histogram peak (peak_ratio {pr:.2f} < "
-            f"{aa.MIN_PEAK_RATIO}); cause not determined — plausibly a magnitude-range mismatch "
-            f"(too few VIRAC-bright stars) or crowding, but that was not measured here.{mag_note}")
+            f"{aa.MIN_PEAK_RATIO}); {counts}. The cause was not determined here.{mag_note}")
 
 
 # Max cell-to-cell spread (robust) for a frame to count as internally consistent enough to PASS.
@@ -1035,16 +1105,23 @@ _CELL_MIN_COVERAGE = 0.5
 _CELL_PR_FLOOR = 1.5
 
 
-def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
-    """Measure the JWST<->VIRAC offset in an ``ncell`` x ``ncell`` spatial grid over the JWST
-    footprint, each cell by the xcorr HISTOGRAM PEAK against the local reference (cropped to the
-    cell + a 2" margin).  Replaces the field-wide nearest-neighbour median, which at GC density
-    reads SMALLER the further the frame is displaced (~1.8 mas at a 2" shift; PR #54 review).
+def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=None):
+    """One ``ncell`` x ``ncell`` pass of the per-cell xcorr tie (see ``_cell_offsets``).
 
-    Returns (cells, dropped): ``cells`` is a list of dicts (i, j grid index; ra, dec centre; dra,
-    dde, off in mas; peak_ratio; n sources) for cells with a peak above ``_CELL_PR_FLOOR``, and
-    ``dropped`` is (i, j, ra, dec, n) for cells with enough sources but NO clear peak -- recorded
-    so coverage is accounted and the map can show them, rather than silently vanishing."""
+    Three DISTINCT thresholds, deliberately not one constant applied to three quantities (the
+    star-vs-pair conflation that cost this repo the _ab_overlap 9.6x inflation):
+      * ``min_src`` -- minimum STAR occupancy required of BOTH the JWST cell and the (2"-margin)
+        reference crop before xcorr is attempted.  At GC density the VIRAC *reference* crop is the
+        binding one -- VIRAC is far sparser than JWST, so a cell can hold 1000+ JWST sources yet
+        < ``min_src`` reference stars, in which case xcorr is never called (that is why sickle's
+        4x4 cells drop with peak_ratio=None -- too few REFERENCE stars, not too few JWST sources).
+      * ``pr_floor`` -- minimum xcorr peak_ratio (peak height / chance background) to trust a peak.
+      * ``min_pairs`` -- minimum number of matched PAIRS in the accepted peak (a pair count, not a
+        star count); defaults to ``min_src``.
+
+    Returns (cells, dropped)."""
+    if min_pairs is None:
+        min_pairs = min_src
     ra = jsc.ra.deg; dec = jsc.dec.deg
     rra = ref_sc.ra.deg; rde = ref_sc.dec.deg
     # RA-wrap guard: a footprint straddling RA=0 would give bogus linear bins (no GC field does).
@@ -1058,19 +1135,55 @@ def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
         for j in range(ncell):
             m = (ra >= re_[i]) & (ra <= re_[i + 1]) & (dec >= de_[j]) & (dec <= de_[j + 1])
             n = int(m.sum())
-            if n < min_per_cell:
+            if n < min_src:                          # too few JWST sources in the cell
                 continue
             cra, cdec = 0.5 * (re_[i] + re_[i + 1]), 0.5 * (de_[j] + de_[j + 1])
             rm = ((rra >= re_[i] - mrg) & (rra <= re_[i + 1] + mrg) &
                   (rde >= de_[j] - mrg) & (rde <= de_[j + 1] + mrg))
-            xc = aa.xcorr(jsc[m], ref_sc[rm]) if int(rm.sum()) >= min_per_cell else None
-            if xc and xc.get("peak_ratio", 0) >= _CELL_PR_FLOOR and xc.get("npairs", 0) >= min_per_cell:
+            n_ref = int(rm.sum())
+            xc = aa.xcorr(jsc[m], ref_sc[rm]) if n_ref >= min_src else None
+            if xc and xc.get("peak_ratio", 0) >= pr_floor and xc.get("npairs", 0) >= min_pairs:
                 cells.append(dict(i=i, j=j, ra=cra, dec=cdec, dra=float(xc["dra"]),
                                   dde=float(xc["ddec"]), off=float(xc["off"]),
-                                  peak_ratio=float(xc["peak_ratio"]), n=n))
+                                  peak_ratio=float(xc["peak_ratio"]), n=n, n_ref=n_ref,
+                                  npairs=int(xc["npairs"])))
             else:
-                dropped.append(dict(i=i, j=j, ra=cra, dec=cdec, n=n))
+                # record WHY it dropped: no reference stars to correlate against, vs a real no-peak.
+                dropped.append(dict(i=i, j=j, ra=cra, dec=cdec, n=n, n_ref=n_ref,
+                                    reason=("too few reference stars" if n_ref < min_src
+                                            else "no clear peak")))
     return cells, dropped
+
+
+def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
+    """Measure the JWST<->VIRAC offset in an ``ncell`` x ``ncell`` spatial grid over the JWST
+    footprint, each cell by the xcorr HISTOGRAM PEAK against the local reference (cropped to the
+    cell + a 2" margin).  Replaces the field-wide nearest-neighbour median, which at GC density
+    reads SMALLER the further the frame is displaced (~1.8 mas at a 2" shift; PR #54 review).
+
+    ADAPTIVE: a small or sparse field (e.g. sickle jw03958-o007, a sub640 subarray) can have a
+    clean WHOLE-FIELD peak yet too few *reference* stars per 4x4 cell to attempt xcorr -- gating
+    only on the fine grid then red-flags a perfectly measurable tie (issue #13; sickle's 4x4 cells
+    hold 1000+ JWST sources but only ~200 VIRAC reference stars, below the 300 crop floor).  So if
+    the requested grid yields no cell, fall back to progressively coarser grids (each cell then
+    spans more reference stars), down to a single whole-field cell measured with the confident bulk
+    gate (``aa.MIN_PEAK_RATIO``).  A handful of common stars is enough for a frame tie; the fine
+    grid is a refinement, not a requirement.
+
+    Returns (cells, dropped, grid_used) -- ``grid_used`` is the ncell of the grid that measured the
+    tie (1 = whole-field fallback, no per-cell spatial information), so the caller can keep the
+    coverage/consistency gates correct instead of inferring 'small field' from a low cell count."""
+    attempts = [(ncell, min_per_cell, _CELL_PR_FLOOR)]
+    if ncell > 2:
+        attempts.append((2, 150, _CELL_PR_FLOOR))
+    attempts.append((1, 100, aa.MIN_PEAK_RATIO))     # whole-field bulk tie, confident peak
+    last_dropped = []
+    for nc, mpc, prf in attempts:
+        cells, dropped = _cell_grid(jsc, ref_sc, nc, mpc, prf)
+        last_dropped = dropped
+        if cells:
+            return cells, dropped, nc
+    return [], last_dropped, 0
 
 
 def _cell_consistency(cells, dropped):
@@ -1192,8 +1305,10 @@ def stage4_offsets(o: Observation, sw):
 
     # Measure the offset PER SPATIAL CELL (robust at density) before building the figure, so an
     # unmeasurable result becomes a red flag rather than an empty panel.
-    cells, dropped = (_cell_offsets(jsc, ref_sc) if (jsc is not None and ref_sc is not None)
-                      else ([], []))
+    if jsc is not None and ref_sc is not None:
+        cells, dropped, grid_used = _cell_offsets(jsc, ref_sc)
+    else:
+        cells, dropped, grid_used = [], [], 0
 
     if not cells:
         bulk = aa.xcorr(jsc, ref_sc) if (jsc is not None and ref_sc is not None) else None
@@ -1220,14 +1335,23 @@ def stage4_offsets(o: Observation, sw):
     # a real 90 mas offset (cell_off_med ~= 87, same-star ~= 13) pass.  Gate on the LARGER of the
     # two so a genuine mis-registration the histogram sees cannot be masked by the refinement.
     gate_off = max(cell_off_med, off_med)
-    # PASS needs a small tie, spatially CONSISTENT cells (no adjacency-confirmed sub-region off by
-    # >30 mas holding >2% of sources; catches a minority a mad_std cannot), enough coverage, and no
-    # inter-module offset.
-    passed = bool(gate_off < aa.THRESH["absolute"] and cc["consistent"] and
+    # PASS needs a small tie, enough COVERAGE, spatially CONSISTENT cells (no adjacency-confirmed
+    # sub-region off by >30 mas holding >2% of sources; catches a minority a mad_std cannot), and no
+    # inter-module offset.  The spatial-consistency (adjacency) test needs a real grid; only the
+    # WHOLE-FIELD fallback (grid_used == 1) genuinely cannot do it, so ONLY that case skips it --
+    # NOT a low cell count (a large field with 3/16 measurable cells is 21% coverage and must still
+    # fail, issue #13 review).  Coverage is enforced in EVERY branch.
+    whole_field = (grid_used == 1)
+    spatial_assessed = not whole_field
+    coverage_ok = cc["coverage"] >= _CELL_MIN_COVERAGE
+    spatial_ok = True if whole_field else cc["consistent"]
+    passed = bool(gate_off < aa.THRESH["absolute"] and spatial_ok and coverage_ok and
                   (io is None or io < aa.THRESH["intermodule"]))
     metrics.update(offset_med_mas=off_med, offset_scatter_mas=spread, offset_signif_med=signif,
                    bulk_off=off_med,                        # reported offset (same-star when available)
                    gate_off_mas=gate_off,                   # value the magnitude gate tests (cell histogram)
+                   spatial_assessed=spatial_assessed,       # False -> whole-field fallback, no per-cell map
+                   grid_used=grid_used,
                    bulk_source=bulk_source, cell_off_med=cell_off_med,
                    same_star_off=(ss["off"] if ss else None),
                    same_star_npairs=(ss["npairs"] if ss else None),
@@ -1262,7 +1386,10 @@ def stage4_offsets(o: Observation, sw):
     # obvious.  Use the TRUE grid edges (same linspace as _cell_offsets), NOT reconstructed from
     # surviving cell centres -- a skipped interior cell would otherwise mis-size the extent.
     from matplotlib.patches import Rectangle
-    NCELL = 4
+    # Draw on the grid that ACTUALLY measured the tie (4x4 / 2x2 / 1x1 whole-field), not a hardcoded
+    # 4x4 -- else a 2x2-fallback field (sickle) paints 4 cells into one quarter with 12/16 grey
+    # "never measured", and a 1x1 field shows itself 94% unmeasured when 100% was measured (#13).
+    NCELL = grid_used or 4
     ra_all = jsc.ra.deg; dec_all = jsc.dec.deg
     if float(np.nanmax(ra_all) - np.nanmin(ra_all)) > 180.0:        # RA-wrap guard (matches source)
         NCELL = 1
@@ -1672,21 +1799,50 @@ def stage5_intermodule(o: Observation, sw):
 
     def _draw_quiver(axq):
         if det:
-            xs = [v["ra"] for v in det.values()]; ys = [v["dec"] for v in det.values()]
-            us = [v["rdra"] for v in det.values()]; vs = [v["rdde"] for v in det.values()]
+            xs = np.array([v["ra"] for v in det.values()], float)
+            ys = np.array([v["dec"] for v in det.values()], float)
+            us = np.array([v["rdra"] for v in det.values()], float)
+            vs = np.array([v["rdde"] for v in det.values()], float)
             cols = ["#4477aa" if d.startswith("nrca") else "#ee6677" for d in det]
+            # ADAPTIVE scale (mas per data-degree): size the largest arrow to ~25% of the field
+            # span, instead of a fixed scale=2000 tuned for a full-mosaic FOV.  On a small subarray
+            # field (sickle sub640 ~0.008 deg) that fixed scale drew ~9" arrows from the corner
+            # detectors that ran clean off the axes (issue #13, "all vectors out of frame").
+            mag = np.hypot(us, vs); maxmag = float(np.nanmax(mag)) if mag.size else 1.0
+            spanx = float(np.ptp(xs)) or 1e-3; spany = float(np.ptp(ys)) or 1e-3
+            span = max(spanx, spany)
+            # Scale (mas per data-degree).  A PURELY adaptive scale (largest arrow = 25% of the span)
+            # would render a 0.5 mas and a 500 mas residual identically -- so floor the scale at a
+            # FIXED 15 mas (= THRESH['intermodule']) reference: residuals below the tie tolerance stay
+            # visibly small, and only larger ones grow (and are then capped to 25% of the span so
+            # they cannot run off the axes, the sub640 failure in #13).
+            ref = float(aa.THRESH["intermodule"]) / (0.25 * span)     # 15 mas -> ~25% of the span
+            scale = max(maxmag / (0.25 * span), ref, 1e-6)
             q = axq.quiver(xs, ys, us, vs, color=cols, angles="xy", scale_units="xy",
-                           scale=2000, width=0.007)
-            axq.quiverkey(q, 0.5, 0.10, 5, "5 mas", labelpos="E", coordinates="axes",
-                          fontproperties={"size": 8})
+                           scale=scale, width=0.007)
+            # key is the fixed 15 mas ruler, so arrow length is comparable across observations
+            axq.quiverkey(q, 0.5, 0.06, float(aa.THRESH["intermodule"]),
+                          f"{aa.THRESH['intermodule']:g} mas (tie tol.)", labelpos="E",
+                          coordinates="axes", fontproperties={"size": 8})
             for d, v in det.items():
                 # annotate each arrow with the number of VIRAC-matched stars behind it
                 axq.annotate(f"{d} (n={v['n']})", (v["ra"], v["dec"]), fontsize=5.8,
                              ha="center", va="bottom")
+            # EXPAND the axes to contain the arrow TIPS (+ margin) so no vector leaves the frame.
+            tipx = xs + us / scale; tipy = ys + vs / scale
+            allx = np.concatenate([xs, tipx]); ally = np.concatenate([ys, tipy])
+            mx = 0.18 * max(float(np.ptp(allx)), 1e-3); my = 0.18 * max(float(np.ptp(ally)), 1e-3)
+            axq.set_xlim(allx.min() - mx, allx.max() + mx)
+            axq.set_ylim(ally.min() - my, ally.max() + my)
             axq.invert_xaxis(); axq.set_ylabel("Dec"); axq.set_xlabel("RA")
+            # 'A−B diff' only means something with BOTH modules; a single-module field has no NRCA
+            # to difference, so drop the 'A−B diff = nan' clause there.
+            two_module = (any(d.startswith("nrca") for d in det) and
+                          any(d.startswith("nrcb") for d in det))
+            abdiff = (f"A−B diff = {metrics['intermodule_diff']:.1f} mas  ·  "
+                      if two_module and metrics.get("intermodule_diff") is not None else "")
             axq.set_title(f"per-detector residual vs VIRAC (bulk-removed) — {filt}\n"
-                          f"A−B diff = {metrics.get('intermodule_diff', float('nan')):.1f} mas  ·  "
-                          f"one arrow/detector (n = VIRAC matches)", fontsize=9, pad=12)
+                          f"{abdiff}one arrow/detector (n = VIRAC matches)", fontsize=9, pad=12)
         else:
             axq.text(0.5, 0.5, "per-detector cats unavailable", ha="center", va="center", fontsize=8)
 
@@ -3135,7 +3291,8 @@ def _caption_for_impl(n, metrics):
                 f"[xcorr histogram peak](DOCROOT#glossary-xcorr) (crowding-robust; a plain "
                 f"nearest-neighbour median collapses toward zero at GC density). The LEFT panel "
                 f"maps the source-weighted tie across the mosaic — filled squares are measured "
-                f"cells (colour = offset), grey squares are cells with sources but no clear peak, "
+                f"cells (colour = offset), grey squares are cells that could not be measured (too "
+                f"few VIRAC reference stars in the cell, or no clear peak), "
                 f"and a green outline marks cells that coherently deviate. The MIDDLE panel plots "
                 f"the per-cell offsets as (ΔRA, ΔDec) points sized by source count, with the "
                 f"source-weighted median tie, the 75 mas gate, and ΔRA/ΔDec marginal histograms. "
@@ -3159,9 +3316,17 @@ def _caption_for_impl(n, metrics):
             base += (f"{ncf} adjacent cell(s) holding {100 * (badf or 0):.0f}% of the sources are "
                      f"tied differently — an internal discontinuity, so it does NOT pass. ")
         base += ("The RIGHT panel, when present, is the "
-                 "[reference-free](DOCROOT#glossary-reffree) NRCA-vs-NRCB inter-module offset. A "
-                 "pass needs a small source-weighted median AND spatially consistent cells. "
-                 "([how this is made](DOCROOT#stage4))")
+                 "[reference-free](DOCROOT#glossary-reffree) NRCA-vs-NRCB inter-module offset. ")
+        if metrics.get("spatial_assessed", True):
+            base += ("A pass needs a small source-weighted median AND spatially consistent cells. "
+                     "([how this is made](DOCROOT#stage4))")
+        else:
+            # whole-field fallback: only one cell measured, so there is NO per-cell spatial check --
+            # say so plainly rather than claim a consistency test that did not run.
+            base += ("NOTE: too few common stars to sub-divide the field, so the tie was measured "
+                     "WHOLE-FIELD (one cell) — a small median passes the magnitude gate, but the "
+                     "per-cell spatial-consistency check was NOT performed and a sub-region "
+                     "discontinuity would not be caught here. ([how this is made](DOCROOT#stage4))")
         if str(metrics.get("source", "")).startswith("release-dao"):
             base += (" (Positions here come from a per-filter DAO catalogue, not a merged/calibrated "
                      "one — this obs is not yet photometrically catalogued, so stage 3 red-flags it.)")
