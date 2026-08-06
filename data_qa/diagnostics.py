@@ -1373,7 +1373,7 @@ def _ab_overlap(a_sc, b_sc):
     the offset/RMS/count, the per-star residual arrays (for the hexbin + marginals), and a list of
     overlap-star positions (for the cutout gallery), or None if unmeasurable."""
     import astropy.units as u
-    from astropy.coordinates import search_around_sky, SkyCoord
+    from astropy.coordinates import SkyCoord
     if a_sc is None or b_sc is None or len(a_sc) < 50 or len(b_sc) < 50:
         return None
     xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
@@ -1382,7 +1382,21 @@ def _ab_overlap(a_sc, b_sc):
     cosd = float(np.cos(np.radians(np.median(a_sc.dec.deg))))
     a_al = SkyCoord((a_sc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
                     (a_sc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
-    ia, ib, sep, _ = search_around_sky(a_al, b_sc, 0.08 * u.arcsec)   # same star after align
+    # One-to-one match, NOT search_around_sky: in a crowded GC field an 80-mas ball match is
+    # many-to-many (one bright B star pairs with every nearby A star), so len(pairs) counts PAIRS,
+    # not distinct overlap stars -- that is the bogus ~34k count.  Take the nearest B for each A,
+    # keep those within 80 mas, then drop duplicate B (keep the closest A) so every physical star
+    # is counted once and fabricated pairs no longer bias the RMS.
+    idx, sep2d, _ = a_al.match_to_catalog_sky(b_sc)
+    keep = sep2d < 0.08 * u.arcsec
+    ia = np.where(keep)[0]
+    ib = np.asarray(idx)[keep]
+    if len(ia) < 20:
+        return None
+    order = np.argsort(sep2d[ia].arcsec)                 # smallest separation first
+    ia, ib = ia[order], ib[order]
+    _, first = np.unique(ib, return_index=True)          # one A per B: the closest
+    ia, ib = ia[first], ib[first]
     if len(ia) < 20:
         return None
     dra = (a_al[ia].ra - b_sc[ib].ra).to(u.mas).value * cosd
@@ -1391,6 +1405,8 @@ def _ab_overlap(a_sc, b_sc):
                 rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
                 n=int(len(ia)), peak_ratio=float(xc["peak_ratio"]),
                 dra_arr=dra, dde_arr=dde,
+                # per-star matched positions (for the spatial overlap-footprint map)
+                ra_arr=b_sc[ib].ra.deg, dec_arr=b_sc[ib].dec.deg,
                 pos=[(b_sc[i].ra.deg, b_sc[i].dec.deg) for i in ib[:200]])
 
 
@@ -1407,6 +1423,25 @@ def _draw_ab_panel(ax, ovd, title):
     axt, _axr = _add_marginals(ax, dra_a, dde_a, color="#5566aa", bins=40)
     axt.set_title(f"{title}  ({ovd['n']} stars)\n"
                   f"offset = {ovd['off']:.1f} mas   RMS = {ovd['rms']:.1f} mas", fontsize=8)
+
+
+def _draw_ab_footprint(ax, ovd, label):
+    """Sky scatter of the A↔B overlap stars, coloured by per-star |A−B| offset.  Confirms WHERE the
+    genuinely-shared stars are (they should trace the NRCA∩NRCB dither-overlap strip, not the whole
+    field) and whether the tie degrades anywhere in it."""
+    import matplotlib.pyplot as plt
+    ra = np.asarray(ovd["ra_arr"], float); dec = np.asarray(ovd["dec_arr"], float)
+    diff = np.hypot(np.asarray(ovd["dra_arr"], float), np.asarray(ovd["dde_arr"], float))
+    vmax = float(np.nanpercentile(diff, 95)) if len(diff) else 1.0
+    sc = ax.scatter(ra, dec, c=diff, s=6, cmap="viridis", vmin=0, vmax=max(vmax, 1.0),
+                    linewidths=0)
+    # data-driven aspect (NOT equal): the overlap is a thin, long strip; a full-width row with
+    # 'auto' aspect fills the panel so the per-star colour is readable (equal made it a sliver).
+    ax.invert_xaxis(); ax.set_aspect("auto"); ax.margins(0.02)
+    ax.set_xlabel("RA [deg]"); ax.set_ylabel("Dec [deg]")
+    plt.colorbar(sc, ax=ax, label="per-star residual |A−B| [mas]", shrink=0.85)
+    ax.set_title(f"A↔B overlap footprint — {label} ({len(ra)} stars)\n"
+                 f"colour = per-star |A−B|; should trace the module-overlap strip", fontsize=8)
 
 
 def _module_hi_sn(o, filt, snmin=10.0):
@@ -1540,19 +1575,27 @@ def stage5_intermodule(o: Observation, sw):
             axq.text(0.5, 0.5, "per-detector cats unavailable", ha="center", va="center", fontsize=8)
 
     if ov:
-        # Top row: per-detector quiver | A↔B overlap (all stars, with marginals) | A↔B (S/N>10).
-        # Bottom row: overlap-star cutout gallery spanning the width.  The S/N>10 column is added
-        # only when measurable, so a field without flux errors just shows the two-panel top row.
+        # Top row: per-detector quiver | A↔B overlap (all stars) | A↔B (S/N>10, if measurable) |
+        # A↔B overlap FOOTPRINT (sky map coloured by |A−B|, high-S/N).  Bottom row: cutout gallery
+        # spanning the width.
+        # Row 0: per-detector quiver | A↔B overlap (all stars) | A↔B (S/N>10, if measurable).
+        # Row 1: the A↔B overlap FOOTPRINT spanning the full width (the overlap is a thin, long
+        # strip, so a full-width row with data-driven aspect makes the per-star colour readable).
+        # Row 2: cutout gallery spanning the full width.
         ncols = 3 if ov_hi else 2
-        fig = plt.figure(figsize=(5.0 * ncols + 1.0, 9.2))
-        gs = fig.add_gridspec(2, ncols, height_ratios=[1.3, 0.75], hspace=0.62, wspace=0.62)
-        # top reserve so the A↔B panels' top-marginal titles clear the suptitle
-        fig.subplots_adjust(top=0.82, bottom=0.06, left=0.06, right=0.97)
+        fig = plt.figure(figsize=(5.0 * ncols + 1.0, 11.5))
+        gs = fig.add_gridspec(3, ncols, height_ratios=[1.25, 0.55, 0.75], hspace=0.7, wspace=0.62)
+        fig.subplots_adjust(top=0.88, bottom=0.05, left=0.06, right=0.97)
         axq = fig.add_subplot(gs[0, 0]); _draw_quiver(axq)
         axo = fig.add_subplot(gs[0, 1]); _draw_ab_panel(axo, ov, "A↔B overlap — all stars")
         if ov_hi:
             axh = fig.add_subplot(gs[0, 2])
             _draw_ab_panel(axh, ov_hi, "A↔B overlap — flux S/N > 10")
+        # footprint map (full-width row): prefer the high-S/N set (cleaner), else all stars
+        axfp = fig.add_subplot(gs[1, :])
+        fp_ov = ov_hi if ov_hi else ov
+        _draw_ab_footprint(axfp, fp_ov, "S/N > 10" if ov_hi else "all stars")
+        metrics["n_overlap_footprint"] = int(len(fp_ov["ra_arr"]))
 
         # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
         ncut = 6
@@ -1562,9 +1605,9 @@ def stage5_intermodule(o: Observation, sw):
                 data = sci.data.astype("float32"); w = WCS(sci.header)
             from astropy.coordinates import SkyCoord
             from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
-            # De-duplicate: search_around_sky returns MANY pairs per bright overlap star, so the
-            # raw list repeats the same few stars (e.g. one star shown 4x).  Greedily keep only
-            # spatially DISTINCT stars (>0.5") so the gallery is 6 DIFFERENT stars.
+            # Space the gallery out: pos is already one entry per distinct overlap star, but greedily
+            # keep only stars >0.5" apart so the 6 cutouts sample different parts of the strip rather
+            # than clustering on one bright clump.
             picks = []
             for ra, dec in ov["pos"][:2000]:
                 if picks:
@@ -1590,7 +1633,7 @@ def stage5_intermodule(o: Observation, sw):
                     continue
                 cuts.append(cut.data)
             shown = len(cuts)
-            strip = fig.add_subplot(gs[1, :]); strip.axis("off")
+            strip = fig.add_subplot(gs[2, :]); strip.axis("off")
             if shown:
                 n = shown
                 for i, cdata in enumerate(cuts):
@@ -2085,8 +2128,9 @@ def _caption_for_impl(n, metrics):
         # overlap measured -> full caption; the S/N>10 panel is only present when ov_hi succeeded
         off = metrics.get("intermodule_off"); rms = metrics.get("intermodule_rms")
         no = metrics.get("n_overlap")
-        # the all-stars overlap panel is TOP-MIDDLE when the S/N>10 panel is also drawn (3 cols),
-        # otherwise TOP-RIGHT (2 cols)
+        # top row is quiver + all-stars + optional S/N>10; the all-stars panel is TOP-MIDDLE when
+        # the S/N panel is present (3 cols), else TOP-RIGHT (2 cols).  The footprint is its own
+        # full-width row below.
         ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
         base = ("**Stage 5 — inter-detector / inter-module tie.** "
                 "[\"Reference-free\"](DOCROOT#glossary-reffree) means JWST is matched against itself "
@@ -2104,6 +2148,11 @@ def _caption_for_impl(n, metrics):
                      f"stars ({metrics['n_overlap_hi']} stars, "
                      f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas RMS), where the "
                      f"scatter reflects the tie rather than faint-source centroiding.")
+        if metrics.get("n_overlap_footprint"):
+            base += (" The full-width row below the panels maps the overlap stars on the sky, "
+                     "coloured by per-star |A−B| — it verifies the shared stars trace the thin "
+                     "NRCA∩NRCB dither-overlap strip (not the whole field) and flags any sub-region "
+                     "where the tie degrades.")
         base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`: a good tie "
                  "shows one round PSF, a mis-tie doubles or elongates the star. "
                  "([how this is made](DOCROOT#stage5))")

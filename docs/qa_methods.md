@@ -255,13 +255,23 @@ Stage 5 checks how well the detectors and the two modules agree, on the SW filte
 three panels; when a field lacks flux errors the S/N>10 panel is omitted (two-panel top row).
 
 - **TOP-LEFT** — the [per-detector residual quiver](#glossary-quiver): one arrow per SW detector,
-  each the detector's median residual against VIRAC with the field bulk offset removed, placed at
-  the detector's mean sky position and annotated with its matched-star count.
+  each the detector's median residual **against VIRAC** with the field bulk offset removed, placed
+  at the detector's mean sky position and annotated with the **number of matched stars**. (This is
+  why an NRCB detector with no NRCA sky overlap still gets a vector — the common reference is
+  VIRAC, not NRCA. See [the quiver note](#glossary-quiver).)
 - **TOP-MIDDLE** — the [reference-free](#glossary-reffree) NRCA∩NRCB overlap tie: the offset and
-  RMS of the same stars seen in both modules (matched JWST-to-JWST, no external catalog), with
-  ΔRA/ΔDec marginal histograms.
-- **TOP-RIGHT** — the same overlap tie restricted to [S/N > 10](#glossary-snr) stars, so the
-  residual scatter reflects the tie rather than photon-noise centroiding of faint sources.
+  RMS of the **same stars** seen in both modules (matched JWST-to-JWST, no external catalog), with
+  **marginal histograms** of the residual ΔRA/ΔDec. Matching is **one-to-one**: after the bulk A→B
+  shift (the xcorr histogram peak) the nearest B source within 80 mas is taken for each A source and
+  duplicate B are dropped (closest A kept), so the reported count is distinct overlap stars — NOT the
+  many-to-many pair count a fixed-radius ball match would return in a crowded field.
+- **TOP-RIGHT** — the same overlap tie restricted to [S/N > 10](#glossary-snr) stars (when the
+  field has flux errors), so the scatter reflects the tie rather than faint-source centroiding.
+- **FULL-WIDTH ROW (below the top panels)** — the A↔B overlap **footprint**: the overlap stars
+  mapped on the sky (RA/Dec), coloured by each star's |A−B| residual, using the S/N > 10 set. The
+  overlap is a thin, long strip, so this row spans the figure width (data-driven aspect) to make
+  the per-star colour readable; it verifies the shared stars trace the NRCA∩NRCB dither-overlap
+  strip (not the whole field) and flags any sub-region where the tie degrades.
 - **BOTTOM STRIP** — a cutout gallery of overlap stars from the SW merged `i2d`. A good tie shows
   one round PSF; a mis-tie doubles or elongates the star (the same source drizzled twice at offset
   positions).
