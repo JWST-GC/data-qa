@@ -446,6 +446,75 @@ def test_mosaic_path_single_module_nrcb(tmp_path, monkeypatch):
     assert D._mosaic_module(D._mosaic_path(o, "F210M")) == ""
 
 
+def test_stage4_2x2_three_of_four_fails_without_spatial_check(monkeypatch):
+    # A 2x2 grid with 3 of 4 cells measured (grid_used=2, coverage 0.75 -- ABOVE the 0.5 floor) must
+    # FAIL, because <4 cells is not 'consistent'.  Coverage cannot catch this (0.75 >= 0.5), so the
+    # grid-keyed spatial gate is the only thing holding it -- reverting to an `n_cells >= 4` heuristic
+    # would flip it green (#13 re-review).
+    ij3 = [(0, 0), (0, 1), (1, 0)]                 # 3 of the 4 cells in a 2x2 grid
+    cells = [dict(i=i, j=j, ra=266.41 + 0.001 * i, dec=-28.89 + 0.001 * j, dra=5.0, dde=0.0,
+                  off=5.0, peak_ratio=8.0, n=400, n_ref=400, npairs=400) for i, j in ij3]
+    dropped = [dict(i=1, j=1, ra=266.41, dec=-28.89, n=400, n_ref=100, reason="too few reference stars")]
+    _stage4_seams(monkeypatch, cells, dropped, grid_used=2)
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    assert m["grid_used"] == 2 and 0.5 <= m["cell_coverage"] < 1.0
+    assert m["spatial_assessed"] is True and m["passed"] is False
+
+
+def test_stage4_caption_states_when_spatial_check_skipped():
+    # ask 2 consumer: the caption must claim the spatial-consistency check only when it ran.
+    assessed = D.caption_for(4, dict(stage=4, offset_med_mas=5.0, n_cells=4,
+                                     offset_scatter_mas=2.0, spatial_assessed=True,
+                                     bulk_source="histogram"))
+    assert "spatially consistent cells" in assessed
+    whole = D.caption_for(4, dict(stage=4, offset_med_mas=5.0, n_cells=1,
+                                  offset_scatter_mas=None, spatial_assessed=False,
+                                  bulk_source="histogram"))
+    assert "WHOLE-FIELD" in whole and "NOT performed" in whole
+    assert "spatially consistent cells" not in whole
+
+
+def test_make_issues_frame_ok_untficked_when_spatial_unassessed(monkeypatch):
+    # ask 2 consumer: make_issues must NOT tick the astrometry box on a whole-field tie.
+    from data_qa import make_issues as MI
+    monkeypatch.setattr(MI, "_guidestar_json", lambda: {})
+    o = Observation(program="3958", obs="007", target="Sickle", release_field="sickle",
+                    instrument="NIRCam", filters=["F210M"], visits=[], epoch="", notes="")
+
+    def _M(spatial):
+        return {"stage1": {"passed": True}, "stage2": {"passed": True}, "stage3": {"passed": True},
+                "stage4": {"passed": True, "spatial_assessed": spatial}, "stage5": {}}
+
+    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: _M(False))
+    line = [l for l in MI.render_body(o).splitlines() if "Astrometry" in l][0]
+    assert "[ ]" in line and "[x]" not in line
+    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: _M(True))
+    line2 = [l for l in MI.render_body(o).splitlines() if "Astrometry" in l][0]
+    assert "[x]" in line2
+
+
+def test_mosaic_path_lone_module_incomplete_when_sibling_filter_two_module(tmp_path, monkeypatch):
+    # issue #13 re-review: the two-module guard must be OBSERVATION-scoped.  cloudef jw02092-o002
+    # F360M has only NRCA, but sibling filters have merged mosaics -> the obs is two-module, so the
+    # lone F360M half must read incomplete (None), while a genuine single-module obs (sickle, all
+    # NRCB, no merged/NRCA anywhere) still returns its nrcb mosaic.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "cloudef" / "F210M" / "pipeline"; d.mkdir(parents=True)
+    (d / "jw02092-o002_t001_nircam_clear-f210m-merged_i2d.fits").write_text("")   # sibling is complete
+    d2 = tmp_path / "cloudef" / "F360M" / "pipeline"; d2.mkdir(parents=True)
+    (d2 / "jw02092-o002_t001_nircam_clear-f360m-nrca_i2d.fits").write_text("")     # lone half
+    o = Observation(program="2092", obs="002", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F210M", "F360M"], visits=[], epoch="", notes="")
+    assert D._mosaic_path(o, "F360M") is None                    # incomplete: obs is two-module
+    assert D._mosaic_path(o, "F210M").endswith("f210m-merged_i2d.fits")
+    # a genuine single-module obs (all NRCB, no merged, no NRCA) still returns its mosaic
+    s = tmp_path / "sickle" / "F210M" / "pipeline"; s.mkdir(parents=True)
+    (s / "jw03958-o007_t001_nircam_clear-f210m-nrcb_i2d.fits").write_text("")
+    so = Observation(program="3958", obs="007", target="Sickle", release_field="sickle",
+                     instrument="NIRCam", filters=["F210M"], visits=[], epoch="", notes="")
+    assert D._mosaic_path(so, "F210M").endswith("f210m-nrcb_i2d.fits")
+
+
 def test_mosaic_path_two_module_no_merged_returns_none(tmp_path, monkeypatch):
     # issue #13 review: a two-module obs that simply has not been merged (both -nrca and -nrcb over
     # DIFFERENT sky, e.g. cloudc o002 F212N) must NOT return one half as 'the mosaic' -- that would

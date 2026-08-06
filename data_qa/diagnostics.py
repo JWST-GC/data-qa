@@ -133,9 +133,33 @@ def _mosaic_path(o: Observation, filt):
         return merged
     nrcb, nrca = find("nrcb"), find("nrca")
     present = [p for p in (nrcb, nrca) if p]
-    if len(present) == 1:                     # a real single-module deliverable
+    if len(present) == 1:                     # only one module has a mosaic for THIS filter
+        # OBSERVATION-level completeness: a lone nrcX is a genuine single-module deliverable only if
+        # the OBSERVATION is single-module.  If a SIBLING filter of the same obsid has a merged
+        # mosaic or both modules, the obs has two modules and this filter is a half-delivered filter
+        # (e.g. cloudef jw02092-o002 F360M has only NRCA while F162M/F210M/F480M have both + merged)
+        # -- return None so it reads incomplete rather than flipping 'delivered' green (#13 review).
+        if _obs_is_two_module(o, dir_pats):
+            return None
         return present[0]
     return None                               # both modules but no merged -> incomplete, not half
+
+
+def _obs_is_two_module(o: Observation, dir_pats):
+    """True if ANY filter of this obsid has a merged mosaic or BOTH NRCA and NRCB mosaics on disk --
+    evidence the observation is two-module, so a lone single-module mosaic for some other filter is
+    an incomplete half, not a single-module deliverable."""
+    a_filts, b_filts = set(), set()
+    for d in dir_pats:
+        for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-*_i2d.fits"):
+            m = re.search(r"clear-(f\d{3}[wnm])-(merged|nrca|nrcb)_i2d\.fits$", os.path.basename(p).lower())
+            if not m:
+                continue
+            filt, tag = m.group(1), m.group(2)
+            if tag == "merged":
+                return True
+            (a_filts if tag == "nrca" else b_filts).add(filt)
+    return bool(a_filts & b_filts)            # some filter has BOTH modules
 
 
 def _mosaic_module(path):
@@ -1148,7 +1172,7 @@ def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
 
     Returns (cells, dropped, grid_used) -- ``grid_used`` is the ncell of the grid that measured the
     tie (1 = whole-field fallback, no per-cell spatial information), so the caller can keep the
-    coverage/consistency gates honest instead of inferring 'small field' from a low cell count."""
+    coverage/consistency gates correct instead of inferring 'small field' from a low cell count."""
     attempts = [(ncell, min_per_cell, _CELL_PR_FLOOR)]
     if ncell > 2:
         attempts.append((2, 150, _CELL_PR_FLOOR))
@@ -3267,7 +3291,8 @@ def _caption_for_impl(n, metrics):
                 f"[xcorr histogram peak](DOCROOT#glossary-xcorr) (crowding-robust; a plain "
                 f"nearest-neighbour median collapses toward zero at GC density). The LEFT panel "
                 f"maps the source-weighted tie across the mosaic — filled squares are measured "
-                f"cells (colour = offset), grey squares are cells with sources but no clear peak, "
+                f"cells (colour = offset), grey squares are cells that could not be measured (too "
+                f"few VIRAC reference stars in the cell, or no clear peak), "
                 f"and a green outline marks cells that coherently deviate. The MIDDLE panel plots "
                 f"the per-cell offsets as (ΔRA, ΔDec) points sized by source count, with the "
                 f"source-weighted median tie, the 75 mas gate, and ΔRA/ΔDec marginal histograms. "
