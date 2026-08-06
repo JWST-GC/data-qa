@@ -7,7 +7,7 @@
 # released observations (e.g. gc2211 o028/o046/o049, mosaics only in images-merged/) are
 # covered too.
 #
-# NIRCam issues -> diagnostics (1-5) + pipeline status.   MIRI issues -> pipeline status only.
+# NIRCam issues -> diagnostics + pipeline status.   MIRI issues -> MIRI basics overview + status.
 #
 # Non-GC fields are SKIPPED (W51, Westerlund 1/2, NGC 6334, globular clusters). Override the
 # skip list with QA_EXCLUDE_FIELDS (space-separated field keys) and/or QA_EXCLUDE_RE (a
@@ -100,6 +100,11 @@ for spec in "${SPECS[@]}"; do
   if [ "${inst,,}" = "nircam" ]; then
     out=$(python3 -m data_qa.diagnostics --program "$prog" --obs "$obs" --target "$disp" --stage $STAGES --post 2>&1); drc=$?
     echo "$out" | grep -iE "SW=|stage [0-9]:|created|updated|FAILED|no obs" || true
+    note_failure "$out" "$drc" && rc_any=1
+  elif [ "${inst,,}" = "miri" ]; then
+    # MIRI: basics overview (MAST i2d + Spitzer side-by-side + saturation mask)
+    out=$(python3 -m data_qa.diagnostics --program "$prog" --obs "$obs" --target "$disp" --miri --post 2>&1); drc=$?
+    echo "$out" | grep -iE "MIRI|created|updated|FAILED|no MIRI" || true
     note_failure "$out" "$drc" && rc_any=1
   fi
   sout=$(python3 -m data_qa.pipeline_status --program "$prog" --obs "$obs" --target "$disp" --instrument "$inst" --post 2>&1); src=$?
