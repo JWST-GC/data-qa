@@ -326,12 +326,35 @@ Source: [`data_qa/diagnostics.py` → `stage9_psf_vs_aper`](../data_qa/diagnosti
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 
-> 🚧 **Planned — implemented in the stage-7 follow-up PR** (not yet in this branch). Documented
-> here so the glossary/stage cross-references resolve; the source function below lands with that PR.
+**What it shows.** The gain of the pipeline over the raw **MAST-delivered** products, over one
+common central window of the mosaic:
+- **TOP — i2d before/after**: the STScI/MAST merged `i2d` mosaic next to our pipeline mosaic (same
+  filter, same sky region, same stretch).
+- **BOTTOM-LEFT — catalog depth (brief)**: magnitude histograms of the **MAST catalogue** vs the
+  [jicama](#glossary-jicama) catalogue in the common window. The MAST catalogue is the
+  MAST-delivered L3 `_cat.fits` **when it is archived** (fetched from MAST if not already local);
+  when MAST did not archive one, it is **approximated** by running DAOStarFinder at 5σ over a
+  Background2D on the MAST i2d. That detection is an approximation of, not a match to, the STScI
+  `SourceCatalogStep` (which uses image segmentation with deblending), so the two source lists
+  differ — read the count as a depth indicator, not a reproduction of the STScI catalogue. jicama
+  recovers more and fainter stars by construction (the point is the count/depth; the two use
+  different zeropoints).
+- **BOTTOM-RIGHT — astrometry (main)**: the [bulk offset](#glossary-bulk) to
+  [VIRAC](#glossary-virac) for each catalogue, measured by the [xcorr histogram
+  peak](#glossary-xcorr) (crowding-robust — a nearest-neighbour-to-VIRAC distance is meaningless
+  at GC density, where VIRAC's ~250 mas source spacing swamps the tie). Shown as a 2-D (ΔRA, ΔDec)
+  cloud with marginals whose CENTRE is the bulk tie: the MAST cloud sits at its raw-WCS bulk
+  offset, the jicama cloud typically near the origin. The panel title and issue caption are derived
+  from the sign of (jicama tie − MAST tie): they assert the pipeline "tightens the tie" only when
+  both ties are measured **and** jicama is tighter, and otherwise report both numbers without
+  claiming an improvement. The cloud's **width** is bounded by the 0.1″ `search_around_sky`
+  cross-match radius — it shows the match distribution, **not** the per-star astrometric precision;
+  see [stage 5](#stage5)/[stage 6](#stage6) for the actual per-star RMS. When a tie is unmeasurable
+  (no xcorr peak within 1.5″, e.g. a grossly mis-registered product): if only the MAST tie is
+  unmeasurable the comparison is flagged as **unavailable** (a possible MAST mis-registration, not a
+  defect in our product, so the stage does not fail on that alone); if the jicama tie is
+  unmeasurable that is our product failing, so the stage does not pass and is red-flagged.
 
-Stage 7 shows the gain of the pipeline over the raw MAST-delivered products, over one common
-window of the mosaic: the MAST L3 `i2d` next to the pipeline `i2d` (before/after); magnitude
-histograms of the MAST catalog vs the [jicama](#glossary-jicama) catalog (depth/count); and the
-[bulk offset to VIRAC](#glossary-bulk) for each (the astrometric tightening).
-
-Source: [`data_qa/diagnostics.py` → `stage7_mast_vs_pipeline`](../data_qa/diagnostics.py).
+**Source:** [`data_qa/diagnostics.py` → `stage7_mast_vs_pipeline`](../data_qa/diagnostics.py)
+(MAST catalogue: `_mast_l3_catalog`/`_load_mast_catalog`; detection fallback: `_detect_on_mosaic`;
+bulk tie: `_tie_cloud`).

@@ -490,3 +490,148 @@ def test_module_positions_normal(tmp_path, monkeypatch):
     assert a_sc is not None and b_sc is not None
     assert not meta["a"]["dead"] and not meta["b"]["dead"]
     assert meta["a"]["nan_frac"] == 0.0
+
+
+# --------------------------------------------------------------------------- stage 7 (MAST vs pipeline)
+def test_tie_cloud_recovers_bulk_shift():
+    # jicama-like catalogue offset from VIRAC by a KNOWN 120 mas E; _tie_cloud must recover it as
+    # the cloud centre (crowding-robust xcorr peak, not the sparse-NN distance)
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(1)
+    ra = 266.40 + rng.uniform(0, 0.03, 1500); dec = -28.90 + rng.uniform(0, 0.03, 1500)
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.9))
+    jsc = SkyCoord((ra + 120.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # jsc is +120 mas E of ref
+    out = D._tie_cloud(jsc, ref)
+    assert out is not None
+    dra, dde, bulk = out
+    assert abs(bulk - 120.0) < 15 and abs(np.median(dra) - 120.0) < 15
+
+
+def test_tie_cloud_none_when_offset_exceeds_maxsep():
+    # a gross offset (> the 1.5" xcorr window) must return None (unmeasurable), NOT a wrong small
+    # tie -- this is what lets stage 7 flag a grossly mis-registered product instead of passing it
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(2)
+    ra = 266.40 + rng.uniform(0, 0.03, 1500); dec = -28.90 + rng.uniform(0, 0.03, 1500)
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.9))
+    jsc = SkyCoord((ra + 5000.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # 5" E, way past 1.5"
+    assert D._tie_cloud(jsc, ref) is None
+
+
+def test_caption_stage7_full():
+    cap = D.caption_for(7, dict(stage=7, n_jicama=294615, n_mast=39365,
+                                jicama_offset_med_mas=14.5, mast_offset_med_mas=134.0))
+    assert "DOCROOT" not in cap and "qa_methods.md#stage7" in cap
+    assert "MAST vs pipeline" in cap and "bulk offset" in cap
+    assert "14 mas (jicama)" in cap and "134 mas (MAST)" in cap
+    # jicama (14) < MAST (134): the improvement clause is present
+    assert "astrometric tightening the pipeline delivers" in cap
+    # the cloud width is the match radius, not the astrometric precision -> caveat present
+    assert "0.1″ cross-match radius" in cap
+
+
+def test_stage7_title_tightening_only_when_jicama_tighter():
+    # (blocker A/C) the panel title asserts 'tighter' ONLY when both ties measured AND jicama < MAST
+    tighter = D._stage7_astrom_title((134.0,) * 3, (14.5,) * 3)   # jicama 14 < MAST 134
+    assert "tighter" in tighter and "jicama tie 14 mas vs MAST 134 mas" in tighter
+    # Sgr C o012 case: jicama 19.56 is WORSE than MAST 17.62 -> no 'tighter', both numbers reported
+    worse = D._stage7_astrom_title((17.62,) * 3, (19.56,) * 3)
+    assert "tighter" not in worse
+    assert "jicama tie 20 mas vs MAST 18 mas" in worse
+    # only one side measured -> neutral wording, never 'tighter'
+    assert "tighter" not in D._stage7_astrom_title(None, (14.5,) * 3)
+    assert "tighter" not in D._stage7_astrom_title((17.6,) * 3, None)
+
+
+def test_caption_stage7_neutral_when_jicama_not_tighter():
+    # (blocker A) jicama (20) NOT tighter than MAST (18): caption reports both, no 'tightening' claim
+    cap = D.caption_for(7, dict(stage=7, jicama_offset_med_mas=19.56, mast_offset_med_mas=17.62))
+    assert "20 mas (jicama)" in cap and "18 mas (MAST)" in cap
+    assert "astrometric tightening the pipeline delivers" not in cap
+    assert "not tighter than MAST" in cap
+
+
+def test_caption_stage7_drops_clause_when_mast_unavailable():
+    # (blocker B) only the MAST tie is unmeasurable: caption drops the improvement clause and states
+    # the comparison is unavailable -- it does not assert tightening.
+    cap = D.caption_for(7, dict(stage=7, jicama_offset_med_mas=14.5))
+    assert "astrometric tightening the pipeline delivers" not in cap
+    assert "MAST comparison is unavailable" in cap
+
+
+def test_stage7_verdict_jicama_unmeasurable_fails_and_redflags():
+    # (blocker B / test 3) our own tie unmeasurable -> passed False AND red_flag set
+    passed, red_flag, reason = D._stage7_verdict("our.fits", (17.6,) * 3, None, jic_unmeas=True)
+    assert passed is False and red_flag is True and reason and "jicama" in reason
+    # and the caption then enters the red-flag branch (no 'tightening' claim)
+    cap = D.caption_for(7, dict(stage=7, red_flag=True, red_flag_reason=reason))
+    assert cap.startswith("🚩") and "RED FLAG" in cap
+    assert "astrometric tightening the pipeline delivers" not in cap
+
+
+def test_stage7_verdict_mast_only_unmeasurable_passes_without_redflag():
+    # (blocker B / test 2) only the MAST tie unmeasurable -> comparison unavailable, NOT our defect:
+    # passed stays True and no red flag, so the boolean does not contradict the caption.
+    passed, red_flag, reason = D._stage7_verdict("our.fits", None, (14.5,) * 3, jic_unmeas=False)
+    assert passed is True and red_flag is False and reason is None
+
+
+def test_stage7_verdict_pass_requires_mosaic_and_no_worse_tie():
+    # a mosaic must exist; and where both ties are measured the pipeline tie must be no worse
+    assert D._stage7_verdict(None, (134.0,) * 3, (14.5,) * 3, jic_unmeas=False)[0] is False
+    assert D._stage7_verdict("our.fits", (134.0,) * 3, (14.5,) * 3, jic_unmeas=False)[0] is True
+    # jicama much worse than MAST -> not improved -> not a pass
+    assert D._stage7_verdict("our.fits", (18.0,) * 3, (140.0,) * 3, jic_unmeas=False)[0] is False
+
+
+def test_mast_i2d_cross_field_and_twildcard(tmp_path, monkeypatch):
+    # (🟠) o002 belongs to cloudc but its MAST i2d is staged under brick/mastDownload; the finder
+    # must reach it via the cross-field fallback, and it must not depend on t001 exactly.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    brick = tmp_path / "brick" / "mastDownload"; brick.mkdir(parents=True)
+    (tmp_path / "cloudc" / "mastDownload").mkdir(parents=True)      # empty for this obs
+    _touch(brick, "jw02221-o002_t004_nircam_clear-f212n_i2d.fits")  # non-t001 tag, sibling field
+    _touch(brick, "jw02221-o002_t004_nircam_clear-f212n-merged_i2d.fits")   # reprocessed: excluded
+    o = Observation(program="2221", obs="002", target="Cloud C", release_field="cloudc",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    got = D._mast_i2d(o, "F212N")
+    assert got is not None and got.endswith("clear-f212n_i2d.fits")
+    assert "merged" not in os.path.basename(got)
+
+
+def test_mast_i2d_and_l3cat_pathing(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    md = tmp_path / "brick" / "mastDownload"; md.mkdir(parents=True)
+    _touch(md, "jw02221-o001_t001_nircam_clear-f212n_i2d.fits")
+    _touch(md, "jw02221-o001_t001_nircam_clear-f212n_cat.fits")
+    _touch(md, "jw02221001001_03101_00001_nrca4_destreak_cat.fits")   # a per-detector one to exclude
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    assert D._mast_i2d(o, "F212N").endswith("clear-f212n_i2d.fits")
+    # local L3 cat is found (download not attempted); the per-detector destreak cat is excluded
+    got = D._mast_l3_catalog(o, "F212N", allow_download=False)
+    assert got.endswith("clear-f212n_cat.fits")
+
+
+def test_load_mast_catalog_radec_and_mag(tmp_path):
+    from astropy.table import Table
+    p = str(tmp_path / "cat.fits")
+    ra = np.append(266.40 + np.arange(25) * 1e-4, np.nan)     # 25 finite + 1 NaN
+    dec = np.append(-28.90 + np.arange(25) * 1e-4, -28.9)
+    mag = np.append(18.0 + np.arange(25) * 0.05, 25.0)
+    Table({"ra": ra, "dec": dec, "aper50_abmag": mag}).write(p, overwrite=True)
+    sc, m = D._load_mast_catalog(p)
+    assert sc is not None and len(sc) == 25 and np.all(np.isfinite(sc.ra.deg))
+    assert len(m) == 25
+
+
+def test_mast_l3_catalog_none_when_absent_and_no_download(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    (tmp_path / "brick" / "mastDownload").mkdir(parents=True)
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    assert D._mast_l3_catalog(o, "F212N", allow_download=False) is None
