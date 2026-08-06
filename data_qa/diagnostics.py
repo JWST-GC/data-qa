@@ -1213,13 +1213,21 @@ def stage4_offsets(o: Observation, sw):
     ss = aa.same_star_tie(jsc, ref_sc)
     off_med = ss["off"] if ss else cell_off_med
     bulk_source = "same-star" if ss else "histogram"
+    # The MAGNITUDE gate is the per-cell xcorr histogram median (``cell_off_med``), which tracks a
+    # real bulk mis-registration up to XMAXSEP.  The same-star tie is a REFINEMENT reported when a
+    # small tie is confirmed, NOT the gate: every same-star pair is matched inside 0.05", so its
+    # median is necessarily < 50 mas < THRESH["absolute"] and cannot fail -- gating on it would let
+    # a real 90 mas offset (cell_off_med ~= 87, same-star ~= 13) pass.  Gate on the LARGER of the
+    # two so a genuine mis-registration the histogram sees cannot be masked by the refinement.
+    gate_off = max(cell_off_med, off_med)
     # PASS needs a small tie, spatially CONSISTENT cells (no adjacency-confirmed sub-region off by
     # >30 mas holding >2% of sources; catches a minority a mad_std cannot), enough coverage, and no
     # inter-module offset.
-    passed = bool(off_med < aa.THRESH["absolute"] and cc["consistent"] and
+    passed = bool(gate_off < aa.THRESH["absolute"] and cc["consistent"] and
                   (io is None or io < aa.THRESH["intermodule"]))
     metrics.update(offset_med_mas=off_med, offset_scatter_mas=spread, offset_signif_med=signif,
-                   bulk_off=off_med,                        # primary offset (same-star when available)
+                   bulk_off=off_med,                        # reported offset (same-star when available)
+                   gate_off_mas=gate_off,                   # value the magnitude gate tests (cell histogram)
                    bulk_source=bulk_source, cell_off_med=cell_off_med,
                    same_star_off=(ss["off"] if ss else None),
                    same_star_npairs=(ss["npairs"] if ss else None),
@@ -2035,10 +2043,10 @@ def _caption_for_impl(n, metrics):
             cellm = metrics.get("cell_off_med")
             base += (f"The quoted bulk is the **same-star** tie from {ssn} mutual nearest pairs"
                      + (f" (per-star scatter {sss:.0f} mas)" if sss is not None else "")
-                     + (f"; the per-cell histogram median is {cellm:.0f} mas, and the {sig:.0f}σ "
-                        f"significance above refers to THAT number, not to this one — an "
-                        f"all-pairs peak against a DENSE reference is pulled by the correlated "
-                        f"wrong-pair background" if (cellm is not None and sig is not None)
+                     + (f", a REFINEMENT of the per-cell histogram median ({cellm:.0f} mas) once the "
+                        f"cells confirm the tie is small — an all-pairs peak against a DENSE "
+                        f"reference is pulled by the correlated wrong-pair background. The pass gate "
+                        f"tests the histogram median, not this refinement" if cellm is not None
                         else "") + ". ")
         if ncf:
             base += (f"{ncf} adjacent cell(s) holding {100 * (badf or 0):.0f}% of the sources are "

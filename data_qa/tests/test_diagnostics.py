@@ -474,16 +474,98 @@ def test_position_valid_unitless_sep_column_treated_as_degrees():
     assert ok.sum() == 150 and "sep<=" in note
 
 
+def _uniform_sc(n, seed, ra0=266.4, dec0=-29.0, span=0.02):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.default_rng(seed)
+    ra = ra0 + rng.uniform(0, span, n); dec = dec0 + rng.uniform(0, span, n)
+    return SkyCoord(ra * u.deg, dec * u.deg)
+
+
 def test_same_star_tie_refuses_when_bulk_is_large():
     # the guard that keeps this from becoming a dense nearest-neighbour median: without a verified
     # SMALL global tie the nearest pair is not the right star, so it must refuse rather than
     # return a number that collapses toward zero.
+    from data_qa import astrometry_audit as aa
+    a = _uniform_sc(400, 0)
+    assert aa.same_star_tie(a, a, bulk=dict(off=500.0)) is None
+    # an explicitly-supplied bulk with no peak_ratio is treated as vetted by the caller
+    out = aa.same_star_tie(a, a, bulk=dict(off=2.0))
+    assert out is not None and out["off"] < 1e-6 and out["npairs"] == 400
+
+
+def test_same_star_tie_refuses_ambiguous_peak_ratio():
+    # an ambiguous xcorr (peak_ratio below MIN_PEAK_RATIO) with a small off must NOT admit the
+    # same-star estimate -- otherwise a chance-small off silently fabricates agreement.
+    from data_qa import astrometry_audit as aa
+    a = _uniform_sc(400, 1)
+    assert aa.same_star_tie(a, a, bulk=dict(off=2.0, peak_ratio=1.0)) is None
+    assert aa.same_star_tie(a, a, bulk=dict(off=2.0, peak_ratio=aa.MIN_PEAK_RATIO)) is not None
+
+
+def test_same_star_tie_real_path_bulk_none():
+    # the path stage 4 actually uses: bulk=None, so xcorr is measured internally (incl. peak_ratio).
+    # A small real tie is recovered; a >100 mas mis-registration is refused (nearest pair is wrong).
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     from data_qa import astrometry_audit as aa
-    rng = np.random.default_rng(0)
-    ra = 266.4 + rng.uniform(0, 0.02, 400); dec = -29.0 + rng.uniform(0, 0.02, 400)
-    a = SkyCoord(ra * u.deg, dec * u.deg)
-    assert aa.same_star_tie(a, a, bulk=dict(off=500.0)) is None
-    out = aa.same_star_tie(a, a, bulk=dict(off=2.0))
-    assert out is not None and out["off"] < 1e-6 and out["npairs"] == 400
+    a = _uniform_sc(3000, 2)
+    cosd = np.cos(np.radians(-29.0))
+    b_small = SkyCoord((a.ra.deg + 8.0 / 3.6e6 / cosd) * u.deg, a.dec.deg * u.deg)   # +8 mas
+    out = aa.same_star_tie(a, b_small)                       # bulk=None -> real xcorr path
+    assert out is not None and abs(out["off"] - 8.0) < 4.0
+    b_far = SkyCoord((a.ra.deg + 300.0 / 3.6e6 / cosd) * u.deg, a.dec.deg * u.deg)   # +300 mas
+    assert aa.same_star_tie(a, b_far) is None
+
+
+def test_xcorr_recentring_no_floor_at_zero():
+    # on a uniform, UNCLUSTERED synthetic the recentred xcorr must not carry the ~half-bin (~5 mas)
+    # quantization floor at truth 0, yet must still track a real 90 mas offset.
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa import astrometry_audit as aa
+    a = _uniform_sc(2000, 3)
+    cosd = np.cos(np.radians(-29.0))
+    z = aa.xcorr(a, a)
+    assert z is not None and z["off"] < 1.5                  # was ~5 mas with a single refinement
+    b90 = SkyCoord((a.ra.deg + 90.0 / 3.6e6 / cosd) * u.deg, a.dec.deg * u.deg)
+    f = aa.xcorr(a, b90)
+    assert f is not None and abs(f["off"] - 90.0) < 3.0
+
+
+def _stage4_injection(monkeypatch, shift_mas):
+    """Run stage4_offsets end-to-end on a dense uniform synthetic field whose JWST positions are
+    shifted ``shift_mas`` in RA from the reference, mocking only the I/O seams.  Returns metrics."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa import astrometry_audit as aa
+    rng = np.random.default_rng(11)
+    n = 12000
+    ra = 266.40 + rng.uniform(0, 0.02, n); dec = -29.00 + rng.uniform(0, 0.02, n)
+    ref_sc = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-29.0))
+    jsc = SkyCoord((ra + shift_mas / 3.6e6 / cosd) * u.deg, dec * u.deg)   # JWST shifted vs ref
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, sw: "/dev/null/mosaic_i2d.fits")
+    monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/refcat.fits")
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, path: 2022.5)
+    monkeypatch.setattr(aa, "load_reference", lambda ref, ep: (ref_sc, None))
+    monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
+    monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
+    _png, metrics = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
+    return metrics
+
+
+def test_stage4_passes_at_zero_offset(monkeypatch):
+    # a correctly-registered frame (0 mas) must PASS end-to-end.
+    m = _stage4_injection(monkeypatch, 0.0)
+    assert m["passed"] is True
+    assert m["cell_off_med"] < 10 and m["gate_off_mas"] < 10
+
+
+def test_stage4_fails_on_90mas_misregistration(monkeypatch):
+    # THE blocker: a 90 mas bulk mis-registration must FAIL, even though the same-star refinement
+    # (mutual NN inside 0.05") would report a small collapsed value.  The gate reads the cell
+    # histogram median, so the mis-registration cannot pass.
+    m = _stage4_injection(monkeypatch, 90.0)
+    assert m["passed"] is False
+    assert m["cell_off_med"] > 75 and m["gate_off_mas"] > 75

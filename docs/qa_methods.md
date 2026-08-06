@@ -240,7 +240,11 @@ offset is the source-count-weighted median across those cells (see [bulk offset]
 
 The reported **tie** is the [bulk offset](#glossary-bulk); its
 [uncertainty](#glossary-tie-uncertainty) is the cell-to-cell standard error and "Nσ" = tie ÷ that
-standard error. Consider it passing if: the tie is small (< 75 mas); the cells are spatially
+standard error. When the cells confirm a small tie, the reported value is refined to a same-star
+(mutual nearest-pair) median, but the **pass gate always tests the per-cell histogram median** (the
+larger of the two), so a real bulk mis-registration the histogram sees cannot be masked by the
+refinement — every same-star pair is matched within 0.05", so its median alone could never exceed
+the 75 mas gate. Consider it passing if: the tie is small (< 75 mas); the cells are spatially
 consistent — no adjacency-confirmed sub-region is off by more than 30 mas while holding more than
 2% of the stars (a lone mis-peaked cell does not count; a coherent block does); at least 4 cells
 were measurable with ≥ 50% coverage of the sources; and the inter-module offset is < 15 mas.

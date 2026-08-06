@@ -81,9 +81,15 @@ def xcorr(a: SkyCoord, b: SkyCoord, maxsep=XMAXSEP, binarc=XBIN):
     bg = float(np.median(H[H > 0])) if (H > 0).any() else 0.0
     dra0 = (xe[i] + xe[i + 1]) / 2.0
     ddec0 = (ye[j] + ye[j + 1]) / 2.0
-    # refine: mean of pairs within one bin of the peak
-    near = (np.abs(dra - dra0) < binarc) & (np.abs(ddec - ddec0) < binarc)
-    if near.sum() >= 5:
+    # refine: median of pairs within one bin of the CURRENT centre, iterated so the estimate leaves
+    # the quantized bin centre and converges off the XBIN grid.  A single pass leaves a ~half-bin
+    # (~5 mas at XBIN=0.05") floor even at a true zero offset, because the +/-1-bin box around the
+    # peak bin is asymmetric about the true value; re-centring a few times removes that floor while
+    # a real offset stays put (truth 0 -> ~0.4 mas, truth 90 -> ~90 mas).
+    for _ in range(4):
+        near = (np.abs(dra - dra0) < binarc) & (np.abs(ddec - ddec0) < binarc)
+        if near.sum() < 5:
+            break
         dra0, ddec0 = float(np.median(dra[near])), float(np.median(ddec[near]))
     return dict(dra=dra0 * 1000, ddec=ddec0 * 1000, off=float(np.hypot(dra0, ddec0) * 1000),
                 npairs=int(len(ia)), peak_ratio=float(H.max() / bg) if bg else float("inf"))
@@ -114,7 +120,12 @@ def same_star_tie(a: SkyCoord, b: SkyCoord, bulk=None, radius=0.05 * u.arcsec, m
     """
     if bulk is None:
         bulk = xcorr(a, b)
-    if not bulk or bulk.get("off", np.inf) > SAME_STAR_MAX_BULK_MAS:
+    # Refuse unless a verified SMALL global tie exists AND the xcorr peak that measured it was
+    # unambiguous (peak_ratio >= MIN_PEAK_RATIO).  An ambiguous xcorr can report a small ``off`` by
+    # chance; admitting the nearest-pair median on top of it would fabricate agreement.  An
+    # explicitly-supplied ``bulk`` with no peak_ratio is treated as already vetted by the caller.
+    if (not bulk or bulk.get("off", np.inf) > SAME_STAR_MAX_BULK_MAS
+            or bulk.get("peak_ratio", np.inf) < MIN_PEAK_RATIO):
         return None
     i_ab, sep, _ = a.match_to_catalog_sky(b)
     i_ba, _, _ = b.match_to_catalog_sky(a)
