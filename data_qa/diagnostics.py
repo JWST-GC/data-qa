@@ -2276,6 +2276,230 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     return _save(fig, f"{o.obsid}_stage7.png"), metrics
 
 
+# --------------------------------------------------------------------------- STAGE 8 (distortion)
+_SKYCOORD_COL_RE = re.compile(r"^skycoord_(f\d{3}[wnm])\.ra$")
+# Fixed absolute amplitude (mas) above which the inter-filter residual is flagged as a GROSS
+# per-filter WCS break rather than the expected ~1 mas distortion term.  Fixed on purpose -- it is
+# NOT scaled by the per-star scatter being tested, so injected noise cannot loosen it.
+_STAGE8_GROSS_OFFSET_MAS = 15.0
+
+
+def _interfilter_residuals(o, f1):
+    """Per-star (RA, Dec, ΔRA, ΔDec) position difference between filter ``f1`` and a second JWST
+    filter of the SAME field, from the merged catalogue's per-band positions of the SAME source
+    rows -- bulk-removed.
+
+    This is the distortion reference the way #60's review asks for: two filters share the frames,
+    the offsets table, the DVA correction and the reference tie, so the ONLY thing that differs is
+    a per-filter WCS term -- exactly the position-dependent distortion residual we want, with no
+    external-catalogue noise (VIRAC's ~20 mas per-star PM error would swamp a few-mas residual).
+    The match radius is not zero: the rows were paired by a mutual-nearest-neighbour cross-band
+    match at ~100 mas per band in ``merge_catalogs.py`` (visible as a hard truncation of the kept
+    separations near 100 mas), so a blind spot survives at ~100 mas.  That is ~100x the ~1 mas
+    signal, so it is far less binding than the VIRAC-referenced version -- but it is a cut, not the
+    absence of one, and it leaves a tail of nearest-neighbour-ambiguous rows (see ``frac_gt_20mas``
+    in the stage metrics) that inflates the per-cell sampling noise.
+
+    The partner filter is the nearest in wavelength that has a ``skycoord_<f>`` column in the same
+    catalogue.  Returns (ra, dec, dra_mas, dde_mas, f2, catname) or None."""
+    from astropy.io import fits
+    from astropy.table import Table
+    import astropy.units as u
+    sc1col = f"skycoord_{f1.lower()}"
+    best = None; rank = (-1.0, -1.0)
+    for p, kind, tier, mtime in _catalog_candidates(o):
+        if (tier, mtime) <= rank:
+            continue
+        try:
+            hdr = fits.getheader(p, ext=1)
+        except (OSError, IndexError):
+            continue
+        ttypes = [str(hdr.get(f"TTYPE{i}", "")).lower() for i in range(1, hdr.get("TFIELDS", 0) + 1)]
+        if f"{sc1col}.ra" not in ttypes:
+            continue
+        others = sorted({m.group(1) for t in ttypes if (m := _SKYCOORD_COL_RE.match(t))
+                         and m.group(1) != f1.lower()})
+        if others:
+            best = (p, others); rank = (tier, mtime)
+    if best is None:
+        return None
+    p, others = best
+
+    def _wl(name):                                          # "f212n" -> 212
+        m = re.search(r"f(\d{3})", name); return int(m.group(1)) if m else 9999
+    f2 = min(others, key=lambda c: abs(_wl(c) - _wl(f1.lower())))
+    try:
+        t = Table.read(p)
+    except (OSError, ValueError):
+        return None
+    sc1 = t[sc1col]; sc2 = t[f"skycoord_{f2}"]
+    g = (np.isfinite(sc1.ra.deg) & np.isfinite(sc1.dec.deg)
+         & np.isfinite(sc2.ra.deg) & np.isfinite(sc2.dec.deg))
+    # keep only WELL-MEASURED stars in BOTH bands (flux S/N > 10 where the columns exist), so the
+    # per-star scatter is the real centroid precision, not blends/faint junk -- this is what makes
+    # a coherent sub-mas distortion recoverable above a shuffled-position null (see stage8).
+    for fb in (f1.lower(), f2):
+        fc, ec = f"flux_{fb}", f"flux_err_{fb}"
+        if fc in t.colnames and ec in t.colnames:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                sn = np.asarray(t[fc], float) / np.asarray(t[ec], float)
+            g &= np.isfinite(sn) & (sn > 10)
+    if int(g.sum()) < 200:
+        return None
+    sc1 = sc1[g]; sc2 = sc2[g]
+    cosd = float(np.cos(np.radians(np.median(sc1.dec.deg))))
+    dra = (sc1.ra - sc2.ra).to(u.mas).value * cosd
+    dde = (sc1.dec - sc2.dec).to(u.mas).value
+    dra -= np.median(dra); dde -= np.median(dde)           # bulk-removed -> residual = distortion
+    return sc1.ra.deg, sc1.dec.deg, dra, dde, f2.upper(), os.path.basename(p)
+
+
+def _binned_median_2d(x, y, vals, nb, minn=3, cosd=1.0):
+    """Median of ``vals`` on an ``nb`` x ``nb`` grid over (x, y), plus the per-cell count.
+    Numpy-only (avoids a scipy dependency that the CI env lacks).  Returns (med, xe, ye, cnt)
+    with med/cnt shaped ``[nb (x), nb (y)]`` and NaN in cells below ``minn`` points.
+
+    When ``x`` is RA in degrees, pass ``cosd = cos(dec)`` so the x bins span equal on-sky
+    distance (a degree of RA is ``cosd`` of a degree of Dec on the sky, ~1.14x at dec=-28.9);
+    the returned edges ``xe`` are converted back to native RA degrees for plotting."""
+    xs = np.asarray(x, float) * cosd
+    xse = np.linspace(np.min(xs), np.max(xs), nb + 1)
+    ye = np.linspace(np.min(y), np.max(y), nb + 1)
+    ix = np.clip(np.digitize(xs, xse) - 1, 0, nb - 1)
+    iy = np.clip(np.digitize(y, ye) - 1, 0, nb - 1)
+    xe = xse / cosd if cosd else xse
+    med = np.full((nb, nb), np.nan); cnt = np.zeros((nb, nb), int)
+    for i in range(nb):
+        xi = ix == i
+        for j in range(nb):
+            m = xi & (iy == j)
+            c = int(m.sum())
+            if c >= minn:
+                med[i, j] = float(np.median(vals[m])); cnt[i, j] = c
+    return med, xe, ye, cnt
+
+
+def _amp90(mx, my, cnt):
+    """90th-percentile per-cell residual amplitude (mas) over POPULATED cells; 0 if none."""
+    cell_amp = np.hypot(np.nan_to_num(mx), np.nan_to_num(my))[cnt > 0]
+    return float(np.nanpercentile(cell_amp, 90)) if cell_amp.size else 0.0
+
+
+def _shuffled_null_amp90(ra, dec, dra, dde, nb, cosd, minn=3, n_perm=20, seed=0):
+    """Null distribution of the 90th-percentile cell amplitude under permuting the
+    (residual-vector) -> (position) association.  Positions and cell membership are held fixed and
+    the (ΔRA, ΔDec) pairs are shuffled together, so each permutation is the cell amplitude expected
+    from finite-sample noise with NO spatial coherence.  This carries the nearest-neighbour tail
+    (``frac_gt_20mas``) and the median's efficiency penalty, both of which the per-cell SEM omits,
+    so it is a less optimistic significance floor.  Returns (median null amp90, all null amp90s)."""
+    rng = np.random.default_rng(seed)
+    dra = np.asarray(dra); dde = np.asarray(dde)
+    nulls = np.empty(int(n_perm))
+    for k in range(int(n_perm)):
+        perm = rng.permutation(len(dra))
+        mxp, _, _, cp = _binned_median_2d(ra, dec, dra[perm], nb, minn=minn, cosd=cosd)
+        myp, _, _, _ = _binned_median_2d(ra, dec, dde[perm], nb, minn=minn, cosd=cosd)
+        nulls[k] = _amp90(mxp, myp, cp)
+    return float(np.median(nulls)), nulls
+
+
+def stage8_distortion(o: Observation, sw):
+    """Distortion diagnostic: the INTER-FILTER position residual (bulk-removed) as a function of
+    position across the field -- ``sw`` minus a second JWST filter of the same field, same source
+    rows.  Two filters share the frames/offsets/DVA/tie, so the residual is a per-filter WCS
+    (distortion) term with no external-catalogue noise (the cross-band match radius moved upstream
+    to ~100 mas per band -- far above the ~1 mas signal; see ``_interfilter_residuals``).
+    LEFT/MIDDLE are binned-median ΔRA/ΔDec maps; RIGHT is a per-cell quiver.  A flat map = no
+    differential distortion; a coherent gradient/swirl = a distortion residual between the two
+    filters' solutions, whose significance is quoted against a shuffled-position null."""
+    import matplotlib
+    matplotlib.use("Agg")
+    metrics = dict(stage=8, sw=sw)
+    res = _interfilter_residuals(o, sw)
+    if res is None:
+        # NOT APPLICABLE, not a defect: a single-filter or not-yet-merged obs simply has no second
+        # band to difference.  Use a distinct "measurement unavailable" state -- do NOT red_flag it
+        # and do NOT mark it failed (either would post a non-defect as a defect).
+        png = _red_flag_figure(o, "stage8", "DISTORTION MAP NOT APPLICABLE",
+                               f"No inter-filter distortion map for {sw}: need a merged catalogue "
+                               f"carrying {sw} positions plus a second filter's positions for the "
+                               f"same sources. (Not a defect — a single-filter or not-yet-merged "
+                               f"obs simply has no second band to difference.)")
+        metrics.update(measurable=False, passed=None,
+                       na_reason="no second-filter positions for an inter-filter distortion map")
+        return png, metrics
+    ra, dec, dra, dde, f2, catname = res
+    cosd = float(np.cos(np.radians(np.median(dec))))
+    rad = np.hypot(dra, dde)                                # bulk already removed upstream
+    metrics.update(f2=f2, catalog=catname, n_stars=int(len(ra)),
+                   resid_rms_mas=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
+                   frac_gt_20mas=float(np.mean(rad > 20.0)))
+
+    nb = 12; minn = 3
+    fig, ax = _fig(1, 3, 5.6, 5.2)
+    fig.subplots_adjust(wspace=0.34, top=0.85, bottom=0.12)
+    # binned-median maps.  med is [x(RA), y(Dec)] -> med.T is [Dec, RA] with column 0 = LOWEST RA,
+    # so extent runs ra.min..ra.max then invert_xaxis() -> RA-increases-left, matching the quiver.
+    mx, xe, ye, cnt = _binned_median_2d(ra, dec, dra, nb, minn=minn, cosd=cosd)
+    my, _, _, _ = _binned_median_2d(ra, dec, dde, nb, minn=minn, cosd=cosd)
+    extent = [xe[0], xe[-1], ye[0], ye[-1]]
+    # aspect = 1/cosd draws a degree of RA and a degree of Dec at their true on-sky ratio (RA is
+    # compressed by cosd on the sky), so a separation read off the map is correct.
+    aspect = (1.0 / cosd) if cosd else "auto"
+    vlim = max(2.0, float(np.nanpercentile(rad, 90)))
+    for col, (med, lab) in enumerate(((mx, "ΔRA"), (my, "ΔDec"))):
+        a = ax[0][col]
+        im = a.imshow(med.T, origin="lower", extent=extent, aspect=aspect,
+                      cmap="RdBu_r", vmin=-vlim, vmax=vlim)
+        fig.colorbar(im, ax=a, label=f"median {lab} ({sw}−{f2}) [mas]", shrink=0.85)
+        a.set_xlabel("RA [deg]"); a.set_ylabel("Dec [deg]"); a.invert_xaxis()
+        a.set_title(f"{lab} residual vs position ({sw}−{f2})", fontsize=9)
+    # per-cell quiver (same binned medians)
+    aq = ax[0][2]
+    xc = 0.5 * (xe[1:] + xe[:-1]); yc = 0.5 * (ye[1:] + ye[:-1])
+    XX, YY = np.meshgrid(xc, yc)
+    q = aq.quiver(XX, YY, mx.T, my.T, np.hypot(mx.T, my.T), angles="xy", cmap="viridis")
+    aq.quiverkey(q, 0.82, 1.08, vlim, f"{vlim:.1f} mas", labelpos="E", coordinates="axes",
+                 fontproperties={"size": 8})
+    aq.invert_xaxis(); aq.set_xlabel("RA [deg]"); aq.set_ylabel("Dec [deg]")
+    if aspect != "auto":
+        aq.set_aspect(aspect)
+
+    cells_total = nb * nb
+    cells_used = int(np.count_nonzero(cnt >= minn))
+    spb = float(np.median(cnt[cnt > 0])) if np.any(cnt > 0) else 0.0
+    per_cell_sem = metrics["resid_rms_mas"] / np.sqrt(max(spb, 1.0))
+    amp = _amp90(mx, my, cnt)
+    # significance from a shuffled-position NULL, not the per-cell SEM.  The SEM (scatter/sqrt n) is
+    # ~2x optimistic because the nearest-neighbour-ambiguous tail (frac_gt_20mas) inflates the
+    # sampling noise of a cell median; the null carries that tail, so it is the reported floor.
+    null_amp, nulls = _shuffled_null_amp90(ra, dec, dra, dde, nb, cosd, minn=minn)
+    signif = float(amp / null_amp) if null_amp > 0 else float("inf")
+    p_value = float((int(np.count_nonzero(nulls >= amp)) + 1) / (len(nulls) + 1))
+    metrics.update(binned_amp90_mas=amp, per_cell_sem_mas=float(per_cell_sem),
+                   null_amp90_mas=float(null_amp), amp90_significance=signif,
+                   amp90_p_value=p_value, stars_per_cell=spb,
+                   cells_used=cells_used, cells_total=cells_total)
+    aq.set_title(f"per-cell residual quiver\n({len(ra)} stars, {metrics['resid_rms_mas']:.2f} mas "
+                 f"per-star; amp90 {amp:.2f} vs null {null_amp:.2f} mas = {signif:.1f}×)",
+                 fontsize=9, pad=16)
+    # A real ~1 mas inter-filter distortion term is an EXPECTED measurement, not a defect, so
+    # pass/fail reflects only whether the MEASUREMENT SUCCEEDED (enough populated cells) -- it is
+    # NOT gated on the amplitude vs a self-derived noise level, so injecting noise cannot flip it
+    # (noise leaves the cells populated).  Amplitude + null significance are reported for reading.
+    metrics["passed"] = bool(cells_used >= minn)
+    # red_flag ONLY on a GROSS absolute inter-filter offset -- a fixed threshold a normal ~1 mas
+    # distortion residual never reaches, so it fires only on a genuine per-filter WCS break.
+    if amp > _STAGE8_GROSS_OFFSET_MAS:
+        metrics.update(red_flag=True,
+                       red_flag_reason=(f"gross inter-filter offset: amp90 {amp:.1f} mas "
+                                        f"(> {_STAGE8_GROSS_OFFSET_MAS:.0f} mas) between {sw} and "
+                                        f"{f2} — likely a per-filter WCS break"))
+    fig.suptitle(f"{o.target} {o.obsid} — inter-filter distortion residual ({sw} − {f2})",
+                 fontsize=11, y=0.98)
+    return _save(fig, f"{o.obsid}_stage8.png"), metrics
+
+
 # --------------------------------------------------------------------------- STAGE 6
 def _internal_pos_rms(o, filt):
     """(mag_vega, internal-position-rms in mas) per star from the highest-tier catalog carrying
@@ -2429,6 +2653,8 @@ def build_stage(o, n, sw, lw):
         return stage6_astrom_error(o, sw, lw)
     if n == 7:
         return stage7_mast_vs_pipeline(o, sw)
+    if n == 8:
+        return stage8_distortion(o, sw)
     if n == 9:
         return stage9_psf_vs_aper(o, sw)
     raise ValueError(n)
@@ -2454,6 +2680,7 @@ _HEADLINE = {
     5: "**Stage 5 — inter-detector / inter-module tie.**",
     6: "**Stage 6 — astrometric precision.**",
     7: "**Stage 7 — MAST vs pipeline.**",
+    8: "**Stage 8 — distortion residual map.**",
     9: "**Stage 9 — PSF vs aperture photometry.**",
 }
 
@@ -2485,7 +2712,50 @@ def caption_for(n, metrics):
     return _linkify(_caption_for_impl(n, metrics))
 
 
+def _caption_stage8(metrics):
+    """Stage-8 caption.  Handles three states: not-applicable (no second band -> no pass/fail, not
+    a red flag), a normal measured residual (amplitude + null-based significance), and a gross
+    inter-filter offset (red-flagged).  Kept out of the generic red-flag branch so a red-flagged
+    gross offset still describes a rendered map, not an empty plot."""
+    sw = metrics.get("sw", "SW")
+    if metrics.get("measurable") is False:
+        return ("**Stage 8 — inter-filter distortion residual: not applicable.** No second-filter "
+                f"positions for {sw} in a merged catalogue, so there is no band to difference (a "
+                "single-filter or not-yet-merged obs). This is not a defect and not a failed "
+                "measurement, so no pass/fail is set. ([how this is made](DOCROOT#stage8))")
+    f2 = metrics.get("f2", "a 2nd filter")
+    nS = metrics.get("n_stars"); rms = metrics.get("resid_rms_mas")
+    amp = metrics.get("binned_amp90_mas"); null = metrics.get("null_amp90_mas")
+    signif = metrics.get("amp90_significance"); frac = metrics.get("frac_gt_20mas")
+    base = (f"**Stage 8 — inter-filter distortion residual ({sw} − {f2}).** The per-star position "
+            f"difference between two JWST filters of the same field (the SAME source rows, "
+            f"[S/N > 10](DOCROOT#glossary-snr) in both, field [bulk](DOCROOT#glossary-bulk) "
+            f"removed) as a function of position. Two filters share the frames, offsets table, DVA "
+            f"and tie, so the residual is a per-filter WCS (distortion) term with **no "
+            f"external-catalogue noise**. The cross-band match radius is not zero — it moved "
+            f"upstream to ~100 mas per band (mutual-NN in `merge_catalogs`, visible as truncation "
+            f"near 100 mas), ~100× the ~1 mas signal, so far less binding than a VIRAC-referenced "
+            f"version. LEFT/MIDDLE: binned-median ΔRA/ΔDec maps; RIGHT: per-cell quiver. A flat "
+            f"map = the two solutions agree; a coherent gradient/swirl = a differential distortion "
+            f"residual. ")
+    if nS is not None and rms is not None:
+        base += f"Here: {nS} stars, {rms:.2f} mas per-star"
+        if amp is not None and null is not None and signif is not None:
+            base += (f"; the map's 90th-percentile cell amplitude is {amp:.2f} mas vs a "
+                     f"shuffled-position null of {null:.2f} mas ({signif:.1f}× — the significance, "
+                     f"in place of the ~2×-optimistic per-cell SEM)")
+        if frac is not None:
+            base += (f"; {100 * frac:.1f}% of kept rows have |Δ| > 20 mas (nearest-neighbour "
+                     f"ambiguity within the match radius, which inflates the SEM)")
+        base += ". "
+    if metrics.get("red_flag"):
+        base += f"🚩 {metrics.get('red_flag_reason', 'gross inter-filter offset')}. "
+    return base + "([how this is made](DOCROOT#stage8))"
+
+
 def _caption_for_impl(n, metrics):
+    if n == 8:
+        return _caption_stage8(metrics)
     # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
     # so the generic "the plot is empty" wording would not fit).
     if metrics.get("red_flag") and n != 7:
@@ -2732,7 +3002,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 9])
+    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 8, 9])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")

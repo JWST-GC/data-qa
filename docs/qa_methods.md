@@ -303,6 +303,53 @@ systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percent
 
 Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnostics.py).
 
+<a id="stage8"></a>
+## Stage 8 — inter-filter distortion residual
+
+The **inter-filter** position residual as a function of position across the field: filter `sw`
+minus a second JWST filter of the same field, using the **same source rows** in the merged
+catalog, [S/N > 10](#glossary-snr) in both bands, [bulk](#glossary-bulk) removed. Two filters of
+one field share the frames, the offsets table, the DVA correction and the reference tie, so the
+only thing that differs is a **per-filter WCS term** — exactly the position-dependent distortion
+residual this stage is for. There is **no external-catalog noise** (VIRAC's ~20 mas per-star PM
+error would swamp a few-mas residual). The cross-band match radius did **not** disappear: the rows
+were paired by a mutual-nearest-neighbour cross-band match at ~100 mas per band in
+`merge_catalogs.py` (visible in the data as a hard truncation of the kept separations near 100 mas).
+That blind spot survives, but at ~100× the ~1 mas signal it is far less binding than the ~0.15″
+match in a VIRAC-referenced version. The partner filter is the nearest in wavelength that has a
+`skycoord_<f>` column in the catalog.
+
+- **LEFT / MIDDLE** — binned-median ΔRA and ΔDec maps (12×12, diverging colour; RA bins carry
+  `cos δ` so cells span equal on-sky distance).
+- **RIGHT** — a per-cell residual quiver.
+
+A flat map means the two filters' solutions agree; a coherent gradient or swirl is a differential
+distortion residual. Significance is quoted against a **shuffled-position null**: the residual
+vectors are permuted across the fixed cells (~20 times) and the 90th-percentile cell amplitude is
+recomputed, so the null carries the nearest-neighbour-ambiguous tail and the median's efficiency
+penalty. On the brick the observed amplitude (~1.1 mas) sits at ~5–6× the null (~0.2 mas). The
+per-cell standard error (per-star scatter ÷ √stars-per-cell) is reported too, but it runs ~2×
+smaller than the null because the ~7–8% of rows with |Δ| > 20 mas (nearest-neighbour ambiguity
+within the match radius) inflate the sampling noise of a cell median beyond scatter/√n; the
+null-based figure is the one to trust. This complements [stage 4](#stage4) (the *bulk* tie + cell
+consistency) by exposing *spatially-structured* residuals.
+
+**Pass/fail semantics.** A real ~1 mas inter-filter distortion term is an *expected measurement*,
+not a defect, so `passed` reflects only whether the measurement **succeeded** (enough populated
+cells) — it is **not** gated on the amplitude versus a self-derived noise level, so injecting noise
+cannot flip it. A single-filter or not-yet-merged obs has no second band to difference: that is a
+distinct *not-applicable* state (no `passed`, no red flag). A **red flag** is raised only on a
+**gross** absolute inter-filter offset (fixed `binned_amp90_mas` > 15 mas), which would indicate a
+genuine per-filter WCS break rather than normal distortion.
+
+Metrics: `n_stars`, `resid_rms_mas` (per-star), `binned_amp90_mas` (90th-percentile cell
+amplitude), `null_amp90_mas` and `amp90_significance` (observed ÷ null; also `amp90_p_value`),
+`per_cell_sem_mas` (reported, ~2× optimistic), `frac_gt_20mas`, `stars_per_cell`,
+`cells_used`/`cells_total`.
+
+**Source:** [`data_qa/diagnostics.py` → `stage8_distortion`](../data_qa/diagnostics.py)
+(`_interfilter_residuals`, `_binned_median_2d`).
+
 <a id="stage9"></a>
 ## Stage 9 — PSF vs aperture photometry
 

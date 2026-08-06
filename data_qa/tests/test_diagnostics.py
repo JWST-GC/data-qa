@@ -635,3 +635,237 @@ def test_mast_l3_catalog_none_when_absent_and_no_download(tmp_path, monkeypatch)
     o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
                     instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
     assert D._mast_l3_catalog(o, "F212N", allow_download=False) is None
+
+
+def test_caption_stage8_distortion():
+    cap = D.caption_for(8, dict(stage=8, sw="F212N", f2="F187N", n_stars=39025,
+                                resid_rms_mas=1.63, binned_amp90_mas=1.09, per_cell_sem_mas=0.10,
+                                null_amp90_mas=0.19, amp90_significance=5.6, frac_gt_20mas=0.076))
+    assert "DOCROOT" not in cap and "qa_methods.md#stage8" in cap
+    assert "inter-filter" in cap.lower() and "F212N − F187N" in cap and "S/N > 10" in cap
+    assert "39025 stars" in cap
+    # quotes the shuffled-position null, not "many-σ from SEM"; states the match radius is not zero
+    assert "null" in cap.lower() and "5.6×" in cap
+    assert "100 mas" in cap and "|Δ| > 20 mas" in cap
+    assert "no match radius" not in cap.lower()
+
+
+def test_caption_stage8_not_applicable_is_not_a_red_flag():
+    cap = D.caption_for(8, dict(stage=8, sw="F212N", measurable=False, passed=None))
+    assert "not applicable" in cap.lower()
+    # a non-defect must NOT be rendered as a red flag / empty plot
+    assert "🚩" not in cap and "RED FLAG" not in cap and "plot is empty" not in cap.lower()
+
+
+def test_caption_stage8_gross_offset_flags_but_describes_map():
+    cap = D.caption_for(8, dict(stage=8, sw="F212N", f2="F187N", n_stars=5000,
+                                resid_rms_mas=2.0, binned_amp90_mas=25.0, null_amp90_mas=0.5,
+                                amp90_significance=50.0, frac_gt_20mas=0.05, red_flag=True,
+                                red_flag_reason="gross inter-filter offset: amp90 25.0 mas"))
+    assert "🚩" in cap and "gross" in cap.lower()
+    # even red-flagged, it describes the rendered map -- not the generic empty-plot caption
+    assert "plot is empty" not in cap.lower()
+
+
+def test_interfilter_residuals_bulk_removed_and_gradient(tmp_path, monkeypatch):
+    from astropy.table import Table
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    rng = np.random.RandomState(5)
+    ra = 266.40 + rng.uniform(0, 0.03, 1000); dec = -28.90 + rng.uniform(0, 0.03, 1000)
+    cosd = np.cos(np.radians(-28.9))
+    grad = (ra - ra.mean()) * 2000.0                       # RA-dependent ΔRA (distortion-like)
+    sc1 = SkyCoord((ra + (60.0 + grad) / 3.6e6 / cosd) * u.deg, dec * u.deg)   # bulk 60 + gradient
+    sc2 = SkyCoord(ra * u.deg, dec * u.deg)
+    t = Table({"skycoord_f212n": sc1, "skycoord_f187n": sc2,
+               "flux_f212n": np.full(len(ra), 1e4), "flux_err_f212n": np.full(len(ra), 1e2),
+               "flux_f187n": np.full(len(ra), 1e4), "flux_err_f187n": np.full(len(ra), 1e2)})
+    p = str(tmp_path / "cat.fits"); t.write(p)
+    monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
+    out = D._interfilter_residuals(object(), "F212N")
+    assert out is not None
+    rr, dd, dra, dde, f2, name = out
+    assert f2 == "F187N"
+    assert abs(np.median(dra)) < 2 and abs(np.median(dde)) < 2          # bulk removed
+    assert np.corrcoef(rr, dra)[0, 1] > 0.8                             # gradient recovered, no flip
+
+
+def test_binned_median_2d_orientation():
+    # a value that increases with x must land in higher-x cells (guards the imshow orientation)
+    x = np.linspace(0, 1, 400); y = np.random.RandomState(7).uniform(0, 1, 400)
+    med, xe, ye, cnt = D._binned_median_2d(x, x, y * 0 + x, nb=4)   # vals == x
+    col_means = np.nanmean(med, axis=1)                              # mean over y per x-bin
+    assert col_means[0] < col_means[-1]                             # increases with x-bin index
+
+
+def test_binned_median_2d_respects_minn():
+    # a cell with fewer than minn (=3 default) points must be EMPTY (NaN, cnt 0), not filled --
+    # pins the minn threshold so a mutation minn 3->1 (or 3->2) is caught.  y is constant so all
+    # points share one y-bin; x splits 2 into x-bin0 and 4 into x-bin1 (nb=2).
+    x = np.array([0.1, 0.2, 0.6, 0.7, 0.8, 0.85])
+    y = np.full(6, 0.2)
+    med, xe, ye, cnt = D._binned_median_2d(x, y, x, nb=2)
+    (i2,) = np.where(cnt.ravel() == 2); (i4,) = np.where(cnt.ravel() == 4)
+    assert i2.size == 0                                    # the 2-point cell is dropped at minn=3
+    assert i4.size == 1 and np.isfinite(med.ravel()[i4[0]])  # the 4-point cell is kept
+    assert np.count_nonzero(cnt) == 1                     # exactly one populated cell
+
+
+def _two_filter_cat(path, ra, dec, dra_mas, dde_mas, sn=100.0,
+                    extra_partner=None, f1="f212n", f2="f187n"):
+    """Write a merged-catalogue-like FITS: ``skycoord_<f1>`` is ``skycoord_<f2>`` shifted by
+    (dra_mas, dde_mas) on the same rows, with matching flux / flux_err giving S/N ``sn``.
+    ``extra_partner`` (e.g. "f480m") adds a farther-wavelength band to test partner selection."""
+    from astropy.table import Table
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    ra = np.asarray(ra, float); dec = np.asarray(dec, float)
+    dra_mas = np.broadcast_to(np.asarray(dra_mas, float), ra.shape)
+    dde_mas = np.broadcast_to(np.asarray(dde_mas, float), ra.shape)
+    cosd = float(np.cos(np.radians(np.median(dec))))
+    sc2 = SkyCoord(ra * u.deg, dec * u.deg)
+    sc1 = SkyCoord((ra + dra_mas / 3.6e6 / cosd) * u.deg, (dec + dde_mas / 3.6e6) * u.deg)
+    n = len(ra); flux = np.full(n, 1e4); ferr = flux / np.broadcast_to(sn, (n,))
+    cols = {f"skycoord_{f1}": sc1, f"skycoord_{f2}": sc2,
+            f"flux_{f1}": flux, f"flux_err_{f1}": ferr.copy(),
+            f"flux_{f2}": flux, f"flux_err_{f2}": ferr.copy()}
+    if extra_partner:
+        cols[f"skycoord_{extra_partner}"] = sc2
+    Table(cols).write(path, overwrite=True)
+
+
+def _grid_radec(n, seed, span=0.03):
+    rng = np.random.RandomState(seed)
+    return 266.40 + rng.uniform(0, span, n), -28.90 + rng.uniform(0, span, n)
+
+
+def test_interfilter_residuals_applies_sn_cut(tmp_path, monkeypatch):
+    # 1000 well-measured stars + 1000 low-S/N junk; only the 1000 high-S/N rows may survive.
+    # A mutation deleting the S/N>10 cut keeps all 2000.
+    ra_g, dec_g = _grid_radec(1000, 1); ra_b, dec_b = _grid_radec(1000, 2)
+    rng = np.random.RandomState(3)
+    ra = np.concatenate([ra_g, ra_b]); dec = np.concatenate([dec_g, dec_b])
+    dra = np.concatenate([np.full(1000, 0.5), rng.normal(0, 80, 1000)])
+    dde = np.concatenate([np.full(1000, 0.5), rng.normal(0, 80, 1000)])
+    sn = np.concatenate([np.full(1000, 100.0), np.full(1000, 5.0)])     # junk < 10
+    p = str(tmp_path / "sn.fits"); _two_filter_cat(p, ra, dec, dra, dde, sn=sn)
+    monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
+    out = D._interfilter_residuals(object(), "F212N")
+    assert out is not None and len(out[0]) == 1000                      # junk excluded
+
+
+def test_interfilter_residuals_partner_is_nearest_wavelength(tmp_path, monkeypatch):
+    # F212N with F187N (25 nm away) and F480M (268 nm away) present -> nearest = F187N.
+    # A mutation min()->max() would pick F480M.
+    ra, dec = _grid_radec(500, 4)
+    p = str(tmp_path / "partner.fits")
+    _two_filter_cat(p, ra, dec, 0.0, 0.0, extra_partner="f480m")
+    monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
+    out = D._interfilter_residuals(object(), "F212N")
+    assert out is not None and out[4] == "F187N"
+
+
+def test_interfilter_residuals_requires_min_stars(tmp_path, monkeypatch):
+    # 150 stars (< the 200 floor) -> None; a mutation 200->0 would return a result.
+    ra, dec = _grid_radec(150, 5)
+    p = str(tmp_path / "few.fits"); _two_filter_cat(p, ra, dec, 0.0, 0.0)
+    monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
+    assert D._interfilter_residuals(object(), "F212N") is None
+
+
+def _run_stage8(tmp_path, monkeypatch, ra, dec, dra, dde, sn=100.0):
+    p = str(tmp_path / "cat.fits"); _two_filter_cat(p, ra, dec, dra, dde, sn=sn)
+    monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "figs"))
+    png, m = D.stage8_distortion(_obs(filt="F212N"), "F212N")
+    assert os.path.exists(png)                                          # it renders
+    return m
+
+
+def test_stage8_recovers_gradient_null_significance_and_amp90(tmp_path, monkeypatch):
+    # KNOWN coherent RA gradient (peak ~6 mas) + 1 mas noise on 8000 high-S/N stars (enough per
+    # cell that the shuffled-position null is well below the coherent amplitude).
+    ra, dec = _grid_radec(8000, 11)
+    ran = (ra - ra.mean()) / (0.5 * (ra.max() - ra.min()))             # ~[-1, 1]
+    rng = np.random.RandomState(12)
+    A = 6.0
+    dra = A * ran + rng.normal(0, 1.0, ra.size)
+    dde = rng.normal(0, 1.0, ra.size)
+    m = _run_stage8(tmp_path, monkeypatch, ra, dec, dra, dde)
+    assert m["n_stars"] == 8000
+    # amp90 recovers the gradient; a mutation amp90->amp50 would report ~0.5*A (~3 mas), so the
+    # >4.2 mas floor separates the 90th percentile (~5.4) from the 50th (~3.0).
+    assert m["binned_amp90_mas"] > 4.2
+    # significance is the NULL ratio (observed / shuffled-position), and it is >> 1 for real signal
+    assert m["null_amp90_mas"] < m["binned_amp90_mas"]
+    assert m["amp90_significance"] > 3.0 and m["amp90_p_value"] < 0.1
+    assert m["cells_total"] == 144 and m["cells_used"] > 0
+    assert m["passed"] is True and not m.get("red_flag")               # a real ~mas term is no defect
+
+
+def test_stage8_pure_noise_significance_near_one_and_does_not_flip_pass(tmp_path, monkeypatch):
+    # pure Gaussian position noise, NO coherent term: significance ~1, and passed stays True
+    # (the gate is measurement-success, not amplitude, so noise cannot flip fail->pass).
+    ra, dec = _grid_radec(3000, 21)
+    rng = np.random.RandomState(22)
+    m = _run_stage8(tmp_path, monkeypatch, ra, dec,
+                    rng.normal(0, 3.0, ra.size), rng.normal(0, 3.0, ra.size))
+    assert m["amp90_significance"] < 2.0                               # no coherent structure
+    assert m["passed"] is True and not m.get("red_flag")
+
+
+def test_stage8_gate_is_measurement_success_not_amplitude(tmp_path, monkeypatch):
+    # adding 5 mas of pure noise onto a modest signal must NOT change passed (old gate flipped
+    # fail->pass here); passed reflects populated cells only.
+    ra, dec = _grid_radec(3000, 31)
+    ran = (ra - ra.mean()) / (0.5 * (ra.max() - ra.min()))
+    rng = np.random.RandomState(32)
+    base = _run_stage8(tmp_path, monkeypatch, ra, dec, 1.0 * ran, np.zeros(ra.size))
+    noisy = _run_stage8(tmp_path, monkeypatch, ra, dec,
+                        1.0 * ran + rng.normal(0, 5.0, ra.size), rng.normal(0, 5.0, ra.size))
+    assert base["passed"] is True and noisy["passed"] is True          # no fail->pass flip
+    assert not base.get("red_flag") and not noisy.get("red_flag")      # 5 mas noise is not gross
+
+
+def test_stage8_gross_offset_red_flags_but_still_passes_measurement(tmp_path, monkeypatch):
+    # a huge (~40 mas peak) inter-filter gradient is a genuine per-filter WCS break -> red_flag,
+    # but the MEASUREMENT still succeeded so passed stays True.
+    ra, dec = _grid_radec(3000, 41)
+    ran = (ra - ra.mean()) / (0.5 * (ra.max() - ra.min()))
+    m = _run_stage8(tmp_path, monkeypatch, ra, dec, 40.0 * ran, np.zeros(ra.size))
+    assert m["binned_amp90_mas"] > 15.0
+    assert m.get("red_flag") is True and m["passed"] is True
+
+
+def test_stage8_too_few_populated_cells_does_not_pass(tmp_path, monkeypatch):
+    # >=200 stars but crammed into two tight clusters -> only 2 of 144 cells populated, so the
+    # measurement did not really sample the field: passed must be False (kills a forced passed=True,
+    # since every well-sampled case legitimately passes).
+    rng = np.random.RandomState(61)
+    jit = lambda: rng.uniform(-1e-5, 1e-5, 100)
+    ra = np.concatenate([266.40 + jit(), 266.43 + jit()])
+    dec = np.concatenate([-28.90 + jit(), -28.87 + jit()])
+    rng2 = np.random.RandomState(62)
+    m = _run_stage8(tmp_path, monkeypatch, ra, dec,
+                    rng2.normal(0, 0.5, ra.size), rng2.normal(0, 0.5, ra.size))
+    assert m["cells_used"] < 3
+    assert m["passed"] is False
+
+
+def test_stage8_not_applicable_state_is_not_a_red_flag(tmp_path, monkeypatch):
+    # single-filter catalogue: no second band -> not-applicable, NOT a red flag and NOT passed.
+    from astropy.table import Table
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    ra, dec = _grid_radec(300, 51)
+    p = str(tmp_path / "single.fits")
+    Table({"skycoord_f212n": SkyCoord(ra * u.deg, dec * u.deg),
+           "flux_f212n": np.full(ra.size, 1e4),
+           "flux_err_f212n": np.full(ra.size, 1e2)}).write(p, overwrite=True)
+    monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "figs"))
+    png, m = D.stage8_distortion(_obs(filt="F212N"), "F212N")
+    assert os.path.exists(png)
+    assert m.get("measurable") is False
+    assert m.get("passed") is None                                     # distinct from True/False
+    assert not m.get("red_flag")                                       # a non-defect is not flagged

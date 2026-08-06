@@ -33,6 +33,7 @@ DIAG_MARKER = "<!-- data-qa:diag:stage{n} -->"
 STAGE_FUNC = {
     1: "stage1_mosaics", 2: "stage2_cmd", 3: "stage3_calibration", 4: "stage4_offsets",
     5: "stage5_intermodule", 6: "stage6_astrom_error", 7: "stage7_mast_vs_pipeline",
+    8: "stage8_distortion",
     9: "stage9_psf_vs_aper",
 }
 
