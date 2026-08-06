@@ -259,13 +259,23 @@ Stage 5 checks how well the detectors and the two modules agree, on the SW filte
 three panels; when a field lacks flux errors the S/N>10 panel is omitted (two-panel top row).
 
 - **TOP-LEFT** — the [per-detector residual quiver](#glossary-quiver): one arrow per SW detector,
-  each the detector's median residual against VIRAC with the field bulk offset removed, placed at
-  the detector's mean sky position and annotated with its matched-star count.
+  each the detector's median residual **against VIRAC** with the field bulk offset removed, placed
+  at the detector's mean sky position and annotated with the **number of matched stars**. (This is
+  why an NRCB detector with no NRCA sky overlap still gets a vector — the common reference is
+  VIRAC, not NRCA. See [the quiver note](#glossary-quiver).)
 - **TOP-MIDDLE** — the [reference-free](#glossary-reffree) NRCA∩NRCB overlap tie: the offset and
-  RMS of the same stars seen in both modules (matched JWST-to-JWST, no external catalog), with
-  ΔRA/ΔDec marginal histograms.
-- **TOP-RIGHT** — the same overlap tie restricted to [S/N > 10](#glossary-snr) stars, so the
-  residual scatter reflects the tie rather than photon-noise centroiding of faint sources.
+  RMS of the **same stars** seen in both modules (matched JWST-to-JWST, no external catalog), with
+  **marginal histograms** of the residual ΔRA/ΔDec. Matching is **one-to-one**: after the bulk A→B
+  shift (the xcorr histogram peak) the nearest B source within 80 mas is taken for each A source and
+  duplicate B are dropped (closest A kept), so the reported count is distinct overlap stars — NOT the
+  many-to-many pair count a fixed-radius ball match would return in a crowded field.
+- **TOP-RIGHT** — the same overlap tie restricted to [S/N > 10](#glossary-snr) stars (when the
+  field has flux errors), so the scatter reflects the tie rather than faint-source centroiding.
+- **FULL-WIDTH ROW (below the top panels)** — the A↔B overlap **footprint**: the overlap stars
+  mapped on the sky (RA/Dec), coloured by each star's |A−B| residual, using the S/N > 10 set. The
+  overlap is a thin, long strip, so this row spans the figure width (data-driven aspect) to make
+  the per-star colour readable; it verifies the shared stars trace the NRCA∩NRCB dither-overlap
+  strip (not the whole field) and flags any sub-region where the tie degrades.
 - **BOTTOM STRIP** — a cutout gallery of overlap stars from the SW merged `i2d`. A good tie shows
   one round PSF; a mis-tie doubles or elongates the star (the same source drizzled twice at offset
   positions).
@@ -297,15 +307,58 @@ systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percent
 
 Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnostics.py).
 
+<a id="stage9"></a>
+## Stage 9 — PSF vs aperture photometry
+
+The jicama catalog reports **PSF-fit** fluxes. Stage 9 **re-measures** simple **aperture**
+photometry on the mosaic at the catalog positions (a 3 px circular aperture with a 6–9 px annulus
+for local background) and compares the two, so a PSF-model or crowding problem shows up as a
+disagreement. (This is a stand-in until the jwst-gc-pipeline emits aperture catalogs of its own;
+aperture photometry is cheap to re-measure.)
+
+To keep a neighbour's light out of the aperture, the comparison is restricted to **isolated**
+stars — nearest catalog neighbour more than **8 px** away. The LEFT panel plots aperture vs PSF
+instrumental magnitude with the 1:1 + aperture-correction line; the RIGHT panel plots
+(aperture − PSF) vs PSF magnitude. `n_isolated`, `aper_corr_med` (the median offset = the aperture
+correction), `aper_psf_scatter`. Consider it passing if the (aperture − PSF) locus is flat at a
+constant offset with small scatter (< ~0.15 mag); curvature or large scatter flags a PSF-model or
+crowding problem.
+
+Source: [`data_qa/diagnostics.py` → `stage9_psf_vs_aper`](../data_qa/diagnostics.py)
+(`_psf_flux_positions`).
+
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 
-> 🚧 **Planned — implemented in the stage-7 follow-up PR** (not yet in this branch). Documented
-> here so the glossary/stage cross-references resolve; the source function below lands with that PR.
+**What it shows.** The gain of the pipeline over the raw **MAST-delivered** products, over one
+common central window of the mosaic:
+- **TOP — i2d before/after**: the STScI/MAST merged `i2d` mosaic next to our pipeline mosaic (same
+  filter, same sky region, same stretch).
+- **BOTTOM-LEFT — catalog depth (brief)**: magnitude histograms of the **MAST catalogue** vs the
+  [jicama](#glossary-jicama) catalogue in the common window. The MAST catalogue is the
+  MAST-delivered L3 `_cat.fits` **when it is archived** (fetched from MAST if not already local);
+  when MAST did not archive one, it is **approximated** by running DAOStarFinder at 5σ over a
+  Background2D on the MAST i2d. That detection is an approximation of, not a match to, the STScI
+  `SourceCatalogStep` (which uses image segmentation with deblending), so the two source lists
+  differ — read the count as a depth indicator, not a reproduction of the STScI catalogue. jicama
+  recovers more and fainter stars by construction (the point is the count/depth; the two use
+  different zeropoints).
+- **BOTTOM-RIGHT — astrometry (main)**: the [bulk offset](#glossary-bulk) to
+  [VIRAC](#glossary-virac) for each catalogue, measured by the [xcorr histogram
+  peak](#glossary-xcorr) (crowding-robust — a nearest-neighbour-to-VIRAC distance is meaningless
+  at GC density, where VIRAC's ~250 mas source spacing swamps the tie). Shown as a 2-D (ΔRA, ΔDec)
+  cloud with marginals whose CENTRE is the bulk tie: the MAST cloud sits at its raw-WCS bulk
+  offset, the jicama cloud typically near the origin. The panel title and issue caption are derived
+  from the sign of (jicama tie − MAST tie): they assert the pipeline "tightens the tie" only when
+  both ties are measured **and** jicama is tighter, and otherwise report both numbers without
+  claiming an improvement. The cloud's **width** is bounded by the 0.1″ `search_around_sky`
+  cross-match radius — it shows the match distribution, **not** the per-star astrometric precision;
+  see [stage 5](#stage5)/[stage 6](#stage6) for the actual per-star RMS. When a tie is unmeasurable
+  (no xcorr peak within 1.5″, e.g. a grossly mis-registered product): if only the MAST tie is
+  unmeasurable the comparison is flagged as **unavailable** (a possible MAST mis-registration, not a
+  defect in our product, so the stage does not fail on that alone); if the jicama tie is
+  unmeasurable that is our product failing, so the stage does not pass and is red-flagged.
 
-Stage 7 shows the gain of the pipeline over the raw MAST-delivered products, over one common
-window of the mosaic: the MAST L3 `i2d` next to the pipeline `i2d` (before/after); magnitude
-histograms of the MAST catalog vs the [jicama](#glossary-jicama) catalog (depth/count); and the
-[bulk offset to VIRAC](#glossary-bulk) for each (the astrometric tightening).
-
-Source: [`data_qa/diagnostics.py` → `stage7_mast_vs_pipeline`](../data_qa/diagnostics.py).
+**Source:** [`data_qa/diagnostics.py` → `stage7_mast_vs_pipeline`](../data_qa/diagnostics.py)
+(MAST catalogue: `_mast_l3_catalog`/`_load_mast_catalog`; detection fallback: `_detect_on_mosaic`;
+bulk tie: `_tie_cloud`).

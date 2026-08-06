@@ -1489,7 +1489,7 @@ def _ab_overlap(a_sc, b_sc):
     the offset/RMS/count, the per-star residual arrays (for the hexbin + marginals), and a list of
     overlap-star positions (for the cutout gallery), or None if unmeasurable."""
     import astropy.units as u
-    from astropy.coordinates import search_around_sky, SkyCoord
+    from astropy.coordinates import SkyCoord
     if a_sc is None or b_sc is None or len(a_sc) < 50 or len(b_sc) < 50:
         return None
     xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
@@ -1498,7 +1498,21 @@ def _ab_overlap(a_sc, b_sc):
     cosd = float(np.cos(np.radians(np.median(a_sc.dec.deg))))
     a_al = SkyCoord((a_sc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
                     (a_sc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
-    ia, ib, sep, _ = search_around_sky(a_al, b_sc, 0.08 * u.arcsec)   # same star after align
+    # One-to-one match, NOT search_around_sky: in a crowded GC field an 80-mas ball match is
+    # many-to-many (one bright B star pairs with every nearby A star), so len(pairs) counts PAIRS,
+    # not distinct overlap stars -- that is the bogus ~34k count.  Take the nearest B for each A,
+    # keep those within 80 mas, then drop duplicate B (keep the closest A) so every physical star
+    # is counted once and fabricated pairs no longer bias the RMS.
+    idx, sep2d, _ = a_al.match_to_catalog_sky(b_sc)
+    keep = sep2d < 0.08 * u.arcsec
+    ia = np.where(keep)[0]
+    ib = np.asarray(idx)[keep]
+    if len(ia) < 20:
+        return None
+    order = np.argsort(sep2d[ia].arcsec)                 # smallest separation first
+    ia, ib = ia[order], ib[order]
+    _, first = np.unique(ib, return_index=True)          # one A per B: the closest
+    ia, ib = ia[first], ib[first]
     if len(ia) < 20:
         return None
     dra = (a_al[ia].ra - b_sc[ib].ra).to(u.mas).value * cosd
@@ -1507,6 +1521,8 @@ def _ab_overlap(a_sc, b_sc):
                 rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
                 n=int(len(ia)), peak_ratio=float(xc["peak_ratio"]),
                 dra_arr=dra, dde_arr=dde,
+                # per-star matched positions (for the spatial overlap-footprint map)
+                ra_arr=b_sc[ib].ra.deg, dec_arr=b_sc[ib].dec.deg,
                 pos=[(b_sc[i].ra.deg, b_sc[i].dec.deg) for i in ib[:200]])
 
 
@@ -1523,6 +1539,25 @@ def _draw_ab_panel(ax, ovd, title):
     axt, _axr = _add_marginals(ax, dra_a, dde_a, color="#5566aa", bins=40)
     axt.set_title(f"{title}  ({ovd['n']} stars)\n"
                   f"offset = {ovd['off']:.1f} mas   RMS = {ovd['rms']:.1f} mas", fontsize=8)
+
+
+def _draw_ab_footprint(ax, ovd, label):
+    """Sky scatter of the A↔B overlap stars, coloured by per-star |A−B| offset.  Confirms WHERE the
+    genuinely-shared stars are (they should trace the NRCA∩NRCB dither-overlap strip, not the whole
+    field) and whether the tie degrades anywhere in it."""
+    import matplotlib.pyplot as plt
+    ra = np.asarray(ovd["ra_arr"], float); dec = np.asarray(ovd["dec_arr"], float)
+    diff = np.hypot(np.asarray(ovd["dra_arr"], float), np.asarray(ovd["dde_arr"], float))
+    vmax = float(np.nanpercentile(diff, 95)) if len(diff) else 1.0
+    sc = ax.scatter(ra, dec, c=diff, s=6, cmap="viridis", vmin=0, vmax=max(vmax, 1.0),
+                    linewidths=0)
+    # data-driven aspect (NOT equal): the overlap is a thin, long strip; a full-width row with
+    # 'auto' aspect fills the panel so the per-star colour is readable (equal made it a sliver).
+    ax.invert_xaxis(); ax.set_aspect("auto"); ax.margins(0.02)
+    ax.set_xlabel("RA [deg]"); ax.set_ylabel("Dec [deg]")
+    plt.colorbar(sc, ax=ax, label="per-star residual |A−B| [mas]", shrink=0.85)
+    ax.set_title(f"A↔B overlap footprint — {label} ({len(ra)} stars)\n"
+                 f"colour = per-star |A−B|; should trace the module-overlap strip", fontsize=8)
 
 
 def _module_hi_sn(o, filt, snmin=10.0):
@@ -1656,19 +1691,27 @@ def stage5_intermodule(o: Observation, sw):
             axq.text(0.5, 0.5, "per-detector cats unavailable", ha="center", va="center", fontsize=8)
 
     if ov:
-        # Top row: per-detector quiver | A↔B overlap (all stars, with marginals) | A↔B (S/N>10).
-        # Bottom row: overlap-star cutout gallery spanning the width.  The S/N>10 column is added
-        # only when measurable, so a field without flux errors just shows the two-panel top row.
+        # Top row: per-detector quiver | A↔B overlap (all stars) | A↔B (S/N>10, if measurable) |
+        # A↔B overlap FOOTPRINT (sky map coloured by |A−B|, high-S/N).  Bottom row: cutout gallery
+        # spanning the width.
+        # Row 0: per-detector quiver | A↔B overlap (all stars) | A↔B (S/N>10, if measurable).
+        # Row 1: the A↔B overlap FOOTPRINT spanning the full width (the overlap is a thin, long
+        # strip, so a full-width row with data-driven aspect makes the per-star colour readable).
+        # Row 2: cutout gallery spanning the full width.
         ncols = 3 if ov_hi else 2
-        fig = plt.figure(figsize=(5.0 * ncols + 1.0, 9.2))
-        gs = fig.add_gridspec(2, ncols, height_ratios=[1.3, 0.75], hspace=0.62, wspace=0.62)
-        # top reserve so the A↔B panels' top-marginal titles clear the suptitle
-        fig.subplots_adjust(top=0.82, bottom=0.06, left=0.06, right=0.97)
+        fig = plt.figure(figsize=(5.0 * ncols + 1.0, 11.5))
+        gs = fig.add_gridspec(3, ncols, height_ratios=[1.25, 0.55, 0.75], hspace=0.7, wspace=0.62)
+        fig.subplots_adjust(top=0.88, bottom=0.05, left=0.06, right=0.97)
         axq = fig.add_subplot(gs[0, 0]); _draw_quiver(axq)
         axo = fig.add_subplot(gs[0, 1]); _draw_ab_panel(axo, ov, "A↔B overlap — all stars")
         if ov_hi:
             axh = fig.add_subplot(gs[0, 2])
             _draw_ab_panel(axh, ov_hi, "A↔B overlap — flux S/N > 10")
+        # footprint map (full-width row): prefer the high-S/N set (cleaner), else all stars
+        axfp = fig.add_subplot(gs[1, :])
+        fp_ov = ov_hi if ov_hi else ov
+        _draw_ab_footprint(axfp, fp_ov, "S/N > 10" if ov_hi else "all stars")
+        metrics["n_overlap_footprint"] = int(len(fp_ov["ra_arr"]))
 
         # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
         ncut = 6
@@ -1678,9 +1721,9 @@ def stage5_intermodule(o: Observation, sw):
                 data = sci.data.astype("float32"); w = WCS(sci.header)
             from astropy.coordinates import SkyCoord
             from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
-            # De-duplicate: search_around_sky returns MANY pairs per bright overlap star, so the
-            # raw list repeats the same few stars (e.g. one star shown 4x).  Greedily keep only
-            # spatially DISTINCT stars (>0.5") so the gallery is 6 DIFFERENT stars.
+            # Space the gallery out: pos is already one entry per distinct overlap star, but greedily
+            # keep only stars >0.5" apart so the 6 cutouts sample different parts of the strip rather
+            # than clustering on one bright clump.
             picks = []
             for ra, dec in ov["pos"][:2000]:
                 if picks:
@@ -1706,7 +1749,7 @@ def stage5_intermodule(o: Observation, sw):
                     continue
                 cuts.append(cut.data)
             shown = len(cuts)
-            strip = fig.add_subplot(gs[1, :]); strip.axis("off")
+            strip = fig.add_subplot(gs[2, :]); strip.axis("off")
             if shown:
                 n = shown
                 for i, cdata in enumerate(cuts):
@@ -1751,12 +1794,602 @@ def stage5_intermodule(o: Observation, sw):
     return _save(fig, f"{o.obsid}_stage5.png"), metrics
 
 
+# --------------------------------------------------------------------------- STAGE 9 (PSF vs aper)
+def _psf_flux_positions(o, filt):
+    """(SkyCoord, PSF flux_fit, catalog basename) from the highest-tier jicama catalog carrying
+    ``flux_<filt>`` + ``skycoord_<filt>``, or (None, None, None)."""
+    from astropy.io import fits
+    from astropy.table import Table
+    fcol = f"flux_{filt.lower()}"; sccol = f"skycoord_{filt.lower()}"
+    best_path = None; best_rank = (-1.0, -1.0)
+    for p, kind, tier, mtime in _catalog_candidates(o):
+        if (tier, mtime) <= best_rank:
+            continue
+        # cheap TTYPE header probe before the (large) full read -- match _catalog_for's pattern
+        try:
+            hdr = fits.getheader(p, ext=1)
+        except (OSError, IndexError):
+            continue
+        low = {str(hdr.get(f"TTYPE{i}", "")).lower() for i in range(1, hdr.get("TFIELDS", 0) + 1)}
+        if fcol in low and f"{sccol}.ra" in low:      # skycoord mixin serializes as "<name>.ra"
+            best_path = p; best_rank = (tier, mtime)
+    if best_path is None:
+        return None, None, None
+    try:
+        t = Table.read(best_path)
+    except (OSError, ValueError):
+        return None, None, None
+    sc = t[sccol]; flux = np.asarray(t[fcol], float); name = os.path.basename(best_path)
+    g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(flux) & (flux > 0)
+    return (sc[g], flux[g], name) if int(g.sum()) >= 50 else (None, None, None)
+
+
+def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px=12.0, maxn=20000):
+    """PSF vs aperture photometry check.  The jicama catalog reports PSF-fit fluxes; here we
+    RE-MEASURE simple aperture photometry (local-annulus background) on the mosaic at the catalog
+    positions and compare.  Restricted to ISOLATED stars (nearest catalog neighbour > ``iso_px``
+    px) so a neighbour's light doesn't contaminate the aperture -- a cheap stand-in until the
+    pipeline emits aperture catalogs.  A tight (aper−psf) locus at a constant offset (the aperture
+    correction) means the two photometries agree; curvature/scatter flags PSF-model or
+    crowding problems."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry, ApertureStats
+    metrics = dict(stage=9, sw=sw, r_ap_px=r_ap, iso_px=iso_px)
+    sc, psf_flux, src = _psf_flux_positions(o, sw)
+    mpath = _mosaic_path(o, sw)
+    if sc is None or not mpath:
+        reason = ("no jicama catalog with a PSF flux column for this filter" if sc is None
+                  else "no mosaic on disk to measure aperture photometry on")
+        png = _red_flag_figure(o, "stage9", "PSF-vs-APER UNMEASURABLE",
+                               f"Cannot compare PSF vs aperture photometry: {reason}.")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        return png, metrics
+    metrics["catalog"] = src
+    try:
+        with fits.open(mpath) as h:
+            sci = h["SCI"] if "SCI" in h else h[1]
+            data = sci.data.astype("float32"); w = WCS(sci.header)
+    except (OSError, ValueError, KeyError):
+        png = _red_flag_figure(o, "stage9", "MOSAIC UNREADABLE", f"Could not read {mpath}.")
+        metrics.update(red_flag=True, red_flag_reason="mosaic unreadable", passed=False)
+        return png, metrics
+    x, y = w.world_to_pixel(sc)
+    ny, nx = data.shape
+    inb = (x > r_out + 1) & (x < nx - r_out - 1) & (y > r_out + 1) & (y < ny - r_out - 1)
+    # ISOLATED: nearest catalog neighbour farther than iso_px (exclude blended stars)
+    from scipy.spatial import cKDTree
+    xy = np.c_[x, y]
+    nn = cKDTree(xy).query(xy, k=2)[0][:, 1]
+    keep = inb & (nn > iso_px)
+    if int(keep.sum()) < 50:
+        png = _red_flag_figure(o, "stage9", "TOO FEW ISOLATED STARS",
+                               f"Only {int(keep.sum())} isolated (>{iso_px:.0f} px) in-bounds stars "
+                               f"— not enough for a PSF-vs-aperture comparison.")
+        metrics.update(red_flag=True, red_flag_reason="too few isolated stars", passed=False)
+        return png, metrics
+    idx = np.where(keep)[0]
+    if idx.size > maxn:                         # cap cost: brightest maxn isolated stars
+        idx = idx[np.argsort(psf_flux[idx])[::-1][:maxn]]
+    pos = np.c_[x[idx], y[idx]]
+    ap = CircularAperture(pos, r=r_ap)
+    ann = CircularAnnulus(pos, r_in=r_in, r_out=r_out)
+    # ApertureStats is NaN-aware -- feed it the RAW data so a coverage-gap NaN in the annulus is
+    # ignored (nan_to_num(0) would bias the median low).  The aperture SUM needs finite pixels, so
+    # zero-fill only there; the `good` mask below drops any star whose aperture still went bad.
+    bkg = ApertureStats(data, ann).median                    # local background per pixel (NaN-aware)
+    raw = aperture_photometry(np.nan_to_num(data, nan=0.0), ap)["aperture_sum"]
+    aper_flux = np.asarray(raw, float) - np.asarray(bkg, float) * ap.area
+    # DROP apertures that contain a NaN pixel (usually a saturated core or coverage gap): zero-fill
+    # would read them too faint by ~0.15 mag with no flag.  Better excluded than silently biased.
+    nanmask = (~np.isfinite(data)).astype("float32")
+    nan_in_ap = np.asarray(aperture_photometry(nanmask, ap)["aperture_sum"], float) > 0.5
+    metrics["n_aper_with_nan"] = int(nan_in_ap.sum())
+    pf = psf_flux[idx]
+    good = np.isfinite(aper_flux) & (aper_flux > 0) & np.isfinite(pf) & (pf > 0) & (~nan_in_ap)
+    m_psf = -2.5 * np.log10(pf[good]); m_aper = -2.5 * np.log10(aper_flux[good])
+    dmag = m_aper - m_psf
+    apcorr = float(np.median(dmag)); scat = float(aa.mad_std(dmag))
+    # tail fraction: the disagreement population mad_std is blind to.  Gate on BOTH the core
+    # scatter and this tail so a PSF-model failure in a minority can't read green.
+    tail_frac = float(np.mean(np.abs(dmag - apcorr) > 0.3)) if len(dmag) else 1.0
+    metrics.update(n_isolated=int(good.sum()), aper_corr_med=apcorr, aper_psf_scatter=scat,
+                   frac_gt_0p3mag=tail_frac, n_capped=bool(idx.size >= maxn),
+                   passed=bool(scat < 0.15 and tail_frac < 0.05))
+    import matplotlib.pyplot as plt
+    fig, ax = _fig(1, 2, 5.6, 5.0)
+    fig.subplots_adjust(wspace=0.32, top=0.86, bottom=0.12)
+    a0 = ax[0][0]
+    hb = a0.hexbin(m_psf, m_aper, gridsize=60, bins="log", cmap="viridis", mincnt=1)
+    fig.colorbar(hb, ax=a0, label="log N", shrink=0.85)
+    lo, hi = np.nanpercentile(np.r_[m_psf, m_aper], [1, 99])
+    a0.plot([lo, hi], [lo + apcorr, hi + apcorr], "r-", lw=1.2,
+            label=f"1:1 + aper.corr ({apcorr:+.2f})")
+    a0.set_xlim(lo, hi); a0.set_ylim(lo, hi); a0.set_aspect("equal")
+    a0.set_xlabel("PSF instrumental mag"); a0.set_ylabel("aperture instrumental mag")
+    a0.legend(fontsize=8, loc="upper left")
+    a0.set_title(f"PSF vs aperture ({_dataset_label({'source': 'release:' + src})})", fontsize=9)
+    a1 = ax[0][1]
+    hb2 = a1.hexbin(m_psf, dmag, gridsize=60, bins="log", cmap="magma", mincnt=1)
+    fig.colorbar(hb2, ax=a1, label="log N", shrink=0.85)
+    a1.axhline(apcorr, color="c", lw=1.2, label=f"median {apcorr:+.2f}")
+    # show the FULL residual range (don't crop the disagreement tail out of the plot that exists to
+    # surface it); pad the data range a little.
+    dlo, dhi = np.nanpercentile(dmag, [0.2, 99.8])
+    a1.set_ylim(min(dlo, apcorr - 0.3), max(dhi, apcorr + 0.3))
+    a1.set_xlabel("PSF instrumental mag"); a1.set_ylabel("aperture − PSF [mag]")
+    a1.legend(fontsize=8, loc="upper right")
+    a1.set_title(f"{int(good.sum())} isolated stars (>{iso_px:.0f} px)  "
+                 f"scatter {scat:.3f} mag\n{100 * tail_frac:.1f}% beyond ±0.3 mag "
+                 f"(r_ap={r_ap:.0f}px)", fontsize=9)
+    fig.suptitle(f"{o.target} {o.obsid} — PSF vs aperture photometry ({sw})", fontsize=11, y=0.98)
+    return _save(fig, f"{o.obsid}_stage9.png"), metrics
+
+
 STAGES = {1: stage1_mosaics, 2: stage2_cmd, 3: stage3_calibration, 4: stage4_offsets,
           5: stage5_intermodule}
 
 
 def _build_stage5(o, sw, lw):
     return stage5_intermodule(o, sw)
+
+
+# --------------------------------------------------------------------------- STAGE 7
+def _mast_i2d(o, filt):
+    """The MAST-delivered STScI level-3 mosaic (``mastDownload/…_<filt>_i2d.fits``), the "raw"
+    product the pipeline improves on.  None if not downloaded for this obs/filter."""
+    if not filt:
+        return None
+    fl = filt.lower()
+
+    def _raw(p):
+        # keep only the MAST-delivered raw i2d: drop per-detector products and any of our own
+        # reprocessed mosaics (merged/residual/destreak/reproject/segm) the recursive+cross-field
+        # globs can otherwise reach under a mastDownload tree.
+        b = os.path.basename(p).lower()
+        return not any(s in b for s in ("nrca", "nrcb", "segm", "merged", "residual",
+                                        "destreak", "reproject", "_data_"))
+    # t* wildcard (the target index is not always t001) and, as a fallback, a cross-field search:
+    # a (program,obs) filed under one field's registry can have its MAST i2d staged in a sibling
+    # field's tree (e.g. jw02221-o002 belongs to cloudc but its i2d sits in brick/mastDownload).
+    for pat in (f"{BASE}/{o.field}/mastDownload/**/{o.obsid}_t*_nircam_clear-{fl}_i2d.fits",
+                f"{BASE}/{o.field}/mastDownload/**/{o.obsid}_t*_nircam_*{fl}*_i2d.fits",
+                f"{BASE}/*/mastDownload/**/{o.obsid}_t*_nircam_clear-{fl}_i2d.fits",
+                f"{BASE}/*/mastDownload/**/{o.obsid}_t*_nircam_*{fl}*_i2d.fits"):
+        hits = [p for p in glob.glob(pat, recursive=True) if _raw(p)]
+        if hits:
+            return sorted(hits)[0]
+    return None
+
+
+def _detect_on_mosaic(path, crop=5000, fwhm_pix=2.5, nsigma=5.0, maxn=500000):
+    """Detect point sources on a mosaic's central ``crop`` x ``crop`` window and return
+    (SkyCoord, instrumental_mag, wcs, cutout_data).  This APPROXIMATES a MAST L3 source list by
+    running DAOStarFinder at ``nsigma``σ over a photutils Background2D -- MAST does not archive the
+    merged catalogue locally, only the i2d.  It is an approximation of, not a match to, the STScI
+    ``SourceCatalogStep`` (which uses image segmentation with deblending), so the two source lists
+    differ; the count is a depth indicator, not a reproduction of the STScI catalogue.  Central crop
+    bounds the cost and gives a common sky region for the MAST-vs-pipeline comparison.  Returns None
+    on failure."""
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.nddata import Cutout2D
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    from photutils.background import Background2D, MMMBackground, MADStdBackgroundRMS
+    from photutils.detection import DAOStarFinder
+    from astropy.stats import SigmaClip
+    try:
+        with fits.open(path) as hdul:
+            sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
+            data = sci.data.astype("float32"); w = WCS(sci.header)
+    except (OSError, ValueError, KeyError):
+        return None
+    ny, nx = data.shape
+    cy, cx = ny // 2, nx // 2
+    size = (min(crop, ny), min(crop, nx))
+    try:
+        cut = Cutout2D(data, (cx, cy), size, wcs=w)
+    except (ValueError, IndexError):
+        return None
+    img = np.nan_to_num(cut.data, nan=np.nanmedian(cut.data))
+    try:
+        bkg = Background2D(img, box_size=128, filter_size=3,
+                           sigma_clip=SigmaClip(sigma=3, maxiters=5),
+                           bkgrms_estimator=MADStdBackgroundRMS(), bkg_estimator=MMMBackground(),
+                           exclude_percentile=90)
+        sub = img - bkg.background
+        rms = float(np.median(bkg.background_rms))
+        found = DAOStarFinder(threshold=nsigma * rms, fwhm=fwhm_pix, peakmax=None)(sub)
+    except (ValueError, RuntimeError):
+        return None
+    if found is None or not len(found):
+        return None
+    if len(found) > maxn:                                  # brightest maxn (bound the crossmatch)
+        found = found[np.argsort(np.asarray(found["flux"]))[::-1][:maxn]]
+    x = np.asarray(found["xcentroid"], float); y = np.asarray(found["ycentroid"], float)
+    flux = np.asarray(found["flux"], float)
+    sc = cut.wcs.pixel_to_world(x, y)
+    sc = SkyCoord(sc.ra, sc.dec)                           # ensure plain ICRS SkyCoord
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mag = -2.5 * np.log10(flux)
+    good = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(mag)
+    return sc[good], mag[good], cut.wcs, cut.data
+
+
+def _mast_l3_catalog(o, filt, allow_download=None):
+    """The MAST-delivered STScI level-3 source catalogue (``*_<filt>_cat.fits``) for this obs.
+    Prefer a local copy; if absent, download it from MAST *when it exists there* (best-effort,
+    guarded -- missing astroquery / no network / no such product all fall back to None, and the
+    caller then RECONSTRUCTS the list by detecting on the i2d).  Returns a path or None."""
+    for d in (f"{BASE}/{o.field}/mastDownload", f"{BASE}/{o.field}/mastDownload/**",
+              f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"):
+        hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_*{filt.lower()}*_cat.fits",
+                                     recursive=True)
+                if not any(s in os.path.basename(p).lower()
+                           for s in ("nrca", "nrcb", "destreak", "segm"))]
+        if hits:
+            return sorted(hits)[-1]
+    if allow_download is None:
+        # opt-in: default OFF so a QA refresh never reaches out over the network, and (below) any
+        # download lands in the scratch OUTDIR, never inside the read-only product tree.
+        allow_download = os.environ.get("QA_MAST_DOWNLOAD", "0") != "0"
+    if not allow_download:
+        return None
+    # Build a specific exception tuple (no bare except) covering astroquery/network failures.
+    excs = [ImportError, OSError, ValueError, KeyError, TimeoutError, ConnectionError]
+    try:
+        from astroquery.exceptions import RemoteServiceError
+        excs.append(RemoteServiceError)
+    except ImportError:
+        pass
+    try:
+        import requests
+        excs.append(requests.exceptions.RequestException)
+    except ImportError:
+        pass
+    # A network HANG is not an exception (the prior "Pipeline MAST hang" was exactly this), so cap
+    # every socket with a default timeout for the duration of the query, and SCOPE the query to
+    # this obsid (obs_id=jw<prog>-o<obs>*) so get_product_list can't pull the whole programme.
+    import socket
+    prev_to = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(float(os.environ.get("QA_MAST_TIMEOUT", "60")))
+    try:
+        from astroquery.mast import Observations
+        obs_t = Observations.query_criteria(
+            obs_collection="JWST", instrument_name="NIRCAM*",
+            obs_id=f"jw{int(o.program):05d}-o{o.obs}*", filters=filt.upper())
+        if obs_t is None or not len(obs_t):
+            return None
+        prod = Observations.get_product_list(obs_t)
+        want = np.array([("_cat.fits" in str(fn).lower() and o.obsid in str(fn)
+                          and filt.lower() in str(fn).lower()
+                          and not any(s in str(fn).lower()
+                                      for s in ("nrca", "nrcb", "destreak", "segm")))
+                         for fn in prod["productFilename"]])
+        if not want.any():
+            return None
+        dl = Observations.download_products(
+            prod[want],
+            download_dir=os.path.join(OUTDIR, "mastDownload"))   # scratch, never the product tree
+        good = [p for p in (dl["Local Path"] if dl is not None and len(dl) else [])
+                if p and os.path.exists(p)]
+        return good[0] if good else None
+    except tuple(excs):
+        return None
+    finally:
+        socket.setdefaulttimeout(prev_to)
+
+
+def _load_mast_catalog(path):
+    """(SkyCoord, abmag) from a MAST-delivered L3 source catalogue, or (None, None)."""
+    from astropy.table import Table
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    try:
+        t = Table.read(path)
+    except (OSError, ValueError):
+        return None, None
+    if "sky_centroid" in t.colnames:
+        sc = t["sky_centroid"]
+    elif {"ra", "dec"}.issubset(set(t.colnames)):
+        sc = SkyCoord(np.asarray(t["ra"], float) * u.deg, np.asarray(t["dec"], float) * u.deg)
+    else:
+        return None, None
+    magc = next((c for c in ("aper_total_abmag", "aper50_abmag", "aper70_abmag", "aper30_abmag",
+                             "abmag") if c in t.colnames), None)
+    mag = np.asarray(t[magc], float) if magc else np.full(len(sc), np.nan)
+    good = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)
+    if int(good.sum()) < 20:
+        return None, None
+    return sc[good], mag[good]
+
+
+def _tie_cloud(jsc, ref_sc):
+    """The per-star (JWST − VIRAC) offset VECTORS for genuinely-matched stars, crowding-robust.
+
+    A plain nearest-neighbour-to-VIRAC distance is USELESS here: VIRAC is sparse, so the nearest
+    reference to a random JWST source is ~its inter-source spacing (~250 mas at GC density) for ANY
+    frame, swamping the real tie.  Instead, coarse-align by the ``aa.xcorr`` histogram peak (finds
+    the bulk shift up to 1.5″), keep only pairs that then fall within 0.1″ (real matches), and
+    return their (ΔRA, ΔDec) in mas.  The cloud's CENTRE is the true bulk offset from VIRAC.
+    Returns (dra_arr, dde_arr, bulk_off_mas) or None."""
+    import astropy.units as u
+    from astropy.coordinates import search_around_sky, SkyCoord
+    if jsc is None or ref_sc is None or len(jsc) < 50:
+        return None
+    xc = aa.xcorr(jsc, ref_sc, maxsep=1.5 * u.arcsec)
+    if not (xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= 100):
+        return None
+    cosd = float(np.cos(np.radians(np.median(jsc.dec.deg))))
+    j_al = SkyCoord((jsc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
+                    (jsc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
+    ia, ib, sep, _ = search_around_sky(j_al, ref_sc, 0.1 * u.arcsec)
+    if len(ia) < 20:
+        return None
+    dra = (jsc[ia].ra - ref_sc[ib].ra).to(u.mas).value * cosd
+    dde = (jsc[ia].dec - ref_sc[ib].dec).to(u.mas).value
+    return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
+
+
+def _stage7_astrom_title(mast_tie, jic_tie):
+    """Astrometry sub-panel title, worded from the SIGN of (jicama tie − MAST tie): it asserts the
+    pipeline is 'tighter' ONLY when both ties are measured AND jicama < MAST; otherwise it reports
+    the number(s) without claiming an improvement.  ``mast_tie``/``jic_tie`` are ``_tie_cloud``
+    results (…, bulk_mas) or None."""
+    both = mast_tie is not None and jic_tie is not None
+    if both:
+        head = (f"astrometry vs VIRAC — jicama tie {jic_tie[2]:.0f} mas vs MAST "
+                f"{mast_tie[2]:.0f} mas")
+        return head + (" (pipeline tighter)" if jic_tie[2] < mast_tie[2] else "")
+    if jic_tie is not None:
+        return f"astrometry vs VIRAC — jicama tie {jic_tie[2]:.0f} mas (MAST tie not measured)"
+    if mast_tie is not None:
+        return f"astrometry vs VIRAC — MAST tie {mast_tie[2]:.0f} mas (pipeline tie not measured)"
+    return "astrometry vs VIRAC (bulk offset)"
+
+
+def _stage7_verdict(our_path, mast_tie, jic_tie, jic_unmeas):
+    """PASS / red-flag decision for stage 7, factored out so it can be pinned by tests.
+
+    An unmeasurable OWN (jicama) tie while VIRAC is present is OUR product failing -> fail AND
+    red-flag.  A missing VIRAC reference, or ONLY the MAST tie being unmeasurable, means the
+    comparison is 'not measured' / 'unavailable' -- not a fail on our side.  Returns
+    (passed: bool, red_flag: bool, red_flag_reason: str|None)."""
+    improved = (jic_tie is not None and mast_tie is not None and jic_tie[2] <= mast_tie[2] + 5)
+    passed = bool(our_path and not jic_unmeas
+                  and (improved or mast_tie is None or jic_tie is None))
+    if jic_unmeas:
+        return False, True, ("pipeline (jicama) frame tie to VIRAC unmeasurable — no xcorr peak "
+                             "within 1.5″ (possible gross mis-registration of our product)")
+    return passed, False, None
+
+
+def stage7_mast_vs_pipeline(o: Observation, sw):
+    """Show the pipeline's improvement over the raw MAST-delivered products:
+    (top) the MAST L3 i2d mosaic vs our pipeline mosaic over the SAME sky region;
+    (bottom-left) source-count / brightness histogram, MAST-i2d detections vs the jicama catalogue;
+    (bottom-right, MAIN) the per-star offset-to-VIRAC distribution for each -- the astrometric
+    tightening that is the pipeline's headline gain."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.nddata import Cutout2D
+    from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
+    metrics = dict(stage=7, sw=sw)
+    mast_path = _mast_i2d(o, sw)
+    our_path = _mosaic_path(o, sw)
+    if not mast_path:
+        png = _red_flag_figure(o, "stage7", "NO MAST i2d ON DISK",
+                               f"No MAST-delivered {sw} i2d in mastDownload/ for this obs, so the "
+                               f"before/after comparison can't be made. (Not a data defect — the "
+                               f"raw MAST product just isn't staged locally.)")
+        metrics.update(red_flag=True, red_flag_reason=f"no MAST {sw} i2d on disk", passed=False)
+        return png, metrics
+
+    # MAST source list: prefer the MAST-delivered L3 catalogue (download if it exists on MAST),
+    # else RECONSTRUCT it by detecting on the MAST i2d (what the STScI L3 step does).
+    mast_sc = mast_mag = None
+    mast_kind = None
+    mcat = _mast_l3_catalog(o, sw)
+    if mcat:
+        mast_sc, mast_mag = _load_mast_catalog(mcat)
+        if mast_sc is not None:
+            mast_kind = "MAST L3 catalogue"
+    if mast_sc is None:
+        det = _detect_on_mosaic(mast_path)
+        if det is not None:
+            mast_sc, mast_mag, _cutwcs, _cutdata = det
+            mast_kind = "MAST i2d (re-detected)"
+    if mast_sc is not None:
+        metrics["n_mast"] = int(len(mast_sc)); metrics["mast_kind"] = mast_kind
+
+    # jicama catalogue positions + mag (the pipeline product).  _jwst_sources falls back to the
+    # MAST per-i2d _cat.fits when no release/merged catalogue exists yet -- in that case the
+    # "pipeline" side is NOT actually the jicama product, so label it as such (else the panel
+    # silently becomes MAST-vs-MAST).
+    jsc, jmag, jsrc = _jwst_sources(o, sw)
+    metrics["jicama_source"] = jsrc
+    jic_is_release = str(jsrc).startswith("release")
+    metrics["jicama_is_release"] = bool(jic_is_release)
+    jic_label = "jicama catalogue" if jic_is_release else "pipeline (no merged catalogue yet)"
+    if jsc is not None:
+        metrics["n_jicama"] = int(len(jsc))
+
+    # display + count window: central crop of the MAST i2d (so both image panels show the SAME sky,
+    # and the source-count comparison is over one common region, not full-field vs a crop).
+    try:
+        with fits.open(mast_path) as h:
+            mh = (h["SCI"] if "SCI" in h else h[1]).header
+        mwcs = WCS(mh); mny, mnx = int(mh["NAXIS2"]), int(mh["NAXIS1"])
+    except (OSError, ValueError, KeyError):
+        mwcs = None; mny = mnx = 0
+    crop = min(5000, mny, mnx) if mwcs is not None else 0
+    cen = mwcs.pixel_to_world(mnx / 2, mny / 2) if mwcs is not None else None
+    if mwcs is not None:
+        cw = mwcs.pixel_to_world([mnx / 2 - crop / 2, mnx / 2 + crop / 2],
+                                 [mny / 2 - crop / 2, mny / 2 + crop / 2])
+        ra_lo, ra_hi = sorted(cw.ra.deg); de_lo, de_hi = sorted(cw.dec.deg)
+
+        def _inbox(sc):
+            return ((sc.ra.deg >= ra_lo) & (sc.ra.deg <= ra_hi) &
+                    (sc.dec.deg >= de_lo) & (sc.dec.deg <= de_hi))
+    else:
+        def _inbox(sc):
+            return np.ones(len(sc), bool)
+
+    # VIRAC reference (PM-propagated) for the crowding-robust bulk-offset comparison
+    ref = _viraccache_path(o) or _refcat_path(o)
+    ep = aa.epoch_of(mast_path) if mast_path else None
+    ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+    mast_tie = _tie_cloud(mast_sc, ref_sc) if mast_sc is not None else None
+    jic_tie = _tie_cloud(jsc, ref_sc) if jsc is not None else None
+    if mast_tie is not None:
+        metrics["mast_offset_med_mas"] = mast_tie[2]
+    if jic_tie is not None:
+        metrics["jicama_offset_med_mas"] = jic_tie[2]
+
+    # ---- figure: two image panels on top, two comparison panels below
+    fig = plt.figure(figsize=(12.5, 10.8))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 0.95], hspace=0.3, wspace=0.28)
+
+    def _show(ax, path, title):
+        try:
+            with fits.open(path) as hdul:
+                sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
+                d = sci.data.astype("float32"); wv = WCS(sci.header)
+        except (OSError, ValueError, KeyError):
+            ax.text(0.5, 0.5, "mosaic unreadable", ha="center", va="center"); ax.axis("off"); return
+        try:
+            if cen is not None:
+                px, py = wv.world_to_pixel(cen)
+                d = Cutout2D(d, (float(px), float(py)), min(5000, *d.shape), wcs=wv).data
+        except (ValueError, IndexError):
+            pass
+        norm = ImageNormalize(d, interval=ZScaleInterval(), stretch=AsinhStretch())
+        ax.imshow(d, origin="lower", cmap="gray", norm=norm)
+        ax.set_xticks([]); ax.set_yticks([]); ax.set_title(title, fontsize=10)
+
+    ax_m = fig.add_subplot(gs[0, 0]); _show(ax_m, mast_path, f"MAST L3 i2d — {sw} (before)")
+    ax_o = fig.add_subplot(gs[0, 1])
+    if our_path:
+        _show(ax_o, our_path, f"pipeline i2d — {sw} (after)")
+    else:
+        ax_o.text(0.5, 0.5, "no pipeline mosaic yet", ha="center", va="center"); ax_o.axis("off")
+
+    # bottom-left: source counts / brightness histogram in the common window (brief -- jicama is
+    # deeper by construction; the point is the count + depth, not the zeropoint).
+    axh = fig.add_subplot(gs[1, 0])
+    n_mast_win = n_jic_win = None
+    # put the two catalogues on the SAME zeropoint (jicama's) so the depth is directly comparable:
+    # shift the MAST mags by the median (jicama − MAST) of cross-matched stars.
+    mast_zp = None
+    if (mast_sc is not None and mast_mag is not None and jsc is not None and jmag is not None):
+        import astropy.units as u
+        idx, sep, _ = mast_sc.match_to_catalog_sky(jsc)
+        mm2 = sep < 0.2 * u.arcsec
+        if int(mm2.sum()) >= 30:
+            mast_zp = float(np.median(jmag[idx[mm2]] - mast_mag[mm2]))
+            metrics["mast_to_jicama_zp"] = mast_zp
+    if mast_sc is not None and mast_mag is not None:
+        mm = mast_mag[_inbox(mast_sc)] + (mast_zp or 0.0)      # on jicama ZP when calibrated
+        n_mast_win = int(len(mm))
+        zlab = "" if mast_zp is not None else " (own ZP)"
+        axh.hist(mm, bins=50, histtype="step", color="#ee6677", lw=1.4,
+                 label=f"{mast_kind}{zlab} (n={n_mast_win})")
+    if jsc is not None and jmag is not None:
+        jm = jmag[_inbox(jsc)]
+        n_jic_win = int(len(jm))
+        axh.hist(jm, bins=50, histtype="step", color="#4477aa", lw=1.4,
+                 label=f"{jic_label} (n={n_jic_win})")
+    if n_mast_win is not None:
+        metrics["n_mast_window"] = n_mast_win
+    if n_jic_win is not None:
+        metrics["n_jicama_window"] = n_jic_win
+    axh.set_yscale("log")
+    axh.set_xlabel("magnitude" + (" (jicama zeropoint)" if mast_zp is not None
+                                  else " (each in its own zeropoint)"))
+    axh.set_ylabel("N sources"); axh.legend(fontsize=7.5, loc="upper left")
+    axh.set_title("source counts in the common window — MAST vs pipeline", fontsize=9)
+
+    # bottom-right (MAIN): the crowding-robust bulk offset to VIRAC for each catalogue, as a 2-D
+    # (ΔRA, ΔDec) cloud with marginals.  A nearest-neighbour-to-VIRAC distance is USELESS here
+    # (VIRAC is sparse -> ~250 mas NN spacing swamps the tie), so this uses the xcorr histogram
+    # peak: the cloud CENTRE is the true bulk offset (MAST far from 0, jicama near 0).
+    axo = fig.add_subplot(gs[1, 1])
+    # Wording is DERIVED from the sign of (jicama tie − MAST tie): only claim the pipeline "tightens
+    # the tie" when BOTH ties are measured AND jicama < MAST.  When jicama is wider/equal, or one
+    # side is unmeasurable, report the numbers without asserting an improvement.
+    both_measured = mast_tie is not None and jic_tie is not None
+    jic_tighter = bool(both_measured and jic_tie[2] < mast_tie[2])
+    metrics["astrom_improved"] = jic_tighter
+    lim = 60.0
+    for tie, col, lab in ((mast_tie, "#ee6677", mast_kind or "MAST"),
+                          (jic_tie, "#4477aa", jic_label)):
+        if tie is not None:
+            dra, dde, bulk = tie
+            axo.scatter(dra, dde, s=3, alpha=0.25, color=col,
+                        label=f"{lab}  (bulk {bulk:.0f} mas)")
+            lim = max(lim, 1.3 * float(np.nanpercentile(np.hypot(dra, dde), 95)))
+    if mast_tie is not None or jic_tie is not None:
+        axo.axhline(0, color="k", lw=0.4); axo.axvline(0, color="k", lw=0.4)
+        axo.plot(0, 0, "k+", ms=12, mew=2, label="VIRAC (target)")
+        axo.set_xlim(-lim, lim); axo.set_ylim(-lim, lim); axo.set_aspect("equal")
+        axo.set_xlabel("ΔRA to VIRAC [mas]"); axo.set_ylabel("ΔDec to VIRAC [mas]")
+        axo.legend(fontsize=7.5, loc="upper right")
+        # combined marginals (both catalogues in ONE pair of inset axes, so they don't overplot);
+        # the panel title goes on the TOP marginal so it can't collide with the histograms.
+        axt = axo.inset_axes([0.0, 1.02, 1.0, 0.16]); axr = axo.inset_axes([1.02, 0.0, 0.16, 1.0])
+        for tie, col in ((mast_tie, "#ee6677"), (jic_tie, "#4477aa")):
+            if tie is not None:
+                axt.hist(tie[0], bins=40, range=(-lim, lim), histtype="step", color=col, lw=1.1)
+                axr.hist(tie[1], bins=40, range=(-lim, lim), orientation="horizontal",
+                         histtype="step", color=col, lw=1.1)
+        axt.set_xlim(-lim, lim); axt.axis("off"); axr.set_ylim(-lim, lim); axr.axis("off")
+        axt.set_title(_stage7_astrom_title(mast_tie, jic_tie), fontsize=8)
+    # UNMEASURABLE (data + VIRAC present but no xcorr peak within 1.5") must be distinguishable from
+    # measured-and-fine -- a grossly mis-registered product (e.g. the ~20" jw01182-v001 class) would
+    # otherwise render as a clean one-cloud pass.
+    mast_unmeas = mast_sc is not None and ref_sc is not None and mast_tie is None
+    jic_unmeas = jsc is not None and ref_sc is not None and jic_tie is None
+    metrics.update(mast_tie_unmeasurable=bool(mast_unmeas), jicama_tie_unmeasurable=bool(jic_unmeas))
+    if mast_tie is None and jic_tie is None:
+        axo.axis("off")
+        if ref_sc is None:
+            axo.text(0.5, 0.5, "no VIRAC reference for the offset comparison",
+                     ha="center", va="center", fontsize=9)
+        else:
+            axo.text(0.5, 0.5, "BOTH ties unmeasurable: no xcorr peak within 1.5″\n"
+                     "→ likely gross mis-registration; investigate",
+                     ha="center", va="center", fontsize=9, color="#c33", weight="bold")
+    elif jic_unmeas:
+        # OUR product cannot be tied to VIRAC -> a defect on our side (handled by passed/red_flag).
+        axo.text(0.5, -0.16, "⚠ pipeline (jicama) tie unmeasurable (>1.5″ or no xcorr peak) — "
+                 "possible gross mis-registration of our product; not a clean pass",
+                 transform=axo.transAxes, ha="center", va="top", fontsize=8, color="#c33")
+    elif mast_unmeas:
+        # only the MAST tie is unmeasurable: the COMPARISON is unavailable, which is not by itself a
+        # defect in OUR product -- so state that, do NOT say "not a clean pass", and (below) the
+        # stage does not fail solely on this.
+        axo.text(0.5, -0.16, "⚠ MAST comparison unavailable (MAST tie >1.5″ or no xcorr peak) — "
+                 "possible MAST mis-registration; the pipeline tie is measured",
+                 transform=axo.transAxes, ha="center", va="top", fontsize=8, color="#c33")
+
+    # PASS / red-flag decision (factored into _stage7_verdict so it is pinned by tests): the pipeline
+    # must be TIEABLE, a mosaic must exist, and where MAST is also measurable the pipeline tie must be
+    # no worse.  A missing VIRAC ref, or ONLY the MAST tie being unmeasurable, is "not measured" /
+    # "comparison unavailable" -> not a fail on our side; an unmeasurable OWN tie fails AND red-flags.
+    passed, red_flag, red_flag_reason = _stage7_verdict(our_path, mast_tie, jic_tie, jic_unmeas)
+    metrics["passed"] = passed
+    if red_flag:
+        metrics["red_flag"] = True
+        metrics["red_flag_reason"] = red_flag_reason
+    fig.suptitle(f"{o.target} {o.obsid} — MAST vs pipeline ({sw})", fontsize=12, y=0.98)
+    return _save(fig, f"{o.obsid}_stage7.png"), metrics
 
 
 # --------------------------------------------------------------------------- STAGE 6
@@ -1910,6 +2543,10 @@ def build_stage(o, n, sw, lw):
         return stage5_intermodule(o, sw)
     if n == 6:
         return stage6_astrom_error(o, sw, lw)
+    if n == 7:
+        return stage7_mast_vs_pipeline(o, sw)
+    if n == 9:
+        return stage9_psf_vs_aper(o, sw)
     raise ValueError(n)
 
 
@@ -1933,6 +2570,7 @@ _HEADLINE = {
     5: "**Stage 5 — inter-detector / inter-module tie.**",
     6: "**Stage 6 — astrometric precision.**",
     7: "**Stage 7 — MAST vs pipeline.**",
+    9: "**Stage 9 — PSF vs aperture photometry.**",
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
@@ -1964,7 +2602,9 @@ def caption_for(n, metrics):
 
 
 def _caption_for_impl(n, metrics):
-    if metrics.get("red_flag"):
+    # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
+    # so the generic "the plot is empty" wording would not fit).
+    if metrics.get("red_flag") and n != 7:
         return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate. "
@@ -2083,8 +2723,9 @@ def _caption_for_impl(n, metrics):
         # overlap measured -> full caption; the S/N>10 panel is only present when ov_hi succeeded
         off = metrics.get("intermodule_off"); rms = metrics.get("intermodule_rms")
         no = metrics.get("n_overlap")
-        # the all-stars overlap panel is TOP-MIDDLE when the S/N>10 panel is also drawn (3 cols),
-        # otherwise TOP-RIGHT (2 cols)
+        # top row is quiver + all-stars + optional S/N>10; the all-stars panel is TOP-MIDDLE when
+        # the S/N panel is present (3 cols), else TOP-RIGHT (2 cols).  The footprint is its own
+        # full-width row below.
         ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
         base = ("**Stage 5 — inter-detector / inter-module tie.** "
                 "[\"Reference-free\"](DOCROOT#glossary-reffree) means JWST is matched against itself "
@@ -2102,9 +2743,81 @@ def _caption_for_impl(n, metrics):
                      f"stars ({metrics['n_overlap_hi']} stars, "
                      f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas RMS), where the "
                      f"scatter reflects the tie rather than faint-source centroiding.")
+        if metrics.get("n_overlap_footprint"):
+            base += (" The full-width row below the panels maps the overlap stars on the sky, "
+                     "coloured by per-star |A−B| — it verifies the shared stars trace the thin "
+                     "NRCA∩NRCB dither-overlap strip (not the whole field) and flags any sub-region "
+                     "where the tie degrades.")
         base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`: a good tie "
                  "shows one round PSF, a mis-tie doubles or elongates the star. "
                  "([how this is made](DOCROOT#stage5))")
+        return base
+    if n == 9:
+        ni = metrics.get("n_isolated"); ac = metrics.get("aper_corr_med")
+        sct = metrics.get("aper_psf_scatter")
+        base = ("**Stage 9 — PSF vs aperture photometry.** The jicama catalogue reports PSF-fit "
+                "fluxes; QA **re-measures** simple aperture photometry (local-annulus background) on "
+                "the mosaic at the catalogue positions and compares them, restricted to **isolated** "
+                "stars (nearest catalogue neighbour beyond the sky annulus) so a neighbour's light "
+                "doesn't contaminate the aperture or its background. LEFT: aperture vs PSF "
+                "instrumental mag with the 1:1 + aperture-correction line. RIGHT: (aperture − PSF) "
+                "vs PSF mag, showing the full range. ")
+        if ni is not None and ac is not None and sct is not None:
+            base += (f"Here: {ni} isolated stars"
+                     + (" (capped)" if metrics.get("n_capped") else "")
+                     + f", aperture correction {ac:+.2f} mag, scatter {sct:.3f} mag")
+            tf = metrics.get("frac_gt_0p3mag")
+            if tf is not None:
+                base += f", {100 * tf:.1f}% beyond ±0.3 mag"
+            base += ". "
+        base += ("A tight locus at a constant offset with a small tail means the two photometries "
+                 "agree; large scatter or a heavy tail flags PSF-model or crowding problems. "
+                 "([how this is made](DOCROOT#stage9))")
+        return base
+    if n == 7:
+        if metrics.get("red_flag"):
+            return (f"🚩 **Stage 7 — RED FLAG.** "
+                    f"{metrics.get('red_flag_reason', 'MAST-vs-pipeline comparison unavailable')}. "
+                    f"([how this is made](DOCROOT#stage7))")
+        # counts in the COMMON WINDOW (fair), not the full-field totals
+        nj = metrics.get("n_jicama_window"); nm = metrics.get("n_mast_window")
+        mo = metrics.get("mast_offset_med_mas"); jo = metrics.get("jicama_offset_med_mas")
+        base = ("**Stage 7 — MAST vs pipeline.** A comparison of the pipeline against the raw "
+                "[MAST-delivered](DOCROOT#glossary-mtier) products. The TOP row shows the "
+                "MAST level-3 `i2d` mosaic (before) next to our pipeline mosaic (after) over the "
+                "same sky region. The BOTTOM-LEFT panel compares source counts — the "
+                "[jicama](DOCROOT#glossary-jicama) catalogue vs the MAST catalogue "
+                "(the MAST-delivered `_cat.fits` when archived, else approximated by running "
+                "DAOStarFinder at 5σ on the MAST i2d — an approximation of, not a match to, the "
+                "STScI L3 catalogue step, which uses segmentation with deblending). ")
+        if nj is not None and nm is not None:
+            base += f"jicama holds {nj} vs {nm} (MAST) in the compared window. "
+        if metrics.get("jicama_is_release") is False:
+            base += ("(NOTE: no merged/release jicama catalogue exists yet for this obs, so the "
+                     "pipeline side falls back to the per-i2d MAST catalogue — the comparison is "
+                     "MAST-vs-MAST here, not pipeline-vs-MAST.) ")
+        base += ("The BOTTOM-RIGHT panel (the main result) is the "
+                 "[bulk offset to VIRAC](DOCROOT#glossary-bulk) (xcorr histogram peak, "
+                 "crowding-robust) for each catalogue")
+        # Improvement clause is CONDITIONAL: assert tightening only when both ties are measured AND
+        # jicama < MAST.  Otherwise report the numbers (or state the comparison is unavailable)
+        # without claiming an improvement.
+        if mo is not None and jo is not None:
+            base += f" — {jo:.0f} mas (jicama) vs {mo:.0f} mas (MAST)"
+            if jo < mo:
+                base += ", the astrometric tightening the pipeline delivers over MAST. "
+            else:
+                base += " (the pipeline tie is not tighter than MAST here). "
+        elif jo is not None:
+            base += (f" — {jo:.0f} mas (jicama); the MAST comparison is unavailable "
+                     f"(MAST tie unmeasurable, possible MAST mis-registration). ")
+        elif mo is not None:
+            base += f" — {mo:.0f} mas (MAST); the pipeline tie is not measurable here. "
+        else:
+            base += ". "
+        base += ("The cloud's WIDTH is bounded by the 0.1″ cross-match radius, not the per-star "
+                 "astrometric RMS — see [stage 5](DOCROOT#stage5)/[stage 6](DOCROOT#stage6) for the "
+                 "actual per-star scatter. ([how this is made](DOCROOT#stage7))")
         return base
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
@@ -2154,7 +2867,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6])
+    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 9])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
