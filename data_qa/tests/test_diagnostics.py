@@ -1033,3 +1033,262 @@ def test_stage8_not_applicable_state_is_not_a_red_flag(tmp_path, monkeypatch):
     assert m.get("measurable") is False
     assert m.get("passed") is None                                     # distinct from True/False
     assert not m.get("red_flag")                                       # a non-defect is not flagged
+
+
+
+
+def test_spitzer_for_miri_band_selection(monkeypatch):
+    monkeypatch.setattr(D.os.path, "exists", lambda p: True)     # pretend both mosaics present
+    assert "IRAC" in D._spitzer_for_miri("F770W")[0]             # 7.7 um -> IRAC 8 um
+    assert "MIPS" in D._spitzer_for_miri("F2100W")[0]            # 21 um -> MIPS 24 um
+    assert "MIPS" in D._spitzer_for_miri("F2550W")[0]
+    assert D._spitzer_for_miri("F999X") is None                  # unknown filter
+
+
+def test_miri_caption_variants():
+    full = D._miri_caption(dict(filt="F2550W", spitzer="gc_mosaic_MIPSGAL.fits",
+                                spitzer_footprint_matched=True,
+                                sat_median=0.012, sat_max=0.02, sat_n_frames=72, sat_kind="_rate"),
+                           "JWST-GC/data-qa")
+    assert "MIRI F2550W basics" in full and "Spitzer" in full and "saturation mask" in full
+    assert "same footprint" in full and "72" in full and "_rate" in full
+    assert "qa_methods.md#stagemiri" in full
+    # an un-matched footprint (reproject failed or off-coverage) must NOT claim a shared footprint
+    unmatched = D._miri_caption(dict(filt="F1500W", spitzer="mips.fits",
+                                     spitzer_footprint_matched=False), "JWST-GC/data-qa")
+    assert "same footprint" not in unmatched and "not matched" in unmatched
+    rf = D._miri_caption(dict(filt="F770W", red_flag=True, red_flag_reason="no MIRI i2d on disk"),
+                         "JWST-GC/data-qa")
+    assert rf.startswith("🚩") and "no MIRI i2d" in rf
+
+
+def test_miri_i2d_pathing(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    md = tmp_path / "brick" / "mastDownload"; md.mkdir(parents=True)
+    (md / "jw02221-o001_t001_miri_f2550w_i2d.fits").write_text("")
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+    assert D._miri_i2d(o, "F2550W").endswith("miri_f2550w_i2d.fits")
+    assert D._miri_i2d(o, "F1800W") is None
+
+
+def test_miri_i2d_recursive_and_tile_token(tmp_path, monkeypatch):
+    """L3 products stage under mastDownload/JWST/<product>/ and the tile token is not always
+    _t001_ -- the finder must recurse and accept _t002_/_t003_."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    sub = tmp_path / "brick" / "mastDownload" / "JWST" / "jw02221-o003_t002_miri_f2550w"
+    sub.mkdir(parents=True)
+    (sub / "jw02221-o003_t002_miri_f2550w_i2d.fits").write_text("")   # nested + _t002_
+    o = Observation(program="2221", obs="003", target="Brick", release_field="brick",
+                    instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+    hit = D._miri_i2d(o, "F2550W")
+    assert hit is not None and hit.endswith("jw02221-o003_t002_miri_f2550w_i2d.fits")
+
+
+def test_miri_i2d_cross_field_fallback(tmp_path, monkeypatch):
+    """cloudc's jw02221-o002 mosaic lives in the sibling brick/ tree (cloudc has no mastDownload
+    of its own): the field-scoped glob misses it, the cross-field wildcard finds it.  A file from
+    a WRONG field must be reachable ONLY through that fallback, never preferred over a scoped hit."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    # obs lives under field=cloudc per the registry, but the file is physically under brick/
+    brick_sub = tmp_path / "brick" / "mastDownload" / "JWST" / "jw02221-o002_t001_miri_f2550w"
+    brick_sub.mkdir(parents=True)
+    (brick_sub / "jw02221-o002_t001_miri_f2550w_i2d.fits").write_text("")
+    (tmp_path / "cloudc").mkdir()                      # cloudc dir exists but has no mastDownload
+    o = Observation(program="2221", obs="002", target="Cloud C", release_field="cloudc",
+                    instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+    hit = D._miri_i2d(o, "F2550W")
+    assert hit is not None and hit.endswith("jw02221-o002_t001_miri_f2550w_i2d.fits")
+
+    # PREFER the field-scoped hit: give cloudc its own mastDownload with the same obsid, plus a
+    # stray same-obsid file in an unrelated field; the scoped one must win.
+    cloudc_sub = tmp_path / "cloudc" / "mastDownload" / "JWST" / "jw02221-o002_t001_miri_f2550w"
+    cloudc_sub.mkdir(parents=True)
+    (cloudc_sub / "jw02221-o002_t001_miri_f2550w_i2d.fits").write_text("")
+    assert "/cloudc/" in D._miri_i2d(o, "F2550W")
+
+
+def test_saturation_mask_obs_scoped(tmp_path, monkeypatch):
+    from astropy.io import fits
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "brick" / "mastDownload" / "JWST" / "jw02221001001_02101_00001_mirimage"
+    d.mkdir(parents=True)
+    dq = np.zeros((8, 8), dtype=np.int32); dq[0, 0] = 2; dq[1, 1] = 2   # 2 SATURATED pixels of 64
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.ImageHDU(np.zeros((8, 8), "float32"), name="SCI"),
+                  fits.ImageHDU(dq, name="DQ")]
+                 ).writeto(d / "jw02221001001_02101_00001_mirimage_cal.fits")
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+    sat = D._saturation_mask(o)
+    assert abs(sat["sat_median"] - 2 / 64) < 1e-9 and abs(sat["sat_max"] - 2 / 64) < 1e-9
+    assert sat["n_frames"] == 1 and sat["kind"] == "_cal" and "jw02221001001" in sat["source"]
+    assert sat["mask"].sum() == 2
+    # a DIFFERENT obs (002) must NOT pick up obs-001's cal (the scoping bug)
+    o2 = Observation(program="2221", obs="002", target="Brick", release_field="brick",
+                     instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+    assert D._saturation_mask(o2) is None
+
+
+def test_saturation_mask_aggregates_and_reports_max(tmp_path, monkeypatch):
+    """With several readable frames the summary spans them all: median and max of the per-frame
+    saturated fraction, n_frames, and the worst frame's mask/name."""
+    from astropy.io import fits
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "brick" / "mastDownload" / "JWST" / "obs001"
+    d.mkdir(parents=True)
+    for i, nsat in enumerate((1, 2, 5)):                 # 3 frames, differing saturation
+        dq = np.zeros((8, 8), dtype=np.int32)
+        dq.flat[:nsat] = 2
+        fits.HDUList([fits.PrimaryHDU(),
+                      fits.ImageHDU(np.zeros((8, 8), "float32"), name="SCI"),
+                      fits.ImageHDU(dq, name="DQ")]
+                     ).writeto(d / f"jw02221001001_0210{i}_00001_mirimage_cal.fits")
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+    sat = D._saturation_mask(o)
+    assert sat["n_frames"] == 3
+    assert abs(sat["sat_median"] - 2 / 64) < 1e-9        # median of (1,2,5)/64 is 2/64
+    assert abs(sat["sat_max"] - 5 / 64) < 1e-9
+    assert sat["mask"].sum() == 5                        # displayed mask is the worst frame
+
+
+def _celestial_wcs(crval, crpix, scale_arcsec, rot_deg=0.0):
+    """A small 2-D TAN WCS header (for building synthetic mosaics)."""
+    from astropy.wcs import WCS
+    w = WCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crval = list(crval)
+    w.wcs.crpix = list(crpix)
+    w.wcs.cdelt = [-scale_arcsec / 3600.0, scale_arcsec / 3600.0]
+    th = np.deg2rad(rot_deg)
+    w.wcs.pc = [[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]]
+    return w
+
+
+def test_miri_overview_reprojects_spitzer(tmp_path, monkeypatch):
+    """Smoke test for miri_overview on a synthetic 2-panel figure (MIRI i2d + Spitzer mosaic):
+    the figure builds under matplotlib Agg, the Spitzer cutout is reprojected onto the MIRI grid
+    (footprint marked matched, output shape == the MIRI shape), and there are 2 axes (MIRI +
+    Spitzer, no saturation product on disk)."""
+    pytest.importorskip("reproject")
+    from astropy.io import fits
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "out"))
+
+    cen = (266.55, -28.72)
+    # MIRI i2d: 40x40, 0.11"/pix, rotated ~266 deg (the obs PA), with an exact-zero border
+    mwcs = _celestial_wcs(cen, [20, 20], 0.11, rot_deg=266.0)
+    md = np.ones((40, 40), "float32")
+    yy, xx = np.mgrid[0:40, 0:40]
+    md += 50.0 * np.exp(-((xx - 20) ** 2 + (yy - 20) ** 2) / 40.0)
+    md[:4, :] = 0.0; md[:, :4] = 0.0                 # zero border -> exercises the _gray non-zero norm
+    sub = tmp_path / "brick" / "mastDownload" / "JWST" / "jw02221-o001_t001_miri_f2550w"
+    sub.mkdir(parents=True)
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.ImageHDU(md, header=mwcs.to_header(), name="SCI")]
+                 ).writeto(sub / "jw02221-o001_t001_miri_f2550w_i2d.fits")
+
+    # synthetic MIPSGAL-like mosaic (F2550W -> MIPS 24 um), north-up, coarse, covering the field
+    swcs = _celestial_wcs(cen, [50, 50], 2.5, rot_deg=0.0)
+    sd = np.ones((100, 100), "float32")
+    yy, xx = np.mgrid[0:100, 0:100]
+    sd += 20.0 * np.exp(-((xx - 50) ** 2 + (yy - 50) ** 2) / 200.0)
+    spath = tmp_path / "mipsgal_mock.fits"
+    fits.PrimaryHDU(sd, header=swcs.to_header()).writeto(spath)
+    monkeypatch.setattr(D, "SPITZER_MIPS24", str(spath))
+
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+
+    captured = {}
+    orig_save = D._save
+    def _cap(fig, name):
+        captured["fig"] = fig
+        captured["n"] = len(fig.axes)
+        return orig_save(fig, name)
+    monkeypatch.setattr(D, "_save", _cap)
+
+    png, metrics = D.miri_overview(o)
+    assert os.path.exists(png)
+    assert metrics.get("passed") is True and not metrics.get("red_flag")
+    assert captured["n"] == 2                              # MIRI + Spitzer, no saturation panel
+    assert metrics.get("spitzer") == "mipsgal_mock.fits"
+    assert metrics.get("spitzer_footprint_matched") is True
+
+    # PIN the PRODUCTION reprojection by inspecting the DRAWN Spitzer panel, not a re-run in the
+    # test: the drawn image must be on the MIRI pixel grid.  Deleting reproject_interp from
+    # miri_overview leaves panel=cut.data at the coarse Spitzer shape (100x100 here, not 40x40), so
+    # this fails -- which the earlier "re-run reproject in the test" form did not.
+    spitzer_img = np.asarray(captured["fig"].axes[1].images[0].get_array(), dtype="float32")
+    assert spitzer_img.shape == md.shape
+    assert np.isfinite(spitzer_img).mean() > 0.5
+
+
+def test_miri_coverage_measured_on_reprojected_panel(tmp_path, monkeypatch):
+    """The footprint-matched gate must read the REPROJECTED panel, not the raw cutout: a Spitzer
+    mosaic offset so it barely overlaps the MIRI field leaves the drawn panel mostly NaN, so the
+    footprint must NOT be reported as matched (`spitzer_panel_finite_frac` < 0.5)."""
+    pytest.importorskip("reproject")
+    from astropy.io import fits
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "out"))
+    cen = (266.55, -28.72)
+    mwcs = _celestial_wcs(cen, [20, 20], 0.11, rot_deg=266.0)
+    md = np.ones((40, 40), "float32")
+    md += 50.0 * np.exp(-((np.mgrid[0:40, 0:40][1] - 20) ** 2) / 40.0)
+    sub = tmp_path / "brick" / "mastDownload" / "JWST" / "jw02221-o001_t001_miri_f2550w"
+    sub.mkdir(parents=True)
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.ImageHDU(md, header=mwcs.to_header(), name="SCI")]
+                 ).writeto(sub / "jw02221-o001_t001_miri_f2550w_i2d.fits")
+    # Spitzer mosaic that does not cover the MIRI field: NaN everywhere except a far corner, so the
+    # cutout around the MIRI centre -- and thus the reprojected drawn panel -- is essentially all NaN
+    # (the sickle-vs-MIPS24 case), even though a raw finite-fraction over the whole array is nonzero.
+    swcs = _celestial_wcs(cen, [50, 50], 2.5, rot_deg=0.0)
+    sd = np.full((100, 100), np.nan, "float32")
+    sd[:12, :12] = 1.0                                    # finite only in a corner, off the field
+    spath = tmp_path / "mips_offset.fits"
+    fits.PrimaryHDU(sd, header=swcs.to_header()).writeto(spath)
+    monkeypatch.setattr(D, "SPITZER_MIPS24", str(spath))
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+    _png, metrics = D.miri_overview(o)
+    assert metrics.get("spitzer_panel_finite_frac", 1.0) < 0.5
+    assert metrics.get("spitzer_footprint_matched") is False
+
+
+def test_miri_degenerate_i2d_does_not_pass(tmp_path, monkeypatch):
+    """A blank/mostly-empty MIRI i2d must NOT read passed=True (the gate has teeth beyond
+    'an i2d opened')."""
+    from astropy.io import fits
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "out"))
+    cen = (266.55, -28.72)
+    mwcs = _celestial_wcs(cen, [20, 20], 0.11, rot_deg=0.0)
+    md = np.zeros((40, 40), "float32")                    # all-zero -> finite-but-degenerate
+    md[20, 20] = 5.0
+    md[md == 0] = np.nan                                  # mostly NaN -> finite fraction ~1/1600
+    sub = tmp_path / "brick" / "mastDownload" / "JWST" / "jw02221-o001_t001_miri_f2550w"
+    sub.mkdir(parents=True)
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.ImageHDU(md, header=mwcs.to_header(), name="SCI")]
+                 ).writeto(sub / "jw02221-o001_t001_miri_f2550w_i2d.fits")
+    monkeypatch.setattr(D, "SPITZER_MIPS24", "/nonexistent")
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="MIRI", filters=["F2550W"], visits=[], epoch="", notes="")
+    _png, metrics = D.miri_overview(o)
+    assert metrics.get("passed") is False
+    assert metrics.get("miri_finite_frac", 1.0) < 0.2
+
+
+def test_miri_overview_red_flag_no_i2d(tmp_path, monkeypatch):
+    """No i2d on disk -> a red-flag figure, passed False."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "out"))
+    (tmp_path / "brick" / "mastDownload").mkdir(parents=True)
+    o = Observation(program="2221", obs="009", target="Brick", release_field="brick",
+                    instrument="MIRI", filters=["F1800W"], visits=[], epoch="", notes="")
+    png, metrics = D.miri_overview(o)
+    assert os.path.exists(png)
+    assert metrics.get("red_flag") is True and metrics.get("passed") is False

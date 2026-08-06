@@ -409,3 +409,28 @@ common central window of the mosaic:
 **Source:** [`data_qa/diagnostics.py` → `stage7_mast_vs_pipeline`](../data_qa/diagnostics.py)
 (MAST catalogue: `_mast_l3_catalog`/`_load_mast_catalog`; detection fallback: `_detect_on_mosaic`;
 bulk tie: `_tie_cloud`).
+
+
+
+<a id="stagemiri"></a>
+## MIRI basics (posted on MIRI issues)
+
+The NIRCam stages above don't apply to MIRI; MIRI issues instead get a **basics** overview
+(`miri_overview`, posted with the `data-qa:diag:stagemiri` marker):
+
+- **MAST i2d image** — the MIRI level-3 mosaic, grayscale (ZScale/asinh). Check for delivery and
+  gross artifacts.
+- **Spitzer side-by-side** — the nearer archival Spitzer band, **reprojected onto the MIRI WCS +
+  pixel grid** (GLIMPSE is GLON-CAR and MIPSGAL is RA-TAN north-up, both a quarter-turn from the
+  MIRI observing PA, so a raw cutout would not line up): **IRAC 8 µm** (GLIMPSE) below ~14 µm (the
+  geometric midpoint of the two bands, so F1280W maps to the closer IRAC), **MIPS 24 µm** (MIPSGAL)
+  above. The "same footprint" note appears only when the cutout both covers the field and reprojects;
+  otherwise the panel is only wavelength-matched. Shows what MIRI resolves that Spitzer could not.
+  (Mosaics: `QA_IRAC4` / `QA_MIPS24`, GC-wide by default.)
+- **Saturation mask** — which pixels are flagged **SATURATED** in the MAST DQ (from the per-exposure
+  `_cal`, falling back to `_rate`; the i2d carries no DQ). Reports the **median** and **max**
+  saturated fraction across every readable frame of the obs (a single frame is one exposure of many)
+  and shows the worst frame's mask. Omitted when no readable DQ is staged locally.
+
+Source: [`data_qa/diagnostics.py` → `miri_overview`](../data_qa/diagnostics.py)
+(`_miri_i2d`, `_spitzer_for_miri`, `_saturation_mask`).

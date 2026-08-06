@@ -2616,6 +2616,203 @@ def stage8_distortion(o: Observation, sw):
     return _save(fig, f"{o.obsid}_stage8.png"), metrics
 
 
+# --------------------------------------------------------------------------- MIRI overview
+# Spitzer comparison mosaics (GC-wide; overridable via env).  IRAC ch4 = 8 um (GLIMPSE),
+# MIPS = 24 um (MIPSGAL).  Cropped to the MIRI footprint at plot time.
+SPITZER_IRAC4 = os.environ.get(
+    "QA_IRAC4", "/orange/adamginsburg/cmz/glimpse_data/GLM_00000+0000_mosaic_I4.fits")
+SPITZER_MIPS24 = os.environ.get(
+    "QA_MIPS24", "/orange/adamginsburg/cmz/mipsgal_24micron_data/gc_mosaic_MIPSGAL.fits")
+# central wavelength (um) of each MIRI imaging filter, to pick the nearest Spitzer band
+_MIRI_WAVE = {"F560W": 5.6, "F770W": 7.7, "F1000W": 10.0, "F1130W": 11.3, "F1280W": 12.8,
+              "F1500W": 15.0, "F1800W": 18.0, "F2100W": 21.0, "F2550W": 25.5}
+
+
+def _miri_i2d(o, filt):
+    """MAST-delivered MIRI level-3 mosaic for one filter, or None.
+
+    MAST stages L3 products under ``mastDownload/JWST/<product>/`` subdirs (so the search must
+    recurse), the tile token varies (``_t001_``/``_t002_``/``_t003_``), and some obs have no
+    field-named mastDownload dir of their own -- e.g. cloudc's ``jw02221-o002`` mosaic lives in
+    the sibling ``brick/mastDownload`` tree.  A cross-field wildcard therefore backs up the
+    field-scoped hit; the field-scoped hit is PREFERRED (tried first) so the wildcard cannot
+    grab a wrong field's file when a scoped one exists."""
+    filt = filt.lower()
+    pats = (f"{BASE}/{o.field}/mastDownload/**/{o.obsid}_t*_miri_*{filt}*_i2d.fits",
+            f"{BASE}/*/mastDownload/**/{o.obsid}_t*_miri_*{filt}*_i2d.fits")
+    for pat in pats:
+        hits = glob.glob(pat, recursive=True)
+        if hits:
+            return sorted(hits)[0]
+    return None
+
+
+def _spitzer_for_miri(filt):
+    """(label, mosaic path) of the nearer Spitzer band for this MIRI filter: IRAC 8 um below
+    ~14 um, MIPS 24 um above.  None if the mosaic isn't on disk.
+
+    The split sits at the geometric midpoint of the two Spitzer bands (sqrt(8*24) = 13.9 um) so
+    F1280W (12.8 um, 4.8 um from IRAC 8 vs 11.2 um from MIPS 24) maps to the closer IRAC band."""
+    w = _MIRI_WAVE.get(filt.upper())
+    if w is None:
+        return None
+    path, lbl = ((SPITZER_IRAC4, "Spitzer IRAC 8 µm (GLIMPSE)") if w < 14
+                 else (SPITZER_MIPS24, "Spitzer MIPS 24 µm (MIPSGAL)"))
+    return (lbl, path) if os.path.exists(path) else None
+
+
+def _saturation_mask(o):
+    """Saturation summary from the SATURATED DQ bit (=2) across the per-exposure MAST products
+    of this obs, or None.  The i2d carries no DQ, so saturation comes from the per-exposure
+    frames.  A single frame is one arbitrary exposure of many, so this scans every readable
+    ``_cal`` (falling back to ``_rate`` when no ``_cal`` opens -- brick's 72 ``_cal`` are empty
+    FITS) and reports the spread.
+
+    Returns a dict: ``sat_median`` / ``sat_max`` (saturated pixel FRACTION, over readable frames),
+    ``n_frames`` (how many were read), ``kind`` ("_cal"/"_rate"), ``mask`` (the DQ mask of the
+    worst frame), and ``source`` (that frame's filename)."""
+    from astropy.io import fits
+    # per-exposure MAST filenames are jw<prog><obs><visit>_..._mirimage_cal.fits (e.g.
+    # jw02221001001_..._mirimage_cal.fits), NOT the o.obsid form jw02221-o001 -- so scope on the
+    # jw<prog><obs> prefix.  An unscoped fallback would silently show a DIFFERENT obs's DQ.
+    stem = f"jw{int(o.program):05d}{o.obs}"
+    for kind in ("_cal", "_rate"):
+        pat = f"{BASE}/{o.field}/mastDownload/**/{stem}*mirimage{kind}.fits"
+        fracs = []      # (frac, mask, name) per readable frame of this product type
+        for p in sorted(glob.glob(pat, recursive=True)):
+            try:
+                with fits.open(p) as h:
+                    if "DQ" not in h:
+                        continue
+                    dq = h["DQ"].data
+                    if dq is None:
+                        continue
+                    sat = (np.asarray(dq).astype(int) & 2) > 0     # SATURATED = bit 1 (value 2)
+                    fracs.append((float(sat.mean()), sat, os.path.basename(p)))
+            except (OSError, ValueError, KeyError, IndexError):
+                continue
+        if not fracs:
+            continue                                              # try the next product type
+        vals = np.array([f for f, _, _ in fracs])
+        worst = max(fracs, key=lambda t: t[0])                    # display the most-saturated frame
+        return dict(sat_median=float(np.median(vals)), sat_max=float(vals.max()),
+                    n_frames=len(fracs), kind=kind, mask=worst[1], source=worst[2])
+    return None
+
+
+def miri_overview(o: Observation, filt=None):
+    """MIRI basics for a MIRI observation: the MAST i2d image, a Spitzer side-by-side at the
+    matching wavelength (IRAC 8 um / MIPS 24 um, reprojected onto the MIRI grid), and a saturation
+    mask from the MAST DQ.  Picks the first MIRI filter with an i2d on disk if ``filt`` is None."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.nddata import Cutout2D
+    from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
+    filts = [filt] if filt else list(o.filters)
+    mpath = None
+    for f in filts:
+        mpath = _miri_i2d(o, f)
+        if mpath:
+            filt = f; break
+    metrics = dict(stage="miri", filt=filt)
+    if not mpath:
+        png = _red_flag_figure(o, "miri", "NO MIRI i2d ON DISK",
+                               f"No MAST MIRI i2d in mastDownload/ for {o.obsid} "
+                               f"(filters tried: {', '.join(filts)}).")
+        metrics.update(red_flag=True, red_flag_reason="no MIRI i2d on disk", passed=False)
+        return png, metrics
+
+    with fits.open(mpath) as h:
+        sci = h["SCI"] if "SCI" in h else h[1]
+        mdata = sci.data.astype("float32"); mwcs = WCS(sci.header)
+    spz = _spitzer_for_miri(filt)
+    sat = _saturation_mask(o)
+    ncol = 1 + (1 if spz else 0) + (1 if sat else 0)
+    fig, ax = _fig(1, ncol, 5.4, 5.2); fig.subplots_adjust(top=0.86, wspace=0.28)
+    col = 0
+
+    def _gray(a, d, title):
+        # scale from finite, NON-ZERO pixels only: a MIRI mosaic can carry a wide exact-zero
+        # border (brick o001 F2550W is ~19% zeros) that drags ZScale limits so far the real
+        # ~90-count signal flattens to invisible.
+        sample = d[np.isfinite(d) & (d != 0)]
+        ref = sample if sample.size else np.nan_to_num(d)
+        norm = ImageNormalize(ref, interval=ZScaleInterval(), stretch=AsinhStretch())
+        a.imshow(d, origin="lower", cmap="gray", norm=norm)
+        a.set_xticks([]); a.set_yticks([]); a.set_title(title, fontsize=9)
+
+    a0 = ax[0][col]; col += 1
+    _gray(a0, mdata, f"MIRI {filt} MAST i2d")
+
+    if spz:                                              # Spitzer, reprojected onto the MIRI grid
+        lbl, spath = spz
+        a1 = ax[0][col]; col += 1
+        try:
+            with fits.open(spath) as h:
+                hd = h[0] if h[0].data is not None else h[1]
+                sd = hd.data.astype("float32"); swcs = WCS(hd.header)
+            cen = mwcs.pixel_to_world(mdata.shape[1] / 2, mdata.shape[0] / 2)
+            # cut a generous window around the MIRI centre (with slack for the ~266 deg PA
+            # rotation) so reproject has enough coverage, then resample onto the MIRI WCS.
+            from astropy.wcs.utils import proj_plane_pixel_scales
+            mscale = float(np.mean(proj_plane_pixel_scales(mwcs)))
+            sscale = float(np.mean(proj_plane_pixel_scales(swcs)))
+            size = int(max(mdata.shape) * mscale / sscale * 1.6)
+            px, py = swcs.world_to_pixel(cen)
+            cut = Cutout2D(sd, (float(px), float(py)), max(size, 20), wcs=swcs, mode="trim")
+            # GLIMPSE (GLON-CAR) / MIPSGAL (RA-TAN) are ~quarter-turn from the MIRI PA; reproject
+            # onto the MIRI WCS+shape so the two panels share orientation and pixel grid.
+            reprojected = False
+            panel = cut.data
+            from reproject import reproject_interp
+            try:
+                rep, _ = reproject_interp((cut.data, cut.wcs), mwcs, shape_out=mdata.shape)
+                panel = rep; reprojected = True
+            except (ValueError, MemoryError, RuntimeError, TypeError):
+                panel = cut.data                             # fall back to the un-reprojected cut
+            # coverage is measured on the panel ACTUALLY DRAWN: an archival mosaic that does not
+            # overlap the field (e.g. sickle o001 vs MIPS24), or that only partly overlaps after the
+            # reprojection onto the MIRI grid, leaves the drawn panel mostly NaN -- do NOT then claim
+            # a matched footprint.  (Measuring the raw cutout instead over-counts coverage, since the
+            # generous pre-reproject window can be half-full while the reprojected panel is far less.)
+            covered = float(np.isfinite(panel).mean()) >= 0.5
+            metrics["spitzer_panel_finite_frac"] = float(np.isfinite(panel).mean())
+            matched = bool(reprojected and covered)
+            note = ("\n(same footprint)" if matched
+                    else "\n(not covered)" if not covered
+                    else "\n(not reprojected)")
+            _gray(a1, panel, f"{lbl}{note}")
+            metrics["spitzer"] = os.path.basename(spath)
+            metrics["spitzer_footprint_matched"] = matched
+        except (ValueError, IndexError, OSError):
+            a1.text(0.5, 0.5, f"{lbl}\nfootprint not covered", ha="center", va="center", fontsize=8)
+            a1.axis("off")
+
+    if sat:                                              # saturation mask from MAST DQ
+        a2 = ax[0][col]; col += 1
+        a2.imshow(sat["mask"], origin="lower", cmap="Reds", vmin=0, vmax=1)
+        a2.set_xticks([]); a2.set_yticks([])
+        a2.set_title(f"saturated pixels (MAST DQ)\nmedian {100 * sat['sat_median']:.2f}%, "
+                     f"max {100 * sat['sat_max']:.2f}% over {sat['n_frames']} {sat['kind']} frames",
+                     fontsize=8)
+        metrics.update(sat_median=sat["sat_median"], sat_max=sat["sat_max"],
+                       sat_n_frames=sat["n_frames"], sat_kind=sat["kind"], sat_source=sat["source"])
+    # MIRI basics is a display panel, not a numeric gate; the one condition that carries information
+    # is whether the primary product -- the MIRI i2d -- actually rendered usable data.  A blank or
+    # mostly-empty mosaic (finite fraction below 20%) does NOT pass, so a degenerate i2d is
+    # distinguishable from a real one rather than both reading passed=True.  Record the component
+    # states so a reader can tell a complete panel from a partial one (Spitzer present / footprint
+    # matched / saturation product present).
+    miri_finite_frac = float(np.isfinite(mdata).mean())
+    metrics.update(miri_finite_frac=miri_finite_frac,
+                   spitzer_present=bool(spz), sat_present=bool(sat), red_flag=False)
+    metrics["passed"] = bool(miri_finite_frac > 0.2)
+    fig.suptitle(f"{o.target} {o.obsid} — MIRI {filt} basics", fontsize=11, y=0.98)
+    return _save(fig, f"{o.obsid}_miri.png"), metrics
+
+
 # --------------------------------------------------------------------------- STAGE 6
 def _internal_pos_rms(o, filt):
     """(mag_vega, internal-position-rms in mas) per star from the highest-tier catalog carrying
@@ -3133,6 +3330,83 @@ def _json_default(o):
     raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
 
 
+def _miri_obs_from_disk(program, obs, base=BASE):
+    """Construct a MIRI Observation from the MAST MIRI i2d(s) on disk (portal-independent)."""
+    from .observations import FIELDS, CURATED
+    obsid = f"jw{int(program):05d}-o{obs}"
+    for d in sorted(glob.glob(f"{base}/*/")):
+        fld = os.path.basename(d.rstrip("/"))
+        # recurse into mastDownload/JWST/<product>/ and accept any tile token (_t001_../_t003_)
+        hits = glob.glob(f"{base}/{fld}/mastDownload/**/{obsid}_t*_miri_*_i2d.fits",
+                         recursive=True)
+        if not hits:
+            continue
+        filts = sorted({m.group(1).upper() for h in hits
+                        if (m := re.search(r"miri_([a-z0-9]+)_i2d", os.path.basename(h).lower()))})
+        cur = CURATED.get(obsid, {})
+        return Observation(program=str(int(program)), obs=obs, target=FIELDS.get(fld, fld.title()),
+                           release_field=fld, instrument="MIRI", filters=filts,
+                           visits=cur.get("visits", []), epoch=cur.get("epoch", ""),
+                           notes=cur.get("notes", ""))
+    return None
+
+
+def _miri_caption(metrics, repo):
+    doc = f"https://github.com/{repo}/blob/main/docs/qa_methods.md#stagemiri"
+    parts = [f"**MIRI {metrics.get('filt','')} basics.** MAST i2d image"]
+    if metrics.get("spitzer"):
+        # only claim a shared footprint when the Spitzer cutout was reprojected onto the MIRI grid
+        # AND actually covers the field; otherwise the panel is only wavelength-matched.
+        foot = (", reprojected onto the MIRI grid (same footprint)"
+                if metrics.get("spitzer_footprint_matched") else " (footprint not matched)")
+        parts.append("a Spitzer side-by-side at the matching wavelength (IRAC 8 µm below ~14 µm, "
+                     "MIPS 24 µm above)" + foot)
+    if metrics.get("sat_median") is not None:
+        parts.append(f"a per-exposure saturation mask from the MAST DQ "
+                     f"(median {100 * metrics['sat_median']:.2f}%, max {100 * metrics['sat_max']:.2f}% "
+                     f"saturated over {metrics['sat_n_frames']} `{metrics['sat_kind']}` frames)")
+    body = ", plus ".join(parts) if len(parts) > 1 else parts[0]
+    if metrics.get("red_flag"):
+        return (f"🚩 **MIRI basics — {metrics.get('red_flag_reason','no data')}.** "
+                f"([how this is made]({doc}))")
+    return f"{body}. ([how this is made]({doc}))"
+
+
+def _run_miri(args):
+    """Build + optionally post the MIRI overview for one observation."""
+    mo = [o for o in registry(programs=[args.program])
+          if o.obs == args.obs and o.instrument == "MIRI"]
+    o = mo[0] if mo else _miri_obs_from_disk(args.program, args.obs)
+    if o is None:
+        print(f"no MIRI obs for program {args.program} obs {args.obs} (portal + on-disk empty)",
+              file=sys.stderr)
+        return 1
+    if args.target:
+        o = replace(o, target=args.target)
+    png, metrics = miri_overview(o)
+    print(f"{o.obsid}: MIRI overview -> {png}  passed={metrics.get('passed')}")
+    mdir = os.path.join(os.path.dirname(__file__), "metrics")
+    os.makedirs(mdir, exist_ok=True)
+    mpath = os.path.join(mdir, f"{o.obsid}.json")
+    all_metrics = {}
+    if os.path.exists(mpath):
+        try:
+            with open(mpath) as fh:
+                all_metrics = json.load(fh)
+        except (OSError, ValueError):
+            all_metrics = {}
+    all_metrics["miri"] = metrics
+    with open(mpath, "w") as fh:
+        json.dump(all_metrics, fh, indent=2, default=_json_default)
+    if args.post:
+        try:
+            from .post_diagnostics import post_stage, PostError
+            post_stage(o, "miri", png, _miri_caption(metrics, args.repo), args.repo)
+        except (PostError, OSError) as e:
+            print(f"  MIRI: post FAILED (figure built OK): {e}", file=sys.stderr)
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
@@ -3142,7 +3416,12 @@ def main(argv=None):
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
     ap.add_argument("--repo", default=os.environ.get("QA_REPO", "JWST-GC/data-qa"))
+    ap.add_argument("--miri", action="store_true",
+                    help="build the MIRI overview (i2d + Spitzer + saturation) instead of NIRCam stages")
     args = ap.parse_args(argv)
+
+    if args.miri:
+        return _run_miri(args)
 
     # diagnostics are NIRCam-only; when the portal registry is reachable it returns BOTH the
     # NIRCam and MIRI observation for a shared obsid (e.g. cloudc 2221-o002), so filter to

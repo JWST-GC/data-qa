@@ -35,6 +35,7 @@ STAGE_FUNC = {
     5: "stage5_intermodule", 6: "stage6_astrom_error", 7: "stage7_mast_vs_pipeline",
     8: "stage8_distortion",
     9: "stage9_psf_vs_aper",
+    "miri": "miri_overview",
 }
 
 
