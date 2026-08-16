@@ -172,10 +172,16 @@ that already exists.
    star-position/catalog-flux check (`rgb_treasury --validate-stars`) as a
    second gate; skipped star checks need an explicit `--no-star-check`
    acknowledgment at publish time, failed ones block outright.
-5. **Cataloging trigger default: plain crf (no destreak).** `EACH_SUFFIX`
-   defaults to `align_o<obs>_crf` (fix_alignment always runs; the no-destreak
-   path names per-exposure crfs `*_align_o<field>_crf.fits`). Destreak stays
-   available via `pipeline_trigger --destreak`; the QA checklist now ASKS
-   whether destreak is needed per observation.
+5. **Cataloging trigger default: the pipeline's own destreak policy**
+   (SUPERSEDES the earlier "plain crf (no destreak)" decision, issue #69).
+   `EACH_SUFFIX` comes from a probe of
+   `jwst_gc_pipeline.reduction.destreak_policy.crf_suffix`, the same value the
+   pipeline's `run_pipeline.build_plan` derives, so the chain globs the crf
+   products the triggered reduction really writes (`destreak_o<obs>_crf` where
+   the policy destreaks, e.g. gc-treasury; `align_o<obs>_crf` where it does
+   not). `align_o<obs>_crf` remains the fallback when the probe fails, with a
+   loud warning. Operator overrides stay available via `pipeline_trigger
+   --destreak` / `--no-destreak` / `--each-suffix` / `--no-probe`; the QA
+   checklist still ASKS whether destreak is needed per observation.
 6. **MIRI 2221 o003: ignored** (left unmapped in `PROGRAMS`; no globulars.)
 7. **Ops stays in data-qa** (no split into its own org repo).

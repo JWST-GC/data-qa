@@ -6,8 +6,8 @@ The pipeline derives cataloging's ``each_suffix`` from
 ``run_pipeline.build_plan``), and stage 1 consults ``destreaks()`` per filter
 before writing ``*_destreak_o<obs>_crf.fits`` vs ``*_align_o<obs>_crf.fits``.
 The trigger runs in a different (stdlib-only) environment, so it asks the same
-policy by subprocessing the pipeline env's python -- one call per (field, obs)
-per run, JSON over stdout.
+policy by subprocessing the pipeline env's python -- one call per distinct
+(field, obs, filters, pipe_root, python) per run, JSON over stdout.
 
 Degrades, never crashes: any probe failure (missing checkout, nonzero exit,
 timeout, unparseable output) prints a loud WARNING naming the mismatch risk and
@@ -72,8 +72,8 @@ def _warn_fallback(field, obs, reason):
     print(f"WARNING: pipeline destreak-policy probe FAILED for {field} "
           f"o{obs}: {reason}.\n"
           f"WARNING: falling back to the trigger's hardcoded default "
-          f"EACH_SUFFIX=align_o{obs}_crf.  If destreak_policy.destreaks() is "
-          f"True for this field (it is for gc-treasury), the reduction writes "
+          f"EACH_SUFFIX=align_o{obs}_crf.  Where destreak_policy.destreaks() "
+          f"is True for the field (gc-treasury among them), the reduction writes "
           f"*_destreak_o{obs}_crf.fits and the dependency-chained cataloging "
           f"globs ZERO inputs -- every chain fails at m1 until a human "
           f"resubmits (data-qa#69).", file=sys.stderr)
@@ -86,7 +86,8 @@ def probe_policy(field, obs, filters, pipe_root=DEFAULT_PIPE_ROOT,
     Returns ``{"each_suffix": "destreak_o<obs>_crf" | "align_o<obs>_crf",
     "destreaks": {FILTER: bool, ...}}`` -- the same values the pipeline's own
     ``run_pipeline.build_plan`` derives -- by running PROBE_CODE in the
-    pipeline env's python.  Cached per (field, obs) within a run.  On ANY
+    pipeline env's python.  Cached per (field, obs, filters, pipe_root, python)
+    within a run.  On ANY
     failure it warns loudly (naming the mismatch risk) and returns None so the
     caller degrades to today's hardcoded default.
     """

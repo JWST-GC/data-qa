@@ -130,6 +130,15 @@ def cataloging_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
         # is inner-CMZ.  It auto-degrades to legacy where a frame lacks a sibling
         # _ramp.fits ZEROFRAME, so it is safe across all GC fields.
         # submit_cataloging.sbatch reads it from the environment (--export=ALL).
+        # SCOPE: this takes effect on exposures with no cached satstar catalog,
+        # i.e. newly reduced data -- the normal auto-trigger case.  The pipeline
+        # caches *_satstar_catalog.fits skip-if-exists and keys that cache on the
+        # RECOVERY signature only, not on the deblend flag
+        # (crowdsource_catalogs_long.load_or_make_satstar_catalog ->
+        # cataloging._satstar_recovery_signature), so a re-catalog of an
+        # ALREADY-cataloged field (brick/cloudc/sgrc) reuses its non-deblended
+        # caches and the deblend is a no-op there until
+        # keflavich/jwst-gc-pipeline#427 lands or those caches are cleared.
         env["DEBLEND_SATSTARS"] = "1"
     if dep:
         env["DEP"] = dep

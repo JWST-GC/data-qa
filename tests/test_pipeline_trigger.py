@@ -189,6 +189,62 @@ def test_probe_garbage_output_warns_and_returns_none(tmp_path, monkeypatch,
     assert "WARNING" in capsys.readouterr().err
 
 
+def test_probe_timeout_warns_and_returns_none(tmp_path, monkeypatch, capsys):
+    """A wedged env (hung filesystem/python) must not hang or crash the poll:
+    TimeoutExpired -> None + the fallback warning."""
+    def hang(argv, capture_output=True, text=True, timeout=None):
+        raise subprocess.TimeoutExpired(argv, timeout)
+    monkeypatch.setattr(pp.subprocess, "run", hang)
+    got = pp.probe_policy("gc-treasury", "001", ["F212N"],
+                          pipe_root=_probe_root(tmp_path), timeout=7)
+    assert got is None
+    err = capsys.readouterr().err
+    assert "timed out after 7s" in err
+    assert "align_o001_crf" in err
+
+
+def test_probe_unrunnable_python_warns_and_returns_none(tmp_path, monkeypatch,
+                                                        capsys):
+    """A missing/non-executable $PIPELINE_PYTHON raises OSError out of
+    subprocess.run -- caught, warned, fallback, so no traceback escapes into
+    the trigger loop."""
+    def missing(argv, capture_output=True, text=True, timeout=None):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+    monkeypatch.setattr(pp.subprocess, "run", missing)
+    got = pp.probe_policy("gc-treasury", "001", ["F212N"],
+                          pipe_root=_probe_root(tmp_path),
+                          python="/nonexistent/python")
+    assert got is None
+    err = capsys.readouterr().err
+    assert "could not run /nonexistent/python" in err
+    assert "align_o001_crf" in err
+
+
+@pytest.mark.parametrize("payload", [
+    json.dumps({"suffix": "destreak_o001_crf"}),         # older probe shape
+    json.dumps({"each_suffix": None, "destreaks": {}}),   # null suffix
+    json.dumps({"each_suffix": "destreak_o001_crf"}),     # destreaks missing
+    json.dumps(["destreak_o001_crf"]),                    # not a mapping
+    json.dumps("destreak_o001_crf"),                      # bare string
+])
+def test_probe_wrong_shape_payload_warns_and_returns_none(payload, tmp_path,
+                                                          monkeypatch, capsys):
+    """Valid JSON of the WRONG shape (older checkout, stray print merged into
+    stdout, partial write) must be rejected rather than cached as truthy
+    policy: a truthy result reaches cataloging_step as ``policy["each_suffix"]``
+    and the KeyError there would abort act_trigger mid-loop, leaving every
+    later observation in that poll unsubmitted."""
+    monkeypatch.setattr(pp.subprocess, "run", _stub_run(payload))
+    got = pp.probe_policy("gc-treasury", "001", ["F212N"],
+                          pipe_root=_probe_root(tmp_path))
+    assert got is None
+    assert "WARNING" in capsys.readouterr().err
+    # ... and the plan still builds, on today's hardcoded default
+    plan = pt.build_plan(10678, "001", filters=["F212N"],
+                         pipe_root=_probe_root(tmp_path))
+    assert plan[1]["env"]["EACH_SUFFIX"] == "align_o001_crf"
+
+
 def test_probe_refuses_bogus_pipe_root(tmp_path, monkeypatch, capsys):
     """A pipe_root without the package must decline WITHOUT subprocessing --
     the pipeline env has an installed copy that would otherwise answer for it."""
@@ -201,7 +257,8 @@ def test_probe_refuses_bogus_pipe_root(tmp_path, monkeypatch, capsys):
 
 
 def test_probe_cached_per_field_obs(tmp_path, monkeypatch):
-    """One subprocess per (field, obs) per run, even for repeated build_plans."""
+    """One subprocess per distinct (field, obs, filters, pipe_root, python) per
+    run, even for repeated build_plans."""
     calls = []
     monkeypatch.setattr(pp.subprocess, "run",
                         _stub_run(json.dumps(TREASURY_POLICY), calls=calls))
@@ -259,7 +316,7 @@ def test_build_plan_no_destreak_consistent_pair():
 
 def test_build_plan_mixed_destreak_policy_warns(tmp_path, monkeypatch, capsys):
     """A per-filter split (sickle: SW destreaks, LW does not) cannot ride one
-    EACH_SUFFIX -- the plan says so instead of silently mis-globbing."""
+    EACH_SUFFIX -- the plan says so, so those filters go by hand."""
     payload = {"each_suffix": "destreak_o002_crf",
                "destreaks": {"F212N": True, "F480M": False}}
     monkeypatch.setattr(pp.subprocess, "run", _stub_run(json.dumps(payload)))
