@@ -50,6 +50,11 @@
 #      only re-report events younger than a week.  Redundant while the daily
 #      --auto entry commits state itself, but harmless (and it keeps the state
 #      fresh if the daily entry is ever swapped back to report-only).
+#      --report --execute rides along on purpose: a commit RETIRES the events
+#      it polled, so a weekly run landing mid-wedge (daily --auto downgraded to
+#      report-only by LOW DISK, its arrival events uncommitted) would retire
+#      those arrivals with nobody ever told.  Reporting announces the batch it
+#      is about to retire; a healthy week has no events and posts nothing.
 #SCRON --account=astronomy-dept
 #SCRON --qos=astronomy-dept-b
 #SCRON --job-name=jwstgc-mastmon-weekly
@@ -57,4 +62,4 @@
 #SCRON --mem=4gb
 #SCRON --time=00:30:00
 #SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_commit_%j.log
-47 7 * * 1 cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --commit-state
+47 7 * * 1 cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --commit-state --report --execute

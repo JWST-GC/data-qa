@@ -1189,12 +1189,41 @@ def _patch_post_status(monkeypatch, rc=0):
 
 
 def test_act_report_arrival_posts_new_comment(monkeypatch):
-    """Any arrival in the batch -> new comment (GitHub notifies for new
-    comments only; an edit reaches nobody)."""
+    """An arrival -> new comment on THAT issue (GitHub notifies for new
+    comments only; an edit reaches nobody), while a planned-only issue in the
+    same batch stays a quiet edit."""
     posted = _patch_post_status(monkeypatch)
     evs = _planned_events() + _trigger_events("001")
     mm.act_report(evs, execute=True)
     assert len(posted) == 2                      # brick issue + treasury issue
+    assert [(title, kw["update_last"]) for title, _, kw in posted] == [
+        ("Brick — jw02221-o001 (NIRCam)", False),      # arrival: notify
+        (mm.TREASURY_ISSUE_TITLE, True)]               # planned only: edit
+
+
+def test_act_report_arrival_classified_per_issue(monkeypatch):
+    """Classification is per ISSUE, not batch-global: a treasury tile that
+    landed notifies on the treasury issue while a planned-only brick batch
+    keeps editing in place."""
+    posted = _patch_post_status(monkeypatch)
+    landed = dict(_planned_events()[0], event="NEWLY_RELEASED",
+                  released=True, calib_level=3, t_obs_release=59900.0)
+    planned_brick = dict(_trigger_events("001")[0], released=False,
+                         calib_level=-1, t_obs_release=None)
+    mm.act_report([planned_brick, landed], execute=True)
+    assert [(title, kw["update_last"]) for title, _, kw in posted] == [
+        ("Brick — jw02221-o001 (NIRCam)", True),       # planned only: edit
+        (mm.TREASURY_ISSUE_TITLE, False)]              # arrival: notify
+
+
+def test_act_report_fresh_downgrade_notifies_every_issue(monkeypatch, tmp_path):
+    """The downgrade notice rides on EVERY comment body, so a fresh one
+    notifies on every issue even where the events are purely planned."""
+    posted = _patch_post_status(monkeypatch)
+    evs = _planned_events() + _trigger_events("001")
+    mm.act_report(evs, execute=True, notice=LOW_DISK_NOTICE,
+                  state={"version": 1, "programs": {}},
+                  state_path=str(tmp_path / "state.json"))
     assert [kw["update_last"] for _, _, kw in posted] == [False, False]
 
 
@@ -1250,14 +1279,18 @@ def test_act_report_healthy_batch_clears_memo(monkeypatch, tmp_path):
     assert mm.NOTIFIED_DOWNGRADE_KEY not in state
 
 
-def test_act_report_reads_memo_from_disk_without_state(monkeypatch, tmp_path):
-    """state=None falls back to reading the memo off the state file."""
+@pytest.mark.parametrize("state", [None, {}])
+def test_act_report_reads_memo_from_disk_without_state(monkeypatch, tmp_path,
+                                                       state):
+    """No usable in-memory state (None, or an EMPTY dict) falls back to
+    reading the memo off the state file; an empty dict must not read as
+    'nothing notified yet' and re-notify."""
     posted = _patch_post_status(monkeypatch)
     state_path = str(tmp_path / "state.json")
     mm.save_state(state_path, {"version": 1, "programs": {},
                                mm.NOTIFIED_DOWNGRADE_KEY: "LOW DISK"})
     mm.act_report(_planned_events(), execute=True, notice=LOW_DISK_NOTICE,
-                  state_path=state_path)
+                  state=state, state_path=state_path)
     (_, _, kw), = posted
     assert kw["update_last"] is True
 
@@ -1345,3 +1378,46 @@ def test_auto_downgrade_episode_end_to_end(monkeypatch, tmp_path):
                                                    target="GC_2")])
     assert mm.main(argv) == 0
     assert posted[-1][2]["update_last"] is False     # new episode: notify
+
+
+def test_retire_downgrade_memo_keeps_memo_on_downgraded_run():
+    """A DOWNGRADED run that still commits keeps its memo, or repeat
+    suppression sees an empty memo every poll and every repeat notifies.
+    (A LOW DISK run commits nothing today; a CAPPED run that acts on a subset
+    and commits for exactly those groups -- issue #67 -- does.)"""
+    for notice in (LOW_DISK_NOTICE, CAPPED_NOTICE):
+        state = {"version": 1, mm.NOTIFIED_DOWNGRADE_KEY: "LOW DISK"}
+        mm.retire_downgrade_memo(state, notice)
+        assert state[mm.NOTIFIED_DOWNGRADE_KEY] == "LOW DISK"
+
+
+def test_retire_downgrade_memo_clears_on_healthy_run():
+    for notice in (None, "SEED RUN — actions suppressed",
+                   "PER-PROGRAM SEED — program(s) 1182"):
+        state = {"version": 1, mm.NOTIFIED_DOWNGRADE_KEY: "LOW DISK"}
+        mm.retire_downgrade_memo(state, notice)
+        assert mm.NOTIFIED_DOWNGRADE_KEY not in state
+
+
+def test_main_commit_state_without_report_clears_memo(monkeypatch, tmp_path):
+    """A --commit-state poll with --report off (the weekly scrontab entry's
+    shape until this PR) never runs act_report, so main()'s commit is the ONLY
+    thing that ends a downgrade episode.  Without it a stale 'LOW DISK' memo is committed
+    to disk and the next episode's first notice edits in place, reaching
+    nobody -- the #71 defect with a one-week fuse."""
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_planned_row("jw10678-o101_t101_nircam")])
+    monkeypatch.setattr(mm, "act_report",
+                        lambda *a, **kw: pytest.fail("--report is off"))
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o001_x")
+    armed = mm.load_state(str(state))
+    armed[mm.NOTIFIED_DOWNGRADE_KEY] = "LOW DISK"        # episode in progress
+    mm.save_state(str(state), armed)
+
+    assert mm.main(["--program", "10678", "--commit-state",
+                    "--state", str(state)]) == 0
+    committed = mm.load_state(str(state))
+    assert mm.NOTIFIED_DOWNGRADE_KEY not in committed     # episode retired
+    assert "jw10678-o101_t101_nircam" in committed["programs"]["10678"]["obs"]

@@ -38,9 +38,11 @@ from .observations import FIELDS
 STATUS_MARKER = "<!-- data-qa:status -->"
 # mast_monitor --report comments carry their own marker so successive monitor
 # reports edit ONE comment per issue instead of stacking, without clobbering
-# the status_report comment.  Batches carrying an ARRIVAL or a fresh LOW DISK
-# / CAPPED downgrade post a NEW comment instead, so watchers are notified
-# (GitHub sends nothing for edits) -- see mast_monitor.act_report (#71).
+# the status_report comment.  An issue whose events carry an ARRIVAL -- and
+# every issue on a run with a FRESH LOW DISK / CAPPED downgrade -- gets a NEW
+# comment carrying the same marker, so watchers are notified (GitHub sends
+# nothing for edits) and the next edit still finds it: mast_monitor.act_report
+# (#71).
 MONITOR_MARKER = "<!-- data-qa:monitor -->"
 DEFAULT_RELEASES_ROOT = "/orange/adamginsburg/jwst/releases"
 DEFAULT_STATE = "/orange/adamginsburg/jwst/ops/mast_state.json"
@@ -147,8 +149,11 @@ def render_status(field="", program=None, obsnum="", jobs=None, state=None,
 
 
 def render_events_comment(events: List[dict], now=None, notice=None) -> str:
-    """Markdown comment body for mast_monitor --report (MONITOR_MARKER header, so
-    the monitor's update-in-place path finds and edits its own comment).
+    """Markdown comment body for mast_monitor --report.  The MONITOR_MARKER
+    header is how the monitor finds its own comment: the update-in-place path
+    edits the marked comment, and a NEW arrival/downgrade comment carries the
+    marker forward so the NEXT edit lands on it rather than on an older one
+    (see mast_monitor.act_report, issue #71).
 
     ``notice`` (e.g. the --auto LOW DISK / SEED / CAPPED downgrade message)
     renders as a loud warning blockquote above the event list.  Events without
