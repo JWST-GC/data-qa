@@ -20,24 +20,32 @@ effect is individually gated:
   --auto           fully automatic: --download --trigger --report --commit-state
                    --execute, gated by the disk-space check (--min-free-tb,
                    against the --download-dir filesystem), the first-run seed
-                   guard, and the --max-submit cap; any failed gate downgrades
-                   the run to report-only with a loud notice
+                   guard, and the --max-submit cap (overflow acts on the oldest
+                   N actionable groups and defers the rest); a failed disk gate
+                   downgrades the run to report-only with a loud notice
   --seed           baseline run: commit the full current state, act on NOTHING
                    (use once at deployment so the backlog never fires as "new")
-  --max-submit N   when more than N (program,obs) groups would act in one run,
-                   act on NOTHING and report everything (default 4)
+  --max-submit N   cap on the actionable (program,obs,instrument) groups one
+                   acting run may touch; overflow acts on the N oldest and
+                   defers the rest to later runs (default 4)
 
 Safety gates on acting runs (--auto, or --download/--trigger with --execute):
   * FIRST-RUN SEED: a missing/empty state file means EVERY observation would
     fire as NEW_OBSERVATION; an acting run instead behaves like --seed
     (commit state, report "SEED RUN", no downloads/submissions).  Plain
     dry-run invocations are unchanged.
-  * SUBMISSION CAP (--max-submit): a MAST re-index / bulk release emitting
-    many groups at once downgrades to report-only, state NOT committed, so
-    the events re-fire.  All-or-nothing on purpose: acting on a subset would
-    need a partial state commit (only the acted events), and partially
-    committed state is a known silent-corruption class -- simpler to act on
-    nothing and let a human raise the cap or act by hand.
+  * SUBMISSION CAP (--max-submit): only groups the run would ACT on count
+    (see ``actionable_groups``) -- event_ready events with a field mapping,
+    minus groups the one-shot ``triggered``/``downloaded`` maps already
+    retired; the trigger dimension counts NIRCam groups only (the MIRI
+    trigger path is manual today).  Overflow acts on the N OLDEST groups and
+    commits state for exactly those; the deferred groups keep their pre-poll
+    baselines, so their events re-fire (and count again) on later runs until
+    the backlog drains.  The CAPPED notice names the deferred groups.
+    (Counting every grouped event and downgrading all-or-nothing without a
+    commit wedged --auto permanently once the group count passed the cap:
+    the same events re-fired and re-counted every later morning -- the
+    treasury-delivery failure of issue #67.)
   * IN-FLIGHT DEDUP (--trigger): a group is skipped when squeue already has a
     job named ``<field><program>-o<obs>-*`` or when the state file's
     ``triggered`` map marks the obs as already submitted (the map is written
@@ -715,6 +723,69 @@ def _group_by_obs(events):
     return grouped
 
 
+def actionable_groups(state, events, download=True, trigger=True):
+    """The (program, obsnum, instrument) groups this run would actually ACT on:
+    ``{group_key: [events]}``, ordered oldest ready event first.  Pure (no
+    network, no filesystem): exactly what the --max-submit cap must count.
+
+    A group consumes a submission slot only when it has a field mapping, at
+    least one event_ready event (planned/unreleased rows report only), and an
+    un-retired action dimension:
+      * download: its ``downloaded`` one-shot key is not burned;
+      * trigger:  NIRCam only (act_trigger SKIPs MIRI as not-automated) and
+        its ``triggered`` one-shot key is not burned.
+    Everything else -- planned treasury tiles, unmapped programs, groups the
+    one-shot maps already retired, MIRI trigger-side -- is skip-chatter, and
+    counting it against the cap is how the first 10678 delivery morning
+    wedged --auto into permanent report-only (issue #67)."""
+    triggered = (state or {}).get("triggered", {})
+    downloaded = (state or {}).get("downloaded", {})
+    out = {}
+    for key, evs in _group_by_obs(events).items():
+        program, obsnum, instr = key
+        if not evs[0]["field"]:
+            continue          # unmapped: act_download/act_trigger both SKIP it
+        if not any(event_ready(ev) for ev in evs):
+            continue          # planned/unreleased: report-only, no slot burned
+        would_download = (download and
+                          download_key(program, obsnum, instr or "NIRCam")
+                          not in downloaded)
+        would_trigger = (trigger and instr == "NIRCam"
+                         and trigger_key(program, obsnum) not in triggered)
+        if would_download or would_trigger:
+            out[key] = evs
+
+    def _age(item):
+        key, evs = item
+        rels = [ev["t_obs_release"] for ev in evs
+                if event_ready(ev) and ev.get("t_obs_release") is not None]
+        return (min(rels) if rels else float("inf"), key)
+
+    return dict(sorted(out.items(), key=_age))
+
+
+def _group_label(key) -> str:
+    """(program, obsnum, instrument) group key -> '10678-o001-NIRCam'."""
+    program, obsnum, instr = key
+    return f"{program}-o{obsnum}-{instr or '?'}"
+
+
+def _revert_deferred(state, old_obs_by_prog, deferred_events):
+    """Restore the deferred groups' obs records to their pre-poll baseline, so
+    the end-of-run commit retires exactly the acted groups: a deferred event
+    diffs out identically (and re-fires) on the next poll.  A record absent
+    from the baseline is popped (re-fires as NEW_OBSERVATION); a changed one is
+    restored (re-fires as NEWLY_RELEASED / CALIB_LEVEL_UP)."""
+    for ev in deferred_events:
+        prog = str(ev["program"])
+        obs_map = state.get("programs", {}).get(prog, {}).get("obs", {})
+        prev = old_obs_by_prog.get(prog, {}).get(ev["obs_id"])
+        if prev is None:
+            obs_map.pop(ev["obs_id"], None)
+        else:
+            obs_map[ev["obs_id"]] = prev
+
+
 # -------------------------------------------------------------------------- disk gate
 DEFAULT_MIN_FREE_TB = 5.0
 DEFAULT_MAX_SUBMIT = 4
@@ -1075,8 +1146,10 @@ def main(argv=None):
                     help="AUTO mode: --download --trigger --report --commit-state "
                          "--execute in one flag, gated by the disk-space check "
                          "(--min-free-tb), the first-run seed guard and the "
-                         "--max-submit cap; a failed gate downgrades the run "
-                         "to report-only with a loud warning")
+                         "--max-submit cap (overflow acts on the oldest N "
+                         "actionable groups and defers the rest); a failed "
+                         "disk gate downgrades the run to report-only with a "
+                         "loud warning")
     ap.add_argument("--seed", action="store_true",
                     help="baseline run: commit the full current state, take NO "
                          "download/trigger actions (use once at deployment so "
@@ -1093,8 +1166,9 @@ def main(argv=None):
                     help="with --rearm: also delete the obs's 'downloaded' "
                          "key(s) so the products re-download")
     ap.add_argument("--max-submit", type=int, default=DEFAULT_MAX_SUBMIT,
-                    help="max (program,obs) groups an acting run may touch; more "
-                         "than this downgrades the WHOLE run to report-only "
+                    help="max actionable (program,obs,instrument) groups an "
+                         "acting run may touch; overflow acts on the N oldest "
+                         "and defers the rest to later runs "
                          f"(default {DEFAULT_MAX_SUBMIT})")
     ap.add_argument("--force-download-unknown-size", action="store_true",
                     help="download even when the projected product size cannot "
@@ -1165,6 +1239,9 @@ def main(argv=None):
 
     from .retrieve_data import mast_query_errors
     all_events, failed_programs, newly_seeded = [], [], []
+    # pre-poll baselines, kept so a capped run can revert its DEFERRED groups'
+    # records before the commit (see _revert_deferred)
+    old_obs_by_prog: Dict[str, dict] = {}
     for prog in programs:
         try:
             rows = query_program(prog)
@@ -1179,6 +1256,7 @@ def main(argv=None):
             continue
         new_obs = summarize(rows, poll_mjd)
         old_obs = state.get("programs", {}).get(str(prog), {}).get("obs", {})
+        old_obs_by_prog[str(prog)] = old_obs
         all_events.extend(diff_events(prog, old_obs, new_obs))
         # an obs that DISAPPEARED from MAST is kept under a 'missing_since'
         # note (report-only; no event, no silent drop) until it reappears
@@ -1248,18 +1326,30 @@ def main(argv=None):
                 print(f"--seed(per-program): {msg}", file=sys.stderr)
                 if notice is None:
                     notice = msg
-        # SUBMISSION CAP: all-or-nothing (see module docstring for why a
-        # partial commit is worse than acting on nothing)
-        n_groups = len(_group_by_obs(actionable))
-        if n_groups > args.max_submit:
-            notice = (f"CAPPED — actions suppressed: {n_groups} (program,obs) "
-                      f"groups would act, exceeding --max-submit "
-                      f"{args.max_submit}.  Downgraded to report-only; state "
-                      "NOT committed, so these events re-fire.  Raise "
-                      "--max-submit or act by hand (all-or-nothing: acting on "
-                      "a subset would require a partial state commit).")
+        # SUBMISSION CAP: count only the groups this run would ACT on (planned
+        # tiles, unmapped programs, retired one-shot keys and the MIRI trigger
+        # side are skip-chatter -- see actionable_groups).  Overflow acts on
+        # the --max-submit OLDEST groups; the deferred groups' baselines are
+        # reverted so the commit retires exactly the acted groups and the
+        # deferred events re-fire (and count again) next run.
+        groups = actionable_groups(state, actionable,
+                                   download=args.download, trigger=args.trigger)
+        if len(groups) > args.max_submit:
+            keys = list(groups)
+            acted_keys = keys[:args.max_submit]
+            deferred_keys = keys[args.max_submit:]
+            actionable = [ev for key in acted_keys for ev in groups[key]]
+            deferred = [ev for key in deferred_keys for ev in groups[key]]
+            _revert_deferred(state, old_obs_by_prog, deferred)
+            notice = (f"CAPPED — {len(groups)} actionable group(s) exceed "
+                      f"--max-submit {args.max_submit}: acting on the "
+                      f"{len(acted_keys)} oldest "
+                      f"({', '.join(_group_label(k) for k in acted_keys)}); "
+                      f"deferred to later runs: "
+                      f"{', '.join(_group_label(k) for k in deferred_keys)}.  "
+                      "State is committed for the acted groups only, so the "
+                      "deferred events re-fire next run.")
             print(f"--max-submit: {notice}", file=sys.stderr)
-            args.download = args.trigger = args.commit_state = False
 
     if all_events:
         if args.download:
