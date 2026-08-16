@@ -38,10 +38,17 @@ Safety gates on acting runs (--auto, or --download/--trigger with --execute):
     (see ``actionable_groups``) -- event_ready events with a field mapping,
     minus groups the one-shot ``triggered``/``downloaded`` maps already
     retired; the trigger dimension counts NIRCam groups only (the MIRI
-    trigger path is manual today).  Overflow acts on the N OLDEST groups and
-    commits state for exactly those; the deferred groups keep their pre-poll
+    trigger path is manual today), and --peppar counts every ready NIRCam
+    group (act_peppar keeps no one-shot key, so it never retires).  Every
+    enabled action is a counted dimension, because the capped run acts on the
+    counted groups ONLY: a group an enabled action needs but the count omits
+    is dropped from the run and committed as seen, losing that action outright
+    where a counted group would merely be postponed.
+    Overflow acts on the N OLDEST groups and commits state for exactly those
+    plus the groups that consume no slot at all (planned tiles, unmapped
+    programs, retired keys); the deferred groups keep their pre-poll
     baselines, so their events re-fire (and count again) on later runs until
-    the backlog drains.  The CAPPED notice names the deferred groups.
+    the backlog drains.  The CAPPED notice names the acted and deferred groups.
     (Counting every grouped event and downgrading all-or-nothing without a
     commit wedged --auto permanently once the group count passed the cap:
     the same events re-fired and re-counted every later morning -- the
@@ -723,7 +730,7 @@ def _group_by_obs(events):
     return grouped
 
 
-def actionable_groups(state, events, download=True, trigger=True):
+def actionable_groups(state, events, download=True, trigger=True, peppar=False):
     """The (program, obsnum, instrument) groups this run would actually ACT on:
     ``{group_key: [events]}``, ordered oldest ready event first.  Pure (no
     network, no filesystem): exactly what the --max-submit cap must count.
@@ -733,11 +740,24 @@ def actionable_groups(state, events, download=True, trigger=True):
     un-retired action dimension:
       * download: its ``downloaded`` one-shot key is not burned;
       * trigger:  NIRCam only (act_trigger SKIPs MIRI as not-automated) and
-        its ``triggered`` one-shot key is not burned.
+        its ``triggered`` one-shot key is not burned;
+      * peppar:   NIRCam only, and armed for EVERY ready group while --peppar is
+        on -- act_peppar has no one-shot state key (its only dedup is the
+        in-flight squeue job name), so each ready NIRCam group is a live
+        fan-out.  It has to be a dimension of its own: a group whose download
+        and trigger keys are both burned would otherwise fall out of this
+        mapping, be dropped from the capped run's truncated event list, and --
+        never having been deferred -- lose its peppar submission permanently.
     Everything else -- planned treasury tiles, unmapped programs, groups the
     one-shot maps already retired, MIRI trigger-side -- is skip-chatter, and
     counting it against the cap is how the first 10678 delivery morning
-    wedged --auto into permanent report-only (issue #67)."""
+    wedged --auto into permanent report-only (issue #67).
+
+    The result is an UPPER BOUND on the submissions a run makes: the act_*
+    functions apply later gates this pure function cannot see (act_trigger's
+    no-filters SKIP and squeue in-flight dedup, act_download's unknown-size /
+    oversize / low-disk SKIPs), so a counted group can consume a slot without
+    submitting anything.  Counting high keeps the cap conservative."""
     triggered = (state or {}).get("triggered", {})
     downloaded = (state or {}).get("downloaded", {})
     out = {}
@@ -752,7 +772,8 @@ def actionable_groups(state, events, download=True, trigger=True):
                           not in downloaded)
         would_trigger = (trigger and instr == "NIRCam"
                          and trigger_key(program, obsnum) not in triggered)
-        if would_download or would_trigger:
+        would_peppar = peppar and instr == "NIRCam"
+        if would_download or would_trigger or would_peppar:
             out[key] = evs
 
     def _age(item):
@@ -1189,6 +1210,10 @@ def main(argv=None):
                          "newly-arrived NIRCam obs. OPT-IN (not part of --auto): the peppar env "
                          "must be repaired first. Honours --execute like the other actions.")
     args = ap.parse_args(argv)
+    if args.max_submit < 0:
+        # a negative cap would slice keys[:negative] -- "act on all but the last
+        # |N| groups", the opposite of a cap.  0 means act on nothing.
+        ap.error(f"--max-submit must be >= 0 (got {args.max_submit})")
 
     if args.rearm_download and not args.rearm:
         ap.error("--rearm-download requires --rearm PROGRAM-oNNN")
@@ -1256,7 +1281,12 @@ def main(argv=None):
             continue
         new_obs = summarize(rows, poll_mjd)
         old_obs = state.get("programs", {}).get(str(prog), {}).get("obs", {})
-        old_obs_by_prog[str(prog)] = old_obs
+        # setdefault, NOT assignment: a duplicated --program argument polls the
+        # same program twice, and the second pass would otherwise overwrite the
+        # true pre-poll baseline with the first pass's POST-poll records, so
+        # _revert_deferred would "restore" deferred groups to what MAST just
+        # returned -- they would commit as seen and never re-fire.
+        old_obs_by_prog.setdefault(str(prog), old_obs)
         all_events.extend(diff_events(prog, old_obs, new_obs))
         # an obs that DISAPPEARED from MAST is kept under a 'missing_since'
         # note (report-only; no event, no silent drop) until it reappears
@@ -1331,9 +1361,14 @@ def main(argv=None):
         # side are skip-chatter -- see actionable_groups).  Overflow acts on
         # the --max-submit OLDEST groups; the deferred groups' baselines are
         # reverted so the commit retires exactly the acted groups and the
-        # deferred events re-fire (and count again) next run.
+        # deferred events re-fire (and count again) next run.  EVERY enabled
+        # action must be a counted dimension (download/trigger/peppar): the
+        # truncated `actionable` below feeds all three, so a group an action
+        # needs but the count omits is dropped from this run AND committed as
+        # seen -- that action is lost outright, with no later run to pick it up.
         groups = actionable_groups(state, actionable,
-                                   download=args.download, trigger=args.trigger)
+                                   download=args.download, trigger=args.trigger,
+                                   peppar=args.peppar)
         if len(groups) > args.max_submit:
             keys = list(groups)
             acted_keys = keys[:args.max_submit]
@@ -1347,8 +1382,12 @@ def main(argv=None):
                       f"({', '.join(_group_label(k) for k in acted_keys)}); "
                       f"deferred to later runs: "
                       f"{', '.join(_group_label(k) for k in deferred_keys)}.  "
-                      "State is committed for the acted groups only, so the "
-                      "deferred events re-fire next run.")
+                      "The DEFERRED groups keep their pre-poll baselines and "
+                      "re-fire next run; every other group in this poll -- the "
+                      "acted ones and the ones that never consume a slot "
+                      "(planned tiles, unmapped programs, groups the one-shot "
+                      "maps already retired) -- is committed now and does not "
+                      "re-fire.")
             print(f"--max-submit: {notice}", file=sys.stderr)
 
     if all_events:

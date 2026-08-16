@@ -157,9 +157,9 @@ def render_events_comment(events: List[dict], now=None, notice=None) -> str:
     marker forward so the NEXT edit lands on it rather than on an older one
     (see mast_monitor.act_report, issue #71).
 
-    ``notice`` (e.g. the --auto LOW DISK / SEED / CAPPED downgrade message)
-    renders as a loud warning blockquote above the event list.  Events without
-    released calibrated data (planned treasury tiles: masked/-1 calib level)
+    ``notice`` (the --auto LOW DISK or SEED downgrade message, or the CAPPED
+    partial-act message) renders as a loud warning blockquote above the event
+    list.  Events without released calibrated data (planned tiles: -1 calib)
     carry a PLANNED tag -- they are report-only, never triggered/downloaded."""
     from .mast_monitor import event_ready, mjd_to_iso   # stdlib-only
     lines = [MONITOR_MARKER,

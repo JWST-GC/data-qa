@@ -331,6 +331,8 @@ def _patch_poll_events(monkeypatch, rows):
                         lambda evs, **kw: calls.append(("trigger", list(evs), kw)))
     monkeypatch.setattr(mm, "act_report",
                         lambda evs, **kw: calls.append(("report", list(evs), kw)))
+    monkeypatch.setattr(mm, "act_peppar",
+                        lambda evs, **kw: calls.append(("peppar", list(evs), kw)))
     return calls
 
 
@@ -420,6 +422,26 @@ def test_actionable_groups_download_dimension_respects_downloaded_map():
     st = {"downloaded": {"10678-o001-NIRCam": "t"}}
     events = [_ready_event(obsnum="001")]
     assert mm.actionable_groups(st, events, download=True, trigger=False) == {}
+
+
+def test_actionable_groups_peppar_dimension_never_retires():
+    """act_peppar has NO one-shot state key, so --peppar keeps a ready NIRCam
+    group actionable even when its triggered/downloaded keys are both burned.
+    Without this dimension the group falls out of the mapping, is dropped from
+    the capped run's truncated event list and is never deferred -- its peppar
+    fan-out is lost instead of postponed."""
+    st = {"triggered": {"10678-o001": "t"},
+          "downloaded": {"10678-o001-NIRCam": "t"}}
+    events = [_ready_event(obsnum="001")]
+    assert mm.actionable_groups(st, events) == {}          # download+trigger: retired
+    assert set(mm.actionable_groups(st, events, peppar=True)) == {
+        (10678, "001", "NIRCam")}
+    # peppar alone never counts a MIRI group (act_peppar SKIPs it as NIRCam-only)
+    miri = [_ready_event(obsnum="002", instr="MIRI/IMAGE")]
+    assert mm.actionable_groups({}, miri, download=False, trigger=False,
+                                peppar=True) == {}
+    # and it stays off unless asked for: default peppar=False
+    assert mm.actionable_groups(st, events, download=False, trigger=False) == {}
 
 
 def test_actionable_groups_ordered_oldest_first():
@@ -535,6 +557,82 @@ def test_planned_treasury_events_do_not_trip_the_cap(monkeypatch, tmp_path):
     assert set(acted) == {"download", "trigger", "report"}   # NOT capped
     assert acted["report"][1]["notice"] is None
     assert len(acted["report"][0]) == 10         # planned tiles still reported
+
+
+def _nircam_row(obsnum, release, calib=3):
+    return {"obs_id": f"jw10678-o{obsnum}_t001_nircam_clear-f212n",
+            "t_max": release - 1, "t_obs_release": release,
+            "calib_level": calib, "instrument_name": "NIRCAM/IMAGE",
+            "filters": "F212N;F480M", "target_name": f"GC_{int(obsnum)}"}
+
+
+def test_capped_run_does_not_drop_peppar_for_retired_groups(monkeypatch,
+                                                            tmp_path):
+    """A capped run acts on the counted groups ONLY, so every enabled action
+    must be a counted dimension.  o001's triggered+downloaded keys are already
+    burned, but --peppar is still live for it (act_peppar keeps no one-shot
+    key): it must either be acted on (peppar sees it) or deferred (its record
+    stays out of the commit so it re-fires) -- never dropped-and-committed,
+    which loses the fan-out permanently."""
+    rows = [_nircam_row("001", release=59901.0),          # oldest, keys burned
+            _nircam_row("002", release=59902.0),
+            _nircam_row("003", release=59903.0)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    mm.save_state(str(state), {
+        "version": 1,
+        "programs": {"10678": {"obs": {
+            # o001 already seen at calib 2 -> this poll fires CALIB_LEVEL_UP
+            "jw10678-o001_t001_nircam_clear-f212n": {
+                "calib_level": 2, "released": True, "t_obs_release": 59901.0,
+                "instrument_name": "NIRCAM/IMAGE", "filters": "F212N;F480M",
+                "target_name": "GC_1"}}}},
+        "triggered": {"10678-o001": "2026-08-16"},
+        "downloaded": {"10678-o001-NIRCam": "2026-08-16"}})
+    args = ["--program", "10678", "--auto", "--peppar", "--max-submit", "2",
+            "--state", str(state), "--download-dir", str(tmp_path)]
+
+    assert mm.main(args) == 0                    # ---------------------- run 1
+    acted = {name: (evs, kw) for name, evs, kw in calls}
+    # peppar counts o001, so the two oldest ACTED groups are o001 and o002
+    assert set(mm._group_by_obs(acted["peppar"][0])) == {
+        (10678, "001", "NIRCam"), (10678, "002", "NIRCam")}
+    committed = mm.load_state(str(state))["programs"]["10678"]["obs"]
+    assert "jw10678-o003_t001_nircam_clear-f212n" not in committed  # deferred
+
+    calls.clear()
+    assert mm.main(args) == 0                    # ---------------------- run 2
+    acted = {name: (evs, kw) for name, evs, kw in calls}
+    # the deferred group re-fires and gets its peppar fan-out on the next run
+    assert set(mm._group_by_obs(acted["peppar"][0])) == {
+        (10678, "003", "NIRCam")}
+
+
+def test_duplicated_program_keeps_the_true_prepoll_baseline(monkeypatch,
+                                                            tmp_path):
+    """`--program 10678 10678` polls the same program twice.  The second pass
+    must not overwrite the pre-poll baseline with the first pass's POST-poll
+    records, or _revert_deferred would 'restore' deferred groups to what MAST
+    just returned: they would commit as seen and never re-fire."""
+    rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in (1, 2, 3)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o999_x")
+    rc = mm.main(["--program", "10678", "10678", "--auto", "--max-submit", "2",
+                  "--state", str(state), "--download-dir", str(tmp_path)])
+    assert rc == 0
+    committed = mm.load_state(str(state))["programs"]["10678"]["obs"]
+    assert "jw10678-o003_t001_nircam_clear-f212n" not in committed   # deferred
+    assert calls                                  # the run really acted
+
+
+def test_negative_max_submit_is_rejected(tmp_path):
+    """keys[:-1] would act on all-but-the-last group -- the opposite of a cap."""
+    with pytest.raises(SystemExit):
+        mm.main(["--program", "10678", "--max-submit", "-1",
+                 "--state", str(tmp_path / "state.json")])
 
 
 # ----------------------------------------------------------- in-flight dedup (HIGH-1c)
