@@ -1,7 +1,10 @@
 """Offline unit tests for data_qa.peppar_trigger cal-file discovery (no sbatch is ever
 run).  Pins the two on-disk layouts of issue #73: the reduction writes
-``<field>/<FILT>/pipeline/*_cal.fits`` while legacy fields (brick) keep cal files flat at
-``<field>/<FILT>/*_cal.fits``."""
+``<field>/<FILT>/pipeline/*_cal.fits`` while older reductions left them flat at
+``<field>/<FILT>/*_cal.fits``, and fields such as brick / gc2211 / ngc6334 hold both --
+so both layouts, their union, and the per-detector ``PEPPAR_DATA_DIR`` are pinned."""
+import glob
+
 import pytest
 
 from data_qa import peppar_trigger as ppt
@@ -82,6 +85,19 @@ def test_mixed_fields_each_program_resolves(tmp_path):
     assert ppt.field_for(PROGRAM, OBS, base=str(tmp_path)) == "gc-treasury"
 
 
+def test_pipeline_layout_is_obs_stem_scoped(tmp_path):
+    """Two pipeline/-layout fields for different programs: the pipeline/ glob is scoped
+    by the jw<program><obs> stem exactly as the flat one is.  Dropping the stem there
+    makes field_for return the alphabetically first field holding any cal file ('brick'
+    here), which fans every peppar job out over the wrong field."""
+    make_field(tmp_path, "brick", "F212N", ["nrca1"], "pipeline", program_obs="02221001")
+    make_field(tmp_path, "gc-treasury", "F480M", ["nrcalong"], "pipeline")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["brick", "gc-treasury"]
+    assert ppt.field_for("2221", "001", base=str(tmp_path)) == "brick"
+    assert ppt.field_for(PROGRAM, OBS, base=str(tmp_path)) == "gc-treasury"
+    assert ppt.field_for("1182", "001", base=str(tmp_path)) is None
+
+
 def test_mixed_within_filter_dir_dedupes_and_unions(tmp_path):
     """Both layouts inside ONE filter dir: a file in both (same basename) is counted
     once, and a flat-only file still contributes its detector."""
@@ -94,11 +110,47 @@ def test_mixed_within_filter_dir_dedupes_and_unions(tmp_path):
     assert f"{fdir}/pipeline/jw10678001001_02101_00001_nrca1_cal.fits" in files
     assert ppt.enumerate_filt_det("gc-treasury", base=str(tmp_path)) == {
         "F212N": ["NRCA1", "NRCA2"]}
-    # data_dir prefers the pipeline/ copy when both layouts hold cal files
+    # filter-level answer: pipeline/ holds cal files
     assert ppt.cal_data_dir(str(fdir)) == f"{fdir}/pipeline"
+    # per-detector answer: NRCA1 migrated, NRCA2 is still flat-only
+    assert ppt.cal_data_dir(str(fdir), "NRCA1") == f"{fdir}/pipeline"
+    assert ppt.cal_data_dir(str(fdir), "NRCA2") == str(fdir)
+
+
+def test_mixed_within_filter_dir_data_dir_is_per_detector(tmp_path):
+    """A flat-only detector in a half-migrated filter dir gets the FLAT dir while its
+    migrated sibling gets pipeline/.  Handing it {FILT}/pipeline would clear the runner's
+    "no images" guard on NRCA1's files and then KeyError in
+    peppar.setup_dict_images_for_run (dict_images[filt][det]) after taking a queue slot."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline")
+    _touch(fdir / "jw10678001001_02101_00001_nrca2_cal.fits")
+    jobs = {j["det"]: j for j in ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))}
+    assert sorted(jobs) == ["NRCA1", "NRCA2"]
+    assert jobs["NRCA1"]["data_dir"] == f"{fdir}/pipeline"
+    assert jobs["NRCA2"]["data_dir"] == str(fdir)
+    # every job's data_dir really holds that detector's cal files
+    for det, job in jobs.items():
+        assert glob.glob(f"{job['data_dir']}/*_{det.lower()}_cal.fits")
+    # outputs still stay at the filter level for both
+    assert jobs["NRCA2"]["stf_dir"] == f"{fdir}/peppar_nrca2"
 
 
 def test_empty_field_raises(tmp_path):
     (tmp_path / "gc-treasury" / "F212N").mkdir(parents=True)
     with pytest.raises(SystemExit):
         ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+
+
+def test_field_with_cal_files_only_outside_filter_dirs_raises(tmp_path):
+    """field_for matches on ANY subdir, enumerate_filt_det only on filter dirs, so a
+    field whose cal files sit in e.g. dolphot/ resolves and then yields no jobs.  That
+    must raise (mast_monitor.act_peppar reports the SystemExit) instead of silently
+    reporting 0 jobs for a field that was never scanned."""
+    make_field(tmp_path, "w51", "dolphot", ["nrca1"], "flat")
+    assert ppt.field_for(PROGRAM, OBS, base=str(tmp_path)) == "w51"
+    assert ppt.enumerate_filt_det("w51", base=str(tmp_path)) == {}
+    with pytest.raises(SystemExit):
+        ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    # an explicit --filters/--dets subset that matches nothing stays a quiet empty list
+    assert ppt.build_jobs(PROGRAM, OBS, field="w51", filters=["F212N"],
+                          base=str(tmp_path)) == []

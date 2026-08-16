@@ -7,12 +7,24 @@ submits ``run_peppar_generic.sbatch`` (env-driven) for each, one SLURM job per d
 
 Two on-disk layouts hold the cal files (issue #73).  The reduction writes
 ``<field>/<FILT>/pipeline/*_cal.fits`` (``PipelineRerunNIRCAM-LONG.py`` outputs to
-``{basepath}{filtername}/pipeline/``); only legacy fields keep them flat at
-``<field>/<FILT>/*_cal.fits``.  Census 2026-08 (flat/pipeline): arches 0/120, sgrc 0/242,
-cloudc 0/480, sgrb2 0/1440; brick is the flat holdout at 1056/0.  Discovery tries the
-``pipeline/`` layout first and falls back to the flat layout; a cal file present in both
-(same basename) is counted once, preferring the ``pipeline/`` copy.  ``PEPPAR_DATA_DIR``
-points at whichever directory holds the cal files, because the runner globs it flat.
+``{basepath}{filtername}/pipeline/``); older reductions left them flat at
+``<field>/<FILT>/*_cal.fits``, and many fields carry BOTH.  Census 2026-08-16 over the
+FILTER dirs of ``/orange/adamginsburg/jwst`` (flat/pipeline) --
+
+  pipeline-only: arches 0/120, cloudc 0/556, cloudef 0/480, quintuplet 0/120, sgra 0/216,
+                 sgrb2 0/1500, sgrc 0/242, sickle 0/309, w51 0/560, wd1 0/696, wd2 0/328
+  both layouts:  brick 720/1296, gc2211 740/740, m92 80/80, ngc6334 1250/1250
+
+``field_for`` also scans non-filter subdirs, where m4 (150/150) and ngc6397 (120/120) add
+two more both-layout fields.  The two copies of one basename hold DIFFERENT bytes:
+``brick/F182M/jw02221001001_07101_00001_nrca1_cal.fits`` is 117538560 B at both paths, and
+the flat copy is dated 2022-12-31 against 2024-07-17 under ``pipeline/`` (md5 of the first
+MB differs), so preferring the ``pipeline/`` copy selects the newer reduction.
+
+Discovery unions the two layouts, counting a basename present in both once and preferring
+the ``pipeline/`` copy.  ``PEPPAR_DATA_DIR`` is resolved per (filter, DETECTOR) by
+``cal_data_dir`` -- a mid-migration filter dir can hold some detectors under ``pipeline/``
+while another is still flat, and the runner globs ``PEPPAR_DATA_DIR`` flat.
 
 Mirrors ``data_qa.pipeline_trigger``: DRY-RUN by default (prints the exact sbatch commands);
 ``--execute`` really submits.  In-flight dedup skips a (field, filter, detector) whose job is
@@ -64,12 +76,24 @@ def _cal_files(fdir: str, stem: str = "") -> List[str]:
     return pipe + flat
 
 
-def cal_data_dir(fdir: str) -> str:
-    """The directory the peppar runner should glob for this filter: the ``pipeline/``
-    subdir when it holds cal files, else the (legacy flat) filter dir itself.  The runner
-    globs ``PEPPAR_DATA_DIR`` flat, so it must point at the layout that matched."""
+def cal_data_dir(fdir: str, det: Optional[str] = None) -> str:
+    """The directory the peppar runner should glob for this filter dir, resolved per
+    DETECTOR when ``det`` is given: the ``pipeline/`` subdir when it holds that detector's
+    cal files, else the (legacy flat) filter dir itself.
+
+    Per-detector because a mid-migration filter dir holds some detectors under
+    ``pipeline/`` while another is still flat, and discovery enumerates the UNION of the
+    two layouts.  A flat-only detector handed ``{FILT}/pipeline`` would clear the runner's
+    "no images" guard on its siblings' files (``scripts/peppar/run_peppar_generic.py``
+    globs ``PEPPAR_DATA_DIR`` flat) and then die in ``peppar.setup_dict_images_for_run``,
+    which indexes ``dict_images[filt][det]`` with no guard -- a KeyError after the job has
+    taken its queue slot.
+
+    Without ``det`` the answer is the filter-level one (``pipeline/`` when it holds any
+    cal file)."""
     fdir = fdir.rstrip("/")
-    if glob.glob(f"{fdir}/pipeline/*_cal.fits"):
+    pat = f"*_{det.lower()}_cal.fits" if det else "*_cal.fits"
+    if glob.glob(f"{fdir}/pipeline/{pat}"):
         return f"{fdir}/pipeline"
     return fdir
 
@@ -134,14 +158,19 @@ def build_jobs(program: str, obs: str, field: Optional[str] = None,
         if want_f and filt not in want_f:
             continue
         filt_dir = f"{base}/{field}/{filt}"
-        data_dir = cal_data_dir(filt_dir)          # pipeline/ when that layout matched
         for det in det_list:
             if want_d and det not in want_d:
                 continue
-            # outputs stay at the filter level in both layouts (products, not reduction)
+            # per DETECTOR: the layout that actually holds THIS detector's cal files
+            data_dir = cal_data_dir(filt_dir, det)
+            # outputs stay at the filter level in both layouts (they are products, and
+            # the reduction owns pipeline/)
             stf_dir = f"{filt_dir}/peppar_{det.lower()}"
             jobs.append(dict(field=field, filt=filt, det=det, data_dir=data_dir,
                              stf_dir=stf_dir, name=job_name(field, filt, det)))
+    if not jobs and not (filters or dets):
+        raise SystemExit(f"peppar_trigger: field {field} under {base} has no filter dir "
+                         f"holding NIRCam *_cal.fits (checked both layouts)")
     return jobs
 
 
