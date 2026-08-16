@@ -1,10 +1,18 @@
 """Fan a peppar PSF-photometry job out per (filter, detector) for a GC observation.
 
 peppar (Matt Hosek's package, /blue/adamginsburg/adamginsburg/repos/peppar) does single-frame
-PSF photometry on the per-exposure ``*_cal.fits``.  Our pipeline already stores those at
-``/orange/adamginsburg/jwst/<field>/<FILT>/*_cal.fits`` -- exactly the layout peppar globs --
-so this trigger just enumerates the (filter, detector) combos that have cal files and submits
-``run_peppar_generic.sbatch`` (env-driven) for each, one SLURM job per detector.
+PSF photometry on the per-exposure ``*_cal.fits``.  This trigger enumerates the (filter,
+detector) combos that have cal files under ``/orange/adamginsburg/jwst/<field>/<FILT>/`` and
+submits ``run_peppar_generic.sbatch`` (env-driven) for each, one SLURM job per detector.
+
+Two on-disk layouts hold the cal files (issue #73).  The reduction writes
+``<field>/<FILT>/pipeline/*_cal.fits`` (``PipelineRerunNIRCAM-LONG.py`` outputs to
+``{basepath}{filtername}/pipeline/``); only legacy fields keep them flat at
+``<field>/<FILT>/*_cal.fits``.  Census 2026-08 (flat/pipeline): arches 0/120, sgrc 0/242,
+cloudc 0/480, sgrb2 0/1440; brick is the flat holdout at 1056/0.  Discovery tries the
+``pipeline/`` layout first and falls back to the flat layout; a cal file present in both
+(same basename) is counted once, preferring the ``pipeline/`` copy.  ``PEPPAR_DATA_DIR``
+points at whichever directory holds the cal files, because the runner globs it flat.
 
 Mirrors ``data_qa.pipeline_trigger``: DRY-RUN by default (prints the exact sbatch commands);
 ``--execute`` really submits.  In-flight dedup skips a (field, filter, detector) whose job is
@@ -44,26 +52,50 @@ RUNNER = os.path.join(_PEPPAR_SCRIPTS, "run_peppar_generic.py")
 _DET_RE = re.compile(r"_(nrc[ab](?:[1-4]|long))_cal\.fits$", re.I)
 
 
+def _cal_files(fdir: str, stem: str = "") -> List[str]:
+    """Cal files under one filter dir, across both layouts: ``pipeline/`` first, then the
+    legacy flat dir.  A file present in both (same basename) is counted once, preferring
+    the ``pipeline/`` copy."""
+    fdir = fdir.rstrip("/")
+    pipe = sorted(glob.glob(f"{fdir}/pipeline/{stem}*_cal.fits"))
+    seen = {os.path.basename(p) for p in pipe}
+    flat = sorted(p for p in glob.glob(f"{fdir}/{stem}*_cal.fits")
+                  if os.path.basename(p) not in seen)
+    return pipe + flat
+
+
+def cal_data_dir(fdir: str) -> str:
+    """The directory the peppar runner should glob for this filter: the ``pipeline/``
+    subdir when it holds cal files, else the (legacy flat) filter dir itself.  The runner
+    globs ``PEPPAR_DATA_DIR`` flat, so it must point at the layout that matched."""
+    fdir = fdir.rstrip("/")
+    if glob.glob(f"{fdir}/pipeline/*_cal.fits"):
+        return f"{fdir}/pipeline"
+    return fdir
+
+
 def field_for(program: str, obs: str, base: str = BASE) -> Optional[str]:
-    """Field dir under ``base`` whose FILT subdirs hold this obs's cal files."""
+    """Field dir under ``base`` whose FILT subdirs hold this obs's cal files (in either
+    the ``pipeline/`` or the legacy flat layout)."""
     stem = f"jw{int(program):05d}{obs}"
     for d in sorted(glob.glob(f"{base}/*/")):
         fld = os.path.basename(d.rstrip("/"))
-        if glob.glob(f"{base}/{fld}/*/{stem}*_cal.fits"):
-            return fld
+        for fdir in sorted(glob.glob(f"{base}/{fld}/*/")):
+            if _cal_files(fdir, stem):
+                return fld
     return None
 
 
 def enumerate_filt_det(field: str, base: str = BASE) -> Dict[str, List[str]]:
-    """{FILTER: [DET, ...]} for every filter dir under the field that holds ``*_cal.fits``.
-    Detectors are read from the filenames (upper-cased)."""
+    """{FILTER: [DET, ...]} for every filter dir under the field that holds ``*_cal.fits``
+    (in either layout).  Detectors are read from the filenames (upper-cased)."""
     out: Dict[str, set] = {}
     for fdir in sorted(glob.glob(f"{base}/{field}/*/")):
         filt = os.path.basename(fdir.rstrip("/"))
         if not re.fullmatch(r"F\d{3,4}[WNM]", filt, re.I):     # only filter dirs
             continue
         dets = set()
-        for p in glob.glob(f"{fdir}/*_cal.fits"):
+        for p in _cal_files(fdir):
             m = _DET_RE.search(os.path.basename(p))
             if m:
                 dets.add(m.group(1).upper())
@@ -101,11 +133,13 @@ def build_jobs(program: str, obs: str, field: Optional[str] = None,
     for filt, det_list in fd.items():
         if want_f and filt not in want_f:
             continue
-        data_dir = f"{base}/{field}/{filt}"
+        filt_dir = f"{base}/{field}/{filt}"
+        data_dir = cal_data_dir(filt_dir)          # pipeline/ when that layout matched
         for det in det_list:
             if want_d and det not in want_d:
                 continue
-            stf_dir = f"{data_dir}/peppar_{det.lower()}"
+            # outputs stay at the filter level in both layouts (products, not reduction)
+            stf_dir = f"{filt_dir}/peppar_{det.lower()}"
             jobs.append(dict(field=field, filt=filt, det=det, data_dir=data_dir,
                              stf_dir=stf_dir, name=job_name(field, filt, det)))
     return jobs
