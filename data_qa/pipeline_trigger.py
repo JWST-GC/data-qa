@@ -17,6 +17,12 @@ Conventions honored (see jwst-gc-pipeline CLAUDE.md):
     the crf products are called (issue #69).  A failed probe degrades to the
     historical hardcoded default with a loud warning.
 
+Registry preflight (issue #68): build_plan verifies the observation is registered
+in the pipeline's fields.yaml BEFORE any sbatch, by subprocessing the pipeline
+env python (``fields.target_for_obsid``).  An unregistered obs raises
+NotRegisteredInPipelineError in-process -- sbatch would have ACCEPTED the jobs
+and KeyError'd on-node minutes later, burning the monitor's one-shot trigger key.
+
 Stdlib-only.  Dry-run (default) prints the exact commands; --execute submits and
 threads the parsed reduction job id into DEP.
 
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -50,6 +57,69 @@ DEP_PLACEHOLDER = "<REDUCTION_JOBID>"
 #: it, so an unknown value survives Detector1 + Image2 (hours) and dies in
 #: Image3; the trigger rejects it at build time instead.
 SKYMATCH_METHODS = ("local", "global", "match", "global+match", "user")
+
+# The registry parser (fields.yaml) lives in jwst_gc_pipeline, whose environment
+# is far heavier than this stdlib-only module -- so the preflight subprocesses
+# the pipeline env python instead of importing.  Override the interpreter with
+# $PIPELINE_PYTHON (the same knob the pipeline's own submit scripts honour).
+DEFAULT_PIPELINE_PYTHON = ("/blue/adamginsburg/adamginsburg/miniconda3/envs/"
+                           "python313/bin/python")
+PREFLIGHT_TIMEOUT_S = 30
+
+# obs tokens are digits, optionally '-'-joined ('001-002' names a joint
+# observation); anything else must never be interpolated into the -c code
+_OBS_TOKEN_RE = re.compile(r"^[0-9]{1,4}(-[0-9]{1,4})*$")
+
+
+class NotRegisteredInPipelineError(RuntimeError):
+    """The (program, obs) has no fields.yaml entry in the pipeline registry:
+    sbatch would ACCEPT the submission and the job would KeyError on-node
+    minutes later, burning the monitor's one-shot trigger key (issue #68)."""
+
+
+def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
+                       timeout_s=PREFLIGHT_TIMEOUT_S):
+    """Verify (program, obs) is registered in the pipeline's fields.yaml BEFORE
+    any sbatch; raises NotRegisteredInPipelineError when it is not.
+
+    ``pipe_root`` fronts PYTHONPATH so the checkout being submitted against is
+    the one consulted; the interpreter is ``python`` / $PIPELINE_PYTHON /
+    DEFAULT_PIPELINE_PYTHON.  FAIL-OPEN cases (warn + proceed): a subprocess
+    TIMEOUT or an interpreter that cannot start.  Both mean the CHECK is
+    broken, and a broken check must not silence real triggers -- a false skip
+    leaves delivered data unreduced with no error recorded anywhere, while
+    proceeding merely reproduces the pre-preflight burn-on-submit behaviour
+    for that one observation."""
+    obs_token = str(obs)
+    if not _OBS_TOKEN_RE.match(obs_token):
+        raise ValueError(f"obs {obs!r} is not a plausible observation token")
+    python = (python or os.environ.get("PIPELINE_PYTHON")
+              or DEFAULT_PIPELINE_PYTHON)
+    code = ("from jwst_gc_pipeline import fields; "
+            f"fields.target_for_obsid('{int(program)}', '{obs_token}')")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = pipe_root + os.pathsep + env.get("PYTHONPATH", "")
+    try:
+        proc = subprocess.run([python, "-c", code], env=env,
+                              capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        print(f"pipeline_trigger: registry preflight TIMED OUT after "
+              f"{timeout_s}s ({python}); proceeding WITHOUT the registry "
+              "check (fail-open: a wedged pipeline import must not silence "
+              "real triggers)", file=sys.stderr)
+        return
+    except OSError as ex:
+        print(f"pipeline_trigger: registry preflight could not run "
+              f"({ex.__class__.__name__}: {ex}); proceeding WITHOUT the "
+              "registry check (fail-open, same rationale as the timeout)",
+              file=sys.stderr)
+        return
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise NotRegisteredInPipelineError(
+            f"program {int(program)} obs {obs_token} is not registered in the "
+            f"pipeline at {pipe_root} (fields.target_for_obsid rc="
+            f"{proc.returncode}" + (f": {tail[-1]}" if tail else "") + ")")
 
 
 def missing_scripts(pipe_root) -> List[str]:
@@ -217,6 +287,11 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_RO
                          "pass --field or add it to mast_monitor.PROGRAMS")
     if not filters:
         raise ValueError("filters required (e.g. --filters F405N F410M)")
+    # registry preflight (issue #68): an unregistered obs must fail IN-PROCESS,
+    # before sbatch accepts jobs that will KeyError on-node.  It runs BEFORE the
+    # destreak-policy probe (issue #69): both subprocess the pipeline env, and
+    # an observation the registry rejects has nothing to probe a policy for.
+    registry_preflight(program, obs, pipe_root=pipe_root)
     policy = None
     if probe and each_suffix is None:
         # probed even under an explicit --destreak/--no-destreak: the flag still
@@ -243,6 +318,20 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_RO
                         modules=catalog_modules, each_suffix=each_suffix,
                         destreak=destreak, policy=policy),
     ]
+
+
+_PARSABLE_JOBID_RE = re.compile(r"(?m)^\s*(\d+)(?:;[\w.-]+)?\s*$")
+_SUBMITTED_JOBID_RE = re.compile(r"Submitted batch job (\d+)")
+
+
+def parse_jobids(text) -> List[str]:
+    """Every SLURM job id in captured submitter stdout: bare ``--parsable``
+    lines (``<jobid>[;cluster]``, the reduction sbatch) plus ``Submitted batch
+    job <id>`` lines (the cataloging chain's sbatch calls), deduped in
+    first-seen order."""
+    ids = [m.group(1) for m in _PARSABLE_JOBID_RE.finditer(text or "")]
+    ids += _SUBMITTED_JOBID_RE.findall(text or "")
+    return list(dict.fromkeys(ids))
 
 
 def shell_line(step: dict) -> str:
@@ -281,17 +370,22 @@ def run_plan(plan: List[dict]) -> Dict[str, str]:
 
 
 def submit(program, obs, field=None, filters=None, pipe_root=None, execute=False,
-           **kwargs) -> List[dict]:
-    """Build + print the plan; submit it when execute=True.  Returns the plan."""
+           **kwargs) -> dict:
+    """Build + print the plan; submit it when execute=True.  Returns
+    ``{"plan": steps, "results": {step: stdout}, "jobids": [ids]}`` --
+    results/jobids are empty on dry-run; jobids are parsed from the captured
+    sbatch output so the caller (act_trigger) can record them alongside the
+    one-shot trigger key."""
     pipe_root = pipe_root or DEFAULT_PIPE_ROOT
     plan = build_plan(program, obs, field=field, filters=filters,
                       pipe_root=pipe_root, **kwargs)
     missing = missing_scripts(pipe_root)
+    results: Dict[str, str] = {}
     if execute:
         if missing:
             raise FileNotFoundError(
                 f"refusing --execute: missing under {pipe_root}: {missing}")
-        run_plan(plan)
+        results = run_plan(plan)
     else:
         print(f"# dry-run (submission sequence for program {program} obs {obs}):")
         for step in plan:
@@ -299,7 +393,8 @@ def submit(program, obs, field=None, filters=None, pipe_root=None, execute=False
         if missing:
             print(f"# WARNING: missing under {pipe_root}: {missing} "
                   "(--execute would refuse)", file=sys.stderr)
-    return plan
+    jobids = parse_jobids("\n".join(results.values()))
+    return dict(plan=plan, results=results, jobids=jobids)
 
 
 def main(argv=None):

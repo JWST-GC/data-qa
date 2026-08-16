@@ -399,6 +399,82 @@ def test_act_trigger_records_triggered_immediately(monkeypatch, tmp_path):
     assert "2221-o001" in state["triggered"]          # mirrored in memory
 
 
+def test_act_trigger_not_registered_keeps_key_armed(monkeypatch, tmp_path,
+                                                    capsys):
+    """The registry preflight failing (issue #68) must skip WITHOUT burning
+    the one-shot key; once the registration lands, the SAME events submit."""
+    from data_qa import pipeline_trigger
+
+    def deny(**kw):
+        raise pipeline_trigger.NotRegisteredInPipelineError(
+            "program 10678 obs 001 is not registered in the pipeline")
+
+    monkeypatch.setattr(pipeline_trigger, "submit", deny)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = tmp_path / "state.json"
+    state = {"version": 1, "programs": {}}
+    events = _trigger_events("001")
+    mm.act_trigger(events, execute=True, state=state,
+                   state_path=str(state_path))
+    err = capsys.readouterr().err
+    assert "SKIPPED(not-registered)" in err
+    assert "stays armed" in err
+    assert "triggered" not in state              # key NOT burned...
+    assert not state_path.exists()               # ...in memory or on disk
+    submitted = _patch_submit(monkeypatch)       # registration lands
+    mm.act_trigger(events, execute=True, state=state,
+                   state_path=str(state_path))
+    assert len(submitted) == 1
+    assert "2221-o001" in state["triggered"]
+
+
+def test_act_trigger_records_jobids_with_key(monkeypatch, tmp_path):
+    """The triggered value is now {when, jobids}: the sbatch ids ride along
+    for later outcome probing."""
+    from data_qa import pipeline_trigger
+    monkeypatch.setattr(
+        pipeline_trigger, "submit",
+        lambda **kw: dict(plan=[], results={}, jobids=["12345", "12346"]))
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = str(tmp_path / "state.json")
+    state = {"version": 1, "programs": {}}
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state=state, state_path=state_path)
+    rec = mm.load_state(state_path)["triggered"]["2221-o001"]
+    assert rec["jobids"] == ["12345", "12346"]
+    assert "when" in rec
+
+
+def test_already_triggered_legacy_bare_value_honored(monkeypatch, tmp_path,
+                                                     capsys):
+    """Pre-#68 state files hold bare timestamp strings; they still dedup."""
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state = {"triggered": {"2221-o001": "2026-07-21 00:00 UTC"}}
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state=state, state_path=str(tmp_path / "state.json"))
+    assert submitted == []
+    err = capsys.readouterr().err
+    assert "SKIPPED(already-triggered)" in err
+    assert "2026-07-21 00:00 UTC" in err
+
+
+def test_already_triggered_message_recommends_rearm(monkeypatch, tmp_path,
+                                                    capsys):
+    """The guidance is the --rearm verb; hand-editing the state file is out."""
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state = {"triggered": {"2221-o001": {"when": "2026-08-16 00:00 UTC",
+                                         "jobids": ["12345"]}}}
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state=state, state_path=str(tmp_path / "state.json"))
+    assert submitted == []
+    err = capsys.readouterr().err
+    assert "--rearm 2221-o001" in err
+    assert "2026-08-16 00:00 UTC" in err
+    assert "delete the 'triggered' entry" not in err
+
+
 def test_act_trigger_dry_run_does_not_record(monkeypatch, tmp_path):
     submitted = _patch_submit(monkeypatch)
     monkeypatch.setattr(mm, "inflight_job_names",
@@ -409,6 +485,108 @@ def test_act_trigger_dry_run_does_not_record(monkeypatch, tmp_path):
     assert len(submitted) == 1
     assert submitted[0]["execute"] is False
     assert not state_path.exists()
+
+
+# ---------------------------------------------------------- --rearm verb (issue #68)
+def test_rearm_removes_and_rearms_end_to_end(monkeypatch, tmp_path, capsys):
+    """Burn a key with a real (patched-submit) trigger, --rearm via the CLI,
+    then the SAME events trigger again."""
+    submitted = _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = str(tmp_path / "state.json")
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state={"version": 1, "programs": {}}, state_path=state_path)
+    assert len(submitted) == 1                   # burned
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state=mm.load_state(state_path), state_path=state_path)
+    assert len(submitted) == 1                   # one-shot holds
+    rc = mm.main(["--rearm", "2221-o001", "--state", state_path])
+    assert rc == 0
+    assert "removed triggered[2221-o001]" in capsys.readouterr().out
+    assert "2221-o001" not in mm.load_state(state_path).get("triggered", {})
+    mm.act_trigger(_trigger_events("001"), execute=True,
+                   state=mm.load_state(state_path), state_path=state_path)
+    assert len(submitted) == 2                   # re-armed
+
+
+def test_rearm_refuses_on_no_match(tmp_path, capsys):
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {"version": 1, "programs": {}})
+    rc = mm.main(["--rearm", "2221-o001", "--state", state_path])
+    assert rc == 1
+    assert "REFUSED" in capsys.readouterr().err
+
+
+def test_rearm_refuses_malformed_spec(tmp_path, capsys):
+    rc = mm.main(["--rearm", "brick-001", "--state", str(tmp_path / "s.json")])
+    assert rc == 1
+    assert "REFUSED" in capsys.readouterr().err
+
+
+def test_rearm_download_also_clears_download_keys(tmp_path, capsys):
+    """--rearm-download clears the obs's instrument-qualified downloaded keys
+    too; other observations' keys stay."""
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {
+        "version": 1, "programs": {},
+        "triggered": {"2221-o002": {"when": "2026-08-16 00:00 UTC",
+                                    "jobids": ["7"]}},
+        "downloaded": {"2221-o002-NIRCam": "2026-08-16 00:00 UTC",
+                       "2221-o002-MIRI": "2026-08-16 00:00 UTC",
+                       "2221-o001-NIRCam": "keep-me"}})
+    rc = mm.main(["--rearm", "2221-o002", "--rearm-download",
+                  "--state", state_path])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "downloaded[2221-o002-NIRCam]" in out
+    assert "downloaded[2221-o002-MIRI]" in out
+    st = mm.load_state(state_path)
+    assert st["triggered"] == {}
+    assert st["downloaded"] == {"2221-o001-NIRCam": "keep-me"}
+
+
+def test_rearm_without_download_flag_keeps_downloads(tmp_path):
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {
+        "version": 1, "programs": {},
+        "triggered": {"2221-o002": "2026-08-16 00:00 UTC"},
+        "downloaded": {"2221-o002-NIRCam": "2026-08-16 00:00 UTC"}})
+    rc = mm.main(["--rearm", "2221-o002", "--state", state_path])
+    assert rc == 0
+    assert "2221-o002-NIRCam" in mm.load_state(state_path)["downloaded"]
+
+
+# ---------------------------------------------------- dated state backups (issue #68)
+def test_backup_before_write_same_day_overwrites(tmp_path):
+    path = str(tmp_path / "state.json")
+    mm.save_state(path, {"version": 1, "gen": 0})    # nothing to back up yet
+    assert not list(tmp_path.glob("*.bak-*"))
+    mm.save_state(path, {"version": 1, "gen": 1})
+    (bak,) = tmp_path.glob("*.bak-*")
+    assert json.loads(bak.read_text())["gen"] == 0   # the pre-write content
+    mm.save_state(path, {"version": 1, "gen": 2})
+    (bak,) = tmp_path.glob("*.bak-*")                # still ONE per day
+    assert json.loads(bak.read_text())["gen"] == 1
+
+
+def test_backup_prunes_beyond_keep_days(tmp_path):
+    import datetime
+    path = str(tmp_path / "state.json")
+    mm.save_state(path, {"version": 1})
+    today = datetime.date.today()
+    old = tmp_path / ("state.json.bak-"
+                      + f"{today - datetime.timedelta(days=30):%Y%m%d}")
+    kept = tmp_path / ("state.json.bak-"
+                       + f"{today - datetime.timedelta(days=3):%Y%m%d}")
+    undated = tmp_path / "state.json.bak-manualcopy"
+    for p in (old, kept, undated):
+        p.write_text("{}")
+    mm.save_state(path, {"version": 1, "n": 2})
+    names = {p.name for p in tmp_path.glob("state.json.bak-*")}
+    assert old.name not in names                     # pruned (> 14 d)
+    assert kept.name in names                        # inside the window
+    assert undated.name in names                     # non-dated left alone
+    assert f"state.json.bak-{today:%Y%m%d}" in names
 
 
 # ------------------------------------------------------- MAST failure isolation (HIGH-2)

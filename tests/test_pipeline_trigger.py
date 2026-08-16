@@ -39,6 +39,23 @@ def _probe_root(tmp_path):
     return str(tmp_path)
 
 
+# the un-stubbed preflight, for its own tests below (the autouse fixture
+# replaces the module attribute before each test runs)
+_REAL_PREFLIGHT = pt.registry_preflight
+
+
+@pytest.fixture(autouse=True)
+def preflight_calls(monkeypatch):
+    """Keep the command-generation tests offline: the registry preflight
+    (a subprocess of the pipeline env python) is stubbed to a recorder.
+    Preflight tests call _REAL_PREFLIGHT with a fake interpreter instead."""
+    calls = []
+    monkeypatch.setattr(
+        pt, "registry_preflight",
+        lambda program, obs, **kw: calls.append((program, obs, kw)))
+    return calls
+
+
 def test_reduction_golden_command():
     step = pt.reduction_step(2221, "001", "brick", FILTERS, pipe_root="/pipe")
     assert pt.shell_line(step) == (
@@ -561,3 +578,94 @@ def test_dry_run_no_probe_flag(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "EACH_SUFFIX=align_o001_crf" in out
+
+
+# ------------------------------------------------- registry preflight (issue #68)
+def _fake_python(tmp_path, body):
+    """An executable stand-in for the pipeline env python."""
+    script = tmp_path / "fakepython"
+    script.write_text("#!/bin/sh\n" + body + "\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_build_plan_runs_registry_preflight(preflight_calls):
+    """build_plan consults the pipeline registry BEFORE returning any step."""
+    pt.build_plan(2221, "001", filters=["F405N"], pipe_root="/pipe")
+    assert preflight_calls == [(2221, "001", {"pipe_root": "/pipe"})]
+
+
+def test_unregistered_obs_raises_before_any_sbatch(monkeypatch):
+    """The typed error escapes submit() with sbatch never reached."""
+    def deny(program, obs, **kw):
+        raise pt.NotRegisteredInPipelineError("not in fields.yaml")
+
+    monkeypatch.setattr(pt, "registry_preflight", deny)
+    monkeypatch.setattr(pt, "run_plan",
+                        lambda plan: pytest.fail("sbatch must not run"))
+    with pytest.raises(pt.NotRegisteredInPipelineError):
+        pt.submit(10678, "001", field="gc-treasury", filters=["F212N"],
+                  execute=True)
+
+
+def test_registry_preflight_unregistered_raises(tmp_path):
+    py = _fake_python(tmp_path,
+                      'echo "KeyError: proposal 10678 observation" >&2\nexit 1')
+    with pytest.raises(pt.NotRegisteredInPipelineError,
+                       match="10678 obs 001.*KeyError"):
+        _REAL_PREFLIGHT(10678, "001", pipe_root="/pipe", python=py)
+
+
+def test_registry_preflight_registered_passes(tmp_path):
+    py = _fake_python(tmp_path, "exit 0")
+    assert _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py) is None
+
+
+def test_registry_preflight_timeout_fails_open(tmp_path, capsys):
+    """A wedged pipeline import must not silence real triggers: TIMEOUT warns
+    and proceeds (fail-open), never raises."""
+    py = _fake_python(tmp_path, "sleep 5")
+    _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py, timeout_s=0.2)
+    err = capsys.readouterr().err
+    assert "TIMED OUT" in err and "fail-open" in err
+
+
+def test_registry_preflight_missing_interpreter_fails_open(tmp_path, capsys):
+    _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe",
+                    python=str(tmp_path / "no-such-python"))
+    assert "could not run" in capsys.readouterr().err
+
+
+def test_registry_preflight_pythonpath_fronts_pipe_root(tmp_path):
+    """The checkout being submitted against is the registry consulted."""
+    out = tmp_path / "pythonpath.txt"
+    py = _fake_python(tmp_path, f'echo "$PYTHONPATH" > {out}\nexit 0')
+    _REAL_PREFLIGHT(2221, "001", pipe_root="/my/pipe", python=py)
+    assert out.read_text().startswith("/my/pipe")
+
+
+def test_registry_preflight_rejects_weird_obs_token(tmp_path):
+    """Only digit/'-' obs tokens may reach the interpolated -c code."""
+    with pytest.raises(ValueError, match="observation token"):
+        _REAL_PREFLIGHT(2221, "001'; import os", pipe_root="/pipe",
+                        python=_fake_python(tmp_path, "exit 0"))
+
+
+def test_registry_preflight_accepts_joint_obs_token(tmp_path):
+    _REAL_PREFLIGHT(2221, "001-002", pipe_root="/pipe",
+                    python=_fake_python(tmp_path, "exit 0"))
+
+
+# ----------------------------------------------------- jobid capture (issue #68)
+def test_parse_jobids_parsable_and_submitted_lines():
+    text = "12345;hpg\nSubmitted batch job 12346\nnoise\n12345\n 12347 \n"
+    assert pt.parse_jobids(text) == ["12345", "12347", "12346"]
+    assert pt.parse_jobids("") == []
+    assert pt.parse_jobids(None) == []
+
+
+def test_submit_dry_run_returns_plan_without_jobids(tmp_path):
+    out = pt.submit(2221, "001", filters=["F405N"], pipe_root=str(tmp_path))
+    assert [s["name"] for s in out["plan"]] == ["reduction", "cataloging-chain"]
+    assert out["jobids"] == []
+    assert out["results"] == {}

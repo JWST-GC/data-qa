@@ -41,9 +41,13 @@ Safety gates on acting runs (--auto, or --download/--trigger with --execute):
   * IN-FLIGHT DEDUP (--trigger): a group is skipped when squeue already has a
     job named ``<field><program>-o<obs>-*`` or when the state file's
     ``triggered`` map marks the obs as already submitted (the map is written
-    immediately on every successful submission, even when the event state is
-    not committed, so a partial failure cannot double-submit; delete the
-    entry to re-arm).
+    immediately on every successful submission -- with the sbatch job ids --
+    even when the event state is not committed, so a partial failure cannot
+    double-submit; re-arm with ``--rearm <program>-o<obs>``).
+  * REGISTRY PREFLIGHT (--trigger): pipeline_trigger.build_plan verifies the
+    obs is registered in the pipeline's fields.yaml BEFORE any sbatch; an
+    unregistered obs prints SKIPPED(not-registered) and the one-shot key
+    stays armed for the poll after the registration lands.
 
 Events:
   NEW_OBSERVATION  obs_id not previously in the state file
@@ -69,6 +73,7 @@ Usage:
     python -m data_qa.mast_monitor --download --trigger --report --execute
     python -m data_qa.mast_monitor --auto --min-free-tb 5 \\
         --download-dir /orange/adamginsburg/jwst/ops/downloads
+    python -m data_qa.mast_monitor --rearm 10678-o001    # re-arm a burned trigger
 """
 from __future__ import annotations
 
@@ -389,12 +394,50 @@ def load_state(path) -> dict:
         return json.load(fh)
 
 
+# A botched hand-edit or bad write used to cost the whole state file (incl. the
+# 1668-row treasury seeding); a dated pre-write backup caps the loss at one day.
+BACKUP_KEEP_DAYS = 14
+
+
+def prune_state_backups(path, today=None, keep_days=BACKUP_KEEP_DAYS):
+    """Delete ``<path>.bak-YYYYMMDD`` siblings older than ``keep_days`` days;
+    files without a parseable date suffix are left alone."""
+    today = today or datetime.date.today()
+    parent = os.path.dirname(os.path.abspath(path))
+    prefix = os.path.basename(path) + ".bak-"
+    for name in os.listdir(parent):
+        if not name.startswith(prefix):
+            continue
+        try:
+            date = datetime.datetime.strptime(name[len(prefix):], "%Y%m%d").date()
+        except ValueError:
+            continue
+        if (today - date).days > keep_days:
+            os.unlink(os.path.join(parent, name))
+
+
+def backup_state(path, today=None) -> Optional[str]:
+    """Copy the existing state file to ``<path>.bak-YYYYMMDD`` before a write:
+    ONE backup per day (later same-day writes overwrite it), pruned beyond
+    BACKUP_KEEP_DAYS.  Returns the backup path (None when there is nothing on
+    disk to back up)."""
+    if not os.path.exists(path):
+        return None
+    today = today or datetime.date.today()
+    bak = f"{path}.bak-{today.strftime('%Y%m%d')}"
+    shutil.copy2(path, bak)
+    prune_state_backups(path, today=today)
+    return bak
+
+
 def save_state(path, state: dict):
     """Atomic write (tmp + rename); auto-creates the parent directory.  A failure
     between write and replace unlinks the orphan tmp file (the exception still
-    propagates)."""
+    propagates).  The previous on-disk state is first copied to a dated
+    ``.bak-YYYYMMDD`` sibling (backup_state); the write itself is unchanged."""
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
+    backup_state(path)
     tmp = f"{path}.tmp.{os.getpid()}"
     try:
         with open(tmp, "w") as fh:
@@ -421,7 +464,7 @@ def download_key(program, obsnum, instrument="NIRCam") -> str:
     return f"{int(program)}-o{obsnum}-{instrument or 'NIRCam'}"
 
 
-def _record_state_key(state_path, mapname: str, key: str, when: str,
+def _record_state_key(state_path, mapname: str, key: str, value,
                       state: Optional[dict] = None):
     """Persist a one-shot action key (``triggered``/``downloaded`` map)
     IMMEDIATELY (fresh read-modify-write of the on-disk state), so a crash or a
@@ -430,18 +473,31 @@ def _record_state_key(state_path, mapname: str, key: str, when: str,
     commit decision the caller made.  Also mirrors the entry into the caller's
     in-memory ``state`` so a later full commit carries it."""
     disk = load_state(state_path)
-    disk.setdefault(mapname, {})[key] = when
+    disk.setdefault(mapname, {})[key] = value
     save_state(state_path, disk)
     if state is not None:
-        state.setdefault(mapname, {})[key] = when
+        state.setdefault(mapname, {})[key] = value
 
 
-def record_triggered(state_path, key: str, when: str, state: Optional[dict] = None):
+def record_triggered(state_path, key: str, when: str,
+                     state: Optional[dict] = None, jobids=None):
     """Persist a successful submission into the ``triggered`` map (see
-    ``_record_state_key``).  Only release-gated successful submits reach this
+    ``_record_state_key``) as ``{"when": ..., "jobids": [...]}`` -- the sbatch
+    job ids ride along so a later run can probe their outcome (sacct) instead
+    of trusting acceptance.  Only release-gated successful submits reach this
     (act_trigger's event_ready gate), so a planned/unreleased observation can
     never burn its one-shot key."""
-    _record_state_key(state_path, "triggered", key, when, state=state)
+    _record_state_key(state_path, "triggered", key,
+                      {"when": when, "jobids": list(jobids or [])}, state=state)
+
+
+def trigger_record_when(value) -> str:
+    """A ``triggered`` map value -> its timestamp.  Values are dicts
+    ``{"when", "jobids"}`` now; bare timestamp strings in pre-#68 state files
+    are still honored."""
+    if isinstance(value, dict):
+        return value.get("when", "?")
+    return value
 
 
 def record_downloaded(state_path, key: str, when: str, state: Optional[dict] = None):
@@ -517,6 +573,43 @@ def retire_downgrade_memo(state: dict, notice: Optional[str]) -> dict:
     if notice_downgrade_reason(notice) is None:
         state.pop(NOTIFIED_DOWNGRADE_KEY, None)
     return state
+
+_REARM_RE = re.compile(r"^(\d+)-o(\d+)$")
+
+
+def rearm(state_path, spec: str, include_download=False) -> int:
+    """--rearm PROGRAM-oNNN: delete the one-shot ``triggered`` key (and, with
+    ``include_download``, the obs's ``downloaded`` keys) so the next poll may
+    act again -- the sanctioned replacement for hand-editing the state file.
+    Prints every removed entry; REFUSES (rc 1) on a malformed spec or when
+    nothing matches, so a typo cannot silently 'succeed'.  Returns a process
+    return code."""
+    m = _REARM_RE.match(spec or "")
+    if not m:
+        print(f"--rearm: REFUSED: {spec!r} does not look like "
+              "'<program>-o<obs>' (e.g. 10678-o001)", file=sys.stderr)
+        return 1
+    key = trigger_key(m.group(1), m.group(2))
+    state = load_state(state_path)
+    removed = []
+    trig = state.get("triggered", {})
+    if key in trig:
+        removed.append(("triggered", key, trig.pop(key)))
+    if include_download:
+        dl = state.get("downloaded", {})
+        # downloaded keys are instrument-qualified: '<program>-o<obs>-<instr>'
+        for dkey in [k for k in sorted(dl) if k.startswith(key + "-")]:
+            removed.append(("downloaded", dkey, dl.pop(dkey)))
+    if not removed:
+        print(f"--rearm: REFUSED: no triggered"
+              + ("/downloaded" if include_download else "")
+              + f" entry matches {key} in {state_path}", file=sys.stderr)
+        return 1
+    save_state(state_path, state)
+    for mapname, k, value in removed:
+        print(f"--rearm: removed {mapname}[{k}] "
+              f"(was: {trigger_record_when(value)})")
+    return 0
 
 
 def inflight_job_names(timeout_s=30) -> Optional[Set[str]]:
@@ -681,7 +774,8 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
 
 
 def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=None):
-    from .pipeline_trigger import submit   # stdlib-only
+    from . import pipeline_trigger   # stdlib-only
+    from .pipeline_trigger import NotRegisteredInPipelineError
     triggered = (state or {}).get("triggered", {})
     inflight = inflight_job_names() if execute else None
     for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
@@ -719,8 +813,9 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
         key = trigger_key(program, obsnum)
         if key in triggered:
             print(f"--trigger: SKIPPED(already-triggered) program {program} obs "
-                  f"{obsnum}: state marks a submission at {triggered[key]} "
-                  "(delete the 'triggered' entry in the state file to re-arm)",
+                  f"{obsnum}: state marks a submission at "
+                  f"{trigger_record_when(triggered[key])} (re-arm with "
+                  f"`python -m data_qa.mast_monitor --rearm {key}`)",
                   file=sys.stderr)
             continue
         prefix = f"{field}{int(program)}-o{obsnum}-"
@@ -728,12 +823,27 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
             print(f"--trigger: SKIPPED(in-flight) program {program} obs {obsnum}: "
                   f"squeue --me already has a job named {prefix}*", file=sys.stderr)
             continue
-        submit(program=program, obs=obsnum, field=field, filters=filters,
-               pipe_root=pipe_root, execute=execute)
+        try:
+            outcome = pipeline_trigger.submit(
+                program=program, obs=obsnum, field=field, filters=filters,
+                pipe_root=pipe_root, execute=execute)
+        except NotRegisteredInPipelineError as ex:
+            # the registry preflight failed in-process, BEFORE any sbatch:
+            # report-only, and crucially does NOT record_triggered -- the
+            # one-shot key stays armed for the poll after the registration
+            # lands in the pipeline's fields.yaml
+            print(f"--trigger: SKIPPED(not-registered) program {program} obs "
+                  f"{obsnum}: {ex} -- register it in the pipeline's "
+                  "fields.yaml; trigger stays armed", file=sys.stderr)
+            continue
         if execute and state_path:
             # written IMMEDIATELY (not at the end-of-run commit) so a partial
-            # failure in a later group cannot re-fire this submission
-            record_triggered(state_path, key, mjd_to_iso(now_mjd()), state=state)
+            # failure in a later group cannot re-fire this submission; the
+            # sbatch job ids ride along for later outcome probing
+            jobids = (outcome.get("jobids", [])
+                      if isinstance(outcome, dict) else [])
+            record_triggered(state_path, key, mjd_to_iso(now_mjd()),
+                             state=state, jobids=jobids)
 
 
 def act_peppar(events, execute=False):
@@ -912,6 +1022,15 @@ def main(argv=None):
                     help="baseline run: commit the full current state, take NO "
                          "download/trigger actions (use once at deployment so "
                          "the existing backlog never fires as new)")
+    ap.add_argument("--rearm", metavar="PROGRAM-oNNN", default=None,
+                    help="delete the one-shot 'triggered' key for the given "
+                         "observation (e.g. --rearm 10678-o001) so the next "
+                         "poll may submit it again; prints what was removed, "
+                         "refuses when nothing matches.  Exits without "
+                         "polling MAST.")
+    ap.add_argument("--rearm-download", action="store_true",
+                    help="with --rearm: also delete the obs's 'downloaded' "
+                         "key(s) so the products re-download")
     ap.add_argument("--max-submit", type=int, default=DEFAULT_MAX_SUBMIT,
                     help="max (program,obs) groups an acting run may touch; more "
                          "than this downgrades the WHOLE run to report-only "
@@ -935,6 +1054,13 @@ def main(argv=None):
                          "newly-arrived NIRCam obs. OPT-IN (not part of --auto): the peppar env "
                          "must be repaired first. Honours --execute like the other actions.")
     args = ap.parse_args(argv)
+
+    if args.rearm_download and not args.rearm:
+        ap.error("--rearm-download requires --rearm PROGRAM-oNNN")
+    if args.rearm:
+        # state-surgery verb: touch only the one-shot maps, no MAST poll
+        return rearm(args.state, args.rearm,
+                     include_download=args.rearm_download)
 
     notice = None
     if args.auto:
