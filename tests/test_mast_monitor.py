@@ -550,16 +550,18 @@ def test_save_state_unlinks_orphan_tmp_on_failure(tmp_path):
     assert not path.exists()
 
 
-def test_act_report_updates_in_place_with_monitor_marker(monkeypatch):
+def test_act_report_planned_batch_edits_with_monitor_marker(monkeypatch):
+    """Purely-planned batches keep the anti-spam edit-in-place path (#71)."""
     from data_qa import status_report
     posted = []
     monkeypatch.setattr(status_report, "post_status",
-                        lambda title, body, **kw: posted.append((title, body, kw)))
-    mm.act_report(_trigger_events("001"), execute=True, notice="CAPPED — x")
+                        lambda title, body, **kw: posted.append((title, body, kw))
+                        or 0)
+    mm.act_report(_planned_events(), execute=True)
     (title, body, kw), = posted
     assert kw["update_last"] is True
     assert kw["marker"] == status_report.MONITOR_MARKER
-    assert "CAPPED" in body
+    assert "PLANNED" in body
 
 
 # ------------------------------------------------- masked MAST values (BLOCKER 2)
@@ -1141,3 +1143,205 @@ def test_disappeared_obs_kept_with_missing_since(monkeypatch, tmp_path, capsys):
     assert "NEW_OBSERVATION" not in out
     rec = mm.load_state(str(state))["programs"]["2221"]["obs"]["jw02221-o009_x"]
     assert "missing_since" not in rec            # cleared on reappearance
+
+
+# --------------------------------------- arrival/downgrade notification (#71)
+LOW_DISK_NOTICE = ("LOW DISK: only 1.0 TB free on the filesystem of /x "
+                   "(< 5.0 TB threshold) -- auto mode downgraded to report-only")
+CAPPED_NOTICE = ("CAPPED — actions suppressed: 9 (program,obs) groups would "
+                 "act, exceeding --max-submit 4.")
+
+
+def test_event_is_arrival_truth_table():
+    (ready,) = _trigger_events("001")            # NEW_OBSERVATION, calib 3
+    assert mm.event_is_arrival(ready) is True    # first seen already released
+    assert mm.event_is_arrival(dict(ready, event="NEWLY_RELEASED")) is True
+    assert mm.event_is_arrival(dict(ready, event="CALIB_LEVEL_UP",
+                                    previous_calib_level=-1)) is True
+    assert mm.event_is_arrival(dict(ready, event="CALIB_LEVEL_UP",
+                                    previous_calib_level=2)) is False  # 2->3
+    (planned,) = _planned_events()
+    assert mm.event_is_arrival(planned) is False
+    assert mm.event_is_arrival(dict(ready, event="NEWLY_RELEASED",
+                                    released=False)) is False   # embargoed
+    assert mm.event_is_arrival(dict(ready, event="NEWLY_RELEASED",
+                                    calib_level=1)) is False    # uncal-only
+
+
+def test_notice_downgrade_reason(monkeypatch, tmp_path):
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(1e12))
+    _, _, msg = mm.disk_gate(str(tmp_path), min_free_tb=5.0)   # the REAL text
+    assert mm.notice_downgrade_reason(msg) == "LOW DISK"
+    assert mm.notice_downgrade_reason(CAPPED_NOTICE) == "CAPPED"
+    assert mm.notice_downgrade_reason(None) is None
+    assert mm.notice_downgrade_reason("SEED RUN — actions suppressed") is None
+    assert mm.notice_downgrade_reason("PER-PROGRAM SEED — program(s) 1182") \
+        is None
+
+
+def _patch_post_status(monkeypatch, rc=0):
+    from data_qa import status_report
+    posted = []
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, **kw: posted.append((title, body, kw))
+                        or rc)
+    return posted
+
+
+def test_act_report_arrival_posts_new_comment(monkeypatch):
+    """Any arrival in the batch -> new comment (GitHub notifies for new
+    comments only; an edit reaches nobody)."""
+    posted = _patch_post_status(monkeypatch)
+    evs = _planned_events() + _trigger_events("001")
+    mm.act_report(evs, execute=True)
+    assert len(posted) == 2                      # brick issue + treasury issue
+    assert [kw["update_last"] for _, _, kw in posted] == [False, False]
+
+
+def test_act_report_downgrade_first_time_posts_new_and_memos(monkeypatch,
+                                                             tmp_path):
+    posted = _patch_post_status(monkeypatch)
+    state_path = str(tmp_path / "state.json")
+    state = {"version": 1, "programs": {}}
+    mm.act_report(_planned_events(), execute=True, notice=LOW_DISK_NOTICE,
+                  state=state, state_path=state_path)
+    (_, body, kw), = posted
+    assert kw["update_last"] is False            # NEW comment: notifies
+    assert "LOW DISK" in body
+    assert mm.load_state(state_path)[mm.NOTIFIED_DOWNGRADE_KEY] == "LOW DISK"
+    assert state[mm.NOTIFIED_DOWNGRADE_KEY] == "LOW DISK"
+
+
+def test_act_report_repeated_downgrade_edits_in_place(monkeypatch, tmp_path):
+    posted = _patch_post_status(monkeypatch)
+    state = {"version": 1, "programs": {},
+             mm.NOTIFIED_DOWNGRADE_KEY: "LOW DISK"}
+    mm.act_report(_planned_events(), execute=True, notice=LOW_DISK_NOTICE,
+                  state=state, state_path=str(tmp_path / "state.json"))
+    (_, _, kw), = posted
+    assert kw["update_last"] is True             # repeat: quiet edit
+    assert not (tmp_path / "state.json").exists()    # memo untouched
+
+
+def test_act_report_downgrade_reason_change_posts_new(monkeypatch, tmp_path):
+    posted = _patch_post_status(monkeypatch)
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {"version": 1, "programs": {},
+                               mm.NOTIFIED_DOWNGRADE_KEY: "LOW DISK"})
+    state = mm.load_state(state_path)
+    mm.act_report(_planned_events(), execute=True, notice=CAPPED_NOTICE,
+                  state=state, state_path=state_path)
+    (_, _, kw), = posted
+    assert kw["update_last"] is False            # new reason: notify again
+    assert mm.load_state(state_path)[mm.NOTIFIED_DOWNGRADE_KEY] == "CAPPED"
+
+
+def test_act_report_healthy_batch_clears_memo(monkeypatch, tmp_path):
+    posted = _patch_post_status(monkeypatch)
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {"version": 1, "programs": {},
+                               mm.NOTIFIED_DOWNGRADE_KEY: "LOW DISK"})
+    state = mm.load_state(state_path)
+    mm.act_report(_planned_events(), execute=True,
+                  state=state, state_path=state_path)
+    (_, _, kw), = posted
+    assert kw["update_last"] is True
+    assert mm.NOTIFIED_DOWNGRADE_KEY not in mm.load_state(state_path)
+    assert mm.NOTIFIED_DOWNGRADE_KEY not in state
+
+
+def test_act_report_reads_memo_from_disk_without_state(monkeypatch, tmp_path):
+    """state=None falls back to reading the memo off the state file."""
+    posted = _patch_post_status(monkeypatch)
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {"version": 1, "programs": {},
+                               mm.NOTIFIED_DOWNGRADE_KEY: "LOW DISK"})
+    mm.act_report(_planned_events(), execute=True, notice=LOW_DISK_NOTICE,
+                  state_path=state_path)
+    (_, _, kw), = posted
+    assert kw["update_last"] is True
+
+
+def test_act_report_dry_run_classifies_but_does_not_memo(monkeypatch,
+                                                         tmp_path):
+    posted = _patch_post_status(monkeypatch)
+    state_path = str(tmp_path / "state.json")
+    mm.act_report(_planned_events(), execute=False, notice=LOW_DISK_NOTICE,
+                  state={"version": 1, "programs": {}}, state_path=state_path)
+    (_, _, kw), = posted
+    assert kw["update_last"] is False            # classification still runs
+    assert not (tmp_path / "state.json").exists()    # nothing posted: no memo
+
+
+def test_act_report_failed_post_does_not_memo(monkeypatch, tmp_path):
+    """A notifying downgrade whose posts ALL fail leaves the memo unset, so
+    the next run notifies again instead of silently editing."""
+    posted = _patch_post_status(monkeypatch, rc=4)
+    state_path = str(tmp_path / "state.json")
+    state = {"version": 1, "programs": {}}
+    mm.act_report(_planned_events(), execute=True, notice=LOW_DISK_NOTICE,
+                  state=state, state_path=state_path)
+    assert len(posted) == 1
+    assert mm.NOTIFIED_DOWNGRADE_KEY not in state
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_act_report_arrival_during_repeated_downgrade_still_notifies(
+        monkeypatch, tmp_path):
+    """Released data waiting while the automation is wedged: keep nagging."""
+    posted = _patch_post_status(monkeypatch)
+    state = {"version": 1, "programs": {},
+             mm.NOTIFIED_DOWNGRADE_KEY: "LOW DISK"}
+    mm.act_report(_trigger_events("001"), execute=True, notice=LOW_DISK_NOTICE,
+                  state=state, state_path=str(tmp_path / "state.json"))
+    (_, _, kw), = posted
+    assert kw["update_last"] is False
+
+
+def test_act_report_explicit_update_last_overrides(monkeypatch):
+    posted = _patch_post_status(monkeypatch)
+    mm.act_report(_trigger_events("001"), execute=True, update_last=True)
+    (_, _, kw), = posted
+    assert kw["update_last"] is True             # caller override wins
+
+
+def _planned_row(obs_id, target="GC_1"):
+    """A planned/unexecuted MAST row, as query_program normalizes it
+    (masked release date + calib level -> None / -1)."""
+    return {"obs_id": obs_id, "t_max": None, "t_obs_release": None,
+            "calib_level": -1, "instrument_name": "NIRCAM/IMAGE",
+            "filters": "F212N;F480M", "target_name": target}
+
+
+def test_auto_downgrade_episode_end_to_end(monkeypatch, tmp_path):
+    """Through main(): LOW DISK notifies once, repeats edit quietly, a healthy
+    committed run ends the episode, and the next downgrade notifies afresh."""
+    posted = _patch_post_status(monkeypatch)
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "act_download", lambda *a, **kw: None)
+    monkeypatch.setattr(mm, "act_trigger", lambda *a, **kw: None)
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_planned_row("jw10678-o101_t101_nircam")])
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o001_x")
+    argv = ["--program", "10678", "--auto", "--state", str(state),
+            "--download-dir", str(tmp_path)]
+
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(1e12))
+    assert mm.main(argv) == 0
+    assert posted[-1][2]["update_last"] is False     # episode start: notify
+    assert mm.main(argv) == 0
+    assert posted[-1][2]["update_last"] is True      # repeat: quiet edit
+
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    assert mm.main(argv) == 0                        # healthy: commit + clear
+    assert posted[-1][2]["update_last"] is True      # planned-only: edit
+    assert mm.NOTIFIED_DOWNGRADE_KEY not in mm.load_state(str(state))
+
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(1e12))
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_planned_row("jw10678-o101_t101_nircam"),
+                                      _planned_row("jw10678-o102_t102_nircam",
+                                                   target="GC_2")])
+    assert mm.main(argv) == 0
+    assert posted[-1][2]["update_last"] is False     # new episode: notify

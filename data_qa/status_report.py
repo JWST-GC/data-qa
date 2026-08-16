@@ -37,8 +37,10 @@ from .observations import FIELDS
 
 STATUS_MARKER = "<!-- data-qa:status -->"
 # mast_monitor --report comments carry their own marker so successive monitor
-# reports (incl. recurring LOW DISK / CAPPED downgrades) edit ONE comment per
-# issue instead of stacking, without clobbering the status_report comment.
+# reports edit ONE comment per issue instead of stacking, without clobbering
+# the status_report comment.  Batches carrying an ARRIVAL or a fresh LOW DISK
+# / CAPPED downgrade post a NEW comment instead, so watchers are notified
+# (GitHub sends nothing for edits) -- see mast_monitor.act_report (#71).
 MONITOR_MARKER = "<!-- data-qa:monitor -->"
 DEFAULT_RELEASES_ROOT = "/orange/adamginsburg/jwst/releases"
 DEFAULT_STATE = "/orange/adamginsburg/jwst/ops/mast_state.json"
