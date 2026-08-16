@@ -746,35 +746,69 @@ def test_act_download_dual_instrument_separate_keys(monkeypatch, tmp_path):
 
 
 # ------------------------------------------------ PROGRAMS completeness (MED-c)
-_PIPE_FILE = ("/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline/"
-              "jwst_gc_pipeline/reduction/PipelineRerunNIRCAM-LONG.py")
+# The pipeline's single field registry (its commit ee33bec, 2026-07-31, replaced
+# the per-driver literal dicts).  Every proposal/observation the reduction maps
+# is declared here.
+_PIPE_REGISTRY = ("/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline/"
+                  "jwst_gc_pipeline/fields.yaml")
 # Globular-cluster programs ride the pipeline for testing only; they are not
 # GC-monitor targets.  Arches/Quintuplet (2045) and Sgr A* (1939) ARE GC fields.
 _GLOBULAR_PROGRAMS = {1334, 1979, 8322, 12587}
+# An obsids entry of '*' declares "every observation of this proposal" -- the
+# registry shape for programs whose observation numbers land only as the visits
+# execute (the 10678 treasury and its 139 GC_<n> tiles).
+_WILDCARD_OBS = "*"
 
 
-def _pipeline_field_map():
-    import ast
-    with open(_PIPE_FILE) as fh:
-        tree = ast.parse(fh.read())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if isinstance(tgt, ast.Name) and tgt.id == "field_to_reg_mapping":
-                    val = node.value
-                    if isinstance(val, ast.Subscript):
-                        val = val.value
-                    return ast.literal_eval(val)
-    return None
+def _obsids_for_instrument(obsids, instrument):
+    """One proposal's observation numbers for one instrument, as a tuple.
+
+    Tolerates every wildcard shape the registry loader may use: the whole
+    ``obsids`` block as ``'*'``, an instrument value of ``'*'``, or a list
+    containing ``'*'``."""
+    if obsids == _WILDCARD_OBS:
+        return (_WILDCARD_OBS,)
+    per_inst = {str(k).lower(): v for k, v in (obsids or {}).items()}
+    ids = per_inst.get(instrument)
+    if ids is None:
+        return ()
+    if isinstance(ids, str):
+        return (ids,)
+    return tuple(str(i) for i in ids)
 
 
-@pytest.mark.skipif(not __import__("os").path.exists(_PIPE_FILE),
-                    reason="jwst-gc-pipeline checkout not available")
-def test_programs_complete_vs_pipeline_field_mapping():
-    """Every GC program/obs the reduction pipeline maps must be monitored
-    (globular-cluster test programs excluded)."""
-    mapping = _pipeline_field_map()
-    assert mapping, "could not parse field_to_reg_mapping from the pipeline"
+def _pipeline_field_map(registry=None, instrument="nircam"):
+    """``{proposal: {obsnum: field}}`` from the pipeline's field registry, for
+    one instrument -- the answer ``jwst_gc_pipeline.fields.field_to_reg_mapping``
+    gives, derived here from the YAML so the guard needs no pipeline import.
+
+    ``joint_obsids`` tokens ('002-998') name catalog runs over observations the
+    ``obsids`` block already lists individually; MAST events carry concrete obs
+    numbers, so joint tokens are left out."""
+    import yaml
+    if registry is None:
+        with open(_PIPE_REGISTRY) as fh:
+            registry = yaml.safe_load(fh)
+    out = {}
+    for field_name, spec in (registry.get("fields") or {}).items():
+        for proposal, obs in (spec.get("observations") or {}).items():
+            for obsid in _obsids_for_instrument(obs.get("obsids"), instrument):
+                promap = out.setdefault(str(proposal), {})
+                if promap.get(obsid, field_name) != field_name:
+                    raise ValueError(
+                        f"proposal {proposal} observation {obsid} claimed by "
+                        f"both {promap[obsid]!r} and {field_name!r}")
+                promap[obsid] = field_name
+    return out
+
+
+def _assert_monitor_covers(mapping):
+    """Fail unless every mapped program/obs is present and correctly named in
+    ``mast_monitor.PROGRAMS`` (globular-cluster test programs excluded).
+
+    A wildcard entry stands for every concrete observation of its proposal;
+    PROGRAMS cannot enumerate obs numbers that do not exist yet, so that check
+    goes through ``field_for()`` with arbitrary concrete probes."""
     for prog_str, obsmap in mapping.items():
         prog = int(prog_str)
         if prog in _GLOBULAR_PROGRAMS:
@@ -782,8 +816,75 @@ def test_programs_complete_vs_pipeline_field_mapping():
         assert prog in mm.PROGRAMS, \
             f"pipeline maps program {prog} but mast_monitor.PROGRAMS lacks it"
         for obsnum, field in obsmap.items():
-            assert obsnum in mm.PROGRAMS[prog], (prog, obsnum)
-            assert mm.PROGRAMS[prog][obsnum] == field, (prog, obsnum, field)
+            if obsnum == _WILDCARD_OBS:
+                for probe in ("001", "042", "139"):
+                    assert mm.field_for(prog, probe) == field, \
+                        (prog, probe, field)
+            else:
+                assert obsnum in mm.PROGRAMS[prog], (prog, obsnum)
+                assert mm.PROGRAMS[prog][obsnum] == field, (prog, obsnum, field)
+
+
+@pytest.mark.skipif(not __import__("os").path.exists(_PIPE_REGISTRY),
+                    reason="jwst-gc-pipeline checkout not available")
+def test_programs_complete_vs_pipeline_field_mapping():
+    """Every GC program/obs the reduction pipeline maps must be monitored
+    (globular-cluster test programs excluded).
+
+    The comparison is the NIRCam map on purpose: PROGRAMS carries the
+    NIRCam-primary orientation, and 2221 numbers its NIRCam and MIRI
+    observations of the same two fields in opposite order (brick is NIRCam 001
+    and MIRI 002; cloudc the reverse), so the MIRI orientation cannot agree
+    with it."""
+    mapping = _pipeline_field_map()
+    assert mapping, "no observations parsed from the pipeline field registry"
+    _assert_monitor_covers(mapping)
+
+
+@pytest.mark.skipif(not __import__("os").path.exists(_PIPE_REGISTRY),
+                    reason="jwst-gc-pipeline checkout not available")
+def test_programs_completeness_detects_missing_and_misnamed(monkeypatch):
+    """The guard still FAILS when a pipeline-mapped program is dropped from
+    PROGRAMS, or one of its fields renamed -- the two regressions it exists
+    to catch."""
+    mapping = _pipeline_field_map()
+    prog_str, obsmap = next(
+        (p, m) for p, m in sorted(mapping.items(), key=lambda kv: int(kv[0]))
+        if int(p) not in _GLOBULAR_PROGRAMS
+        and any(o != _WILDCARD_OBS for o in m))
+    prog = int(prog_str)
+    obsnum = next(o for o in obsmap if o != _WILDCARD_OBS)
+    with monkeypatch.context() as m:
+        m.setattr(mm, "PROGRAMS",
+                  {k: v for k, v in mm.PROGRAMS.items() if k != prog})
+        with pytest.raises(AssertionError):
+            _assert_monitor_covers(mapping)
+    with monkeypatch.context() as m:
+        renamed = {k: dict(v) for k, v in mm.PROGRAMS.items()}
+        renamed[prog][obsnum] = "misnamed-field"
+        m.setattr(mm, "PROGRAMS", renamed)
+        with pytest.raises(AssertionError):
+            _assert_monitor_covers(mapping)
+
+
+def test_pipeline_field_map_wildcard_obsids(monkeypatch):
+    """A wildcard obsids entry -- the incoming registry shape for the 10678
+    treasury -- parses to {'*': field} in every YAML spelling the loader may
+    use, satisfies the completeness check for any concrete observation, and
+    still fails it when the program is unmonitored or misnamed."""
+    for obsids in ("*", {"nircam": "*"}, {"nircam": ["*"]}):
+        reg = {"fields": {"gc-treasury": {
+            "root": "orange",
+            "observations": {"10678": {"obsids": obsids}}}}}
+        assert _pipeline_field_map(reg) == {"10678": {"*": "gc-treasury"}}
+    _assert_monitor_covers({"10678": {"*": "gc-treasury"}})
+    with pytest.raises(AssertionError):
+        _assert_monitor_covers({"10678": {"*": "wrong-field"}})
+    with monkeypatch.context() as m:
+        m.setattr(mm, "PROGRAMS", {k: v for k, v in mm.PROGRAMS.items()
+                                   if k != mm.TREASURY_PROGRAM})
+        with pytest.raises(AssertionError):
+            _assert_monitor_covers({"10678": {"*": "gc-treasury"}})
 
 
 # --------------------------------------------- treasury rolling issue (MED-d)
