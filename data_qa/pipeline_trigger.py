@@ -67,8 +67,32 @@ DEFAULT_PIPELINE_PYTHON = ("/blue/adamginsburg/adamginsburg/miniconda3/envs/"
 PREFLIGHT_TIMEOUT_S = 30
 
 # obs tokens are digits, optionally '-'-joined ('001-002' names a joint
-# observation); anything else must never be interpolated into the -c code
-_OBS_TOKEN_RE = re.compile(r"^[0-9]{1,4}(-[0-9]{1,4})*$")
+# observation); anything else must never be interpolated into the -c code.
+# fullmatch, not match+'$': '$' also matches before a trailing newline, and
+# '001\n' would reach the -c code as a syntax error (rc 1) instead of a
+# rejected token.
+_OBS_TOKEN_RE = re.compile(r"[0-9]{1,4}(-[0-9]{1,4})*")
+
+# The child answers with a STATUS, not merely non-zero: only rc 3 is the
+# registry's own verdict ("this observation is not in fields.yaml").  Any other
+# non-zero rc means the CHECK broke -- a failed import (half-installed env, bad
+# PYTHONPATH), an OOM kill, a syntax error -- and must fail OPEN, exactly like
+# the timeout/OSError paths.  Reporting every non-zero rc as 'not registered'
+# would let one broken pipeline env silence EVERY trigger, for every already
+# registered program, on every poll.
+PREFLIGHT_NOT_REGISTERED_RC = 3
+_VERDICT_MARK = "REGISTRY-VERDICT: "
+_PREFLIGHT_CODE = (
+    # the import sits OUTSIDE the try on purpose: an ImportError here is a
+    # broken check (rc 1 -> fail-open), never a registry verdict
+    "import sys\n"
+    "from jwst_gc_pipeline import fields\n"
+    "try:\n"
+    "    fields.target_for_obsid('{program}', '{obs}')\n"
+    "except (KeyError, fields.FieldRegistryError) as ex:\n"
+    "    sys.stderr.write('{mark}%s\\n' % (ex,))\n"
+    "    sys.exit({rc})\n"
+)
 
 
 class NotRegisteredInPipelineError(RuntimeError):
@@ -84,19 +108,25 @@ def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
 
     ``pipe_root`` fronts PYTHONPATH so the checkout being submitted against is
     the one consulted; the interpreter is ``python`` / $PIPELINE_PYTHON /
-    DEFAULT_PIPELINE_PYTHON.  FAIL-OPEN cases (warn + proceed): a subprocess
-    TIMEOUT or an interpreter that cannot start.  Both mean the CHECK is
-    broken, and a broken check must not silence real triggers -- a false skip
-    leaves delivered data unreduced with no error recorded anywhere, while
-    proceeding merely reproduces the pre-preflight burn-on-submit behaviour
-    for that one observation."""
+    DEFAULT_PIPELINE_PYTHON.
+
+    ONLY the child's rc 3 (PREFLIGHT_NOT_REGISTERED_RC, written by the child
+    when target_for_obsid raises KeyError/FieldRegistryError) blocks.  Every
+    other failure mode -- subprocess TIMEOUT, an interpreter that cannot start,
+    and any other non-zero rc (import failure in a half-installed env, OOM
+    kill) -- warns and PROCEEDS.  All of them mean the CHECK is broken, and a
+    broken check must not silence real triggers: a false skip leaves delivered
+    data unreduced with no error recorded anywhere and the operator pointed at
+    a registration that is already correct, while proceeding reproduces the
+    pre-preflight burn-on-submit behaviour for that one observation."""
     obs_token = str(obs)
-    if not _OBS_TOKEN_RE.match(obs_token):
+    if not _OBS_TOKEN_RE.fullmatch(obs_token):
         raise ValueError(f"obs {obs!r} is not a plausible observation token")
     python = (python or os.environ.get("PIPELINE_PYTHON")
               or DEFAULT_PIPELINE_PYTHON)
-    code = ("from jwst_gc_pipeline import fields; "
-            f"fields.target_for_obsid('{int(program)}', '{obs_token}')")
+    code = _PREFLIGHT_CODE.format(program=int(program), obs=obs_token,
+                                  mark=_VERDICT_MARK,
+                                  rc=PREFLIGHT_NOT_REGISTERED_RC)
     env = dict(os.environ)
     env["PYTHONPATH"] = pipe_root + os.pathsep + env.get("PYTHONPATH", "")
     try:
@@ -114,12 +144,25 @@ def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
               "registry check (fail-open, same rationale as the timeout)",
               file=sys.stderr)
         return
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        raise NotRegisteredInPipelineError(
-            f"program {int(program)} obs {obs_token} is not registered in the "
-            f"pipeline at {pipe_root} (fields.target_for_obsid rc="
-            f"{proc.returncode}" + (f": {tail[-1]}" if tail else "") + ")")
+    if proc.returncode == 0:
+        return
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    if proc.returncode != PREFLIGHT_NOT_REGISTERED_RC:
+        # the check itself broke -> fail open (see the docstring)
+        raise_line = tail[-1] if tail else "no output"
+        print(f"pipeline_trigger: registry preflight FAILED to reach a verdict "
+              f"for program {int(program)} obs {obs_token} (rc="
+              f"{proc.returncode}: {raise_line}); proceeding WITHOUT the "
+              "registry check (fail-open: a broken pipeline env must not "
+              "silence real triggers)", file=sys.stderr)
+        return
+    verdict = [ln for ln in tail if ln.startswith(_VERDICT_MARK)]
+    detail = (verdict[-1][len(_VERDICT_MARK):] if verdict
+              else (tail[-1] if tail else ""))
+    raise NotRegisteredInPipelineError(
+        f"program {int(program)} obs {obs_token} is not registered in the "
+        f"pipeline at {pipe_root} (fields.target_for_obsid"
+        + (f": {detail}" if detail else "") + ")")
 
 
 def missing_scripts(pipe_root) -> List[str]:

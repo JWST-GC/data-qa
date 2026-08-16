@@ -569,6 +569,42 @@ def test_backup_before_write_same_day_overwrites(tmp_path):
     assert json.loads(bak.read_text())["gen"] == 1
 
 
+def test_backup_failure_still_writes_the_state(tmp_path, monkeypatch, capsys):
+    """A backup that cannot be written must NOT abort the write it precedes:
+    record_triggered runs right after a successful sbatch, so losing that write
+    leaves the jobs queued with the one-shot key unarmed -- the next poll would
+    re-submit the same observation."""
+    path = str(tmp_path / "state.json")
+    mm.save_state(path, {"version": 1, "gen": 1})
+
+    def denied(*a, **kw):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(mm.shutil, "copy2", denied)
+    mm.save_state(path, {"version": 1, "gen": 2})
+    assert mm.load_state(path)["gen"] == 2
+    assert "backup FAILED" in capsys.readouterr().err
+
+
+def test_rearm_accepts_joint_obs_token(tmp_path):
+    """The trigger key of a joint observation ('2221-o001-002') is addressable
+    -- the --rearm grammar matches pipeline_trigger's obs-token grammar."""
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {
+        "version": 1, "programs": {},
+        "triggered": {"2221-o001-002": {"when": "2026-08-16 00:00 UTC",
+                                        "jobids": []}}})
+    assert mm.main(["--rearm", "2221-o001-002", "--state", state_path]) == 0
+    assert mm.load_state(state_path)["triggered"] == {}
+
+
+def test_rearm_download_without_rearm_is_refused(tmp_path):
+    """--rearm-download alone would silently do nothing; argparse errors (rc 2)."""
+    with pytest.raises(SystemExit) as ex:
+        mm.main(["--rearm-download", "--state", str(tmp_path / "s.json")])
+    assert ex.value.code == 2
+
+
 def test_backup_prunes_beyond_keep_days(tmp_path):
     import datetime
     path = str(tmp_path / "state.json")

@@ -434,10 +434,18 @@ def save_state(path, state: dict):
     """Atomic write (tmp + rename); auto-creates the parent directory.  A failure
     between write and replace unlinks the orphan tmp file (the exception still
     propagates).  The previous on-disk state is first copied to a dated
-    ``.bak-YYYYMMDD`` sibling (backup_state); the write itself is unchanged."""
+    ``.bak-YYYYMMDD`` sibling (backup_state); a backup that CANNOT be written
+    (read-only or foreign-owned leftover, ENOSPC) warns and the write PROCEEDS
+    -- the backup is a convenience, while a lost write loses a just-recorded
+    trigger key and re-submits that observation on the next poll."""
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
-    backup_state(path)
+    try:
+        backup_state(path)
+    except OSError as ex:
+        print(f"mast_monitor: state backup FAILED for {path} "
+              f"({ex.__class__.__name__}: {ex}); writing the new state anyway",
+              file=sys.stderr)
     tmp = f"{path}.tmp.{os.getpid()}"
     try:
         with open(tmp, "w") as fh:
@@ -574,7 +582,11 @@ def retire_downgrade_memo(state: dict, notice: Optional[str]) -> dict:
         state.pop(NOTIFIED_DOWNGRADE_KEY, None)
     return state
 
-_REARM_RE = re.compile(r"^(\d+)-o(\d+)$")
+
+# '<program>-o<obs>', where <obs> may be a joint token ('001-002') -- the same
+# grammar pipeline_trigger._OBS_TOKEN_RE accepts, so every key the monitor can
+# write is addressable by --rearm
+_REARM_RE = re.compile(r"(\d+)-o(\d+(?:-\d+)*)")
 
 
 def rearm(state_path, spec: str, include_download=False) -> int:
@@ -584,7 +596,7 @@ def rearm(state_path, spec: str, include_download=False) -> int:
     Prints every removed entry; REFUSES (rc 1) on a malformed spec or when
     nothing matches, so a typo cannot silently 'succeed'.  Returns a process
     return code."""
-    m = _REARM_RE.match(spec or "")
+    m = _REARM_RE.fullmatch(spec or "")
     if not m:
         print(f"--rearm: REFUSED: {spec!r} does not look like "
               "'<program>-o<obs>' (e.g. 10678-o001)", file=sys.stderr)

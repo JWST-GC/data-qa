@@ -1,5 +1,8 @@
 """Offline unit tests for data_qa.pipeline_trigger + pipeline_policy (command
-generation only -- no sbatch and no real policy-probe subprocess is ever run)."""
+generation only -- no sbatch is ever run).  The policy probe is stubbed
+throughout; the registry preflight is stubbed except in its own tests, which
+drive it with fake interpreters plus one real-interpreter case against a
+tmp_path checkout."""
 import json
 import os
 import subprocess
@@ -609,11 +612,46 @@ def test_unregistered_obs_raises_before_any_sbatch(monkeypatch):
 
 
 def test_registry_preflight_unregistered_raises(tmp_path):
-    py = _fake_python(tmp_path,
-                      'echo "KeyError: proposal 10678 observation" >&2\nexit 1')
+    """rc 3 + the verdict line = the registry's OWN answer -> block."""
+    py = _fake_python(
+        tmp_path,
+        'echo "REGISTRY-VERDICT: KeyError: proposal 10678 observation" >&2\n'
+        f'exit {pt.PREFLIGHT_NOT_REGISTERED_RC}')
     with pytest.raises(pt.NotRegisteredInPipelineError,
                        match="10678 obs 001.*KeyError"):
         _REAL_PREFLIGHT(10678, "001", pipe_root="/pipe", python=py)
+
+
+@pytest.mark.parametrize("body,tell", [
+    ('echo "ModuleNotFoundError: No module named astropy" >&2\nexit 1',
+     "ModuleNotFoundError"),
+    ("exit 137", "rc=137"),                     # OOM-killed subprocess
+    ("exit 2", "rc=2"),
+])
+def test_registry_preflight_broken_check_fails_open(tmp_path, capsys, body, tell):
+    """ONLY rc 3 blocks.  A pipeline env that cannot import (conda update,
+    half-installed dependency, bad PYTHONPATH) or a killed subprocess must NOT
+    be reported as 'not registered' -- that would silence EVERY trigger, for
+    every already-registered program, on every poll until the env is repaired."""
+    py = _fake_python(tmp_path, body)
+    assert _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py) is None
+    err = capsys.readouterr().err
+    assert "FAILED to reach a verdict" in err and "fail-open" in err
+    assert tell in err
+    assert "not registered" not in err
+
+
+def test_registry_preflight_child_code_matches_the_real_registry(tmp_path):
+    """The rc-3 protocol is a contract with the pipeline's fields module, so
+    exercise it against the REAL interpreter + registry: a registered obs
+    passes, a nonexistent proposal raises (not fails open)."""
+    py = pt.DEFAULT_PIPELINE_PYTHON
+    pipe_root = pt.DEFAULT_PIPE_ROOT
+    if not (os.path.exists(py) and os.path.isdir(pipe_root)):
+        pytest.skip("pipeline env/checkout not on this host")
+    assert _REAL_PREFLIGHT(2221, "001", pipe_root=pipe_root, python=py) is None
+    with pytest.raises(pt.NotRegisteredInPipelineError, match="99999 obs 001"):
+        _REAL_PREFLIGHT(99999, "001", pipe_root=pipe_root, python=py)
 
 
 def test_registry_preflight_registered_passes(tmp_path):
@@ -648,6 +686,14 @@ def test_registry_preflight_rejects_weird_obs_token(tmp_path):
     """Only digit/'-' obs tokens may reach the interpolated -c code."""
     with pytest.raises(ValueError, match="observation token"):
         _REAL_PREFLIGHT(2221, "001'; import os", pipe_root="/pipe",
+                        python=_fake_python(tmp_path, "exit 0"))
+
+
+def test_registry_preflight_rejects_trailing_newline_obs_token(tmp_path):
+    """fullmatch, not match+'$': '001\\n' would otherwise reach the -c code and
+    die of a syntax error (rc 1)."""
+    with pytest.raises(ValueError, match="observation token"):
+        _REAL_PREFLIGHT(2221, "001\n", pipe_root="/pipe",
                         python=_fake_python(tmp_path, "exit 0"))
 
 
