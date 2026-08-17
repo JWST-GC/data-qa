@@ -29,30 +29,53 @@ effect is individually gated:
                    acting run may touch; overflow acts on the N oldest and
                    defers the rest to later runs (default 4)
 
-Safety gates on acting runs (--auto, or --download/--trigger with --execute):
+Safety gates on acting runs (--auto, or --download/--trigger/--peppar with
+--execute):
   * FIRST-RUN SEED: a missing/empty state file means EVERY observation would
     fire as NEW_OBSERVATION; an acting run instead behaves like --seed
-    (commit state, report "SEED RUN", no downloads/submissions).  Plain
-    dry-run invocations are unchanged.
+    (commit state, report "SEED RUN", no downloads/submissions/fan-outs).
+    Plain dry-run invocations are unchanged.
   * SUBMISSION CAP (--max-submit): only groups the run would ACT on count
     (see ``actionable_groups``) -- event_ready events with a field mapping,
     minus groups the one-shot ``triggered``/``downloaded`` maps already
     retired; the trigger dimension counts NIRCam groups only (the MIRI
     trigger path is manual today), and --peppar counts every ready NIRCam
     group (act_peppar keeps no one-shot key, so it never retires).  Every
-    enabled action is a counted dimension, because the capped run acts on the
-    counted groups ONLY: a group an enabled action needs but the count omits
-    is dropped from the run and committed as seen, losing that action outright
-    where a counted group would merely be postponed.
+    action enabled on an acting run is a counted dimension, because the capped
+    run acts on the counted groups ONLY: a group an enabled action needs but
+    the count omits is dropped from the run and committed as seen, losing that
+    action outright where a counted group would merely be postponed.  This is
+    why ``--peppar --execute`` on its own also counts as an acting run: it
+    would otherwise skip this whole block and fan out the entire backlog.
     Overflow acts on the N OLDEST groups and commits state for exactly those
     plus the groups that consume no slot at all (planned tiles, unmapped
     programs, retired keys); the deferred groups keep their pre-poll
     baselines, so their events re-fire (and count again) on later runs until
-    the backlog drains.  The CAPPED notice names the acted and deferred groups.
+    the backlog drains.  The CAPPED notice names the acted and deferred groups
+    (long lists are truncated with an "and N more" tail).
     (Counting every grouped event and downgrading all-or-nothing without a
     commit wedged --auto permanently once the group count passed the cap:
     the same events re-fired and re-counted every later morning -- the
     treasury-delivery failure of issue #67.)
+    Vocabulary used throughout this block and in ``actionable_groups``:
+      one-shot key  an entry in the state file's ``triggered`` /
+                    ``downloaded`` map.  Written the moment an action
+                    succeeds and never rewritten, so it fires at most once per
+                    obs for the life of the state file; ARMED means the key is
+                    absent (the action is still owed), BURNED / RETIRED means
+                    the key is present (the action already happened).  Delete
+                    the entry by hand to re-arm.
+      dimension     one action (download / trigger / peppar) that
+                    ``actionable_groups`` evaluates per group.
+      slot          one unit of the --max-submit budget.  A group consumes one
+                    slot when at least one dimension is armed for it,
+                    regardless of how many dimensions are; a group with every
+                    dimension retired consumes none.
+      skip-chatter  events that reach the act_* functions and print SKIP
+                    without doing anything (planned tiles, unmapped programs,
+                    MIRI on the trigger path).  They consume no slot.
+      fan-out       act_peppar's per-filter/per-detector job submission for
+                    one obs -- many SLURM jobs from one event.
   * IN-FLIGHT DEDUP (--trigger): a group is skipped when squeue already has a
     job named ``<field><program>-o<obs>-*`` or when the state file's
     ``triggered`` map marks the obs as already submitted (the map is written
@@ -791,6 +814,21 @@ def _group_label(key) -> str:
     return f"{program}-o{obsnum}-{instr or '?'}"
 
 
+NOTICE_LABEL_LIMIT = 10
+
+
+def _group_label_list(keys, limit: int = NOTICE_LABEL_LIMIT) -> str:
+    """Comma-joined group labels for the CAPPED notice, capped in length.
+    Beyond ``limit`` labels the tail collapses to 'and N more', keeping the
+    notice readable when a treasury backlog runs to dozens of groups (the
+    notice is posted verbatim into a GitHub issue comment)."""
+    keys = list(keys)
+    shown = ", ".join(_group_label(k) for k in keys[:limit])
+    if len(keys) > limit:
+        return f"{shown}, and {len(keys) - limit} more"
+    return shown
+
+
 def _revert_deferred(state, old_obs_by_prog, deferred_events):
     """Restore the deferred groups' obs records to their pre-poll baseline, so
     the end-of-run commit retires exactly the acted groups: a deferred event
@@ -1281,11 +1319,12 @@ def main(argv=None):
             continue
         new_obs = summarize(rows, poll_mjd)
         old_obs = state.get("programs", {}).get(str(prog), {}).get("obs", {})
-        # setdefault, NOT assignment: a duplicated --program argument polls the
-        # same program twice, and the second pass would otherwise overwrite the
-        # true pre-poll baseline with the first pass's POST-poll records, so
-        # _revert_deferred would "restore" deferred groups to what MAST just
-        # returned -- they would commit as seen and never re-fire.
+        # setdefault keeps the FIRST pass's baseline: a duplicated --program
+        # argument polls the same program twice, and the second pass's
+        # "pre-poll" records are already the first pass's POST-poll records.
+        # Overwriting with those would have _revert_deferred "restore"
+        # deferred groups to what MAST just returned, so they would commit as
+        # seen and never re-fire.
         old_obs_by_prog.setdefault(str(prog), old_obs)
         all_events.extend(diff_events(prog, old_obs, new_obs))
         # an obs that DISAPPEARED from MAST is kept under a 'missing_since'
@@ -1318,16 +1357,20 @@ def main(argv=None):
                      if failed_programs else ""))
 
     # FIRST-RUN SEED gate: with no baseline, every observation fires as NEW --
-    # an acting run (auto, or download/trigger with --execute) must not submit
-    # the entire backlog.  Seed instead: commit state, act on nothing.
-    acting = args.execute and (args.download or args.trigger)
+    # an acting run must not submit the entire backlog.  Seed instead: commit
+    # state, act on nothing.
+    # EVERY submitting action counts here (download / trigger / peppar).  A
+    # --peppar-only acting run used to leave `acting` False, which skipped both
+    # this gate and the SUBMISSION CAP below and fanned the whole backlog out
+    # on the first run.
+    acting = args.execute and (args.download or args.trigger or args.peppar)
     seed = args.seed or (first_run and bool(all_events) and acting)
     actionable = all_events
     if seed:
         seed_notice = (f"SEED RUN — actions suppressed: committing the current "
                        f"state ({len(all_events)} event(s)) as the baseline; "
-                       "nothing downloaded or submitted.  Subsequent runs act "
-                       "only on genuinely new events."
+                       "nothing downloaded, submitted or fanned out.  "
+                       "Subsequent runs act only on genuinely new events."
                        + ("" if args.seed else "  (state file was missing/empty)"))
         print(f"--seed: {seed_notice}", file=sys.stderr)
         # A LOW DISK notice from the --auto disk gate keeps the FRONT of the
@@ -1337,7 +1380,7 @@ def main(argv=None):
         # nobody -- the #71 defect inside a --seed --auto invocation.  One
         # line, since render_events_comment renders the notice as a blockquote.
         notice = f"{notice}  {seed_notice}" if notice else seed_notice
-        args.download = args.trigger = False
+        args.download = args.trigger = args.peppar = False
         args.commit_state = True
     elif acting:
         # PER-PROGRAM SEED: a program polled successfully for the first time
@@ -1361,11 +1404,13 @@ def main(argv=None):
         # side are skip-chatter -- see actionable_groups).  Overflow acts on
         # the --max-submit OLDEST groups; the deferred groups' baselines are
         # reverted so the commit retires exactly the acted groups and the
-        # deferred events re-fire (and count again) next run.  EVERY enabled
-        # action must be a counted dimension (download/trigger/peppar): the
-        # truncated `actionable` below feeds all three, so a group an action
-        # needs but the count omits is dropped from this run AND committed as
-        # seen -- that action is lost outright, with no later run to pick it up.
+        # deferred events re-fire (and count again) next run.  EVERY action
+        # enabled here must be a counted dimension (download/trigger/peppar):
+        # the truncated `actionable` below feeds all three, so a group an
+        # action needs but the count omits is dropped from this run AND
+        # committed as seen -- that action is lost outright, with no later run
+        # to pick it up.  `acting` above gates entry to this block, so it has
+        # to name the same three actions.
         groups = actionable_groups(state, actionable,
                                    download=args.download, trigger=args.trigger,
                                    peppar=args.peppar)
@@ -1376,19 +1421,32 @@ def main(argv=None):
             actionable = [ev for key in acted_keys for ev in groups[key]]
             deferred = [ev for key in deferred_keys for ev in groups[key]]
             _revert_deferred(state, old_obs_by_prog, deferred)
-            notice = (f"CAPPED — {len(groups)} actionable group(s) exceed "
+            # the commit sentence tracks --commit-state: this notice is posted
+            # verbatim onto the QA issue, so an operator reads it to know what
+            # re-fires.  A dry-state acting run (--download/--trigger/--peppar
+            # --execute without --commit-state) commits nothing at all.
+            if args.commit_state:
+                commit_clause = (
+                    "The DEFERRED groups keep their pre-poll baselines and "
+                    "re-fire next run; every other group in this poll -- the "
+                    "acted ones and the ones that consume no slot (planned "
+                    "tiles, unmapped programs, groups the one-shot maps "
+                    "already retired) -- is committed now and does not "
+                    "re-fire.")
+            else:
+                commit_clause = (
+                    "This run commits no state (--commit-state is off), so "
+                    "every group in this poll re-fires next run.")
+            capped = (f"CAPPED — {len(groups)} actionable group(s) exceed "
                       f"--max-submit {args.max_submit}: acting on the "
                       f"{len(acted_keys)} oldest "
-                      f"({', '.join(_group_label(k) for k in acted_keys)}); "
+                      f"({_group_label_list(acted_keys)}); "
                       f"deferred to later runs: "
-                      f"{', '.join(_group_label(k) for k in deferred_keys)}.  "
-                      "The DEFERRED groups keep their pre-poll baselines and "
-                      "re-fire next run; every other group in this poll -- the "
-                      "acted ones and the ones that never consume a slot "
-                      "(planned tiles, unmapped programs, groups the one-shot "
-                      "maps already retired) -- is committed now and does not "
-                      "re-fire.")
-            print(f"--max-submit: {notice}", file=sys.stderr)
+                      f"{_group_label_list(deferred_keys)}.  " + commit_clause)
+            # keep an earlier notice (PER-PROGRAM SEED, LOW DISK): both
+            # describe this run and the operator needs both
+            notice = f"{notice}  {capped}" if notice else capped
+            print(f"--max-submit: {capped}", file=sys.stderr)
 
     if all_events:
         if args.download:

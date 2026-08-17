@@ -628,6 +628,173 @@ def test_duplicated_program_keeps_the_true_prepoll_baseline(monkeypatch,
     assert calls                                  # the run really acted
 
 
+def test_capped_run_does_not_drop_trigger_for_download_retired_groups(
+        monkeypatch, tmp_path):
+    """Mirror of the peppar test for the TRIGGER dimension: o001's
+    ``downloaded`` key is burned while ``triggered`` is still armed.  Dropping
+    trigger from the count leaves o001 out of the truncated event list, so it
+    is committed as seen and never submitted on any later run."""
+    rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in (1, 2, 3, 4, 5)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    mm.save_state(str(state), {
+        "version": 1,
+        "programs": {"10678": {"obs": {
+            # o001 already seen at calib 2 -> this poll fires CALIB_LEVEL_UP
+            "jw10678-o001_t001_nircam_clear-f212n": {
+                "calib_level": 2, "released": True, "t_obs_release": 59901.0,
+                "instrument_name": "NIRCAM/IMAGE", "filters": "F212N;F480M",
+                "target_name": "GC_1"}}}},
+        "downloaded": {"10678-o001-NIRCam": "2026-08-16"}})
+    args = ["--program", "10678", "--auto", "--max-submit", "2",
+            "--state", str(state), "--download-dir", str(tmp_path)]
+
+    assert mm.main(args) == 0                    # ---------------------- run 1
+    acted = {name: (evs, kw) for name, evs, kw in calls}
+    # the trigger dimension counts o001, so it is one of the two oldest ACTED
+    assert set(mm._group_by_obs(acted["trigger"][0])) == {
+        (10678, "001", "NIRCam"), (10678, "002", "NIRCam")}
+    committed = mm.load_state(str(state))["programs"]["10678"]["obs"]
+    assert committed["jw10678-o001_t001_nircam_clear-f212n"]["calib_level"] == 3
+    for i in (3, 4, 5):
+        assert f"jw10678-o{i:03d}_t001_nircam_clear-f212n" not in committed
+
+    calls.clear()
+    assert mm.main(args) == 0                    # ---------------------- run 2
+    acted = {name: (evs, kw) for name, evs, kw in calls}
+    assert set(mm._group_by_obs(acted["trigger"][0])) == {
+        (10678, "003", "NIRCam"), (10678, "004", "NIRCam")}
+    # o001 was acted on in run 1 and is retired: it never re-fires, so run 1
+    # was its only chance to be triggered
+    assert not any(ev["obsnum"] == "001" for ev in acted["report"][0])
+
+
+def test_peppar_only_run_is_seeded_and_capped(monkeypatch, tmp_path, capsys):
+    """``--peppar --execute`` with no --download/--trigger is an acting run:
+    the first-run seed guard and the --max-submit cap both apply to it.  With
+    peppar outside the `acting` test it skipped both gates and fanned the whole
+    backlog out on the very first poll."""
+    rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in range(1, 6)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    state = tmp_path / "state.json"
+    args = ["--program", "10678", "--peppar", "--execute", "--report",
+            "--commit-state", "--max-submit", "2", "--state", str(state)]
+
+    assert mm.main(args) == 0                    # ------- run 1: first run
+    assert [name for name, _evs, _kw in calls if name == "peppar"] == []
+    assert "SEED RUN" in capsys.readouterr().err
+
+    # a second poll returns 5 MORE groups on top of the seeded baseline
+    rows.extend(_nircam_row(f"{i:03d}", release=59900.0 + i)
+                for i in range(6, 11))
+    calls.clear()
+    assert mm.main(args) == 0                    # ------- run 2: capped
+    acted = {name: (evs, kw) for name, evs, kw in calls}
+    assert set(mm._group_by_obs(acted["peppar"][0])) == {
+        (10678, "006", "NIRCam"), (10678, "007", "NIRCam")}
+    assert "CAPPED" in acted["report"][1]["notice"]
+
+
+def test_exactly_at_the_cap_is_not_capped(monkeypatch, tmp_path):
+    """The cap trips on STRICT overflow.  `>=` would post a CAPPED notice with
+    an empty deferred list at equality and truncate the event list the act_*
+    functions see."""
+    rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in (1, 2)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o999_x")
+    assert mm.main(["--program", "10678", "--auto", "--max-submit", "2",
+                    "--state", str(state),
+                    "--download-dir", str(tmp_path)]) == 0
+    acted = {name: (evs, kw) for name, evs, kw in calls}
+    assert acted["report"][1]["notice"] is None
+    assert set(mm._group_by_obs(acted["trigger"][0])) == {
+        (10678, "001", "NIRCam"), (10678, "002", "NIRCam")}
+
+
+def test_capped_notice_keeps_an_earlier_notice(monkeypatch, tmp_path):
+    """PER-PROGRAM SEED and CAPPED both describe the same run; the CAPPED text
+    is appended so the issue comment carries both."""
+    rows = {10678: [_nircam_row(f"{i:03d}", release=59900.0 + i)
+                    for i in (1, 2, 3)],
+            2221: [_row("jw02221-o001_t001_nircam_clear-f405n")]}
+    calls = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows[prog]))
+    for name in ("act_download", "act_trigger", "act_report", "act_peppar"):
+        monkeypatch.setattr(
+            mm, name,
+            (lambda nm: lambda evs, **kw: calls.append((nm, list(evs), kw)))(
+                name.removeprefix("act_")))
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o999_x")   # 2221 unseeded
+    assert mm.main(["--program", "10678", "2221", "--auto", "--max-submit", "2",
+                    "--state", str(state),
+                    "--download-dir", str(tmp_path)]) == 0
+    notice = {name: kw for name, _evs, kw in calls}["report"]["notice"]
+    assert "PER-PROGRAM SEED" in notice
+    assert "CAPPED" in notice
+
+
+def test_capped_notice_tracks_commit_state(monkeypatch, tmp_path):
+    """The notice is posted verbatim onto the QA issue.  An acting run without
+    --commit-state commits nothing, so the notice says so."""
+    rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in (1, 2, 3)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o999_x")
+    base = ["--program", "10678", "--download", "--trigger", "--report",
+            "--execute", "--max-submit", "2", "--state", str(state),
+            "--download-dir", str(tmp_path)]
+
+    assert mm.main(base) == 0                    # no --commit-state
+    notice = {name: kw for name, _evs, kw in calls}["report"]["notice"]
+    assert "commits no state" in notice
+    assert "is committed now" not in notice
+    committed = mm.load_state(str(state))["programs"]["10678"]["obs"]
+    assert "jw10678-o001_t001_nircam_clear-f212n" not in committed
+
+    calls.clear()
+    assert mm.main(base + ["--commit-state"]) == 0
+    notice = {name: kw for name, _evs, kw in calls}["report"]["notice"]
+    assert "is committed now" in notice
+    assert "commits no state" not in notice
+
+
+def test_capped_notice_truncates_long_group_lists(monkeypatch, tmp_path):
+    """100 groups against --max-submit 16 named in full is a ~2.3 kB notice in
+    every issue comment that run; the tail collapses to 'and N more'."""
+    rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in range(1, 101)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o999_x")
+    assert mm.main(["--program", "10678", "--auto", "--max-submit", "16",
+                    "--state", str(state),
+                    "--download-dir", str(tmp_path)]) == 0
+    notice = {name: kw for name, _evs, kw in calls}["report"]["notice"]
+    assert "and 6 more" in notice                 # 16 acted, 10 named
+    assert "and 74 more" in notice                # 84 deferred, 10 named
+    assert len(notice) < 900
+    # the truncation is display-only: all 16 oldest groups are still acted on
+    acted = {name: (evs, kw) for name, evs, kw in calls}
+    assert len(mm._group_by_obs(acted["trigger"][0])) == 16
+
+
+def test_group_label_list_truncates_beyond_the_limit():
+    keys = [(10678, f"{i:03d}", "NIRCam") for i in range(1, 15)]
+    assert mm._group_label_list(keys[:3]) == (
+        "10678-o001-NIRCam, 10678-o002-NIRCam, 10678-o003-NIRCam")
+    out = mm._group_label_list(keys)
+    assert out.endswith("and 4 more")
+    assert out.count("10678-o") == 10
+    assert "10678-o011-NIRCam" not in out
+
+
 def test_negative_max_submit_is_rejected(tmp_path):
     """keys[:-1] would act on all-but-the-last group -- the opposite of a cap."""
     with pytest.raises(SystemExit):
