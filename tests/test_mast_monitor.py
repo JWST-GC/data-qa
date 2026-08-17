@@ -471,7 +471,8 @@ def test_already_triggered_message_recommends_rearm(monkeypatch, tmp_path,
     assert submitted == []
     err = capsys.readouterr().err
     assert "--rearm 2221-o001" in err
-    assert "2026-08-16 00:00 UTC" in err
+    assert "at 2026-08-16 00:00 UTC (re-arm" in err   # the timestamp, unwrapped
+    assert "jobids" not in err                        # not the raw record dict
     assert "delete the 'triggered' entry" not in err
 
 
