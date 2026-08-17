@@ -141,11 +141,50 @@ def test_mixed_within_filter_dir_dedupes_and_unions(tmp_path):
     assert f"{fdir}/pipeline/jw10678001001_02101_00001_nrca1_cal.fits" in files
     assert ppt.enumerate_filt_det("gc-treasury", base=str(tmp_path)) == {
         "F212N": ["NRCA1", "NRCA2"]}
-    # filter-level answer: pipeline/ holds cal files
-    assert ppt.cal_data_dir(str(fdir)) == f"{fdir}/pipeline"
     # per-detector answer: NRCA1 migrated, NRCA2 is still flat-only
     assert ppt.cal_data_dir(str(fdir), "NRCA1") == f"{fdir}/pipeline"
     assert ppt.cal_data_dir(str(fdir), "NRCA2") == str(fdir)
+    # filter-level answer: flat serves both exposures here, pipeline/ only one
+    assert ppt.cal_data_dir(str(fdir)) == str(fdir)
+
+
+def test_detector_split_across_layouts_serves_the_larger_side(tmp_path, capsys):
+    """One detector's exposures SPLIT across the two layouts.  The runner globs
+    PEPPAR_DATA_DIR flat, so it sees exactly one layout; discovery counted the union.
+    Picking the side that holds more removes the loss whenever one layout is a superset,
+    which is the ordinary half-migrated shape (a re-reduction rewrites some exposures)."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline", nexp=3)
+    # the flat dir holds one older exposure of the same detector
+    _touch(fdir / "jw10678001001_02101_00009_nrca1_cal.fits")
+    assert len(ppt._cal_files(str(fdir))) == 4
+    (job,) = ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    assert job["data_dir"] == f"{fdir}/pipeline"          # 3 files beats the flat 1
+    # the reverse split picks flat
+    fdir2 = make_field(tmp_path, "gc-treasury", "F480M", ["nrcalong"], "flat", nexp=3)
+    _touch(fdir2 / "pipeline" / "jw10678001001_02101_00009_nrcalong_cal.fits")
+    assert ppt.cal_data_dir(str(fdir2), "NRCALONG") == str(fdir2)
+
+
+def test_disjoint_split_warns_instead_of_running_quiet_on_a_subset(tmp_path, capsys):
+    """When neither layout is a superset the chosen dir still misses the remainder, and
+    the runner's "no images" guard passes on the files it does see.  That must say so."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline", nexp=2)
+    _touch(fdir / "jw10678001001_02101_00007_nrca1_cal.fits")
+    capsys.readouterr()
+    assert ppt.cal_data_dir(str(fdir), "NRCA1") == f"{fdir}/pipeline"
+    err = capsys.readouterr().err
+    assert "splits across both layouts" in err
+    assert "serves 2 of 3 cal files" in err
+
+
+def test_no_warning_when_one_layout_is_a_superset(tmp_path, capsys):
+    """Every (filter, detector) pair on the real archive today has flat as a subset of
+    pipeline/ by basename, so the ordinary case stays silent."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline", nexp=2)
+    _touch(fdir / "jw10678001001_02101_00001_nrca1_cal.fits")
+    capsys.readouterr()
+    assert ppt.cal_data_dir(str(fdir), "NRCA1") == f"{fdir}/pipeline"
+    assert capsys.readouterr().err == ""
 
 
 def test_mixed_within_filter_dir_data_dir_is_per_detector(tmp_path):

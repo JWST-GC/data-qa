@@ -37,7 +37,7 @@ Discovery unions the two layouts, counting a basename present in both once.  The
 The copy that actually reaches peppar is chosen by ``cal_data_dir``, which resolves
 ``PEPPAR_DATA_DIR`` per (filter, DETECTOR): the runner globs ``PEPPAR_DATA_DIR`` flat, so it
 sees one layout, and a mid-migration filter dir can hold some detectors under ``pipeline/``
-while another is still flat, preferring the ``pipeline/`` copy.
+while another is still flat.
 
 Mirrors ``data_qa.pipeline_trigger``: DRY-RUN by default (prints the exact sbatch commands);
 ``--execute`` really submits.  In-flight dedup skips a (field, filter, detector) whose job is
@@ -98,25 +98,41 @@ def _cal_files(fdir: str, stem: str = "") -> List[str]:
 
 
 def cal_data_dir(fdir: str, det: Optional[str] = None) -> str:
-    """The directory the peppar runner should glob for this filter dir, resolved per
-    DETECTOR when ``det`` is given: the ``pipeline/`` subdir when it holds that detector's
-    cal files, else the (legacy flat) filter dir itself.
+    """The single directory the peppar runner should glob for this filter dir, resolved
+    per DETECTOR when ``det`` is given.
 
-    Per-detector because a mid-migration filter dir holds some detectors under
-    ``pipeline/`` while another is still flat, and discovery enumerates the UNION of the
-    two layouts.  A flat-only detector handed ``{FILT}/pipeline`` would clear the runner's
-    "no images" guard on its siblings' files (``scripts/peppar/run_peppar_generic.py``
-    globs ``PEPPAR_DATA_DIR`` flat) and then die in ``peppar.setup_dict_images_for_run``,
-    which indexes ``dict_images[filt][det]`` with no guard -- a KeyError after the job has
-    taken its queue slot.
+    The runner globs ``PEPPAR_DATA_DIR`` flat (``scripts/peppar/run_peppar_generic.py``),
+    so it sees ONE layout while discovery enumerates the union of both.  Two ways that
+    bites, both fixed here by choosing the layout that serves the most cal files for the
+    scope asked about (ties go to ``pipeline/``, the newer reduction):
 
-    Without ``det`` the answer is the filter-level one (``pipeline/`` when it holds any
-    cal file)."""
+    * a detector present only in the flat dir, handed ``{FILT}/pipeline``, clears the
+      runner's "no images" guard on its SIBLINGS' files and then dies in
+      ``peppar.setup_dict_images_for_run``, which indexes ``dict_images[filt][det]``
+      with no guard -- a KeyError after the job has taken its queue slot;
+    * a detector whose exposures are SPLIT across the two layouts runs quietly on
+      whichever subset the chosen dir holds.  Choosing the larger side removes the loss
+      whenever one layout is a superset of the other (the ordinary half-migrated shape);
+      a genuinely disjoint split still loses the remainder, so that case warns on stderr
+      instead of passing unremarked.
+
+    Without ``det`` the answer is the filter-level one, by the same rule."""
     fdir = fdir.rstrip("/")
     pat = f"*_{det.lower()}_cal.fits" if det else "*_cal.fits"
-    if glob.glob(f"{fdir}/pipeline/{pat}"):
-        return f"{fdir}/pipeline"
-    return fdir
+    pipe = {os.path.basename(p) for p in glob.glob(f"{fdir}/pipeline/{pat}")}
+    flat = {os.path.basename(p) for p in glob.glob(f"{fdir}/{pat}")}
+    if not pipe:
+        return fdir
+    pipe_wins = len(pipe) >= len(flat)
+    chosen, served = (f"{fdir}/pipeline", pipe) if pipe_wins else (fdir, flat)
+    union = pipe | flat
+    if len(served) < len(union):
+        print(f"peppar_trigger: WARNING {fdir}"
+              f"{' ' + det.upper() if det else ''} splits across both layouts; "
+              f"{chosen} serves {len(served)} of {len(union)} cal files "
+              f"({len(union) - len(served)} exist only in the other layout)",
+              file=sys.stderr)
+    return chosen
 
 
 def field_for(program: str, obs: str, base: str = BASE) -> Optional[str]:
