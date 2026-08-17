@@ -1,30 +1,43 @@
 """Fan a peppar PSF-photometry job out per (filter, detector) for a GC observation.
 
 peppar (Matt Hosek's package, /blue/adamginsburg/adamginsburg/repos/peppar) does single-frame
-PSF photometry on the per-exposure ``*_cal.fits``.  This trigger enumerates the (filter,
-detector) combos that have cal files under ``/orange/adamginsburg/jwst/<field>/<FILT>/`` and
-submits ``run_peppar_generic.sbatch`` (env-driven) for each, one SLURM job per detector.
+PSF photometry on the per-exposure ``*_cal.fits``.  A "cal file" is one JWST stage-2
+calibrated product: a single exposure of a single detector in a single filter.  This trigger
+enumerates the (filter, detector) combos that have cal files under
+``/orange/adamginsburg/jwst/<field>/<FILT>/`` and submits ``run_peppar_generic.sbatch``
+(env-driven) for each, one SLURM job per detector.
 
 Two on-disk layouts hold the cal files (issue #73).  The reduction writes
 ``<field>/<FILT>/pipeline/*_cal.fits`` (``PipelineRerunNIRCAM-LONG.py`` outputs to
 ``{basepath}{filtername}/pipeline/``); older reductions left them flat at
-``<field>/<FILT>/*_cal.fits``, and many fields carry BOTH.  Census 2026-08-16 over the
-FILTER dirs of ``/orange/adamginsburg/jwst`` (flat/pipeline) --
+``<field>/<FILT>/*_cal.fits``, and many fields carry BOTH.  Census 2026-08-16 over
+``/orange/adamginsburg/jwst`` (flat/pipeline), FILTER-dir scope -- what
+``enumerate_filt_det`` sees, so what decides jobs --
 
   pipeline-only: arches 0/120, cloudc 0/556, cloudef 0/480, quintuplet 0/120, sgra 0/216,
                  sgrb2 0/1500, sgrc 0/242, sickle 0/309, w51 0/560, wd1 0/696, wd2 0/328
   both layouts:  brick 720/1296, gc2211 740/740, m92 80/80, ngc6334 1250/1250
 
-``field_for`` also scans non-filter subdirs, where m4 (150/150) and ngc6397 (120/120) add
-two more both-layout fields.  The two copies of one basename hold DIFFERENT bytes:
-``brick/F182M/jw02221001001_07101_00001_nrca1_cal.fits`` is 117538560 B at both paths, and
-the flat copy is dated 2022-12-31 against 2024-07-17 under ``pipeline/`` (md5 of the first
-MB differs), so preferring the ``pipeline/`` copy selects the newer reduction.
+``field_for`` matches ANY subdir, so in its wider scope brick becomes 1296/1296 (``dolphot/``
+adds 576 flat) and three more fields hold both -- m4 150/150 and ngc6397 120/120 (their cal
+files sit in ``F150W2``/``F322W2``) and w51 64/560 (64 flat in ``dolphot/``) -- for SEVEN
+both-layout fields.  ``field_for`` also sees the flat-only jw02731 760/0, jw02732 1058/0 and
+jwebbinar_prep 6/0, which no filter-dir census lists.
 
-Discovery unions the two layouts, counting a basename present in both once and preferring
-the ``pipeline/`` copy.  ``PEPPAR_DATA_DIR`` is resolved per (filter, DETECTOR) by
-``cal_data_dir`` -- a mid-migration filter dir can hold some detectors under ``pipeline/``
-while another is still flat, and the runner globs ``PEPPAR_DATA_DIR`` flat.
+Across the 3060 basename pairs present in both layouts, 1600 (52%, all of m4 / m92 /
+ngc6334 / ngc6397) are HARDLINKS -- one file with two names, where the choice of layout
+changes nothing.  The other 1460 (brick and gc2211) are separate files, and the ``pipeline/``
+copy is the newer one in all 1460: e.g.
+``brick/F182M/jw02221001001_07101_00001_nrca1_cal.fits`` is 117538560 B at both paths, dated
+2022-12-31 flat against 2024-07-17 under ``pipeline/``, with differing md5 over the first MB.
+So preferring ``pipeline/`` selects the newer reduction where the two differ at all.
+
+Discovery unions the two layouts, counting a basename present in both once.  The order
+``_cal_files`` returns is immaterial -- both callers use the result as a set of detectors.
+The copy that actually reaches peppar is chosen by ``cal_data_dir``, which resolves
+``PEPPAR_DATA_DIR`` per (filter, DETECTOR): the runner globs ``PEPPAR_DATA_DIR`` flat, so it
+sees one layout, and a mid-migration filter dir can hold some detectors under ``pipeline/``
+while another is still flat, preferring the ``pipeline/`` copy.
 
 Mirrors ``data_qa.pipeline_trigger``: DRY-RUN by default (prints the exact sbatch commands);
 ``--execute`` really submits.  In-flight dedup skips a (field, filter, detector) whose job is
@@ -60,8 +73,16 @@ _PEPPAR_SCRIPTS = os.path.join(_REPO_ROOT, "scripts", "peppar")
 SBATCH = os.path.join(_PEPPAR_SCRIPTS, "run_peppar_generic.sbatch")
 RUNNER = os.path.join(_PEPPAR_SCRIPTS, "run_peppar_generic.py")
 
-# a NIRCam detector token in a cal filename: nrca1..nrcb4 (SW) or nrcalong/nrcblong (LW)
+# A NIRCam detector token in a cal filename.  SW (short-wavelength channel) detectors are
+# nrca1..nrcb4; the LW (long-wavelength) channel is one detector per module, nrcalong /
+# nrcblong.
 _DET_RE = re.compile(r"_(nrc[ab](?:[1-4]|long))_cal\.fits$", re.I)
+
+# A filter-dir name.  This rejects the NIRCam wide filters F150W2 / F322W2 (trailing "2"),
+# which is why m4 and ngc6397 -- whose cal files live in F150W2/ and F322W2/ -- resolve as
+# fields and then enumerate nothing.  Widening it is issue #82, a separate change: it turns
+# two fields that emit no peppar job today into fields that emit one per detector.
+_FILT_RE = re.compile(r"F\d{3,4}[WNM]", re.I)
 
 
 def _cal_files(fdir: str, stem: str = "") -> List[str]:
@@ -116,7 +137,7 @@ def enumerate_filt_det(field: str, base: str = BASE) -> Dict[str, List[str]]:
     out: Dict[str, set] = {}
     for fdir in sorted(glob.glob(f"{base}/{field}/*/")):
         filt = os.path.basename(fdir.rstrip("/"))
-        if not re.fullmatch(r"F\d{3,4}[WNM]", filt, re.I):     # only filter dirs
+        if not _FILT_RE.fullmatch(filt):                       # only filter dirs
             continue
         dets = set()
         for p in _cal_files(fdir):
@@ -125,6 +146,20 @@ def enumerate_filt_det(field: str, base: str = BASE) -> Dict[str, List[str]]:
                 dets.add(m.group(1).upper())
         if dets:
             out[filt.upper()] = sorted(dets)
+    return out
+
+
+def nonfilter_cal_dirs(field: str, base: str = BASE) -> List[str]:
+    """Subdir names under the field that hold ``*_cal.fits`` (either layout) and are NOT
+    filter dirs by ``_FILT_RE``.  These are the reason a field can resolve in ``field_for``
+    -- which matches any subdir -- and then enumerate nothing: ``dolphot/`` (brick, w51) or
+    the wide-filter dirs ``F150W2``/``F322W2`` (m4, ngc6397).  Named in the no-jobs error so
+    it reports the pattern rather than reading as "no data on disk"."""
+    out = []
+    for fdir in sorted(glob.glob(f"{base}/{field}/*/")):
+        name = os.path.basename(fdir.rstrip("/"))
+        if not _FILT_RE.fullmatch(name) and _cal_files(fdir):
+            out.append(name)
     return out
 
 
@@ -169,8 +204,14 @@ def build_jobs(program: str, obs: str, field: Optional[str] = None,
             jobs.append(dict(field=field, filt=filt, det=det, data_dir=data_dir,
                              stf_dir=stf_dir, name=job_name(field, filt, det)))
     if not jobs and not (filters or dets):
-        raise SystemExit(f"peppar_trigger: field {field} under {base} has no filter dir "
-                         f"holding NIRCam *_cal.fits (checked both layouts)")
+        msg = (f"peppar_trigger: field {field} under {base} has no filter dir "
+               f"holding NIRCam *_cal.fits (checked both layouts)")
+        other = nonfilter_cal_dirs(field, base)
+        if other:
+            msg += (f"; these subdirs DO hold cal files and are skipped because their "
+                    f"name fails the filter-dir pattern {_FILT_RE.pattern}: "
+                    + ", ".join(other))
+        raise SystemExit(msg)
     return jobs
 
 

@@ -98,6 +98,37 @@ def test_pipeline_layout_is_obs_stem_scoped(tmp_path):
     assert ppt.field_for("1182", "001", base=str(tmp_path)) is None
 
 
+def test_stem_is_obs_scoped_in_both_layouts(tmp_path):
+    """The OBS half of the ``jw<program><obs>`` stem discriminates too, in both layouts.
+
+    Three real programs have cal files under more than one field dir, and for two of them
+    the obs token is the only discriminator: jw02045 o001 is arches while o003 is
+    quintuplet, jw01979 o001 is ngc6397 while o002 is m4.  ``field_for`` walks fields in
+    sorted order, so dropping ``{obs}`` from the stem returns the alphabetically first
+    field of the program -- arches for 2045/003 and m4 for 1979/001 -- and fans every
+    peppar job out over the wrong field with no error and a populated data_dir.
+
+    Both fixtures mirror that live geometry: the pipeline-layout pair for the pipeline
+    glob, the flat-layout pair for the flat one.
+    """
+    make_field(tmp_path, "arches", "F212N", ["nrca1"], "pipeline", program_obs="02045001")
+    make_field(tmp_path, "quintuplet", "F212N", ["nrca1"], "pipeline",
+               program_obs="02045003")
+    make_field(tmp_path, "m4", "F212N", ["nrca1"], "flat", program_obs="01979002")
+    make_field(tmp_path, "ngc6397", "F212N", ["nrca1"], "flat", program_obs="01979001")
+    # sorted() order is what an unscoped glob would return, so pin it
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "arches", "m4", "ngc6397", "quintuplet"]
+    # pipeline layout: same program, obs alone decides
+    assert ppt.field_for("2045", "001", base=str(tmp_path)) == "arches"
+    assert ppt.field_for("2045", "003", base=str(tmp_path)) == "quintuplet"
+    # flat layout: same program, obs alone decides
+    assert ppt.field_for("1979", "002", base=str(tmp_path)) == "m4"
+    assert ppt.field_for("1979", "001", base=str(tmp_path)) == "ngc6397"
+    # an obs of a program that is present resolves to nothing when that obs is not
+    assert ppt.field_for("2045", "007", base=str(tmp_path)) is None
+
+
 def test_mixed_within_filter_dir_dedupes_and_unions(tmp_path):
     """Both layouts inside ONE filter dir: a file in both (same basename) is counted
     once, and a flat-only file still contributes its detector."""
@@ -154,3 +185,24 @@ def test_field_with_cal_files_only_outside_filter_dirs_raises(tmp_path):
     # an explicit --filters/--dets subset that matches nothing stays a quiet empty list
     assert ppt.build_jobs(PROGRAM, OBS, field="w51", filters=["F212N"],
                           base=str(tmp_path)) == []
+
+
+def test_no_jobs_error_names_the_skipped_dirs(tmp_path):
+    """m4 and ngc6397 keep their cal files in F150W2/ and F322W2/; the trailing "2" fails
+    the filter-dir pattern, so they resolve as fields and enumerate nothing.  The error
+    must name those dirs and the pattern -- otherwise it reads as "no data on disk" while
+    the data is there."""
+    make_field(tmp_path, "m4", "F150W2", ["nrca1"], "pipeline")
+    make_field(tmp_path, "m4", "F322W2", ["nrcalong"], "flat")
+    assert ppt.enumerate_filt_det("m4", base=str(tmp_path)) == {}
+    assert ppt.nonfilter_cal_dirs("m4", base=str(tmp_path)) == ["F150W2", "F322W2"]
+    with pytest.raises(SystemExit) as ei:
+        ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    msg = str(ei.value)
+    assert "F150W2" in msg and "F322W2" in msg
+    assert ppt._FILT_RE.pattern in msg
+    # it reports only the dirs the pattern rejects: a real filter dir alongside a
+    # dolphot/ one leaves just dolphot
+    make_field(tmp_path, "brick", "F212N", ["nrca1"], "pipeline")
+    make_field(tmp_path, "brick", "dolphot", ["nrca1"], "flat")
+    assert ppt.nonfilter_cal_dirs("brick", base=str(tmp_path)) == ["dolphot"]

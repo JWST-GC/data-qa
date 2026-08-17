@@ -15,7 +15,8 @@ The PSF / detection / fitting parameters are copied verbatim from Matt Hosek's w
 Environment variables:
     PEPPAR_DATA_DIR   required  dir holding the per-exposure ``*_cal.fits``, globbed FLAT.
                                 Our layout has two forms and ``data_qa.peppar_trigger``
-                                passes the one holding THIS detector's files:
+                                passes the one holding THIS detector's files -- the side
+                                holding more of them when both do:
                                 /orange/adamginsburg/jwst/<field>/<FILT>/pipeline/ (what
                                 the reduction writes) or the legacy flat
                                 /orange/adamginsburg/jwst/<field>/<FILT>/
