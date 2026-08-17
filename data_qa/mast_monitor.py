@@ -43,7 +43,10 @@ Safety gates on acting runs (--auto, or --download/--trigger with --execute):
     ``triggered`` map marks the obs as already submitted (the map is written
     immediately on every successful submission -- with the sbatch job ids --
     even when the event state is not committed, so a partial failure cannot
-    double-submit; re-arm with ``--rearm <program>-o<obs>``).
+    double-submit; re-arm with ``--rearm <program>-o<obs>``).  ARMED = the obs
+    has no key in that map, so the monitor is allowed to fire its one-shot
+    action for it; recording the key DISARMS (burns) it, and --rearm deletes
+    the key to arm it again.
   * REGISTRY PREFLIGHT (--trigger): pipeline_trigger.build_plan verifies the
     obs is registered in the pipeline's fields.yaml BEFORE any sbatch; an
     unregistered obs prints SKIPPED(not-registered) and the one-shot key
@@ -418,15 +421,31 @@ def prune_state_backups(path, today=None, keep_days=BACKUP_KEEP_DAYS):
 
 def backup_state(path, today=None) -> Optional[str]:
     """Copy the existing state file to ``<path>.bak-YYYYMMDD`` before a write:
-    ONE backup per day (later same-day writes overwrite it), pruned beyond
-    BACKUP_KEEP_DAYS.  Returns the backup path (None when there is nothing on
-    disk to back up)."""
+    ONE backup per day, the FIRST write of that day, so the sibling holds the
+    state as it stood before today's run touched it.  A later same-day write
+    keeps that first snapshot -- refreshing it would converge the "backup" on
+    the current state (``_record_state_key`` writes once per recorded key, so a
+    single run writes several times) and leave nothing to restore from.
+    Returns the backup path (None when there is nothing on disk to back up).
+
+    The copy goes to a tmp sibling and is renamed into place, so an interrupted
+    copy (ENOSPC, RLIMIT_FSIZE) cannot leave a truncated file sitting at
+    exactly the path a restore would use."""
     if not os.path.exists(path):
         return None
     today = today or datetime.date.today()
     bak = f"{path}.bak-{today.strftime('%Y%m%d')}"
-    shutil.copy2(path, bak)
-    prune_state_backups(path, today=today)
+    if os.path.isfile(bak):
+        return bak
+    tmp = f"{bak}.tmp.{os.getpid()}"
+    try:
+        shutil.copy2(path, tmp)
+        os.replace(tmp, bak)
+    finally:
+        try:
+            os.unlink(tmp)          # no-op on success: os.replace consumed it
+        except FileNotFoundError:
+            pass
     return bak
 
 
@@ -437,13 +456,21 @@ def save_state(path, state: dict):
     ``.bak-YYYYMMDD`` sibling (backup_state); a backup that CANNOT be written
     (read-only or foreign-owned leftover, ENOSPC) warns and the write PROCEEDS
     -- the backup is a convenience, while a lost write loses a just-recorded
-    trigger key and re-submits that observation on the next poll."""
+    trigger key and re-submits that observation on the next poll.  Pruning old
+    backups is reported separately: a prune that fails says so, instead of
+    claiming the backup failed when it succeeded."""
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     try:
         backup_state(path)
     except OSError as ex:
         print(f"mast_monitor: state backup FAILED for {path} "
+              f"({ex.__class__.__name__}: {ex}); writing the new state anyway",
+              file=sys.stderr)
+    try:
+        prune_state_backups(path)
+    except OSError as ex:
+        print(f"mast_monitor: pruning old state backups FAILED for {path} "
               f"({ex.__class__.__name__}: {ex}); writing the new state anyway",
               file=sys.stderr)
     tmp = f"{path}.tmp.{os.getpid()}"
@@ -583,19 +610,29 @@ def retire_downgrade_memo(state: dict, notice: Optional[str]) -> dict:
     return state
 
 
-# '<program>-o<obs>', where <obs> may be a joint token ('001-002') -- the same
-# grammar pipeline_trigger._OBS_TOKEN_RE accepts, so every key the monitor can
-# write is addressable by --rearm
-_REARM_RE = re.compile(r"(\d+)-o(\d+(?:-\d+)*)")
+# An observation token: 1-4 digits, optionally '-'-joined.  A JOINT token
+# ('001-002') names several observations cataloged as one unit -- Sgr B2's MIRI
+# 002 and 998 tile one field between them, so they are reduced and cataloged
+# together and the state file keys them as one.  SINGLE SOURCE of the grammar:
+# pipeline_trigger imports this pattern for the obs token it interpolates into
+# its preflight -c code, so every key the monitor can write is addressable by
+# --rearm.  '[0-9]' rather than '\d' (which also matches Arabic-Indic digits)
+# and a length bound, on both sides.
+OBS_TOKEN_PATTERN = r"[0-9]{1,4}(?:-[0-9]{1,4})*"
+# '<program>-o<obs>' as --rearm spells it
+_REARM_RE = re.compile(rf"([0-9]+)-o({OBS_TOKEN_PATTERN})")
 
 
 def rearm(state_path, spec: str, include_download=False) -> int:
     """--rearm PROGRAM-oNNN: delete the one-shot ``triggered`` key (and, with
     ``include_download``, the obs's ``downloaded`` keys) so the next poll may
-    act again -- the sanctioned replacement for hand-editing the state file.
-    Prints every removed entry; REFUSES (rc 1) on a malformed spec or when
-    nothing matches, so a typo cannot silently 'succeed'.  Returns a process
-    return code."""
+    act again -- the observation goes back to ARMED, the state in which the
+    monitor is allowed to fire its one-shot action for it.  The sanctioned
+    replacement for hand-editing the state file.  Prints every removed entry;
+    REFUSES (rc 1) on a malformed spec or when nothing matches, so a typo
+    cannot silently 'succeed' (which also makes it non-idempotent: a second
+    --rearm of the same observation exits 1).  Returns a process return
+    code."""
     m = _REARM_RE.fullmatch(spec or "")
     if not m:
         print(f"--rearm: REFUSED: {spec!r} does not look like "
@@ -609,8 +646,12 @@ def rearm(state_path, spec: str, include_download=False) -> int:
         removed.append(("triggered", key, trig.pop(key)))
     if include_download:
         dl = state.get("downloaded", {})
-        # downloaded keys are instrument-qualified: '<program>-o<obs>-<instr>'
-        for dkey in [k for k in sorted(dl) if k.startswith(key + "-")]:
+        # downloaded keys are instrument-qualified: '<program>-o<obs>-<instr>',
+        # and an instrument name carries no '-' while a JOINT obs token does --
+        # so match the suffix exactly, or '--rearm 2221-o001 --rearm-download'
+        # would also clear the SEPARATE observation '2221-o001-002'
+        dl_re = re.compile(re.escape(key) + r"-[A-Za-z0-9]+")
+        for dkey in [k for k in sorted(dl) if dl_re.fullmatch(k)]:
             removed.append(("downloaded", dkey, dl.pop(dkey)))
     if not removed:
         print(f"--rearm: REFUSED: no triggered"
@@ -1038,7 +1079,9 @@ def main(argv=None):
                     help="delete the one-shot 'triggered' key for the given "
                          "observation (e.g. --rearm 10678-o001) so the next "
                          "poll may submit it again; prints what was removed, "
-                         "refuses when nothing matches.  Exits without "
+                         "refuses (rc 1) when nothing matches -- so a repeat "
+                         "of the same --rearm also exits 1, which an '&&' "
+                         "chain will read as a failure.  Exits without "
                          "polling MAST.")
     ap.add_argument("--rearm-download", action="store_true",
                     help="with --rearm: also delete the obs's 'downloaded' "

@@ -60,6 +60,29 @@ that already exists.
 - Deployment: **scrontab** entry (template in `docs/scrontab.example`),
   daily; SLURM conventions `astronomy-dept-b`.
 
+#### One-shot action keys, `--rearm`, and the state backups (issue #68)
+- The state file's `triggered` map holds one key per submitted observation
+  (`<program>-o<obs>` → `{"when", "jobids"}`), and `downloaded` one per
+  instrument-qualified download (`<program>-o<obs>-<instrument>`). An
+  observation with no key is **armed**: the monitor may fire its one-shot
+  action for it. Recording the key burns it.
+- Re-arm a burned observation with
+  `python -m data_qa.mast_monitor --rearm <program>-o<obs>` (add
+  `--rearm-download` to clear its download keys too). It prints every entry it
+  removed, exits without polling MAST, and refuses (rc 1) on a typo or when
+  nothing matches — so a repeated `--rearm` exits 1 as well. This replaces
+  hand-editing the state file.
+- `--trigger` runs a **registry preflight** before any sbatch: an observation
+  absent from the pipeline's `fields.yaml` prints `SKIPPED(not-registered)` and
+  keeps its key armed for the poll after the registration lands. The check
+  FAILS OPEN — a broken pipeline env, a timeout, or a verdict reached from a
+  checkout other than the one being submitted against warns on stderr and
+  proceeds, so one broken environment cannot silence every trigger.
+- Every state write first copies the previous file to a dated
+  `<state>.bak-YYYYMMDD` sibling (the first write of each day, kept 14 days),
+  so `/orange/adamginsburg/jwst/ops/` carries up to 14 such files. A backup
+  that cannot be written warns and the state write proceeds.
+
 ### 2. `data_qa/pipeline_trigger.py` — reduction + cataloging submission
 - Maps program/obs → field/target/filters through `mast_monitor.field_for`
   (the `PROGRAMS` table). `PROGRAMS` mirrors the pipeline's field registry

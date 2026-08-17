@@ -9,6 +9,7 @@ import subprocess
 
 import pytest
 
+from data_qa import mast_monitor as mm
 from data_qa import pipeline_policy as pp
 from data_qa import pipeline_trigger as pt
 
@@ -584,10 +585,16 @@ def test_dry_run_no_probe_flag(tmp_path, monkeypatch, capsys):
 
 
 # ------------------------------------------------- registry preflight (issue #68)
-def _fake_python(tmp_path, body):
-    """An executable stand-in for the pipeline env python."""
+def _fake_python(tmp_path, body, module="/pipe/jwst_gc_pipeline/fields.py"):
+    """An executable stand-in for the pipeline env python.  It announces the
+    fields module it 'imported' first, as the real preflight code does; pass
+    ``module=None`` for a child that never got that far (an import failure)."""
+    lines = ["#!/bin/sh"]
+    if module:
+        lines.append(f'echo "{pt._MODULE_MARK}{module}" >&2')
+    lines.append(body)
     script = tmp_path / "fakepython"
-    script.write_text("#!/bin/sh\n" + body + "\n")
+    script.write_text("\n".join(lines) + "\n")
     script.chmod(0o755)
     return str(script)
 
@@ -632,8 +639,10 @@ def test_registry_preflight_broken_check_fails_open(tmp_path, capsys, body, tell
     """ONLY rc 3 blocks.  A pipeline env that cannot import (conda update,
     half-installed dependency, bad PYTHONPATH) or a killed subprocess must NOT
     be reported as 'not registered' -- that would silence EVERY trigger, for
-    every already-registered program, on every poll until the env is repaired."""
-    py = _fake_python(tmp_path, body)
+    every already-registered program, on every poll until the env is repaired.
+    The rc verdict is read BEFORE the registry-provenance check, so a child
+    that died before naming its fields module still reports the rc."""
+    py = _fake_python(tmp_path, body, module=None)
     assert _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py) is None
     err = capsys.readouterr().err
     assert "FAILED to reach a verdict" in err and "fail-open" in err
@@ -654,9 +663,12 @@ def test_registry_preflight_child_code_matches_the_real_registry(tmp_path):
         _REAL_PREFLIGHT(99999, "001", pipe_root=pipe_root, python=py)
 
 
-def test_registry_preflight_registered_passes(tmp_path):
+def test_registry_preflight_registered_passes(tmp_path, capsys):
+    """A clean pass is SILENT: any warning here would print on every poll for
+    every registered observation, which is how a fail-open branch hides."""
     py = _fake_python(tmp_path, "exit 0")
     assert _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py) is None
+    assert capsys.readouterr().err == ""
 
 
 def test_registry_preflight_timeout_fails_open(tmp_path, capsys):
@@ -700,6 +712,102 @@ def test_registry_preflight_rejects_trailing_newline_obs_token(tmp_path):
 def test_registry_preflight_accepts_joint_obs_token(tmp_path):
     _REAL_PREFLIGHT(2221, "001-002", pipe_root="/pipe",
                     python=_fake_python(tmp_path, "exit 0"))
+
+
+def test_obs_token_grammar_is_shared_with_rearm():
+    """--rearm must be able to address every key the preflight lets the monitor
+    write, so the two validators are ONE pattern ('\\d' is Unicode-aware and
+    unbounded; '[0-9]{1,4}' is neither, and they used to disagree)."""
+    assert pt._OBS_TOKEN_RE.pattern == mm.OBS_TOKEN_PATTERN
+    for token, ok in [("001", True), ("001-002", True), ("1", True),
+                      ("00001", False), ("12345", False), ("١٢٣", False),
+                      ("001\n", False), ("001x", False), ("-001", False)]:
+        assert bool(pt._OBS_TOKEN_RE.fullmatch(token)) is ok, token
+        assert bool(mm._REARM_RE.fullmatch(f"2221-o{token}")) is ok, token
+
+
+def test_registry_preflight_verdict_from_another_checkout_fails_open(tmp_path,
+                                                                     capsys):
+    """jwst_gc_pipeline is pip-installed in the pipeline env, so a pipe_root
+    holding no importable package leaves the PYTHONPATH prepend inert and the
+    INSTALLED registry answers.  A refusal naming a checkout it never consulted
+    is not a verdict: warn and proceed."""
+    py = _fake_python(tmp_path, f"exit {pt.PREFLIGHT_NOT_REGISTERED_RC}",
+                      module="/somewhere/else/jwst_gc_pipeline/fields.py")
+    assert _REAL_PREFLIGHT(10678, "001", pipe_root="/pipe", python=py) is None
+    err = capsys.readouterr().err
+    assert "/somewhere/else" in err and "not under /pipe" in err
+    assert "fail-open" in err
+
+
+def test_registry_preflight_unidentified_registry_fails_open(tmp_path, capsys):
+    """A child that exits 3 without naming the fields module it imported has
+    not answered the protocol -- rc alone must not block."""
+    py = _fake_python(tmp_path, f"exit {pt.PREFLIGHT_NOT_REGISTERED_RC}",
+                      module=None)
+    assert _REAL_PREFLIGHT(10678, "001", pipe_root="/pipe", python=py) is None
+    assert "unidentified registry" in capsys.readouterr().err
+
+
+def test_registry_preflight_verdict_quotes_the_registrys_own_line(tmp_path):
+    """The child's stderr also carries whatever the pipeline import printed
+    (deprecation warnings, CRDS chatter); the raised message quotes the MARKED
+    verdict line, not the last thing on stderr."""
+    py = _fake_python(
+        tmp_path,
+        'echo "REGISTRY-VERDICT: KeyError: proposal 10678 not in fields.yaml" >&2\n'
+        'echo "WARNING: some astropy deprecation" >&2\n'
+        f"exit {pt.PREFLIGHT_NOT_REGISTERED_RC}")
+    with pytest.raises(pt.NotRegisteredInPipelineError) as ex:
+        _REAL_PREFLIGHT(10678, "001", pipe_root="/pipe", python=py)
+    assert "not in fields.yaml" in str(ex.value)
+    assert "deprecation" not in str(ex.value)
+
+
+def _real_pipeline_env():
+    return (os.path.exists(pt.DEFAULT_PIPELINE_PYTHON)
+            and os.path.isdir(pt.DEFAULT_PIPE_ROOT))
+
+
+def test_preflight_child_code_fails_open_on_a_broken_checkout(tmp_path, capsys):
+    """The child's ``from jwst_gc_pipeline import fields`` sits OUTSIDE its try
+    so an ImportError is rc 1 (fail-open), never a verdict.  Run the REAL
+    _PREFLIGHT_CODE through the real interpreter against a checkout whose
+    package cannot import: moving that import inside the try and widening the
+    except would otherwise turn a broken env into 'not registered' with a green
+    suite."""
+    if not os.path.exists(pt.DEFAULT_PIPELINE_PYTHON):
+        pytest.skip("pipeline env python not on this host")
+    pkg = tmp_path / "jwst_gc_pipeline"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("import definitely_not_a_real_module\n")
+    (pkg / "fields.py").write_text("raise AssertionError('never reached')\n")
+    assert _REAL_PREFLIGHT(2221, "001", pipe_root=str(tmp_path),
+                           python=pt.DEFAULT_PIPELINE_PYTHON) is None
+    err = capsys.readouterr().err
+    assert "FAILED to reach a verdict" in err and "fail-open" in err
+    assert "definitely_not_a_real_module" in err
+    assert "not registered" not in err
+
+
+def test_preflight_instrument_selects_the_registry_section():
+    """Joint obs tokens are a MIRI reality (sgrb2 5365 '002-998'); the nircam
+    section answers 'not registered' for them, so the section the preflight
+    asks must be selectable."""
+    if not _real_pipeline_env():
+        pytest.skip("pipeline env/checkout not on this host")
+    kw = dict(pipe_root=pt.DEFAULT_PIPE_ROOT, python=pt.DEFAULT_PIPELINE_PYTHON)
+    assert _REAL_PREFLIGHT(5365, "002-998", instrument="miri", **kw) is None
+    with pytest.raises(pt.NotRegisteredInPipelineError, match=r"\(nircam\)"):
+        _REAL_PREFLIGHT(5365, "002-998", instrument="nircam", **kw)
+
+
+def test_registry_preflight_rejects_weird_instrument(tmp_path):
+    """The instrument is interpolated into the -c code too."""
+    with pytest.raises(ValueError, match="instrument"):
+        _REAL_PREFLIGHT(2221, "001", instrument="nircam'; import os",
+                        pipe_root="/pipe",
+                        python=_fake_python(tmp_path, "exit 0"))
 
 
 # ----------------------------------------------------- jobid capture (issue #68)

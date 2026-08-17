@@ -43,7 +43,7 @@ import sys
 from typing import Dict, List, Optional
 
 from . import pipeline_policy
-from .mast_monitor import GC_FIELDS, field_for
+from .mast_monitor import GC_FIELDS, OBS_TOKEN_PATTERN, field_for
 
 #: single home for the pipe-root default (pipeline_policy owns it; re-exported
 #: here so the trigger's callers and CLI keep the historical name)
@@ -66,12 +66,17 @@ DEFAULT_PIPELINE_PYTHON = ("/blue/adamginsburg/adamginsburg/miniconda3/envs/"
                            "python313/bin/python")
 PREFLIGHT_TIMEOUT_S = 30
 
-# obs tokens are digits, optionally '-'-joined ('001-002' names a joint
-# observation); anything else must never be interpolated into the -c code.
+# obs tokens are digits, optionally '-'-joined ('001-002' names a JOINT
+# observation: several observations cataloged as one unit); anything else must
+# never be interpolated into the -c code.  The pattern is imported from
+# mast_monitor so --rearm and this validator share ONE grammar (they used to
+# drift: '\d+' is Unicode-aware and unbounded, '[0-9]{1,4}' is neither).
 # fullmatch, not match+'$': '$' also matches before a trailing newline, and
 # '001\n' would reach the -c code as a syntax error (rc 1) instead of a
 # rejected token.
-_OBS_TOKEN_RE = re.compile(r"[0-9]{1,4}(-[0-9]{1,4})*")
+_OBS_TOKEN_RE = re.compile(OBS_TOKEN_PATTERN)
+# instruments name a fields.yaml section ('nircam'/'miri'/...); same reasoning
+_INSTRUMENT_RE = re.compile(r"[a-z]{2,10}")
 
 # The child answers with a STATUS, not merely non-zero: only rc 3 is the
 # registry's own verdict ("this observation is not in fields.yaml").  Any other
@@ -82,17 +87,30 @@ _OBS_TOKEN_RE = re.compile(r"[0-9]{1,4}(-[0-9]{1,4})*")
 # registered program, on every poll.
 PREFLIGHT_NOT_REGISTERED_RC = 3
 _VERDICT_MARK = "REGISTRY-VERDICT: "
+# The child also names the fields module it actually imported: jwst_gc_pipeline
+# is pip-installed in the pipeline env, so a pipe_root holding no importable
+# package leaves the PYTHONPATH prepend inert and the INSTALLED registry
+# answers -- a verdict from a checkout other than the one the error message
+# names.  The parent verifies the reported path lies under pipe_root and fails
+# open when it does not.
+_MODULE_MARK = "REGISTRY-MODULE: "
 _PREFLIGHT_CODE = (
     # the import sits OUTSIDE the try on purpose: an ImportError here is a
     # broken check (rc 1 -> fail-open), never a registry verdict
-    "import sys\n"
+    "import os, sys\n"
     "from jwst_gc_pipeline import fields\n"
+    "sys.stderr.write('{modmark}%s\\n' % (os.path.realpath(fields.__file__),))\n"
     "try:\n"
-    "    fields.target_for_obsid('{program}', '{obs}')\n"
+    "    fields.target_for_obsid('{program}', '{obs}', instrument='{instrument}')\n"
     "except (KeyError, fields.FieldRegistryError) as ex:\n"
     "    sys.stderr.write('{mark}%s\\n' % (ex,))\n"
     "    sys.exit({rc})\n"
 )
+
+
+def _marked(lines, mark) -> List[str]:
+    """The payloads of the child's ``<MARK>...`` protocol lines."""
+    return [ln[len(mark):] for ln in lines if ln.startswith(mark)]
 
 
 class NotRegisteredInPipelineError(RuntimeError):
@@ -102,30 +120,42 @@ class NotRegisteredInPipelineError(RuntimeError):
 
 
 def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
-                       timeout_s=PREFLIGHT_TIMEOUT_S):
+                       timeout_s=PREFLIGHT_TIMEOUT_S, instrument="nircam"):
     """Verify (program, obs) is registered in the pipeline's fields.yaml BEFORE
     any sbatch; raises NotRegisteredInPipelineError when it is not.
 
     ``pipe_root`` fronts PYTHONPATH so the checkout being submitted against is
     the one consulted; the interpreter is ``python`` / $PIPELINE_PYTHON /
-    DEFAULT_PIPELINE_PYTHON.
+    DEFAULT_PIPELINE_PYTHON.  ``instrument`` selects the fields.yaml section --
+    joint obs tokens ('002-998') exist under miri, and the nircam section
+    answers "not registered" for them.
 
     ONLY the child's rc 3 (PREFLIGHT_NOT_REGISTERED_RC, written by the child
-    when target_for_obsid raises KeyError/FieldRegistryError) blocks.  Every
-    other failure mode -- subprocess TIMEOUT, an interpreter that cannot start,
-    and any other non-zero rc (import failure in a half-installed env, OOM
-    kill) -- warns and PROCEEDS.  All of them mean the CHECK is broken, and a
-    broken check must not silence real triggers: a false skip leaves delivered
-    data unreduced with no error recorded anywhere and the operator pointed at
-    a registration that is already correct, while proceeding reproduces the
-    pre-preflight burn-on-submit behaviour for that one observation."""
+    when target_for_obsid raises KeyError/FieldRegistryError) blocks, and only
+    when the child reports importing the fields module from UNDER pipe_root.
+    Every other outcome -- subprocess TIMEOUT, an interpreter that cannot
+    start, any other non-zero rc (import failure in a half-installed env, OOM
+    kill), and a verdict reached from a registry outside pipe_root -- warns and
+    PROCEEDS.  All of them mean the CHECK is broken, and a broken check must
+    not silence real triggers: a false skip leaves delivered data unreduced
+    with no error recorded anywhere and the operator pointed at a registration
+    that is already correct, while proceeding reproduces the pre-preflight
+    burn-on-submit behaviour for that one observation."""
     obs_token = str(obs)
     if not _OBS_TOKEN_RE.fullmatch(obs_token):
-        raise ValueError(f"obs {obs!r} is not a plausible observation token")
+        raise ValueError(
+            f"obs {obs!r} is not a plausible observation token "
+            "(1-4 digits, optionally '-'-joined for a joint observation, "
+            "e.g. '001' or '001-002')")
+    instrument = str(instrument).lower()
+    if not _INSTRUMENT_RE.fullmatch(instrument):
+        raise ValueError(f"instrument {instrument!r} is not a plausible "
+                         "instrument name (lowercase letters, e.g. 'nircam')")
     python = (python or os.environ.get("PIPELINE_PYTHON")
               or DEFAULT_PIPELINE_PYTHON)
     code = _PREFLIGHT_CODE.format(program=int(program), obs=obs_token,
-                                  mark=_VERDICT_MARK,
+                                  instrument=instrument, mark=_VERDICT_MARK,
+                                  modmark=_MODULE_MARK,
                                   rc=PREFLIGHT_NOT_REGISTERED_RC)
     env = dict(os.environ)
     env["PYTHONPATH"] = pipe_root + os.pathsep + env.get("PYTHONPATH", "")
@@ -144,24 +174,38 @@ def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
               "registry check (fail-open, same rationale as the timeout)",
               file=sys.stderr)
         return
-    if proc.returncode == 0:
-        return
-    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-    if proc.returncode != PREFLIGHT_NOT_REGISTERED_RC:
+    lines = [ln.strip() for ln
+             in ((proc.stderr or "") + (proc.stdout or "")).splitlines()
+             if ln.strip()]
+    if proc.returncode not in (0, PREFLIGHT_NOT_REGISTERED_RC):
         # the check itself broke -> fail open (see the docstring)
-        raise_line = tail[-1] if tail else "no output"
+        plain = [ln for ln in lines
+                 if not ln.startswith((_VERDICT_MARK, _MODULE_MARK))]
+        raise_line = plain[-1] if plain else "no output"
         print(f"pipeline_trigger: registry preflight FAILED to reach a verdict "
               f"for program {int(program)} obs {obs_token} (rc="
               f"{proc.returncode}: {raise_line}); proceeding WITHOUT the "
               "registry check (fail-open: a broken pipeline env must not "
               "silence real triggers)", file=sys.stderr)
         return
-    verdict = [ln for ln in tail if ln.startswith(_VERDICT_MARK)]
-    detail = (verdict[-1][len(_VERDICT_MARK):] if verdict
-              else (tail[-1] if tail else ""))
+    consulted = ([""] + _marked(lines, _MODULE_MARK))[-1]
+    root = os.path.realpath(pipe_root)
+    if not (consulted == root or consulted.startswith(root + os.sep)):
+        # the answer came from a registry other than the checkout being
+        # submitted against (pip-installed package, inert PYTHONPATH prepend)
+        print(f"pipeline_trigger: registry preflight consulted "
+              f"{consulted or 'an unidentified registry'}, which is not under "
+              f"{pipe_root}; proceeding WITHOUT the registry check (fail-open: "
+              "a verdict must come from the checkout being submitted against)",
+              file=sys.stderr)
+        return
+    if proc.returncode == 0:
+        return
+    verdict = _marked(lines, _VERDICT_MARK)
+    detail = verdict[-1] if verdict else ""
     raise NotRegisteredInPipelineError(
-        f"program {int(program)} obs {obs_token} is not registered in the "
-        f"pipeline at {pipe_root} (fields.target_for_obsid"
+        f"program {int(program)} obs {obs_token} ({instrument}) is not "
+        f"registered in the pipeline at {pipe_root} (fields.target_for_obsid"
         + (f": {detail}" if detail else "") + ")")
 
 

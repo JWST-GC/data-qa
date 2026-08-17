@@ -523,6 +523,25 @@ def test_rearm_refuses_malformed_spec(tmp_path, capsys):
     assert "REFUSED" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("spec", [
+    "2221-o001\n",                  # '$' would accept a trailing newline
+    "2221-o001 --and-something",
+    "2221-o001; rm -rf /",
+    "2221-o001WRONG",
+])
+def test_rearm_refuses_a_spec_with_trailing_junk(tmp_path, capsys, spec):
+    """fullmatch, not match: the operator gets a refusal on a mistyped spec
+    instead of a silent re-arm of whatever prefix happened to parse."""
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {
+        "version": 1, "programs": {},
+        "triggered": {"2221-o001": {"when": "2026-08-16 00:00 UTC",
+                                    "jobids": []}}})
+    assert mm.main(["--rearm", spec, "--state", state_path]) == 1
+    assert "REFUSED" in capsys.readouterr().err
+    assert "2221-o001" in mm.load_state(state_path)["triggered"]
+
+
 def test_rearm_download_also_clears_download_keys(tmp_path, capsys):
     """--rearm-download clears the obs's instrument-qualified downloaded keys
     too; other observations' keys stay."""
@@ -545,6 +564,39 @@ def test_rearm_download_also_clears_download_keys(tmp_path, capsys):
     assert st["downloaded"] == {"2221-o001-NIRCam": "keep-me"}
 
 
+def test_rearm_download_does_not_reach_a_joint_observation(tmp_path, capsys):
+    """A downloaded key is instrument-qualified ('...-NIRCam', no '-'), while a
+    JOINT obs token carries one, so '2221-o001' must not sweep up the separate
+    observation '2221-o001-002'.  Joint obsids are real (sgrb2 5365 MIRI
+    '002-998', sickle 3958 MIRI '001-002')."""
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {
+        "version": 1, "programs": {},
+        "triggered": {"2221-o001": {"when": "2026-08-16 00:00 UTC",
+                                    "jobids": []}},
+        "downloaded": {"2221-o001-NIRCam": "mine",
+                       "2221-o001-002-NIRCam": "another observation"}})
+    assert mm.main(["--rearm", "2221-o001", "--rearm-download",
+                    "--state", state_path]) == 0
+    assert mm.load_state(state_path)["downloaded"] == {
+        "2221-o001-002-NIRCam": "another observation"}
+
+
+def test_rearm_download_reaches_the_joint_observations_own_keys(tmp_path):
+    """...and naming the joint token clears exactly its own keys."""
+    state_path = str(tmp_path / "state.json")
+    mm.save_state(state_path, {
+        "version": 1, "programs": {},
+        "triggered": {"2221-o001-002": {"when": "2026-08-16 00:00 UTC",
+                                        "jobids": []}},
+        "downloaded": {"2221-o001-NIRCam": "keep-me",
+                       "2221-o001-002-NIRCam": "clear-me"}})
+    assert mm.main(["--rearm", "2221-o001-002", "--rearm-download",
+                    "--state", state_path]) == 0
+    assert mm.load_state(state_path)["downloaded"] == {
+        "2221-o001-NIRCam": "keep-me"}
+
+
 def test_rearm_without_download_flag_keeps_downloads(tmp_path):
     state_path = str(tmp_path / "state.json")
     mm.save_state(state_path, {
@@ -557,7 +609,11 @@ def test_rearm_without_download_flag_keeps_downloads(tmp_path):
 
 
 # ---------------------------------------------------- dated state backups (issue #68)
-def test_backup_before_write_same_day_overwrites(tmp_path):
+def test_backup_keeps_the_first_snapshot_of_the_day(tmp_path):
+    """ONE backup per day, holding the state as it stood before the day's first
+    write.  _record_state_key calls save_state once per recorded key, so
+    refreshing on every write would copy a 1.5 MB file several times a run and
+    converge the 'backup' on the current state -- nothing to restore from."""
     path = str(tmp_path / "state.json")
     mm.save_state(path, {"version": 1, "gen": 0})    # nothing to back up yet
     assert not list(tmp_path.glob("*.bak-*"))
@@ -566,6 +622,47 @@ def test_backup_before_write_same_day_overwrites(tmp_path):
     assert json.loads(bak.read_text())["gen"] == 0   # the pre-write content
     mm.save_state(path, {"version": 1, "gen": 2})
     (bak,) = tmp_path.glob("*.bak-*")                # still ONE per day
+    assert json.loads(bak.read_text())["gen"] == 0   # and still the first one
+
+
+def test_backup_leaves_no_partial_file_at_the_restore_path(tmp_path, monkeypatch,
+                                                           capsys):
+    """An interrupted copy (ENOSPC, RLIMIT_FSIZE) must not leave a truncated
+    file sitting at exactly the path a restore would use, for 14 days: the copy
+    goes to a tmp sibling and is renamed in."""
+    path = str(tmp_path / "state.json")
+    mm.save_state(path, {"version": 1, "gen": 1})
+    real_copy = mm.shutil.copy2
+
+    def truncated(src, dst, *a, **kw):
+        real_copy(src, dst, *a, **kw)
+        raise OSError(27, "File too large")
+
+    monkeypatch.setattr(mm.shutil, "copy2", truncated)
+    mm.save_state(path, {"version": 1, "gen": 2})
+    assert mm.load_state(path)["gen"] == 2           # the write still happened
+    assert "backup FAILED" in capsys.readouterr().err
+    assert not list(tmp_path.glob("*.bak-*"))        # no half-written 'backup'
+
+
+def test_backup_prune_failure_is_not_reported_as_a_backup_failure(tmp_path,
+                                                                  monkeypatch,
+                                                                  capsys):
+    """Pruning is a separate step: a prune that fails must not claim the backup
+    failed when the backup succeeded."""
+    path = str(tmp_path / "state.json")
+    mm.save_state(path, {"version": 1, "gen": 1})
+
+    def denied(*a, **kw):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(mm, "prune_state_backups", denied)
+    mm.save_state(path, {"version": 1, "gen": 2})
+    err = capsys.readouterr().err
+    assert "pruning old state backups FAILED" in err
+    assert "state backup FAILED" not in err
+    assert mm.load_state(path)["gen"] == 2
+    (bak,) = tmp_path.glob("*.bak-*")
     assert json.loads(bak.read_text())["gen"] == 1
 
 
