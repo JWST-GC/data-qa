@@ -10,20 +10,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The PROGRAMS-completeness guard reads the reduction's field registry
+      # with the pipeline's own loader.  Without a checkout it skipped, which is
+      # how it stayed green here while red on HiPerGator (#74).
+      # keflavich/jwst-gc-pipeline is public, so the default token reads it.
+      - name: Check out the reduction pipeline (field registry)
+        uses: actions/checkout@v4
+        with:
+          repository: keflavich/jwst-gc-pipeline
+          ref: main
+          path: _pipe
+          fetch-depth: 1
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
       - name: Install dependencies
+        # pyyaml is what the pipeline's fields.py loader reads the registry
+        # with; it used to arrive only as an astropy transitive.
         run: |
           python -m pip install --upgrade pip
-          pip install numpy scipy astropy photutils matplotlib pytest reproject pyavm pillow requests astroquery
+          pip install numpy scipy astropy photutils matplotlib pytest reproject pyavm pillow requests astroquery pyyaml
 
       # Test modules use pytest.importorskip for optional heavy deps, so a
       # missing extra skips its tests instead of failing collection.
       # Both test roots are covered: top-level tests/ (ops layer, PR #19)
       # and data_qa/tests/ (imaging + publish, PR #21) -- whichever exist.
       - name: Run tests
+        env:
+          # Where the step above put the pipeline.  REQUIRE_PIPE_REGISTRY makes
+          # a checkout that produced nothing fail the suite; a skip would leave
+          # the completeness guard green without running it.
+          PIPE_ROOT: ${{ github.workspace }}/_pipe
+          REQUIRE_PIPE_REGISTRY: "1"
         run: |
           paths="data_qa"
           if [ -d tests ]; then paths="tests $paths"; fi

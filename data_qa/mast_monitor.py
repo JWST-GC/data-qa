@@ -71,9 +71,13 @@ import time
 from typing import Dict, List, Optional, Set
 
 # Monitored programs: program id -> {obs number -> release field}.  Mirrors the
-# reduction's field_to_reg_mapping (PipelineRerunNIRCAM-LONG.py) restricted to the
+# reduction's field registry (jwst_gc_pipeline/fields.yaml, read through
+# jwst_gc_pipeline.fields.field_to_reg_mapping; it lived in a literal dict in
+# PipelineRerunNIRCAM-LONG.py until pipeline commit ee33bec) restricted to the
 # GC-treasury/QA programs; field names match data_qa.observations.FIELDS keys where
 # released (cloudef/sgra/ngc6334 have no public release page yet).
+# tests/test_mast_monitor.py::test_programs_complete_vs_pipeline_field_mapping
+# compares the two and fails when this table falls behind the registry.
 #
 # ================================ PRIORITY WATCH =================================
 # 10678 is THE GC Treasury program: ~1668 planned observations tiling the GC as
