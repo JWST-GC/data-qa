@@ -182,6 +182,11 @@ that already exists.
    not). `align_o<obs>_crf` remains the fallback when the probe fails, with a
    loud warning. Operator overrides stay available via `pipeline_trigger
    --destreak` / `--no-destreak` / `--each-suffix` / `--no-probe`; the QA
-   checklist still ASKS whether destreak is needed per observation.
+   checklist still ASKS whether destreak is needed per observation. A
+   `--destreak`/`--no-destreak` that contradicts the probed policy still wins
+   the suffix, with a warning naming the disagreeing filters: the reduction
+   driver applies the policy itself, so the chain would glob a suffix the
+   reduction never writes (zero inputs at m1). `--each-suffix` names the glob
+   outright and skips the probe.
 6. **MIRI 2221 o003: ignored** (left unmapped in `PROGRAMS`; no globulars.)
 7. **Ops stays in data-qa** (no split into its own org repo).

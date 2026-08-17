@@ -14,6 +14,19 @@ timeout, unparseable output) prints a loud WARNING naming the mismatch risk and
 returns None, and the caller falls back to the trigger's historical hardcoded
 default -- exactly today's behavior.
 
+Terms used here and in ``pipeline_trigger`` (see also the glossary in
+``docs/qa_methods.md``):
+  * **crf** -- the cosmic-ray-flagged per-exposure product Image3 writes for
+    each input frame (``*_<suffix>_o<obs>_crf.fits``); stage 2 photometers these.
+  * **destreak** -- stage 1's 1/f-streak removal.  Where it runs, the crf
+    products are named ``destreak_o<obs>_crf``; where it does not, stage 1
+    copies ``*_cal.fits`` -> ``*_align.fits`` and the crfs are ``align_o<obs>_crf``.
+  * **EACH_SUFFIX** -- the env var carrying that suffix to the cataloging chain
+    (``--each-suffix``); it is the glob pattern stage 2 photometers.
+  * **satstar** -- a saturated star, fit from a separate ``*_satstar_catalog.fits``;
+    **ZEROFRAME** is the frame-zero read the deblend uses to split merged
+    saturated cores.
+
 Stdlib-only, like the rest of the trigger path.
 """
 from __future__ import annotations
@@ -62,6 +75,18 @@ _CACHE: Dict[Tuple, Optional[dict]] = {}
 
 def pipeline_python() -> str:
     return os.environ.get("PIPELINE_PYTHON", DEFAULT_PIPELINE_PYTHON)
+
+
+def crf_suffix(obs, destreak) -> str:
+    """``destreak_o<obs>_crf`` / ``align_o<obs>_crf`` for a KNOWN destreak choice.
+
+    The one place data-qa spells the crf suffix form, used where the probe
+    cannot answer (failed/skipped) or where an operator names the choice
+    outright.  The pipeline owns the form at
+    ``jwst_gc_pipeline.reduction.destreak_policy.crf_suffix``; a probed policy
+    carries that value verbatim, so this local mirror is a fallback path.
+    """
+    return f"{'destreak' if destreak else 'align'}_o{obs}_crf"
 
 
 def clear_cache():

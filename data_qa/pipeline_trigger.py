@@ -38,10 +38,18 @@ from typing import Dict, List, Optional
 from . import pipeline_policy
 from .mast_monitor import GC_FIELDS, field_for
 
-DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
+#: single home for the pipe-root default (pipeline_policy owns it; re-exported
+#: here so the trigger's callers and CLI keep the historical name)
+DEFAULT_PIPE_ROOT = pipeline_policy.DEFAULT_PIPE_ROOT
 REDUCTION_SBATCH = "scripts/reduction/submit_reduction.sbatch"
 CATALOGING_CHAIN = "scripts/reduction/submit_cataloging_chain.sh"
 DEP_PLACEHOLDER = "<REDUCTION_JOBID>"
+
+#: SkyMatchStep.spec's ``skymethod`` options.  submit_reduction.sbatch passes
+#: SKYMATCH straight through as --skymatch-method and nothing downstream checks
+#: it, so an unknown value survives Detector1 + Image2 (hours) and dies in
+#: Image3; the trigger rejects it at build time instead.
+SKYMATCH_METHODS = ("local", "global", "match", "global+match", "user")
 
 
 def missing_scripts(pipe_root) -> List[str]:
@@ -85,6 +93,11 @@ def reduction_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
     # same way EACH_SUFFIX is.
     skymatch = os.environ.get("SKYMATCH")
     if skymatch:
+        if skymatch not in SKYMATCH_METHODS:
+            raise ValueError(
+                f"SKYMATCH={skymatch!r} is not a SkyMatchStep skymethod "
+                f"{SKYMATCH_METHODS}; the reduction would run Detector1 and "
+                "Image2 for hours before Image3 rejects it")
         env["SKYMATCH"] = skymatch
     return dict(name="reduction", argv=argv, env=env)
 
@@ -110,11 +123,11 @@ def cataloging_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
     if each_suffix:
         suffix = each_suffix
     elif destreak is not None:
-        suffix = f"{'destreak' if destreak else 'align'}_o{obs}_crf"
+        suffix = pipeline_policy.crf_suffix(obs, destreak)
     elif policy:
         suffix = policy["each_suffix"]
     else:
-        suffix = f"align_o{obs}_crf"
+        suffix = pipeline_policy.crf_suffix(obs, False)
     env = {
         "PROPOSAL": str(int(program)),
         "FIELD": obs,
@@ -123,27 +136,66 @@ def cataloging_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
         "EACH_SUFFIX": suffix,
         "FILTERS": " ".join(filters),
     }
-    if field in GC_FIELDS:
-        # ZEROFRAME satstar deblend: the pipeline README marks DEBLEND_SATSTARS=1
-        # "required for crowded GC fields (gc2211/arches/quintuplet/sgra)"
-        # (jwst-gc-pipeline scripts/reduction/README.md), and every treasury tile
-        # is inner-CMZ.  It auto-degrades to legacy where a frame lacks a sibling
-        # _ramp.fits ZEROFRAME, so it is safe across all GC fields.
-        # submit_cataloging.sbatch reads it from the environment (--export=ALL).
-        # SCOPE: this takes effect on exposures with no cached satstar catalog,
-        # i.e. newly reduced data -- the normal auto-trigger case.  The pipeline
-        # caches *_satstar_catalog.fits skip-if-exists and keys that cache on the
-        # RECOVERY signature only, not on the deblend flag
-        # (crowdsource_catalogs_long.load_or_make_satstar_catalog ->
-        # cataloging._satstar_recovery_signature), so a re-catalog of an
-        # ALREADY-cataloged field (brick/cloudc/sgrc) reuses its non-deblended
-        # caches and the deblend is a no-op there until
-        # keflavich/jwst-gc-pipeline#427 lands or those caches are cleared.
-        env["DEBLEND_SATSTARS"] = "1"
+    # ZEROFRAME satstar deblend: the pipeline README marks DEBLEND_SATSTARS=1
+    # "required for crowded GC fields (gc2211/arches/quintuplet/sgra)"
+    # (jwst-gc-pipeline scripts/reduction/README.md), and every treasury tile
+    # is inner-CMZ.  It auto-degrades to legacy where a frame lacks a sibling
+    # _ramp.fits ZEROFRAME, so it is safe across all GC fields.
+    # submit_cataloging.sbatch reads it from the environment (--export=ALL).
+    # The non-GC value is the EMPTY string, set explicitly: run_plan composes
+    # dict(os.environ, **step["env"]) and the chain exports ALL, so an omitted
+    # key lets an ambient DEBLEND_SATSTARS through to
+    # `[ -n "$DEBLEND_SATSTARS" ] && DEBLEND_ARG=--deblend-satstars`
+    # (submit_cataloging.sbatch:119-121), where ANY non-empty value -- "0"
+    # included -- turns the deblend on.  Empty is that check's off value.
+    # SCOPE: this takes effect on exposures with no cached satstar catalog,
+    # i.e. newly reduced data -- the normal auto-trigger case.  The pipeline
+    # caches *_satstar_catalog.fits skip-if-exists and keys that cache on the
+    # RECOVERY signature only, not on the deblend flag
+    # (crowdsource_catalogs_long.load_or_make_satstar_catalog ->
+    # cataloging._satstar_recovery_signature), so a re-catalog of an
+    # ALREADY-cataloged field (brick/cloudc/sgrc) reuses its non-deblended
+    # caches and the deblend is a no-op there until
+    # keflavich/jwst-gc-pipeline#427 lands or those caches are cleared.
+    env["DEBLEND_SATSTARS"] = "1" if field in GC_FIELDS else ""
     if dep:
         env["DEP"] = dep
     return dict(name="cataloging-chain", env=env,
                 argv=[os.path.join(pipe_root, CATALOGING_CHAIN)])
+
+
+def _warn_destreak_contradiction(field, obs, destreak, policy) -> List[str]:
+    """Warn when an explicit --destreak/--no-destreak fights the probed policy.
+
+    The flag sets EACH_SUFFIX, and the reduction driver consults
+    ``destreak_policy.destreaks`` on its own
+    (``PipelineRerunNIRCAM-LONG.py:289-291``), so a contradiction means the
+    chain globs a suffix the reduction never writes: zero inputs at m1, hours
+    after submission (issue #69).  Returns the disagreeing filters.
+    """
+    disagree = sorted(f for f, v in policy["destreaks"].items()
+                      if bool(v) != bool(destreak))
+    if not disagree:
+        return []
+    asked = "--destreak" if destreak else "--no-destreak"
+    suffix = pipeline_policy.crf_suffix(obs, destreak)
+    print(f"--trigger: WARNING {asked} contradicts the pipeline's destreak "
+          f"policy for {field} o{obs} on {', '.join(disagree)} "
+          f"(destreak_policy.destreaks() -> {policy['destreaks']}).  The "
+          f"reduction driver applies that policy itself, so it writes "
+          f"{policy['each_suffix']} for those filters while the chained "
+          f"cataloging globs EACH_SUFFIX={suffix}: ZERO inputs at m1 "
+          f"(data-qa#69).", file=sys.stderr)
+    if not destreak:
+        # NO_DESTREAK=1 is the flag's only reduction-side effect and the
+        # pipeline has no consumer for it yet (the pipeline-side half of #69),
+        # so --no-destreak cannot make the reduction match the align suffix.
+        print(f"--trigger: WARNING NO_DESTREAK=1 has no consumer in the "
+              f"pipeline yet, so the reduction destreaks {field} regardless.  "
+              f"Drop --no-destreak, or pass --each-suffix "
+              f"{policy['each_suffix']} to catalog what it writes.",
+              file=sys.stderr)
+    return disagree
 
 
 def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_ROOT,
@@ -152,10 +204,12 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_RO
                probe=True) -> List[dict]:
     """The full submission sequence for one observation (list of step dicts).
 
-    With no explicit ``each_suffix``/``destreak`` override (the --auto trigger
-    path), the pipeline's destreak policy is probed so EACH_SUFFIX names the crf
-    products the reduction really writes; ``probe=False`` skips the subprocess
-    and keeps the historical hardcoded default.
+    With no explicit ``each_suffix`` the pipeline's destreak policy is probed.
+    On the --auto trigger path (no override at all) it sets EACH_SUFFIX, so the
+    chain globs the crf products the reduction really writes.  Under an explicit
+    ``destreak`` the flag still wins, and the probe serves the contradiction
+    warning (``_warn_destreak_contradiction``).  ``probe=False`` skips the
+    subprocess and keeps the historical hardcoded default.
     """
     field = field or field_for(program, obs)
     if not field:
@@ -164,17 +218,23 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_RO
     if not filters:
         raise ValueError("filters required (e.g. --filters F405N F410M)")
     policy = None
-    if probe and each_suffix is None and destreak is None:
+    if probe and each_suffix is None:
+        # probed even under an explicit --destreak/--no-destreak: the flag still
+        # wins the EACH_SUFFIX ladder, and the policy is what tells us the flag
+        # contradicts what the reduction will write.  An explicit --each-suffix
+        # names the glob outright, so it needs no probe.
         policy = pipeline_policy.probe_policy(field, obs, filters,
                                               pipe_root=pipe_root)
-        if policy and len(set(policy["destreaks"].values())) > 1:
-            # sickle-style split (SW destreaks, LW does not): the chain takes ONE
-            # EACH_SUFFIX, so some filters glob the wrong products -- that field
-            # needs per-filter manual submissions (run_pipeline suffix_by_filter)
-            print(f"--trigger: WARNING field {field} destreaks per-filter "
-                  f"({policy['destreaks']}); a single EACH_SUFFIX="
-                  f"{policy['each_suffix']} is wrong for part of the filter "
-                  "list -- submit those filters by hand", file=sys.stderr)
+    if policy and destreak is None and len(set(policy["destreaks"].values())) > 1:
+        # sickle-style split (SW destreaks, LW does not): the chain takes ONE
+        # EACH_SUFFIX, so some filters glob the wrong products -- that field
+        # needs per-filter manual submissions (run_pipeline suffix_by_filter)
+        print(f"--trigger: WARNING field {field} destreaks per-filter "
+              f"({policy['destreaks']}); a single EACH_SUFFIX="
+              f"{policy['each_suffix']} is wrong for part of the filter "
+              "list -- submit those filters by hand", file=sys.stderr)
+    if policy and destreak is not None:
+        _warn_destreak_contradiction(field, obs, destreak, policy)
     return [
         reduction_step(program, obs, field, filters, pipe_root=pipe_root,
                        modules=modules, skip_step12=skip_step12,

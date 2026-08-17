@@ -1,6 +1,7 @@
 """Offline unit tests for data_qa.pipeline_trigger + pipeline_policy (command
 generation only -- no sbatch and no real policy-probe subprocess is ever run)."""
 import json
+import os
 import subprocess
 
 import pytest
@@ -90,6 +91,32 @@ def test_cataloging_each_suffix_override_wins():
     assert step["env"]["EACH_SUFFIX"] == "custom_o001_crf"
 
 
+def test_cataloging_each_suffix_ladder_precedence():
+    """The four EACH_SUFFIX levels rank explicit suffix > explicit destreak >
+    probed policy > historical fallback, asserted on cataloging_step directly so
+    the contract holds for callers build_plan's gating cannot reach."""
+    policy = {"each_suffix": "destreak_o001_crf",
+              "destreaks": {"F212N": True}}
+    common = dict(pipe_root="/pipe")
+
+    def suffix(**kw):
+        return pt.cataloging_step(2221, "001", "brick", ["F212N"],
+                                  **common, **kw)["env"]["EACH_SUFFIX"]
+
+    # 1 explicit each_suffix outranks everything
+    assert suffix(each_suffix="custom_o001_crf", destreak=False,
+                  policy=policy) == "custom_o001_crf"
+    # 2 an explicit destreak choice outranks the probed policy
+    assert suffix(destreak=False, policy=policy) == "align_o001_crf"
+    assert suffix(destreak=True, policy={"each_suffix": "align_o001_crf",
+                                         "destreaks": {"F212N": False}}
+                  ) == "destreak_o001_crf"
+    # 3 the probed policy outranks the historical fallback
+    assert suffix(policy=policy) == "destreak_o001_crf"
+    # 4 the fallback with nothing supplied
+    assert suffix() == "align_o001_crf"
+
+
 def test_cataloging_guard_vars_all_present():
     """submit_cataloging.sbatch hard-fails unless these travel together."""
     step = pt.cataloging_step(1182, "004", "brick", ["F200W"], pipe_root="/pipe")
@@ -168,16 +195,39 @@ def test_probe_parses_align_policy(tmp_path, monkeypatch):
 
 
 def test_probe_failure_warns_and_returns_none(tmp_path, monkeypatch, capsys):
-    """rc!=0 -> None + a loud warning naming the m1 zero-inputs mismatch risk."""
+    """rc!=0 -> None + a loud warning naming the m1 zero-inputs mismatch risk.
+
+    The warning carries the return code and the stderr tail, which is the whole
+    operator-facing diagnostic for the likeliest real failure (a pipeline env
+    that cannot import the package)."""
     monkeypatch.setattr(pp.subprocess, "run",
-                        _stub_run(rc=1, stderr="ModuleNotFoundError: boom"))
+                        _stub_run(rc=1, stderr="Traceback...\n"
+                                               "ModuleNotFoundError: boom"))
     got = pp.probe_policy("gc-treasury", "001", ["F212N"],
                           pipe_root=_probe_root(tmp_path))
     assert got is None
     err = capsys.readouterr().err
     assert "WARNING" in err
+    assert "rc=1" in err
+    assert "ModuleNotFoundError: boom" in err
     assert "align_o001_crf" in err
     assert "data-qa#69" in err
+
+
+def test_probe_nonzero_rc_rejects_even_a_valid_payload(tmp_path, monkeypatch,
+                                                       capsys):
+    """A probe that FAILED is not trusted for what it printed: rc!=0 with a
+    well-formed payload on stdout (a partial run, a wrapper that echoes a
+    cached answer then exits nonzero) still degrades to the fallback."""
+    monkeypatch.setattr(pp.subprocess, "run",
+                        _stub_run(json.dumps(TREASURY_POLICY), rc=2,
+                                  stderr="probe wrapper failed"))
+    got = pp.probe_policy("gc-treasury", "001", ["F212N"],
+                          pipe_root=_probe_root(tmp_path))
+    assert got is None
+    err = capsys.readouterr().err
+    assert "rc=2" in err
+    assert "probe wrapper failed" in err
 
 
 def test_probe_garbage_output_warns_and_returns_none(tmp_path, monkeypatch,
@@ -230,10 +280,10 @@ def test_probe_unrunnable_python_warns_and_returns_none(tmp_path, monkeypatch,
 def test_probe_wrong_shape_payload_warns_and_returns_none(payload, tmp_path,
                                                           monkeypatch, capsys):
     """Valid JSON of the WRONG shape (older checkout, stray print merged into
-    stdout, partial write) must be rejected rather than cached as truthy
-    policy: a truthy result reaches cataloging_step as ``policy["each_suffix"]``
-    and the KeyError there would abort act_trigger mid-loop, leaving every
-    later observation in that poll unsubmitted."""
+    stdout, partial write) must be rejected.  Caching it as a truthy policy
+    would send it to cataloging_step as ``policy["each_suffix"]``, and the
+    KeyError there aborts act_trigger mid-loop, leaving every later observation
+    in that poll unsubmitted."""
     monkeypatch.setattr(pp.subprocess, "run", _stub_run(payload))
     got = pp.probe_policy("gc-treasury", "001", ["F212N"],
                           pipe_root=_probe_root(tmp_path))
@@ -268,6 +318,24 @@ def test_probe_cached_per_field_obs(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_probe_cache_key_includes_filters(tmp_path, monkeypatch):
+    """The filter list is part of the key, because the policy is per filter:
+    sickle o002 F212N -> destreak_o002_crf while F480M -> align_o002_crf, so a
+    second filter list must not be served the first list's answer."""
+    calls = []
+    monkeypatch.setattr(pp.subprocess, "run",
+                        _stub_run(json.dumps(TREASURY_POLICY), calls=calls))
+    root = _probe_root(tmp_path)
+    pp.probe_policy("sickle", "002", ["F212N"], pipe_root=root)
+    pp.probe_policy("sickle", "002", ["F480M"], pipe_root=root)
+    assert len(calls) == 2
+    assert calls[0][-1] == "F212N"
+    assert calls[1][-1] == "F480M"
+    # ... and the same list still hits the cache
+    pp.probe_policy("sickle", "002", ["F480M"], pipe_root=root)
+    assert len(calls) == 2
+
+
 # ------------------------------------------- probed env defaults in the plan (#69)
 def test_build_plan_probed_each_suffix(tmp_path, monkeypatch):
     """The auto-trigger path (no overrides) catalogs what the reduction writes:
@@ -295,14 +363,73 @@ def test_build_plan_probe_failure_keeps_today_default(tmp_path, monkeypatch,
     assert "WARNING" in capsys.readouterr().err
 
 
-def test_build_plan_explicit_override_skips_probe(monkeypatch):
-    """An operator destreak choice wins outright; no subprocess runs."""
+def test_build_plan_each_suffix_override_skips_probe(monkeypatch):
+    """An explicit --each-suffix names the glob outright, so no subprocess runs."""
     def boom(*a, **k):
-        raise AssertionError("probe must not run under an explicit override")
+        raise AssertionError("probe must not run under an explicit each_suffix")
     monkeypatch.setattr(pp, "probe_policy", boom)
     plan = pt.build_plan(4147, "012", filters=["F405N"], pipe_root="/pipe",
-                         destreak=True)
-    assert plan[1]["env"]["EACH_SUFFIX"] == "destreak_o012_crf"
+                         each_suffix="custom_o012_crf")
+    assert plan[1]["env"]["EACH_SUFFIX"] == "custom_o012_crf"
+
+
+def test_build_plan_destreak_override_wins_but_still_probes(tmp_path,
+                                                            monkeypatch):
+    """An operator destreak choice wins the EACH_SUFFIX ladder, and the probe
+    still runs -- the policy is what can tell the operator the flag contradicts
+    what the reduction will write."""
+    calls = []
+    monkeypatch.setattr(pp.subprocess, "run",
+                        _stub_run(json.dumps(TREASURY_POLICY), calls=calls))
+    plan = pt.build_plan(10678, "001", filters=["F212N"], destreak=True,
+                         pipe_root=_probe_root(tmp_path))
+    assert plan[1]["env"]["EACH_SUFFIX"] == "destreak_o001_crf"
+    assert len(calls) == 1
+
+
+def test_build_plan_no_destreak_contradicting_policy_warns(tmp_path,
+                                                           monkeypatch, capsys):
+    """--no-destreak on a field the policy destreaks reproduces the #69 zero
+    glob: the driver applies destreak_policy itself and writes
+    destreak_o001_crf, while the chain globs align_o001_crf.  NO_DESTREAK=1
+    cannot stop it (no consumer in the pipeline), so the plan says so."""
+    payload = {"each_suffix": "destreak_o001_crf",
+               "destreaks": {"F405N": True, "F410M": True}}
+    monkeypatch.setattr(pp.subprocess, "run", _stub_run(json.dumps(payload)))
+    plan = pt.build_plan(2221, "001", filters=["F405N", "F410M"],
+                         destreak=False, pipe_root=_probe_root(tmp_path))
+    assert plan[1]["env"]["EACH_SUFFIX"] == "align_o001_crf"   # the flag wins
+    err = capsys.readouterr().err
+    assert "--no-destreak contradicts" in err
+    assert "F405N, F410M" in err
+    assert "ZERO inputs at m1" in err
+    assert "NO_DESTREAK=1 has no consumer" in err
+
+
+def test_build_plan_destreak_on_policy_off_field_warns(tmp_path, monkeypatch,
+                                                       capsys):
+    """The mirror direction: --destreak on an extended-emission field globs
+    destreak_o001_crf against an align_* reduction."""
+    payload = {"each_suffix": "align_o001_crf", "destreaks": {"F150W": False}}
+    monkeypatch.setattr(pp.subprocess, "run", _stub_run(json.dumps(payload)))
+    plan = pt.build_plan(6151, "001", filters=["F150W"], destreak=True,
+                         pipe_root=_probe_root(tmp_path))
+    assert plan[1]["env"]["EACH_SUFFIX"] == "destreak_o001_crf"
+    err = capsys.readouterr().err
+    assert "--destreak contradicts" in err
+    assert "F150W" in err
+    # the NO_DESTREAK note belongs to the other direction only
+    assert "NO_DESTREAK=1 has no consumer" not in err
+
+
+def test_build_plan_destreak_agreeing_with_policy_is_quiet(tmp_path,
+                                                           monkeypatch, capsys):
+    """An explicit flag that matches the policy warns about nothing."""
+    monkeypatch.setattr(pp.subprocess, "run",
+                        _stub_run(json.dumps(TREASURY_POLICY)))
+    pt.build_plan(10678, "001", filters=["F212N", "F480M"], destreak=True,
+                  pipe_root=_probe_root(tmp_path))
+    assert "contradicts" not in capsys.readouterr().err
 
 
 def test_build_plan_no_destreak_consistent_pair():
@@ -338,12 +465,47 @@ def test_deblend_satstars_set_for_gc_fields():
         assert step["env"]["DEBLEND_SATSTARS"] == "1", field
 
 
-def test_deblend_satstars_absent_for_non_gc_fields():
+def test_deblend_satstars_off_for_non_gc_fields():
+    """Off is the EMPTY value, set explicitly: submit_cataloging.sbatch tests
+    `[ -n "$DEBLEND_SATSTARS" ]`, so empty is the only value that means off."""
     for field, program, obsnum in (("wd1", 1905, "001"), ("w51", 6151, "001"),
                                    ("ngc6334", 6778, "001")):
         step = pt.cataloging_step(program, obsnum, field, ["F150W"],
                                   pipe_root="/pipe")
-        assert "DEBLEND_SATSTARS" not in step["env"], field
+        assert step["env"]["DEBLEND_SATSTARS"] == "", field
+
+
+@pytest.mark.parametrize("ambient", ["1", "0", "off"])
+def test_deblend_satstars_non_gc_overrides_ambient_env(monkeypatch, ambient):
+    """An ambient DEBLEND_SATSTARS must not reach a non-GC chain: run_plan
+    composes dict(os.environ, **step["env"]) and the chain exports ALL, and
+    `[ -n ... ]` treats ANY non-empty value -- "0" included -- as on."""
+    monkeypatch.setenv("DEBLEND_SATSTARS", ambient)
+    step = pt.cataloging_step(6151, "001", "w51", ["F150W"], pipe_root="/pipe")
+    composed = dict(os.environ, **step["env"])
+    assert composed["DEBLEND_SATSTARS"] == ""
+    gc_step = pt.cataloging_step(10678, "001", "gc-treasury", ["F212N"],
+                                 pipe_root="/pipe")
+    assert dict(os.environ, **gc_step["env"])["DEBLEND_SATSTARS"] == "1"
+
+
+def test_skymatch_rejects_a_value_skymatchstep_cannot_take(monkeypatch):
+    """SKYMATCH rides through unchecked to --skymatch-method, so a typo would
+    survive Detector1 + Image2 and die in Image3 hours later; build time is
+    where it costs nothing."""
+    monkeypatch.setenv("SKYMATCH", "matchh")
+    with pytest.raises(ValueError, match="SkyMatchStep skymethod"):
+        pt.reduction_step(10678, "001", "gc-treasury", ["F212N"],
+                          pipe_root="/pipe")
+
+
+@pytest.mark.parametrize("method", ["local", "global", "match",
+                                    "global+match", "user"])
+def test_skymatch_accepts_every_skymatchstep_method(monkeypatch, method):
+    monkeypatch.setenv("SKYMATCH", method)
+    step = pt.reduction_step(10678, "001", "gc-treasury", ["F212N"],
+                             pipe_root="/pipe")
+    assert step["env"]["SKYMATCH"] == method
 
 
 def test_skymatch_passthrough_when_operator_sets_it(monkeypatch):
