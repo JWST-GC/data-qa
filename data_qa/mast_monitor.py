@@ -8,8 +8,11 @@ effect is individually gated:
   --download       fetch the new observation's products via data_qa.retrieve_data
   --trigger        build the reduction+cataloging submission (data_qa.pipeline_trigger)
   --report         comment the events on the per-observation QA issue (status_report);
-                   an issue whose events include an ARRIVAL, and every issue on a
-                   run carrying a FRESH LOW DISK / CAPPED notice, gets a NEW comment
+                   an issue whose events include an ARRIVAL (calibrated data
+                   landing: NEWLY_RELEASED, a CALIB_LEVEL_UP crossing the
+                   actionable level, or a NEW_OBSERVATION already released), and
+                   every issue on a run carrying a LOW DISK / CAPPED notice whose
+                   reason differs from the last one announced, gets a NEW comment
                    (GitHub notifies watchers); anything else edits the previous
                    monitor comment in place (see act_report)
   --execute        actually do it (download / sbatch / post); without it the actions
@@ -46,6 +49,13 @@ Events:
   NEW_OBSERVATION  obs_id not previously in the state file
   NEWLY_RELEASED   t_obs_release passed since the last committed poll
   CALIB_LEVEL_UP   calib_level increased (e.g. 2 -> 3: mosaics available)
+
+  ARRIVAL is the subset that announces calibrated data actually landing, the
+  class --report must interrupt a human for: NEWLY_RELEASED, a CALIB_LEVEL_UP
+  that crossed MIN_ACTIONABLE_CALIB_LEVEL, or a NEW_OBSERVATION first seen
+  already released and calibrated (see event_is_arrival).  A planned tile and
+  a 2 -> 3 reprocessing bump stay routine: they edit the monitor comment in
+  place.
 
 Anonymous MAST metadata queries work without auth; ``~/.mast_api_token`` is used if
 present (exclusive-access programs).  astroquery is imported lazily so the module
@@ -453,8 +463,13 @@ NOTIFIED_DOWNGRADE_KEY = "last_notified_downgrade"
 
 def notice_downgrade_reason(notice: Optional[str]) -> Optional[str]:
     """Coarse downgrade class of a run notice ('LOW DISK' / 'CAPPED'), or None
-    for no notice or a non-downgrade notice (SEED RUN / PER-PROGRAM SEED are
-    deliberate baselines and never need to interrupt anyone)."""
+    for no notice or a non-downgrade notice.
+
+    Scoped to the NOTICE alone: SEED RUN / PER-PROGRAM SEED are deliberate
+    baselines, so the notice itself never needs to interrupt anyone.  A seed
+    run's EVENTS are classified independently -- a backlog holding released
+    observations still carries arrivals, and act_report posts a notifying
+    comment for them."""
     for prefix in DOWNGRADE_NOTICE_PREFIXES:
         if notice is not None and notice.startswith(prefix):
             return prefix
@@ -766,9 +781,10 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
       * post a NEW comment (watchers notified) when that issue's events
         carry an ARRIVAL (``event_is_arrival``: calibrated data actually
         landed), or when the run carries a downgrade notice (LOW DISK /
-        CAPPED) whose coarse reason differs from the state file's
-        last-notified memo (the notice rides on EVERY comment body, so a
-        fresh downgrade notifies on every issue);
+        CAPPED) whose coarse reason is FRESH -- differing from the memo
+        (state key ``last_notified_downgrade``) that records the reason last
+        announced with a notifying comment.  The notice rides on EVERY
+        comment body, so a fresh downgrade notifies on every issue;
       * edit the previous MONITOR_MARKER comment in place for that issue's
         purely-planned events and for REPEATS of an already-notified
         downgrade reason (a LOW DISK run commits no state, so the identical
@@ -782,11 +798,21 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
     notifies: those arrivals were never announced, and the seed notice itself
     is not a downgrade (``notice_downgrade_reason`` -> None).
 
-    The anti-spam memo (state key ``last_notified_downgrade``) is written on
-    an executing run immediately after a notifying downgrade comment posts,
-    and cleared by any executed batch without a downgrade notice (plus by
-    main()'s commit path, ``retire_downgrade_memo`` -- the only clearing path
-    when --report is off), so each downgrade EPISODE notifies exactly once.
+    The anti-spam memo is written on an executing run immediately after EVERY
+    notifying downgrade comment in the batch posted successfully (a partial
+    failure leaves it unarmed, so the next poll re-notifies: a duplicate
+    comment on the issues that did post is cheaper than an issue whose
+    watchers never hear the notice).  It is cleared by any executed batch
+    without a downgrade notice, plus by main()'s commit path,
+    ``retire_downgrade_memo`` -- the only clearing path when --report is off.
+
+    A downgrade episode therefore notifies once per uninterrupted run of
+    downgraded polls.  Any downgrade-free run in between ends the episode and
+    re-arms the notification, including a poll that carries no notice because
+    it never ran the disk gate: the weekly ``--commit-state --report
+    --execute`` entry (docs/scrontab.example) has no --auto, so a LOW DISK
+    wedge spanning a Monday re-notifies on the Tuesday poll.
+
     A downgraded run that keeps re-firing ARRIVAL events keeps posting new
     comments on purpose: released data is waiting while the automation is
     wedged, at the deployed poll cadence of once a day
@@ -842,9 +868,14 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             issue_cache=issue_cache,
             create_labels=["QA", f"program:{TREASURY_PROGRAM}"])))
     if execute and state_path:
-        notified = any(rc == 0 and not edit for edit, rc in posts)
+        notifying = [rc for edit, rc in posts if not edit]
+        # EVERY notifying comment must have landed before repeats are
+        # suppressed: arming on a partial success (issue A posted, issue B
+        # returned rc!=0) would leave B editing quietly forever and B's
+        # watchers would never see the notice
+        notified = bool(notifying) and all(rc == 0 for rc in notifying)
         if reason is not None and notified:
-            # a notifying comment carrying the downgrade notice went out:
+            # every notifying comment carrying the downgrade notice went out:
             # arm repeat suppression
             _memo_notified_downgrade(state_path, reason, state=state)
         elif reason is None:
@@ -992,12 +1023,19 @@ def main(argv=None):
     seed = args.seed or (first_run and bool(all_events) and acting)
     actionable = all_events
     if seed:
-        notice = (f"SEED RUN — actions suppressed: committing the current state "
-                  f"({len(all_events)} event(s)) as the baseline; nothing "
-                  "downloaded or submitted.  Subsequent runs act only on "
-                  "genuinely new events."
-                  + ("" if args.seed else "  (state file was missing/empty)"))
-        print(f"--seed: {notice}", file=sys.stderr)
+        seed_notice = (f"SEED RUN — actions suppressed: committing the current "
+                       f"state ({len(all_events)} event(s)) as the baseline; "
+                       "nothing downloaded or submitted.  Subsequent runs act "
+                       "only on genuinely new events."
+                       + ("" if args.seed else "  (state file was missing/empty)"))
+        print(f"--seed: {seed_notice}", file=sys.stderr)
+        # A LOW DISK notice from the --auto disk gate keeps the FRONT of the
+        # run notice.  Overwriting it dropped the warning from every comment
+        # body AND (the coarse reason is prefix-matched) cleared the
+        # last-notified memo mid-episode, so the wedge announced itself to
+        # nobody -- the #71 defect inside a --seed --auto invocation.  One
+        # line, since render_events_comment renders the notice as a blockquote.
+        notice = f"{notice}  {seed_notice}" if notice else seed_notice
         args.download = args.trigger = False
         args.commit_state = True
     elif acting:

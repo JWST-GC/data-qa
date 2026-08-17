@@ -1421,3 +1421,95 @@ def test_main_commit_state_without_report_clears_memo(monkeypatch, tmp_path):
     committed = mm.load_state(str(state))
     assert mm.NOTIFIED_DOWNGRADE_KEY not in committed     # episode retired
     assert "jw10678-o101_t101_nircam" in committed["programs"]["10678"]["obs"]
+
+
+def test_act_report_regular_issue_edits_with_monitor_marker(monkeypatch):
+    """The per-observation (non-treasury) branch selects the MONITOR marker.
+    With STATUS_MARKER it would edit the pipeline status comment and silently
+    delete something a human needed, with a green suite."""
+    from data_qa import status_report
+    posted = _patch_post_status(monkeypatch)
+    planned_brick = dict(_trigger_events("001")[0], released=False,
+                         calib_level=-1, t_obs_release=None)
+    mm.act_report([planned_brick], execute=True)
+    (title, _, kw), = posted
+    assert title == "Brick — jw02221-o001 (NIRCam)"      # regular-issue branch
+    assert kw["update_last"] is True
+    assert kw["marker"] == status_report.MONITOR_MARKER
+
+
+def test_act_report_partial_notify_failure_does_not_memo(monkeypatch, tmp_path):
+    """A fresh downgrade where one notifying comment posts and another FAILS
+    leaves the memo unarmed: arming it would send the failed issue back to
+    quiet edits forever, and its watchers would never see the notice."""
+    from data_qa import status_report
+    posted, rcs = [], iter([0, 4])
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, **kw: posted.append((title, kw))
+                        or next(rcs))
+    state_path = str(tmp_path / "state.json")
+    state = {"version": 1, "programs": {}}
+    mm.act_report(_trigger_events("001") + _planned_events(), execute=True,
+                  notice=LOW_DISK_NOTICE, state=state, state_path=state_path)
+    assert [kw["update_last"] for _, kw in posted] == [False, False]
+    assert mm.NOTIFIED_DOWNGRADE_KEY not in state
+    assert not os.path.exists(state_path)
+
+
+def test_main_weekly_commit_report_without_auto_clears_memo(monkeypatch,
+                                                            tmp_path):
+    """The deployed weekly entry (--commit-state --report --execute, no
+    --auto) never runs the disk gate, so it carries no notice and ends any
+    downgrade episode it lands in: an ongoing LOW DISK wedge notifies again on
+    the next --auto poll.  Pins what act_report's docstring states."""
+    posted = _patch_post_status(monkeypatch)
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm.shutil, "disk_usage",
+                        lambda p: pytest.fail("no --auto: no disk gate"))
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_planned_row("jw10678-o101_t101_nircam")])
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o001_x")
+    armed = mm.load_state(str(state))
+    armed[mm.NOTIFIED_DOWNGRADE_KEY] = "LOW DISK"        # wedge in progress
+    mm.save_state(str(state), armed)
+
+    assert mm.main(["--program", "10678", "--commit-state", "--report",
+                    "--execute", "--state", str(state)]) == 0
+    assert posted[-1][2]["update_last"] is True          # planned only: quiet
+    assert mm.NOTIFIED_DOWNGRADE_KEY not in mm.load_state(str(state))
+
+    # Tuesday: the wedge is still on, and it announces itself afresh
+    monkeypatch.setattr(mm, "act_download", lambda *a, **kw: None)
+    monkeypatch.setattr(mm, "act_trigger", lambda *a, **kw: None)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(1e12))
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_planned_row("jw10678-o101_t101_nircam"),
+                                      _planned_row("jw10678-o102_t102_nircam",
+                                                   target="GC_2")])
+    assert mm.main(["--program", "10678", "--auto", "--state", str(state),
+                    "--download-dir", str(tmp_path)]) == 0
+    assert posted[-1][2]["update_last"] is False         # re-notified
+
+
+def test_main_seed_run_keeps_low_disk_notice_and_memo(monkeypatch, tmp_path):
+    """--seed on an --auto run whose disk gate failed keeps the LOW DISK
+    warning: the seed text is appended, so the warning reaches every comment
+    body and the last-notified memo survives the seed commit."""
+    posted = _patch_post_status(monkeypatch)
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "act_download", lambda *a, **kw: None)
+    monkeypatch.setattr(mm, "act_trigger", lambda *a, **kw: None)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(1e12))
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_planned_row("jw10678-o101_t101_nircam")])
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o001_x")
+
+    assert mm.main(["--program", "10678", "--auto", "--seed",
+                    "--state", str(state),
+                    "--download-dir", str(tmp_path)]) == 0
+    (_, body, kw), = posted
+    assert "LOW DISK" in body and "SEED RUN" in body
+    assert kw["update_last"] is False                    # fresh downgrade
+    assert mm.load_state(str(state))[mm.NOTIFIED_DOWNGRADE_KEY] == "LOW DISK"
