@@ -1,4 +1,5 @@
 """Offline unit tests for data_qa.mast_monitor (state diffing; no network)."""
+import datetime
 import json
 import os
 
@@ -644,6 +645,20 @@ def test_backup_leaves_no_partial_file_at_the_restore_path(tmp_path, monkeypatch
     assert mm.load_state(path)["gen"] == 2           # the write still happened
     assert "backup FAILED" in capsys.readouterr().err
     assert not list(tmp_path.glob("*.bak-*"))        # no half-written 'backup'
+
+
+def test_backup_path_occupied_by_a_directory_is_reported(tmp_path, capsys):
+    """A directory sitting at the backup path used to swallow the copy (copy2
+    writes INSIDE it, empty stderr, nothing at the restore path).  The rename
+    refuses it and says so, and the state write still happens."""
+    path = str(tmp_path / "state.json")
+    mm.save_state(path, {"version": 1, "gen": 1})
+    bak = tmp_path / f"state.json.bak-{datetime.date.today():%Y%m%d}"
+    bak.mkdir()
+    mm.save_state(path, {"version": 1, "gen": 2})
+    assert mm.load_state(path)["gen"] == 2
+    assert "IsADirectoryError" in capsys.readouterr().err
+    assert list(bak.iterdir()) == []
 
 
 def test_backup_prune_failure_is_not_reported_as_a_backup_failure(tmp_path,
