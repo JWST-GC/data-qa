@@ -10,7 +10,12 @@ Conventions honored (see jwst-gc-pipeline CLAUDE.md):
   * job names at SUBMIT time: <target><program>-o<obsid>-<stage>
   * comma-valued vars (MODULES) go through the process ENVIRONMENT + --export=ALL,
     never inside the --export list (the SLURM --export comma trap);
-  * the cataloging guard needs PROPOSAL/FIELD/TARGET/EACH_SUFFIX/MODULES together.
+  * the cataloging guard needs PROPOSAL/FIELD/TARGET/EACH_SUFFIX/MODULES together;
+  * env defaults come from the pipeline's OWN policy (pipeline_policy.probe_policy
+    -> destreak_policy.crf_suffix), the same derivation run_pipeline.build_plan
+    uses, so the triggered reduction and cataloging cannot disagree about what
+    the crf products are called (issue #69).  A failed probe degrades to the
+    historical hardcoded default with a loud warning.
 
 Stdlib-only.  Dry-run (default) prints the exact commands; --execute submits and
 threads the parsed reduction job id into DEP.
@@ -30,12 +35,21 @@ import subprocess
 import sys
 from typing import Dict, List, Optional
 
-from .mast_monitor import field_for
+from . import pipeline_policy
+from .mast_monitor import GC_FIELDS, field_for
 
-DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
+#: single home for the pipe-root default (pipeline_policy owns it; re-exported
+#: here so the trigger's callers and CLI keep the historical name)
+DEFAULT_PIPE_ROOT = pipeline_policy.DEFAULT_PIPE_ROOT
 REDUCTION_SBATCH = "scripts/reduction/submit_reduction.sbatch"
 CATALOGING_CHAIN = "scripts/reduction/submit_cataloging_chain.sh"
 DEP_PLACEHOLDER = "<REDUCTION_JOBID>"
+
+#: SkyMatchStep.spec's ``skymethod`` options.  submit_reduction.sbatch passes
+#: SKYMATCH straight through as --skymatch-method and nothing downstream checks
+#: it, so an unknown value survives Detector1 + Image2 (hours) and dies in
+#: Image3; the trigger rejects it at build time instead.
+SKYMATCH_METHODS = ("local", "global", "match", "global+match", "user")
 
 
 def missing_scripts(pipe_root) -> List[str]:
@@ -45,11 +59,20 @@ def missing_scripts(pipe_root) -> List[str]:
 
 
 def reduction_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
-                   modules="nrca,nrcb,merged", skip_step12=False) -> dict:
+                   modules="nrca,nrcb,merged", skip_step12=False,
+                   destreak=None) -> dict:
     """The reduction array submission: one array task per filter.
 
     ``skip_step12=False`` (default) sets SKIP=0: a NEW observation has no *_cal.fits
     yet, so Detector1/Image2 must run.  Set True to reuse existing cal files.
+
+    ``destreak`` mirrors the cataloging step's choice so the pair stays
+    consistent: None (default) leaves the driver on its own destreak_policy;
+    False adds NO_DESTREAK=1 so an operator forcing the align products gets an
+    align reduction to match (the sbatch passthrough for it is the pipeline-side
+    half of issue #69; harmless where not yet honored).  True needs nothing --
+    the driver already destreaks wherever the policy allows (the policy can only
+    turn destreaking OFF, so destreak=True cannot override a policy-off field).
     """
     job = f"{field}{int(program)}-o{obs}-reduce"
     export = (f"ALL,PROPOSAL={int(program)},FIELD={obs},"
@@ -58,53 +81,167 @@ def reduction_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
             f"--array=0-{len(filters) - 1}", f"--export={export}",
             os.path.join(pipe_root, REDUCTION_SBATCH)]
     # MODULES is comma-valued -> environment + --export=ALL (the --export comma trap)
-    return dict(name="reduction", argv=argv, env={"MODULES": modules})
+    env = {"MODULES": modules}
+    if destreak is False:
+        env["NO_DESTREAK"] = "1"
+    # SKYMATCH: submit_reduction.sbatch reads it from the environment
+    # (--skymatch-method).  Passed through ONLY when the operator sets it; the
+    # trigger invents no default.
+    # TODO(keflavich/jwst-gc-pipeline#419): once the treasury F480M skymatch
+    # policy decision lands (a skymatch_policy module beside destreak_policy, or
+    # SKYMATCH=match for program 10678), derive this from the policy probe the
+    # same way EACH_SUFFIX is.
+    skymatch = os.environ.get("SKYMATCH")
+    if skymatch:
+        if skymatch not in SKYMATCH_METHODS:
+            raise ValueError(
+                f"SKYMATCH={skymatch!r} is not a SkyMatchStep skymethod "
+                f"{SKYMATCH_METHODS}; the reduction would run Detector1 and "
+                "Image2 for hours before Image3 rejects it")
+        env["SKYMATCH"] = skymatch
+    return dict(name="reduction", argv=argv, env=env)
 
 
 def cataloging_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
-                    modules="merged", each_suffix=None, destreak=False,
-                    dep: Optional[str] = DEP_PLACEHOLDER) -> dict:
+                    modules="merged", each_suffix=None, destreak=None,
+                    policy=None, dep: Optional[str] = DEP_PLACEHOLDER) -> dict:
     """The cataloging chain (env-var driven; DEP gates it on the reduction array).
 
-    EACH_SUFFIX default is the plain (no-destreak) crf form ``align_o<obs>_crf``:
-    the reduction ALWAYS runs fix_alignment, and on the no-destreak path it copies
-    ``*_cal.fits`` -> ``*_align.fits`` before Image3, so the per-exposure crf
-    products are named ``*_align_o<field>_crf.fits`` (PipelineRerunNIRCAM-LONG.py
-    destreak/align loop + its CRF-naming fix).  ``destreak=True`` selects the
-    destreaked products' ``destreak_o<obs>_crf`` instead -- whether an observation
-    needs destreak is a per-observation QA decision (see the QA-issue checklist).
+    EACH_SUFFIX resolution, strongest first:
+      1. ``each_suffix`` -- an explicit operator override, used verbatim;
+      2. ``destreak`` True/False -- an explicit operator choice of the
+         ``destreak_o<obs>_crf`` / ``align_o<obs>_crf`` form;
+      3. ``policy`` -- the pipeline's own destreak policy as probed by
+         ``pipeline_policy.probe_policy`` (``policy["each_suffix"]``), the same
+         value the pipeline's run_pipeline.build_plan derives, so the chain
+         globs exactly what the triggered reduction writes (issue #69);
+      4. the historical hardcoded fallback ``align_o<obs>_crf`` (the reduction
+         ALWAYS runs fix_alignment, and the no-destreak path copies
+         ``*_cal.fits`` -> ``*_align.fits`` before Image3, so the per-exposure
+         crf products are ``*_align_o<field>_crf.fits``).
     """
+    if each_suffix:
+        suffix = each_suffix
+    elif destreak is not None:
+        suffix = pipeline_policy.crf_suffix(obs, destreak)
+    elif policy:
+        suffix = policy["each_suffix"]
+    else:
+        suffix = pipeline_policy.crf_suffix(obs, False)
     env = {
         "PROPOSAL": str(int(program)),
         "FIELD": obs,
         "TARGET": field,
         "MODULES": modules,
-        "EACH_SUFFIX": each_suffix
-        or f"{'destreak' if destreak else 'align'}_o{obs}_crf",
+        "EACH_SUFFIX": suffix,
         "FILTERS": " ".join(filters),
     }
+    # ZEROFRAME satstar deblend: the pipeline README marks DEBLEND_SATSTARS=1
+    # "required for crowded GC fields (gc2211/arches/quintuplet/sgra)"
+    # (jwst-gc-pipeline scripts/reduction/README.md), and every treasury tile
+    # is inner-CMZ.  It auto-degrades to legacy where a frame lacks a sibling
+    # _ramp.fits ZEROFRAME, so it is safe across all GC fields.
+    # submit_cataloging.sbatch reads it from the environment (--export=ALL).
+    # The non-GC value is the EMPTY string, set explicitly: run_plan composes
+    # dict(os.environ, **step["env"]) and the chain exports ALL, so an omitted
+    # key lets an ambient DEBLEND_SATSTARS through to
+    # `[ -n "$DEBLEND_SATSTARS" ] && DEBLEND_ARG=--deblend-satstars`
+    # (submit_cataloging.sbatch:119-121), where ANY non-empty value -- "0"
+    # included -- turns the deblend on.  Empty is that check's off value.
+    # SCOPE: this takes effect on exposures with no cached satstar catalog,
+    # i.e. newly reduced data -- the normal auto-trigger case.  The pipeline
+    # caches *_satstar_catalog.fits skip-if-exists and keys that cache on the
+    # RECOVERY signature only, not on the deblend flag
+    # (crowdsource_catalogs_long.load_or_make_satstar_catalog ->
+    # cataloging._satstar_recovery_signature), so a re-catalog of an
+    # ALREADY-cataloged field (brick/cloudc/sgrc) reuses its non-deblended
+    # caches and the deblend is a no-op there until
+    # keflavich/jwst-gc-pipeline#427 lands or those caches are cleared.
+    env["DEBLEND_SATSTARS"] = "1" if field in GC_FIELDS else ""
     if dep:
         env["DEP"] = dep
     return dict(name="cataloging-chain", env=env,
                 argv=[os.path.join(pipe_root, CATALOGING_CHAIN)])
 
 
+def _warn_destreak_contradiction(field, obs, destreak, policy) -> List[str]:
+    """Warn when an explicit --destreak/--no-destreak fights the probed policy.
+
+    The flag sets EACH_SUFFIX, and the reduction driver consults
+    ``destreak_policy.destreaks`` on its own
+    (``PipelineRerunNIRCAM-LONG.py:289-291``), so a contradiction means the
+    chain globs a suffix the reduction never writes: zero inputs at m1, hours
+    after submission (issue #69).  Returns the disagreeing filters.
+    """
+    disagree = sorted(f for f, v in policy["destreaks"].items()
+                      if bool(v) != bool(destreak))
+    if not disagree:
+        return []
+    asked = "--destreak" if destreak else "--no-destreak"
+    suffix = pipeline_policy.crf_suffix(obs, destreak)
+    print(f"--trigger: WARNING {asked} contradicts the pipeline's destreak "
+          f"policy for {field} o{obs} on {', '.join(disagree)} "
+          f"(destreak_policy.destreaks() -> {policy['destreaks']}).  The "
+          f"reduction driver applies that policy itself, so it writes "
+          f"{policy['each_suffix']} for those filters while the chained "
+          f"cataloging globs EACH_SUFFIX={suffix}: ZERO inputs at m1 "
+          f"(data-qa#69).", file=sys.stderr)
+    if not destreak:
+        # NO_DESTREAK=1 is the flag's only reduction-side effect and the
+        # pipeline has no consumer for it yet (the pipeline-side half of #69),
+        # so --no-destreak cannot make the reduction match the align suffix.
+        print(f"--trigger: WARNING NO_DESTREAK=1 has no consumer in the "
+              f"pipeline yet, so the reduction destreaks {field} regardless.  "
+              f"Drop --no-destreak, or pass --each-suffix "
+              f"{policy['each_suffix']} to catalog what it writes.",
+              file=sys.stderr)
+    return disagree
+
+
 def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_ROOT,
                modules="nrca,nrcb,merged", catalog_modules="merged",
-               each_suffix=None, destreak=False, skip_step12=False) -> List[dict]:
-    """The full submission sequence for one observation (list of step dicts)."""
+               each_suffix=None, destreak=None, skip_step12=False,
+               probe=True) -> List[dict]:
+    """The full submission sequence for one observation (list of step dicts).
+
+    With no explicit ``each_suffix`` the pipeline's destreak policy is probed.
+    On the --auto trigger path (no override at all) it sets EACH_SUFFIX, so the
+    chain globs the crf products the reduction really writes.  Under an explicit
+    ``destreak`` the flag still wins, and the probe serves the contradiction
+    warning (``_warn_destreak_contradiction``).  ``probe=False`` skips the
+    subprocess and keeps the historical hardcoded default.
+    """
     field = field or field_for(program, obs)
     if not field:
         raise ValueError(f"no field mapping for program {program} obs {obs}; "
                          "pass --field or add it to mast_monitor.PROGRAMS")
     if not filters:
         raise ValueError("filters required (e.g. --filters F405N F410M)")
+    policy = None
+    if probe and each_suffix is None:
+        # probed even under an explicit --destreak/--no-destreak: the flag still
+        # wins the EACH_SUFFIX ladder, and the policy is what tells us the flag
+        # contradicts what the reduction will write.  An explicit --each-suffix
+        # names the glob outright, so it needs no probe.
+        policy = pipeline_policy.probe_policy(field, obs, filters,
+                                              pipe_root=pipe_root)
+    if policy and destreak is None and len(set(policy["destreaks"].values())) > 1:
+        # sickle-style split (SW destreaks, LW does not): the chain takes ONE
+        # EACH_SUFFIX, so some filters glob the wrong products -- that field
+        # needs per-filter manual submissions (run_pipeline suffix_by_filter)
+        print(f"--trigger: WARNING field {field} destreaks per-filter "
+              f"({policy['destreaks']}); a single EACH_SUFFIX="
+              f"{policy['each_suffix']} is wrong for part of the filter "
+              "list -- submit those filters by hand", file=sys.stderr)
+    if policy and destreak is not None:
+        _warn_destreak_contradiction(field, obs, destreak, policy)
     return [
         reduction_step(program, obs, field, filters, pipe_root=pipe_root,
-                       modules=modules, skip_step12=skip_step12),
+                       modules=modules, skip_step12=skip_step12,
+                       destreak=destreak),
         cataloging_step(program, obs, field, filters, pipe_root=pipe_root,
                         modules=catalog_modules, each_suffix=each_suffix,
-                        destreak=destreak),
+                        destreak=destreak, policy=policy),
     ]
 
 
@@ -181,11 +318,19 @@ def main(argv=None):
     ap.add_argument("--catalog-modules", default="merged",
                     help="cataloging MODULES (default merged)")
     ap.add_argument("--each-suffix", default=None,
-                    help="cataloging EACH_SUFFIX (default align_o<obs>_crf, the "
-                         "plain no-destreak crf products)")
-    ap.add_argument("--destreak", action="store_true",
-                    help="catalog the destreaked products "
+                    help="cataloging EACH_SUFFIX override (default: probe the "
+                         "pipeline's destreak policy; align_o<obs>_crf if the "
+                         "probe fails)")
+    ap.add_argument("--destreak", dest="destreak", action="store_true",
+                    default=None,
+                    help="force cataloging the destreaked products "
                          "(EACH_SUFFIX destreak_o<obs>_crf)")
+    ap.add_argument("--no-destreak", dest="destreak", action="store_false",
+                    help="force the plain align products (EACH_SUFFIX "
+                         "align_o<obs>_crf + NO_DESTREAK=1 to the reduction)")
+    ap.add_argument("--no-probe", action="store_true",
+                    help="skip the destreak-policy probe subprocess and keep "
+                         "the hardcoded EACH_SUFFIX default")
     ap.add_argument("--skip-step12", action="store_true",
                     help="SKIP=1: reuse existing *_cal.fits (default SKIP=0 "
                          "for fresh data)")
@@ -198,7 +343,7 @@ def main(argv=None):
                pipe_root=args.pipe_root, execute=args.execute,
                modules=args.modules, catalog_modules=args.catalog_modules,
                each_suffix=args.each_suffix, destreak=args.destreak,
-               skip_step12=args.skip_step12)
+               skip_step12=args.skip_step12, probe=not args.no_probe)
     except (ValueError, FileNotFoundError, RuntimeError) as ex:
         print(f"ERROR: {ex}", file=sys.stderr)
         return 1

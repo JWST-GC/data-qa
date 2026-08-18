@@ -109,6 +109,18 @@ PROGRAMS: Dict[int, Dict[str, str]] = {
     7213: {"001": "ngc6334"},
 }
 
+# Programs whose fields sit in the inner Galactic Center / CMZ -- the crowded
+# fields the pipeline README marks DEBLEND_SATSTARS=1 "required for crowded GC
+# fields" (jwst-gc-pipeline scripts/reduction/README.md).  Membership is decided
+# per FIELD (the cataloging TARGET), derived from these programs' PROGRAMS rows.
+# 1182 is left out on purpose: it maps BOTH brick (GC -- already covered via
+# 2221) and w51 (non-GC), so deriving fields from it would wrongly sweep w51 in.
+GC_PROGRAMS = (TREASURY_PROGRAM, 2221, 2211, 4147, 5365, 2045, 3958, 2092, 1939)
+
+GC_FIELDS = frozenset(
+    field for prog in GC_PROGRAMS for field in PROGRAMS[prog].values()
+) | {TREASURY_FIELD}
+
 DEFAULT_STATE = "/orange/adamginsburg/jwst/ops/mast_state.json"
 
 # Columns kept from the MAST observation table (t_* are MJD floats).

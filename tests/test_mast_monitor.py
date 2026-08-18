@@ -47,6 +47,19 @@ def test_programs_cross_check_release_fields():
             assert field in FIELDS or field in unreleased, (prog, field)
 
 
+def test_gc_fields_membership():
+    """DEBLEND_SATSTARS keys off GC_FIELDS: every inner-GC/CMZ field is in, and
+    the 1182 brick+w51 split must never sweep w51 (or any other non-GC field)
+    into the set."""
+    assert {"gc-treasury", "brick", "cloudc", "gc2211", "sgrc", "sgrb2",
+            "arches", "quintuplet", "sickle", "cloudef", "sgra"} <= mm.GC_FIELDS
+    assert not {"w51", "wd1", "wd2", "ngc6334"} & mm.GC_FIELDS
+    # every GC field is a field the monitor can actually map to
+    mappable = {f for obsmap in mm.PROGRAMS.values() for f in obsmap.values()}
+    mappable.add(mm.TREASURY_FIELD)
+    assert mm.GC_FIELDS <= mappable
+
+
 # --------------------------------------------------------------------------- diffing
 def test_new_observation_event():
     new = mm.summarize([_row("jw02221-o001_t001_nircam_clear-f405n")], POLL)
