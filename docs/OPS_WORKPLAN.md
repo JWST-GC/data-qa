@@ -81,7 +81,12 @@ that already exists.
 - Every state write first copies the previous file to a dated
   `<state>.bak-YYYYMMDD` sibling (the first write of each day, kept 14 days),
   so `/orange/adamginsburg/jwst/ops/` carries up to 14 such files. A backup
-  that cannot be written warns and the state write proceeds.
+  that cannot be written warns and the state write proceeds. A sibling already
+  at today's date is taken as today's snapshot as-is, so confirm a file you
+  restore from parses before you trust it.
+- The preflight and the destreak-policy probe (issue #69) both subprocess the
+  pipeline env, and the preflight runs first: an observation the registry
+  rejects has no policy worth probing.
 
 ### 2. `data_qa/pipeline_trigger.py` — reduction + cataloging submission
 - Maps program/obs → field/target/filters through `mast_monitor.field_for`

@@ -128,7 +128,16 @@ def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
     the one consulted; the interpreter is ``python`` / $PIPELINE_PYTHON /
     DEFAULT_PIPELINE_PYTHON.  ``instrument`` selects the fields.yaml section --
     joint obs tokens ('002-998') exist under miri, and the nircam section
-    answers "not registered" for them.
+    answers "not registered" for them.  ``instrument`` is a DIRECT-CALL
+    argument: build_plan wraps the NIRCam reduction/cataloging submitters only,
+    so it asks the nircam section and grows an instrument of its own when the
+    trigger learns to submit MIRI.
+
+    ``pipe_root`` is compared as a REALPATH against the realpath the child
+    reports, and with a trailing separator: this account's checkouts are reached
+    through symlinked components and its worktrees are named '<root>-<slug>'
+    beside the root, so an unresolved compare would fail open on every call and
+    a separator-less prefix would accept a sibling checkout's verdict.
 
     ONLY the child's rc 3 (PREFLIGHT_NOT_REGISTERED_RC, written by the child
     when target_for_obsid raises KeyError/FieldRegistryError) blocks, and only
@@ -378,6 +387,8 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_RO
     # before sbatch accepts jobs that will KeyError on-node.  It runs BEFORE the
     # destreak-policy probe (issue #69): both subprocess the pipeline env, and
     # an observation the registry rejects has nothing to probe a policy for.
+    # The nircam section is the one asked: every step this plan submits is a
+    # NIRCam wrapper (submit_reduction.sbatch / submit_cataloging_chain.sh).
     registry_preflight(program, obs, pipe_root=pipe_root)
     policy = None
     if probe and each_suffix is None:

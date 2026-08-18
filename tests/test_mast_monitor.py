@@ -738,6 +738,27 @@ def test_backup_prunes_beyond_keep_days(tmp_path):
     assert f"state.json.bak-{today:%Y%m%d}" in names
 
 
+def test_backup_prune_boundary_keeps_exactly_keep_days(tmp_path):
+    """The retention window is inclusive at its edge: a backup exactly
+    BACKUP_KEEP_DAYS old survives and the next day's does not, so an operator
+    reading '14 days' gets 14 restorable days rather than 13."""
+    import datetime
+    path = str(tmp_path / "state.json")
+    today = datetime.date.today()
+
+    def dated(days):
+        p = tmp_path / ("state.json.bak-"
+                        + f"{today - datetime.timedelta(days=days):%Y%m%d}")
+        p.write_text("{}")
+        return p
+
+    edge = dated(mm.BACKUP_KEEP_DAYS)
+    over = dated(mm.BACKUP_KEEP_DAYS + 1)
+    mm.prune_state_backups(path, today=today)
+    assert edge.exists()
+    assert not over.exists()
+
+
 # ------------------------------------------------------- MAST failure isolation (HIGH-2)
 def test_query_failure_skips_program_not_poll(monkeypatch, tmp_path, capsys):
     import requests

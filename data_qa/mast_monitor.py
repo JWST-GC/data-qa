@@ -430,7 +430,13 @@ def backup_state(path, today=None) -> Optional[str]:
 
     The copy goes to a tmp sibling and is renamed into place, so an interrupted
     copy (ENOSPC, RLIMIT_FSIZE) cannot leave a truncated file sitting at
-    exactly the path a restore would use."""
+    exactly the path a restore would use.
+
+    Consequence of the one-per-day rule: an existing ``.bak-<today>`` is taken
+    as today's snapshot whatever it holds and whatever its mode, so a file an
+    operator put there by hand, or a read-only one, is kept silently.  A
+    restore reads the sibling, and ``json.load`` is the check that it is a
+    state file."""
     if not os.path.exists(path):
         return None
     today = today or datetime.date.today()
