@@ -1495,7 +1495,10 @@ def test_main_weekly_commit_report_without_auto_clears_memo(monkeypatch,
 def test_main_seed_run_keeps_low_disk_notice_and_memo(monkeypatch, tmp_path):
     """--seed on an --auto run whose disk gate failed keeps the LOW DISK
     warning: the seed text is appended, so the warning reaches every comment
-    body and the last-notified memo survives the seed commit."""
+    body and the last-notified memo survives the seed commit.  The seed also
+    commits the baseline the disk gate withheld, which is what the gate comment
+    at the --auto downgrade calls out as the exception to "the state is NOT
+    committed"."""
     posted = _patch_post_status(monkeypatch)
     monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
     monkeypatch.setattr(mm, "act_download", lambda *a, **kw: None)
@@ -1512,4 +1515,8 @@ def test_main_seed_run_keeps_low_disk_notice_and_memo(monkeypatch, tmp_path):
     (_, body, kw), = posted
     assert "LOW DISK" in body and "SEED RUN" in body
     assert kw["update_last"] is False                    # fresh downgrade
-    assert mm.load_state(str(state))[mm.NOTIFIED_DOWNGRADE_KEY] == "LOW DISK"
+    committed = mm.load_state(str(state))
+    assert committed[mm.NOTIFIED_DOWNGRADE_KEY] == "LOW DISK"
+    # the seed commits the baseline even though the disk gate cleared
+    # commit_state: the polled observation is now in the state file
+    assert "jw10678-o101_t101_nircam" in committed["programs"]["10678"]["obs"]

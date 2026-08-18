@@ -946,6 +946,12 @@ def main(argv=None):
             # report-only downgrade: the issue comment still posts (with the
             # LOW DISK warning), but nothing is downloaded/submitted and the
             # state is NOT committed so the events re-fire next run.
+            # EXCEPTION: a --seed run (or a first run that seeds itself) sets
+            # commit_state back to True below, since a seed exists to write the
+            # baseline; a hand-run `--seed --auto` under LOW DISK therefore
+            # retires the events this gate withheld.  The LOW DISK notice and
+            # the last-notified memo survive that path (the seed text is
+            # appended to `notice` rather than replacing it).
             args.download = args.trigger = args.commit_state = False
             notice = msg
 
