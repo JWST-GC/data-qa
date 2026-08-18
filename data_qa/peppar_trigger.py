@@ -18,7 +18,11 @@ Two on-disk layouts hold the cal files (issue #73).  The reduction writes
                  sgrb2 0/1500, sgrc 0/242, sickle 0/309, w51 0/560, wd1 0/696, wd2 0/328
   both layouts:  brick 720/1296, gc2211 740/740, m92 80/80, ngc6334 1250/1250
 
-``field_for`` matches ANY subdir, so in its wider scope brick becomes 1296/1296 (``dolphot/``
+``field_for`` resolves the field by cal-file COUNT, since a field dir can hold a handful of
+another observation's frames: jw02221 obs 001 reduces to brick and obs 002 to cloudc, yet
+brick also carries 96 obs-002 frames and cloudc 72 obs-001 ones, so first-match answered
+brick for both and left cloudc's 480 obs-002 files unreachable.  It matches ANY subdir, so
+in its wider scope brick becomes 1296/1296 (``dolphot/``
 adds 576 flat) and three more fields hold both -- m4 150/150 and ngc6397 120/120 (their cal
 files sit in ``F150W2``/``F322W2``) and w51 64/560 (64 flat in ``dolphot/``) -- for SEVEN
 both-layout fields.  ``field_for`` also sees the flat-only jw02731 760/0, jw02732 1058/0 and
@@ -101,10 +105,11 @@ def cal_data_dir(fdir: str, det: Optional[str] = None) -> str:
     """The single directory the peppar runner should glob for this filter dir, resolved
     per DETECTOR when ``det`` is given.
 
-    The runner globs ``PEPPAR_DATA_DIR`` flat (``scripts/peppar/run_peppar_generic.py``),
-    so it sees ONE layout while discovery enumerates the union of both.  Two ways that
-    bites, both fixed here by choosing the layout that serves the most cal files for the
-    scope asked about (ties go to ``pipeline/``, the newer reduction):
+    The runner globs ``PEPPAR_DATA_DIR`` flat
+    (``scripts/peppar/run_peppar_generic.py::run_peppar_script``), so it sees ONE layout
+    while discovery enumerates the union of both.  Two ways that bites, both fixed here by
+    choosing the layout that serves the most cal files for the scope asked about (ties go
+    to ``pipeline/``, the newer reduction):
 
     * a detector present only in the flat dir, handed ``{FILT}/pipeline``, clears the
       runner's "no images" guard on its SIBLINGS' files and then dies in
@@ -115,6 +120,15 @@ def cal_data_dir(fdir: str, det: Optional[str] = None) -> str:
       whenever one layout is a superset of the other (the ordinary half-migrated shape);
       a genuinely disjoint split still loses the remainder, so that case warns on stderr
       instead of passing unremarked.
+
+    What this rule maximises is the file COUNT, which can select the older reduction: the
+    module docstring's ``pipeline/`` preference holds where both layouts hold the same
+    basename (the dedup in ``_cal_files``, and the tie here), while a half-migrated
+    detector whose flat side is bigger is served the flat copies, older on brick and
+    gc2211.  Serving the whole detector beats serving the newer part of it, and the
+    disjoint case says so on stderr.  On the live archive flat is a subset of
+    ``pipeline/`` by basename in all 539 (filter, detector) pairs, so ``pipeline/`` wins
+    wherever it exists.
 
     Without ``det`` the answer is the filter-level one, by the same rule."""
     fdir = fdir.rstrip("/")
@@ -135,16 +149,54 @@ def cal_data_dir(fdir: str, det: Optional[str] = None) -> str:
     return chosen
 
 
-def field_for(program: str, obs: str, base: str = BASE) -> Optional[str]:
-    """Field dir under ``base`` whose FILT subdirs hold this obs's cal files (in either
-    the ``pipeline/`` or the legacy flat layout)."""
+def field_cal_counts(program: str, obs: str, base: str = BASE) -> Dict[str, int]:
+    """{field: number of this obs's cal files under it} over every field dir in ``base``,
+    counting both layouts and a basename present in both once.  Fields holding none are
+    omitted."""
     stem = f"jw{int(program):05d}{obs}"
+    counts: Dict[str, int] = {}
     for d in sorted(glob.glob(f"{base}/*/")):
         fld = os.path.basename(d.rstrip("/"))
-        for fdir in sorted(glob.glob(f"{base}/{fld}/*/")):
-            if _cal_files(fdir, stem):
-                return fld
-    return None
+        n = sum(len(_cal_files(fdir, stem))
+                for fdir in sorted(glob.glob(f"{base}/{fld}/*/")))
+        if n:
+            counts[fld] = n
+    return counts
+
+
+def field_for(program: str, obs: str, base: str = BASE) -> Optional[str]:
+    """Field dir under ``base`` holding the MOST of this obs's cal files (in either the
+    ``pipeline/`` or the legacy flat layout); ``None`` when no field holds any.
+
+    Several field dirs hold a few frames of an observation that reduces into a DIFFERENT
+    field, so "the first field that matches" answers the wrong one.  jw02221 is the live
+    case: obs 001 reduces to brick and obs 002 to cloudc, while brick's LW filter dirs
+    also carry 96 obs-002 frames and cloudc's F2550W carries 72 obs-001 frames.  Returning
+    the first sorted match gave brick for BOTH observations, so cloudc's 480 obs-002 cal
+    files -- 30 (filter, detector) jobs -- were unreachable from ``--peppar`` for every
+    observation of the only program that reaches them, silently and with a populated
+    ``data_dir``.  Counting answers brick for 2221/001 (1056 against 72) and cloudc for
+    2221/002 (480 against 144), and reproduces ``mast_monitor.PROGRAMS`` -- the reduction's
+    own field registry -- for every registered observation that resolves on disk.
+
+    A contested observation warns on stderr with the per-field counts, since a field
+    holding a minority of another observation's frames is a misfiling worth seeing.
+    An exact tie resolves alphabetically, so the answer is stable across polls.
+
+    ``mast_monitor.act_peppar`` passes ``field=`` from that registry, so this is the
+    resolver for the CLI and for any caller without a registry entry.  It reads every
+    field dir (~1.6 s over the 55 fields on the live archive), which suits the poll
+    cadence the trigger runs at."""
+    counts = field_cal_counts(program, obs, base)
+    if not counts:
+        return None
+    best = max(sorted(counts), key=counts.get)
+    if len(counts) > 1:
+        rest = ", ".join(f"{f} {counts[f]}" for f in sorted(counts) if f != best)
+        print(f"peppar_trigger: WARNING jw{int(program):05d}-o{obs} has cal files under "
+              f"{len(counts)} fields; running {best} ({counts[best]} cal files), leaving "
+              f"{rest}", file=sys.stderr)
+    return best
 
 
 def enumerate_filt_det(field: str, base: str = BASE) -> Dict[str, List[str]]:
