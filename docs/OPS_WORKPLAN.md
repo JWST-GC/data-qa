@@ -61,9 +61,13 @@ that already exists.
   daily; SLURM conventions `astronomy-dept-b`.
 
 ### 2. `data_qa/pipeline_trigger.py` — reduction + cataloging submission
-- Maps program/obs → field/target/filters (mirrors
-  `PipelineRerunNIRCAM-LONG.py:1637` map; single source imported at runtime
-  when the pipeline repo is available, vendored fallback table otherwise).
+- Maps program/obs → field/target/filters through `mast_monitor.field_for`
+  (the `PROGRAMS` table). `PROGRAMS` mirrors the pipeline's field registry
+  `jwst_gc_pipeline/fields.yaml`, read through
+  `jwst_gc_pipeline.fields.field_to_reg_mapping`; the map lived in a literal
+  dict in `PipelineRerunNIRCAM-LONG.py` until pipeline commit ee33bec.
+  `tests/test_mast_monitor.py::test_programs_complete_vs_pipeline_field_mapping`
+  fails when the table falls behind the registry.
 - Emits the exact submission sequence, respecting repo conventions
   (`--account=astronomy-dept --qos=astronomy-dept-b`, job names
   `<target><program>-o<obsid>-<stage>[-FILTER]` at submit time,
