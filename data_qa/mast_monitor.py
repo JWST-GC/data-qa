@@ -7,7 +7,14 @@ effect is individually gated:
   --commit-state   update the state file (otherwise the same events re-report)
   --download       fetch the new observation's products via data_qa.retrieve_data
   --trigger        build the reduction+cataloging submission (data_qa.pipeline_trigger)
-  --report         comment the events on the per-observation QA issue (status_report)
+  --report         comment the events on the per-observation QA issue (status_report);
+                   an issue whose events include an ARRIVAL (calibrated data
+                   landing: NEWLY_RELEASED, a CALIB_LEVEL_UP crossing the
+                   actionable level, or a NEW_OBSERVATION already released), and
+                   every issue on a run carrying a LOW DISK / CAPPED notice whose
+                   reason differs from the last one announced, gets a NEW comment
+                   (GitHub notifies watchers); anything else edits the previous
+                   monitor comment in place (see act_report)
   --execute        actually do it (download / sbatch / post); without it the actions
                    above are dry-run prints
   --auto           fully automatic: --download --trigger --report --commit-state
@@ -42,6 +49,13 @@ Events:
   NEW_OBSERVATION  obs_id not previously in the state file
   NEWLY_RELEASED   t_obs_release passed since the last committed poll
   CALIB_LEVEL_UP   calib_level increased (e.g. 2 -> 3: mosaics available)
+
+  ARRIVAL is the subset that announces calibrated data actually landing, the
+  class --report must interrupt a human for: NEWLY_RELEASED, a CALIB_LEVEL_UP
+  that crossed MIN_ACTIONABLE_CALIB_LEVEL, or a NEW_OBSERVATION first seen
+  already released and calibrated (see event_is_arrival).  A planned tile and
+  a 2 -> 3 reprocessing bump stay routine: they edit the monitor comment in
+  place.
 
 Anonymous MAST metadata queries work without auth; ``~/.mast_api_token`` is used if
 present (exclusive-access programs).  astroquery is imported lazily so the module
@@ -175,6 +189,23 @@ def event_ready(ev: dict) -> bool:
     finally arrives."""
     return (bool(ev.get("released"))
             and (ev.get("calib_level") or 0) >= MIN_ACTIONABLE_CALIB_LEVEL)
+
+
+def event_is_arrival(ev: dict) -> bool:
+    """True when the event announces calibrated data actually LANDING (the
+    event class that must interrupt a human, issue #71): the observation is
+    event_ready AND the event is the arrival edge -- NEWLY_RELEASED, a
+    CALIB_LEVEL_UP that CROSSED MIN_ACTIONABLE_CALIB_LEVEL, or a
+    NEW_OBSERVATION first seen with released calibrated data (a treasury tile
+    that executed between polls fires this way; act_download/act_trigger act
+    on it just like the other two).  A CALIB_LEVEL_UP entirely above the
+    threshold (2 -> 3 reprocessing) is routine and is NOT an arrival."""
+    if not event_ready(ev):
+        return False
+    if ev["event"] == "CALIB_LEVEL_UP":
+        prev = ev.get("previous_calib_level")
+        return (prev if prev is not None else 0) < MIN_ACTIONABLE_CALIB_LEVEL
+    return ev["event"] in ("NEW_OBSERVATION", "NEWLY_RELEASED")
 
 
 def instrument_class(instrument_name) -> str:
@@ -417,6 +448,75 @@ def record_downloaded(state_path, key: str, when: str, state: Optional[dict] = N
     """Persist a successful download into the ``downloaded`` map (mirror of the
     ``triggered`` map; release-gated the same way)."""
     _record_state_key(state_path, "downloaded", key, when, state=state)
+
+
+# --auto downgrade notices that must interrupt a human when they FIRST appear
+# (issue #71).  Matched by PREFIX against the run notice, and the memo below
+# keys on this coarse class: the LOW DISK text embeds the fluctuating free-TB
+# figure, so keying on the full message would re-notify on every 0.1 TB wiggle.
+DOWNGRADE_NOTICE_PREFIXES = ("LOW DISK", "CAPPED")
+
+# Top-level state-file key remembering which downgrade reason was last
+# announced with a NEW (notifying) comment.
+NOTIFIED_DOWNGRADE_KEY = "last_notified_downgrade"
+
+
+def notice_downgrade_reason(notice: Optional[str]) -> Optional[str]:
+    """Coarse downgrade class of a run notice ('LOW DISK' / 'CAPPED'), or None
+    for no notice or a non-downgrade notice.
+
+    Scoped to the NOTICE alone: SEED RUN / PER-PROGRAM SEED are deliberate
+    baselines, so the notice itself never needs to interrupt anyone.  A seed
+    run's EVENTS are classified independently -- a backlog holding released
+    observations still carries arrivals, and act_report posts a notifying
+    comment for them."""
+    for prefix in DOWNGRADE_NOTICE_PREFIXES:
+        if notice is not None and notice.startswith(prefix):
+            return prefix
+    return None
+
+
+def _memo_notified_downgrade(state_path, reason: Optional[str],
+                             state: Optional[dict] = None):
+    """Persist (str) or clear (None) the last-notified downgrade reason
+    IMMEDIATELY (fresh read-modify-write, like the ``triggered`` map: a LOW
+    DISK run commits no state at all, so the memo must ride its own write).
+    No disk write when the stored value already matches; the caller's
+    in-memory ``state`` is mirrored so a later full commit carries it."""
+    disk = load_state(state_path)
+    if disk.get(NOTIFIED_DOWNGRADE_KEY) != reason:
+        if reason is None:
+            disk.pop(NOTIFIED_DOWNGRADE_KEY, None)
+        else:
+            disk[NOTIFIED_DOWNGRADE_KEY] = reason
+        save_state(state_path, disk)
+    if state is not None:
+        if reason is None:
+            state.pop(NOTIFIED_DOWNGRADE_KEY, None)
+        else:
+            state[NOTIFIED_DOWNGRADE_KEY] = reason
+
+
+def retire_downgrade_memo(state: dict, notice: Optional[str]) -> dict:
+    """Commit-time end of a downgrade episode: drop the last-notified memo
+    from ``state`` when the run carried NO downgrade notice, so the next
+    LOW DISK / CAPPED notice posts a fresh (notifying) comment.  Returns the
+    same dict.
+
+    This is the ONLY clearing path on a ``--commit-state`` run without
+    ``--report`` (act_report, the other one, does not run) -- the shape the
+    weekly scrontab poll had until issue #71 (docs/scrontab.example now adds
+    --report --execute so a mid-wedge weekly run announces the arrivals its
+    commit retires, but --commit-state alone stays a supported invocation).
+
+    Gated on the notice instead of clearing unconditionally: a DOWNGRADED run
+    that still commits must KEEP its memo.  A LOW DISK run commits nothing, so
+    the gate is inert for it today, but a CAPPED run that acts on a subset and
+    commits for exactly those groups (issue #67) would otherwise wipe the memo
+    on every poll and re-notify each repeat."""
+    if notice_downgrade_reason(notice) is None:
+        state.pop(NOTIFIED_DOWNGRADE_KEY, None)
+    return state
 
 
 def inflight_job_names(timeout_s=30) -> Optional[Set[str]]:
@@ -669,12 +769,80 @@ def act_peppar(events, execute=False):
 TREASURY_ISSUE_TITLE = f"GC Treasury — program {TREASURY_PROGRAM} deliveries"
 
 
-def act_report(events, execute=False, repo=None, update_last=True, notice=None):
+def act_report(events, execute=False, repo=None, update_last=None, notice=None,
+               state=None, state_path=None):
+    """Comment the event batch on the QA issue(s).
+
+    NOTIFICATION POLICY (issue #71): GitHub sends NO notification for a
+    comment EDIT, so pure update-in-place silently swallowed the one event
+    class that must interrupt a human.  With ``update_last=None`` each ISSUE
+    is classified on its OWN events:
+
+      * post a NEW comment (watchers notified) when that issue's events
+        carry an ARRIVAL (``event_is_arrival``: calibrated data actually
+        landed), or when the run carries a downgrade notice (LOW DISK /
+        CAPPED) whose coarse reason is FRESH -- differing from the memo
+        (state key ``last_notified_downgrade``) that records the reason last
+        announced with a notifying comment.  The notice rides on EVERY
+        comment body, so a fresh downgrade notifies on every issue;
+      * edit the previous MONITOR_MARKER comment in place for that issue's
+        purely-planned events and for REPEATS of an already-notified
+        downgrade reason (a LOW DISK run commits no state, so the identical
+        batch re-fires every poll -- the memo keeps those repeats from
+        stacking).
+
+    Per-issue rather than batch-global: one brick arrival must not make the
+    planned-only treasury tiles post notifying comments too.
+
+    A SEED RUN / PER-PROGRAM SEED backlog that contains released observations
+    notifies: those arrivals were never announced, and the seed notice itself
+    is not a downgrade (``notice_downgrade_reason`` -> None).
+
+    The anti-spam memo is written on an executing run immediately after EVERY
+    notifying downgrade comment in the batch posted successfully (a partial
+    failure leaves it unarmed, so the next poll re-notifies: a duplicate
+    comment on the issues that did post is cheaper than an issue whose
+    watchers never hear the notice).  It is cleared by any executed batch
+    without a downgrade notice, plus by main()'s commit path,
+    ``retire_downgrade_memo`` -- the only clearing path when --report is off.
+
+    A downgrade episode therefore notifies once per uninterrupted run of
+    downgraded polls.  Any downgrade-free run in between ends the episode and
+    re-arms the notification, including a poll that carries no notice because
+    it never ran the disk gate: the weekly ``--commit-state --report
+    --execute`` entry (docs/scrontab.example) has no --auto, so a LOW DISK
+    wedge spanning a Monday re-notifies on the Tuesday poll.
+
+    A downgraded run that keeps re-firing ARRIVAL events keeps posting new
+    comments on purpose: released data is waiting while the automation is
+    wedged, at the deployed poll cadence of once a day
+    (docs/scrontab.example).  Pass ``update_last=True/False`` to override the
+    classification for every issue.
+    """
     from . import status_report
+    reason = notice_downgrade_reason(notice)
+    if state:
+        last_notified = state.get(NOTIFIED_DOWNGRADE_KEY)
+    elif state_path:
+        last_notified = load_state(state_path).get(NOTIFIED_DOWNGRADE_KEY)
+    else:
+        last_notified = None
+    fresh_downgrade = reason is not None and reason != last_notified
+    override = update_last
+
+    def _update_last(evs) -> bool:
+        """Edit-in-place (True) vs new notifying comment (False) for ONE
+        issue's events."""
+        if override is not None:
+            return override
+        return not (fresh_downgrade
+                    or any(event_is_arrival(ev) for ev in evs))
+
     # ONE existing_issues() fetch for the whole run, shared by every
     # post_status call below (a per-group refetch is the ~1668-treasury-group
     # rate-limit hazard); post_status fills it on first use.
     issue_cache: dict = {}
+    posts: List[tuple] = []                      # (update_last, rc) per issue
     treasury = [ev for ev in events if ev.get("field") == TREASURY_FIELD]
     regular = [ev for ev in events if ev.get("field") != TREASURY_FIELD]
     for (program, obsnum, instr), evs in sorted(_group_by_obs(regular).items()):
@@ -684,22 +852,36 @@ def act_report(events, execute=False, repo=None, update_last=True, notice=None):
         title = status_report.issue_title_for(program, obsnum, field=field,
                                               instrument=instr or "NIRCam")
         body = status_report.render_events_comment(evs, notice=notice)
-        # update-in-place on the monitor-marked comment: successive monitor
-        # reports (esp. recurring LOW DISK / CAPPED downgrades, which re-fire
-        # daily because state is not committed) edit ONE comment per issue
-        # instead of stacking identical ones
-        status_report.post_status(title, body, repo=repo, update_last=update_last,
-                                  marker=status_report.MONITOR_MARKER,
-                                  dry_run=not execute, issue_cache=issue_cache)
+        edit = _update_last(evs)
+        posts.append((edit, status_report.post_status(
+            title, body, repo=repo, update_last=edit,
+            marker=status_report.MONITOR_MARKER,
+            dry_run=not execute, issue_cache=issue_cache)))
     if treasury:
         # single rolling issue (auto-created if absent) instead of per-obs
         # rc=3 "no issue titled ..." failures for every treasury tile
         body = status_report.render_events_comment(treasury, notice=notice)
-        status_report.post_status(
-            TREASURY_ISSUE_TITLE, body, repo=repo, update_last=update_last,
+        edit = _update_last(treasury)
+        posts.append((edit, status_report.post_status(
+            TREASURY_ISSUE_TITLE, body, repo=repo, update_last=edit,
             marker=status_report.MONITOR_MARKER, dry_run=not execute,
             issue_cache=issue_cache,
-            create_labels=["QA", f"program:{TREASURY_PROGRAM}"])
+            create_labels=["QA", f"program:{TREASURY_PROGRAM}"])))
+    if execute and state_path:
+        notifying = [rc for edit, rc in posts if not edit]
+        # EVERY notifying comment must have landed before repeats are
+        # suppressed: arming on a partial success (issue A posted, issue B
+        # returned rc!=0) would leave B editing quietly forever and B's
+        # watchers would never see the notice
+        notified = bool(notifying) and all(rc == 0 for rc in notifying)
+        if reason is not None and notified:
+            # every notifying comment carrying the downgrade notice went out:
+            # arm repeat suppression
+            _memo_notified_downgrade(state_path, reason, state=state)
+        elif reason is None:
+            # downgrade-free batch: the episode is over; the NEXT downgrade
+            # notice posts a fresh (notifying) comment
+            _memo_notified_downgrade(state_path, None, state=state)
 
 
 # ------------------------------------------------------------------------------- main
@@ -764,6 +946,12 @@ def main(argv=None):
             # report-only downgrade: the issue comment still posts (with the
             # LOW DISK warning), but nothing is downloaded/submitted and the
             # state is NOT committed so the events re-fire next run.
+            # EXCEPTION: a --seed run (or a first run that seeds itself) sets
+            # commit_state back to True below, since a seed exists to write the
+            # baseline; a hand-run `--seed --auto` under LOW DISK therefore
+            # retires the events this gate withheld.  The LOW DISK notice and
+            # the last-notified memo survive that path (the seed text is
+            # appended to `notice` rather than replacing it).
             args.download = args.trigger = args.commit_state = False
             notice = msg
 
@@ -841,12 +1029,19 @@ def main(argv=None):
     seed = args.seed or (first_run and bool(all_events) and acting)
     actionable = all_events
     if seed:
-        notice = (f"SEED RUN — actions suppressed: committing the current state "
-                  f"({len(all_events)} event(s)) as the baseline; nothing "
-                  "downloaded or submitted.  Subsequent runs act only on "
-                  "genuinely new events."
-                  + ("" if args.seed else "  (state file was missing/empty)"))
-        print(f"--seed: {notice}", file=sys.stderr)
+        seed_notice = (f"SEED RUN — actions suppressed: committing the current "
+                       f"state ({len(all_events)} event(s)) as the baseline; "
+                       "nothing downloaded or submitted.  Subsequent runs act "
+                       "only on genuinely new events."
+                       + ("" if args.seed else "  (state file was missing/empty)"))
+        print(f"--seed: {seed_notice}", file=sys.stderr)
+        # A LOW DISK notice from the --auto disk gate keeps the FRONT of the
+        # run notice.  Overwriting it dropped the warning from every comment
+        # body AND (the coarse reason is prefix-matched) cleared the
+        # last-notified memo mid-episode, so the wedge announced itself to
+        # nobody -- the #71 defect inside a --seed --auto invocation.  One
+        # line, since render_events_comment renders the notice as a blockquote.
+        notice = f"{notice}  {seed_notice}" if notice else seed_notice
         args.download = args.trigger = False
         args.commit_state = True
     elif acting:
@@ -892,11 +1087,19 @@ def main(argv=None):
         if args.peppar:
             act_peppar(actionable, execute=args.execute)
         if args.report:
-            # report EVERYTHING (incl. per-program-seed-suppressed events)
+            # report EVERYTHING (incl. per-program-seed-suppressed events);
+            # state/state_path carry the last-notified-downgrade memo that
+            # decides new-comment-vs-edit (see act_report)
             act_report(all_events, execute=args.execute, repo=args.repo,
-                       notice=notice)
+                       notice=notice, state=state, state_path=args.state)
 
     if args.commit_state:
+        # end the downgrade episode when this run was not itself downgraded,
+        # so the NEXT downgrade notice posts a fresh (notifying) comment; a
+        # downgraded run that still commits keeps its memo (see
+        # retire_downgrade_memo).  This is the only clearing path when
+        # --report is off (a plain --commit-state poll).
+        retire_downgrade_memo(state, notice)
         save_state(args.state, state)
         print(f"state committed: {args.state}")
     return 0

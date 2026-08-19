@@ -118,6 +118,23 @@ def test_post_status_update_last_marker_selects_monitor_comment(monkeypatch):
     assert calls["posted"] == []
 
 
+def test_post_status_new_comment_with_marked_comment_present(monkeypatch):
+    """update_last=False POSTS even when a marked comment is already there --
+    the path mast_monitor.act_report takes for an arrival / fresh downgrade
+    (issue #71).  Editing here would reach nobody: GitHub notifies on new
+    comments only."""
+    comments = [
+        {"id": 10, "body": f"{sr.STATUS_MARKER}\npipeline status"},
+        {"id": 11, "body": f"{sr.MONITOR_MARKER}\nold monitor events"},
+    ]
+    calls = _patch_github(monkeypatch, comments)
+    rc = sr.post_status("T", "ARRIVAL", dry_run=False, update_last=False,
+                        marker=sr.MONITOR_MARKER)
+    assert rc == 0
+    assert calls["posted"] == [(5, "ARRIVAL")]        # new comment: notifies
+    assert calls["updated"] == []                     # comment 11 left alone
+
+
 def test_post_status_update_last_monitor_marker_absent_posts_new(monkeypatch):
     comments = [{"id": 10, "body": f"{sr.STATUS_MARKER}\npipeline status"}]
     calls = _patch_github(monkeypatch, comments)
