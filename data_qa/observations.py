@@ -64,6 +64,18 @@ CURATED: Dict[str, dict] = {
     ),
 }
 
+# Per-INSTRUMENT field override for coordinated-parallel programs whose MIRI and NIRCam
+# observations share an obs number but point at DIFFERENT fields.  ``PROGRAMS`` (mast_monitor)
+# maps obsnum->field for the pipeline's NIRCam routing; when the MIRI parallel of the same
+# obsnum lands on another field, list it here so the QA registry labels the MIRI observation by
+# where it actually points -- NOT by the NIRCam obsnum->field table.
+#   2221 o002: NIRCam images Cloud C, but the MIRI parallel (TARGPROP BRICK-IKP2016-G0.253+0.015,
+#   MAST target_name BRICK-...) images the Brick.  Without this the MIRI o002 issue is mislabeled
+#   "Cloud C" (issue #31); the actual Cloud C MIRI data is only the o003 background field.
+FIELD_OVERRIDE: Dict[tuple, str] = {
+    (2221, "002", "MIRI"): "brick",
+}
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -194,7 +206,9 @@ def _observations_for_program(program) -> List["Observation"]:
 
     out = []
     for (obsnum, inst), g in sorted(grouped.items()):
-        field = want[obsnum]
+        # obsnum->field is the pipeline's NIRCam routing; a MIRI parallel of the same obsnum can
+        # point at another field (2221 o002: NIRCam=cloudc, MIRI=brick) -> label by where it points.
+        field = FIELD_OVERRIDE.get((int(program), obsnum, inst), want[obsnum])
         oid = f"jw{int(program):05d}-o{obsnum}"
         cur = CURATED.get(oid, {})
         out.append(Observation(
