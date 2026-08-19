@@ -1692,13 +1692,15 @@ def _ab_overlap(a_sc, b_sc):
     Two factors separate that from a stage-6 curve, and both have to be applied to compare them:
     ``hypot`` COMBINES the axes where stage 6 divides by sqrt(2) to stay per-axis, and each
     residual is a DIFFERENCE A - B of two independent measurements of one star, so its per-axis
-    scatter is already sqrt(2) above a single module's.  Against stage 6's ``sig_pos`` and
-    ``rms(jwst)``, both per-axis single-measurement quantities, this number therefore runs 2x
-    higher for isotropic scatter (measured: 10.00 mas per-axis single-module error -> 20.00 here,
-    10.00 there).  Aligning A onto B removes two numbers over ~1000 stars, which does not touch
-    that.  Stage 6's ``rms(offset)`` is a different quantity again -- it is against VIRAC and
-    carries VIRAC's error, and its median-radial estimator reads 0.83x a per-axis sigma -- so no
-    single factor relates this number to that curve.
+    scatter is already sqrt(2) above a single module's.  All three stage-6 curves are per-axis
+    single-measurement quantities, so this number runs 2x above each of them for isotropic scatter
+    (measured: a 10.00 mas per-axis single-module error gives 20.00 mas here and 10.00 mas there).
+    Aligning A onto B removes two numbers over ~1000 stars, which does not touch that.
+
+    ``rms(offset)`` sits higher than ``sig_pos`` on a real field for a reason that is NOT a
+    convention: it is measured against VIRAC and carries VIRAC's ~20 mas per-star error.  Its
+    estimator is ``sqrt(mean(r**2))`` (``_binned_rms``) over a residual stage 6 has already divided
+    by sqrt(2), which reads 1.00x a per-axis sigma, the same as ``sig_pos``.
 
     Returns a dict with the offset/scatter/count, the per-star residual arrays (for the
     hexbin + marginals), and a list of overlap-star positions (for the cutout gallery), or None

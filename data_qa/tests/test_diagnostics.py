@@ -603,6 +603,22 @@ def test_ab_overlap_rms_is_twice_the_per_axis_single_module_error():
     assert 1.8 * sig_mas < ov["rms"] < 2.2 * sig_mas
 
 
+def test_binned_rms_reads_one_times_the_per_axis_sigma():
+    # The other half of the 2x claim: it holds against ALL THREE stage-6 curves only because each
+    # is per-axis.  rms(offset) builds hypot(dra', dde')/sqrt(2) and hands it to _binned_rms, whose
+    # estimator is sqrt(mean(r**2)) -- so it reads 1.00x a per-axis sigma, the same as sig_pos.
+    # (The MEDIAN of that same residual is 0.83x, which is the factor the docstring used to quote.)
+    # Pinning the estimator here keeps the docs' factor from drifting if _binned_rms changes.
+    rng = np.random.RandomState(17)
+    n, sig_mas = 200000, 10.0
+    d = rng.normal(0, sig_mas, (n, 2))
+    resid = np.hypot(d[:, 0] - np.median(d[:, 0]), d[:, 1] - np.median(d[:, 1])) / np.sqrt(2.0)
+    mag = rng.uniform(14.0, 18.0, n)                       # spread over several magnitude bins
+    rms, ctr = D._binned_rms(mag, resid)
+    assert rms is not None and len(ctr) >= 3
+    assert 0.97 * sig_mas < float(np.median(rms)) < 1.03 * sig_mas
+
+
 def test_ab_overlap_one_to_one_no_pair_inflation():
     # Guards the count fix: several A sources clustered inside 80 mas of ONE B source must collapse
     # to a SINGLE match (one-to-one), not one pair each -- the search_around_sky many-to-many ball
