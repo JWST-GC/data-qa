@@ -88,11 +88,11 @@ def test_caption_stage5_full_when_overlap_present():
                                 intermodule_rms=6.2, n_overlap=137,
                                 intermodule_off_hi=4.0, intermodule_rms_hi=4.4, n_overlap_hi=34355))
     assert "137 shared stars" in cap and "4.1 mas" in cap
-    assert "TOP-LEFT" in cap and "Reference-free" in cap    # panels labelled + term defined
+    assert "TOP-LEFT" in cap and "glossary-reffree" in cap  # panels labelled + term linked
     assert "S/N > 10" in cap and "marginal" in cap          # the new S/N panel + marginals noted
     assert "TOP-MIDDLE" in cap and "to its right" in cap    # correct panel positions
     # the NRCB2/no-overlap question is answered inline
-    assert "NRCB2" in cap and "VIRAC, not NRCA" in cap
+    assert "NRCB2" in cap and "shares no sky with NRCA" in cap
 
 
 def test_caption_stage5_overlap_without_hi_sn_panel():

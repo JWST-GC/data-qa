@@ -1003,8 +1003,8 @@ def _pooled_daophot(o: Observation, filt, max_files=64):
         return None
     if len(cats) > max_files:
         # Cap the pool, but sample ROUND-ROBIN across detectors: a plain alphabetical head takes
-        # nrca1..nrca3 and drops nrca4 + all of NRCB, so the significance panel / stage-6 curve
-        # would describe module A only -- exactly the module the inter-module tie compares.
+        # nrca1..nrca3 and drops nrca4 + all of NRCB, so the stage-6 curve would describe module A
+        # only -- one of the two modules stage 5 sets out to compare.
         by_det = {}
         for c in cats:
             m = re.search(r"_(nrc[ab](?:[1-4]|long))_", os.path.basename(c))
@@ -1643,15 +1643,17 @@ def _finite_sc(sc):
 
 
 def _module_positions(o, filt):
-    """(NRCA, NRCB) finite SkyCoords for the A/B tie, pooled from the per-detector daophot cats,
-    plus per-module ``meta``.  The per-detector cats are the PRIMARY source.  A module is None
-    either because it is genuinely ABSENT (single-module obs, e.g. sickle = NRCB only) or because
-    its centroids are unusable -- the caller MUST distinguish these (an all-NaN module is an
-    astrometry FAILURE to red-flag, not a legitimate single-module pass).
+    """(NRCA, NRCB) finite SkyCoords for the A-vs-B comparison, pooled from the per-detector
+    daophot cats, plus per-module ``meta``.  The per-detector cats are the PRIMARY source.  A module
+    comes back None for one of two reasons -- it is genuinely ABSENT (a single-module obs, e.g.
+    sickle = NRCB only), or its centroids are unusable -- and the caller MUST tell them apart: an
+    all-NaN module is an astrometry FAILURE to red-flag, and it would otherwise pass as a
+    single-module observation.
 
     Returns ``(a_sc, b_sc, meta)`` where meta[module] = dict(present, n_raw, n_nan, nan_frac,
-    dead): ``present`` = cats exist on disk; ``dead`` = cats exist but too few finite centroids
-    to tie (astrometry failed); ``nan_frac`` = dropped fraction (flagged when high even if usable)."""
+    dead): ``present`` = cats exist on disk; ``dead`` = cats exist but hold too few finite centroids
+    to measure with (astrometry failed); ``nan_frac`` = dropped fraction (flagged when high even
+    where the module is still usable)."""
     from astropy.table import vstack, Table
 
     def pool(dets):
@@ -1680,12 +1682,18 @@ def _module_positions(o, filt):
 
 
 def _ab_overlap(a_sc, b_sc):
-    """Reference-free NRCA↔NRCB tie from two module position lists (no external catalogue).
-    Crowding-robust: the bulk A→B shift is the ``aa.xcorr`` histogram PEAK (a direct
-    search_around_sky median fabricates pairs in a dense field); the RMS (tie precision) is the
-    residual scatter of the SAME stars after aligning A onto B by that peak.  Returns a dict with
-    the offset/RMS/count, the per-star residual arrays (for the hexbin + marginals), and a list of
-    overlap-star positions (for the cutout gallery), or None if unmeasurable."""
+    """How far a star seen in NRCA sits from the same star seen in NRCB, from two module position
+    lists and no external catalogue.
+
+    ``off`` is the bulk A->B shift, taken as the ``aa.xcorr`` histogram PEAK.  A
+    search_around_sky median would fabricate pairs at this density.  ``rms`` is the scatter left in
+    the SAME stars after A is aligned onto B by that peak: ``hypot`` of the two axes' ``mad_std``,
+    so it is the COMBINED (RA, Dec) scatter, sqrt(2) times the per-axis robust sigma.  Stage 6
+    plots a per-axis-equivalent curve, which for isotropic scatter reads ~1.7x smaller than this
+    number; the two are not interchangeable.  Returns a dict with the offset/scatter/count, the
+    per-star residual arrays (for the
+    hexbin + marginals), and a list of overlap-star positions (for the cutout gallery), or None
+    when it cannot be measured."""
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     if a_sc is None or b_sc is None or len(a_sc) < 50 or len(b_sc) < 50:
@@ -1696,11 +1704,11 @@ def _ab_overlap(a_sc, b_sc):
     cosd = float(np.cos(np.radians(np.median(a_sc.dec.deg))))
     a_al = SkyCoord((a_sc.ra.deg + xc["dra"] / 1000.0 / 3600.0 / cosd) * u.deg,
                     (a_sc.dec.deg + xc["ddec"] / 1000.0 / 3600.0) * u.deg)
-    # One-to-one match, NOT search_around_sky: in a crowded GC field an 80-mas ball match is
-    # many-to-many (one bright B star pairs with every nearby A star), so len(pairs) counts PAIRS,
-    # not distinct overlap stars -- that is the bogus ~34k count.  Take the nearest B for each A,
-    # keep those within 80 mas, then drop duplicate B (keep the closest A) so every physical star
-    # is counted once and fabricated pairs no longer bias the RMS.
+    # One-to-one match.  In a crowded GC field an 80-mas ball match is many-to-many -- one bright
+    # B star pairs with every nearby A star -- so search_around_sky counts PAIRS where the reader
+    # expects distinct overlap stars, which is where the ~34k count came from.  Take the nearest B
+    # for each A, keep those within 80 mas, then drop duplicate B (keeping the closest A), so every
+    # physical star is counted once and fabricated pairs stay out of the scatter.
     idx, sep2d, _ = a_al.match_to_catalog_sky(b_sc)
     keep = sep2d < 0.08 * u.arcsec
     ia = np.where(keep)[0]
@@ -1725,9 +1733,9 @@ def _ab_overlap(a_sc, b_sc):
 
 
 def _draw_ab_panel(ax, ovd, title):
-    """Draw one reference-free A↔B residual panel: a 2-D hexbin of the per-star ΔRA/ΔDec
-    residuals (same stars, aligned by the histogram peak) with ΔRA/ΔDec marginal histograms.
-    The numeric summary goes on the TOP marginal's title so it can't collide with the marginals."""
+    """Draw one A↔B residual panel: a 2-D hexbin of the per-star ΔRA/ΔDec residuals (the same
+    stars, aligned by the histogram peak) with ΔRA/ΔDec marginal histograms.  The numeric summary
+    goes on the TOP marginal's title, clear of the marginals themselves."""
     dra_a = np.asarray(ovd["dra_arr"], float); dde_a = np.asarray(ovd["dde_arr"], float)
     ax.hexbin(dra_a, dde_a, gridsize=40, bins="log", cmap="cividis", mincnt=1)
     ax.axhline(0, color="w", lw=0.5); ax.axvline(0, color="w", lw=0.5)
@@ -1736,34 +1744,36 @@ def _draw_ab_panel(ax, ovd, title):
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
     axt, _axr = _add_marginals(ax, dra_a, dde_a, color="#5566aa", bins=40)
     axt.set_title(f"{title}  ({ovd['n']} stars)\n"
-                  f"offset = {ovd['off']:.1f} mas   RMS = {ovd['rms']:.1f} mas", fontsize=8)
+                  f"offset = {ovd['off']:.1f} mas   scatter = {ovd['rms']:.1f} mas (ΔRA,ΔDec "
+                  f"combined)", fontsize=8)
 
 
 def _draw_ab_footprint(ax, ovd, label):
-    """Sky scatter of the A↔B overlap stars, coloured by per-star |A−B| offset.  Confirms WHERE the
-    genuinely-shared stars are (they should trace the NRCA∩NRCB dither-overlap strip, not the whole
-    field) and whether the tie degrades anywhere in it."""
+    """Sky scatter of the A↔B overlap stars, coloured by per-star |A−B| offset.  Shows WHERE the
+    genuinely-shared stars are -- they trace the thin NRCA∩NRCB dither-overlap strip -- and whether
+    the two modules agree less well in some part of it."""
     import matplotlib.pyplot as plt
     ra = np.asarray(ovd["ra_arr"], float); dec = np.asarray(ovd["dec_arr"], float)
     diff = np.hypot(np.asarray(ovd["dra_arr"], float), np.asarray(ovd["dde_arr"], float))
     vmax = float(np.nanpercentile(diff, 95)) if len(diff) else 1.0
     sc = ax.scatter(ra, dec, c=diff, s=6, cmap="viridis", vmin=0, vmax=max(vmax, 1.0),
                     linewidths=0)
-    # data-driven aspect (NOT equal): the overlap is a thin, long strip; a full-width row with
-    # 'auto' aspect fills the panel so the per-star colour is readable (equal made it a sliver).
+    # Data-driven aspect: the overlap is a thin, long strip, and a full-width row with 'auto'
+    # aspect fills the panel so the per-star colour is readable ('equal' rendered it as a sliver).
     ax.invert_xaxis(); ax.set_aspect("auto"); ax.margins(0.02)
     ax.set_xlabel("RA [deg]"); ax.set_ylabel("Dec [deg]")
     plt.colorbar(sc, ax=ax, label="per-star residual |A−B| [mas]", shrink=0.85)
     ax.set_title(f"A↔B overlap footprint — {label} ({len(ra)} stars)\n"
-                 f"colour = per-star |A−B|; should trace the module-overlap strip", fontsize=8)
+                 f"colour = per-star |A−B|; these stars trace the module-overlap strip",
+                 fontsize=8)
 
 
 def _module_hi_sn(o, filt, snmin=10.0):
     """(NRCA, NRCB) finite SkyCoords restricted to flux S/N > ``snmin`` (S/N = flux_fit/flux_err
     from the per-exposure PSF fit), pooled from the per-detector daophot cats.  Used for the
-    stage-5 high-S/N overlap panel so the A↔B residual reflects the tie, not faint-source
-    centroiding.  Either module is None if its cats lack flux errors or have too few high-S/N
-    stars."""
+    stage-5 high-S/N overlap panel, where the residual scatter measures how well the two modules
+    agree rather than how well a faint star's centroid is known.  Either module is None if its cats
+    lack flux errors or hold too few high-S/N stars."""
     from astropy.table import vstack, Table
 
     def pool(dets):
@@ -1792,10 +1802,11 @@ def _module_hi_sn(o, filt, snmin=10.0):
 
 
 def stage5_intermodule(o: Observation, sw):
-    """Inter-detector / inter-module tie quality:
-    (1) per-detector residual quiver vs VIRAC, bulk-subtracted (relative ties);
-    (2) reference-free NRCA-vs-NRCB overlap: median offset + RMS of the SAME stars;
-    (3) doubled-star cutout gallery on the module-overlap zone (mis-tie -> split PSF)."""
+    """How well the detectors and the two modules agree on where a star is:
+    (1) per-detector residual quiver vs VIRAC, field offset removed, so the arrows are relative;
+    (2) NRCA vs NRCB in their overlap, using no external catalog: offset + scatter of the SAME
+        stars;
+    (3) cutout gallery on the module-overlap zone, where disagreement shows as a split PSF."""
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     from astropy.io import fits
@@ -1808,27 +1819,26 @@ def stage5_intermodule(o: Observation, sw):
     ep = aa.epoch_of(mpath) if mpath else None
     ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
 
-    # (2) reference-free A vs B overlap from the per-detector cats (primary source).
-    # CROWDING-ROBUST: the bulk A-B offset is the peak of the pair-separation histogram
-    # (aa.xcorr) -- a direct search_around_sky+median fabricates pairs in a dense field (400k
-    # chance coincidences within 0.3", RMS blown to ~100 mas). The RMS (tie precision) is the
-    # residual scatter of the SAME stars: align A onto B by the peak, keep the tight matches.
+    # (2) A vs B overlap from the per-detector cats (primary source), using no external catalog.
+    # The bulk A-B offset is the peak of the pair-separation histogram (aa.xcorr).  A direct
+    # search_around_sky+median fabricates pairs at this density -- 400k chance coincidences within
+    # 0.3", which blows the scatter up to ~100 mas.  The scatter reported is what is left in the
+    # SAME stars: align A onto B by the peak, keep the tight matches, measure their spread.
     ov = None
     single_module = None
     a_sc, b_sc, minfo = _module_positions(o, filt)
     metrics["nan_frac"] = round(max(minfo["a"]["nan_frac"], minfo["b"]["nan_frac"]), 4)
-    # A module that is None because its cats exist on disk but have too few finite centroids is
-    # an astrometry FAILURE (dead) -- NOT a legitimate single-module obs.  Surface it loudly
-    # instead of letting it masquerade as a single-module pass.
+    # A module whose cats exist on disk but hold too few finite centroids is an astrometry
+    # FAILURE (dead).  Surface it loudly; left alone it reads as a single-module obs and passes.
     dead_module = next((mod for mod, sc, k in (("NRCA", a_sc, "a"), ("NRCB", b_sc, "b"))
                         if sc is None and minfo[k]["present"] and minfo[k]["dead"]), None)
     if dead_module:
         k = "a" if dead_module == "NRCA" else "b"
         png = _red_flag_figure(o, "stage5", f"{dead_module} ASTROMETRY FAILED",
                                f"{dead_module} has per-exposure catalogs but "
-                               f"{minfo[k]['nan_frac'] * 100:.0f}% NaN centroids (<50 usable) — the "
-                               f"A/B tie cannot be measured. This is an astrometry failure, not a "
-                               f"single-module observation.")
+                               f"{minfo[k]['nan_frac'] * 100:.0f}% NaN centroids (<50 usable), so "
+                               f"NRCA cannot be compared with NRCB. This is an astrometry "
+                               f"failure in {dead_module}.")
         metrics.update(red_flag=True, red_flag_reason=f"{dead_module} centroids unusable (NaN)",
                        dead_module=dead_module, passed=False)
         return png, metrics
@@ -1837,9 +1847,9 @@ def stage5_intermodule(o: Observation, sw):
     ov = _ab_overlap(a_sc, b_sc)
     if ov:
         metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"])
-    # Same tie restricted to flux S/N > 10 (best-measured stars): the residual scatter then
-    # reflects the A↔B tie rather than faint-source centroiding.  An ADDITIONAL panel, not a
-    # replacement -- the all-stars panel above stays.
+    # The same comparison restricted to flux S/N > 10 (the best-measured stars), where the
+    # residual scatter measures how well the two modules agree rather than how well a faint star's
+    # centroid is known.  This adds a panel; the all-stars panel above stays.
     ov_hi = None
     if ov:
         a_hi, b_hi = _module_hi_sn(o, filt, snmin=10.0)
@@ -1862,8 +1872,8 @@ def stage5_intermodule(o: Observation, sw):
             metrics["worst_detector"] = max(det, key=lambda d: np.hypot(det[d]["rdra"], det[d]["rdde"]))
 
     # ---- figure layout depends on whether there is an A/B overlap to show.  With NO overlap
-    # (single module, or not measurable) the A/B half + cutout gallery are OMITTED entirely --
-    # an empty panel is noise -- and the figure is just the per-detector quiver.
+    # (single module, or unmeasurable) the A/B half + cutout gallery are OMITTED and the figure is
+    # the per-detector quiver alone; an empty panel would only add noise.
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1883,8 +1893,8 @@ def stage5_intermodule(o: Observation, sw):
             spanx = float(np.ptp(xs)) or 1e-3; spany = float(np.ptp(ys)) or 1e-3
             span = max(spanx, spany)
             # Scale (mas per data-degree).  A PURELY adaptive scale (largest arrow = 25% of the span)
-            # would render a 0.5 mas and a 500 mas residual identically -- so floor the scale at a
-            # FIXED 15 mas (= THRESH['intermodule']) reference: residuals below the tie tolerance stay
+            # would render a 0.5 mas and a 500 mas residual identically, so floor the scale at a
+            # FIXED 15 mas (= THRESH['intermodule']) reference: residuals below the gate stay
             # visibly small, and only larger ones grow (and are then capped to 25% of the span so
             # they cannot run off the axes, the sub640 failure in #13).
             ref = float(aa.THRESH["intermodule"]) / (0.25 * span)     # 15 mas -> ~25% of the span
@@ -1893,7 +1903,7 @@ def stage5_intermodule(o: Observation, sw):
                            scale=scale, width=0.007)
             # key is the fixed 15 mas ruler, so arrow length is comparable across observations
             axq.quiverkey(q, 0.5, 0.06, float(aa.THRESH["intermodule"]),
-                          f"{aa.THRESH['intermodule']:g} mas (tie tol.)", labelpos="E",
+                          f"{aa.THRESH['intermodule']:g} mas (gate)", labelpos="E",
                           coordinates="axes", fontproperties={"size": 8})
             for d, v in det.items():
                 # annotate each arrow with the number of VIRAC-matched stars behind it
@@ -1992,8 +2002,8 @@ def stage5_intermodule(o: Observation, sw):
             fig.text(0.5, 0.02,
                      f"{shown} star{'s' if shown != 1 else ''} from the NRCA∩NRCB overlap of the "
                      f"{filt} merged mosaic (each detected in BOTH modules; 25 px ≈ "
-                     f"{25 * pscale:.1f}\").  A good A↔B tie = one round PSF; a mis-tie doubles or "
-                     f"elongates the star.",
+                     f"{25 * pscale:.1f}\").  Where the two modules agree the star is one round "
+                     f"PSF; where they disagree it doubles or elongates.",
                      ha="center", fontsize=8)
         title_extra = ""
         suptitle_y = 0.98
@@ -2016,7 +2026,7 @@ def stage5_intermodule(o: Observation, sw):
         title_extra += f"  ·  ⚠ {nan_frac * 100:.0f}% NaN centroids"
     metrics["passed"] = bool((single_module or (ov and ov["off"] < aa.THRESH["intermodule"]))
                              and not high_nan)
-    fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module tie ({filt}){title_extra}",
+    fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module agreement ({filt}){title_extra}",
                  fontsize=11, y=suptitle_y)
     return _save(fig, f"{o.obsid}_stage5.png"), metrics
 
@@ -3217,7 +3227,7 @@ _HEADLINE = {
     2: "**Stage 2 — colour–magnitude diagram.**",
     3: "**Stage 3 — photometric calibration.**",
     4: "**Stage 4 — positional offsets (JWST catalogue − VIRAC).**",
-    5: "**Stage 5 — inter-detector / inter-module tie.**",
+    5: "**Stage 5 — inter-detector / inter-module agreement.**",
     6: "**Stage 6 — astrometric precision.**",
     7: "**Stage 7 — MAST vs pipeline.**",
     8: "**Stage 8 — distortion residual map.**",
@@ -3405,26 +3415,25 @@ def _caption_for_impl(n, metrics):
                      "yet to be photometrically catalogued, which is what stage 3 red-flags.)")
         return base
     if n == 5:
-        # Built entirely in code (not the CAPTIONS[5] template) so: (a) the S/N>10 clause is gated
-        # on the panel actually being present (ov_hi), (b) the panel POSITION wording is correct
-        # ("to its right", it is gs[0,2]), and (c) a missing intermodule_diff can never KeyError.
+        # Built entirely in code, which lets it (a) gate the S/N>10 clause on the panel actually
+        # being present (ov_hi), (b) get the panel POSITION right ("to its right", it is gs[0,2]),
+        # and (c) survive a missing intermodule_diff without a KeyError.
         diff = metrics.get("intermodule_diff")
         diff_clause = (f" The [per-detector quiver](DOCROOT#glossary-quiver) shows an A–B diff of "
                        f"{diff:.1f} mas." if diff is not None else "")
         if metrics.get("intermodule_off") is None:
-            # a legitimate single-module obs, or two modules with no shared stars to tie them
+            # a legitimate single-module obs, or two modules sharing no stars to compare
             if metrics.get("single_module"):
-                return (f"**Stage 5 — inter-detector tie.** Single module "
+                return (f"**Stage 5 — inter-detector agreement.** Single module "
                         f"({metrics['single_module']}) for this observation, so there is no "
-                        f"NRCA–NRCB tie to check — the [reference-free](DOCROOT#glossary-reffree) "
-                        f"overlap panel is omitted.{diff_clause} "
-                        f"([how this is made](DOCROOT#stage5))")
-            return ("**Stage 5 — inter-detector / inter-module tie.** The "
-                    "[reference-free](DOCROOT#glossary-reffree) NRCA–NRCB overlap could not be "
-                    "measured (no shared stars in the NRCA∩NRCB dither overlap after alignment), so "
-                    "that panel and the cutout gallery are omitted."
-                    f"{diff_clause} The inter-module tie is unverified for this observation. "
-                    "([how this is made](DOCROOT#stage5))")
+                        f"NRCA–NRCB comparison to make and the "
+                        f"[JWST-against-itself](DOCROOT#glossary-reffree) overlap panel is "
+                        f"omitted.{diff_clause} ([how this is made](DOCROOT#stage5))")
+            return ("**Stage 5 — inter-detector / inter-module agreement.** The NRCA–NRCB overlap "
+                    "could not be measured (no shared stars in the NRCA∩NRCB dither overlap after "
+                    "alignment), so that panel and the cutout gallery are omitted."
+                    f"{diff_clause} How well the two modules agree is unverified for this "
+                    "observation. ([how this is made](DOCROOT#stage5))")
         # overlap measured -> full caption; the S/N>10 panel is only present when ov_hi succeeded
         off = metrics.get("intermodule_off"); rms = metrics.get("intermodule_rms")
         no = metrics.get("n_overlap")
@@ -3432,30 +3441,30 @@ def _caption_for_impl(n, metrics):
         # the S/N panel is present (3 cols), else TOP-RIGHT (2 cols).  The footprint is its own
         # full-width row below.
         ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
-        base = ("**Stage 5 — inter-detector / inter-module tie.** "
-                "[\"Reference-free\"](DOCROOT#glossary-reffree) means JWST is matched against itself "
-                "(NRCA vs NRCB), using no external catalogue. The TOP-LEFT "
+        base = ("**Stage 5 — inter-detector / inter-module agreement.** How far a star seen in one "
+                "detector sits from the same star seen in another. The TOP-LEFT "
                 "[per-detector quiver](DOCROOT#glossary-quiver) shows each detector's median "
-                "residual **against VIRAC** (field bulk offset removed), each arrow annotated with "
-                "its matched-star count — every detector gets a vector because the shared reference "
-                "is VIRAC, not NRCA, so e.g. NRCB2 (which never overlaps NRCA on the sky) is still "
-                f"measured; the NRCA−NRCB difference is {(diff if diff is not None else float('nan')):.1f} "
-                f"mas. The {ov_pos} panel is the reference-free NRCA∩NRCB overlap tie — {off:.1f} "
-                f"mas offset, {rms:.1f} mas RMS over {no} shared stars — with ΔRA/ΔDec marginal "
-                f"histograms.")
+                "residual **against VIRAC** (field offset removed), each arrow annotated with its "
+                "matched-star count. VIRAC is the shared reference, so every detector gets a "
+                "vector, including NRCB2, which shares no sky with NRCA at all; the NRCA−NRCB "
+                f"difference is {(diff if diff is not None else float('nan')):.1f} mas. The "
+                f"{ov_pos} panel compares [JWST against itself](DOCROOT#glossary-reffree) in the "
+                f"NRCA∩NRCB overlap — {off:.1f} mas offset, {rms:.1f} mas scatter (ΔRA and ΔDec "
+                f"combined) over {no} shared stars — with ΔRA/ΔDec marginal histograms.")
         if metrics.get("n_overlap_hi"):
-            base += (f" The panel to its right repeats the tie for [S/N > 10](DOCROOT#glossary-snr) "
-                     f"stars ({metrics['n_overlap_hi']} stars, "
-                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas RMS), where the "
-                     f"scatter reflects the tie rather than faint-source centroiding.")
+            base += (f" The panel to its right repeats that comparison for "
+                     f"[S/N > 10](DOCROOT#glossary-snr) stars ({metrics['n_overlap_hi']} stars, "
+                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas scatter), where "
+                     f"the scatter measures how well the modules agree, with the centroid noise of "
+                     f"faint stars taken out of it.")
         if metrics.get("n_overlap_footprint"):
             base += (" The full-width row below the panels maps the overlap stars on the sky, "
-                     "coloured by per-star |A−B| — it verifies the shared stars trace the thin "
-                     "NRCA∩NRCB dither-overlap strip (not the whole field) and flags any sub-region "
-                     "where the tie degrades.")
-        base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`: a good tie "
-                 "shows one round PSF, a mis-tie doubles or elongates the star. "
-                 "([how this is made](DOCROOT#stage5))")
+                     "coloured by per-star |A−B|. It shows the shared stars tracing the thin "
+                     "NRCA∩NRCB dither-overlap strip, and flags any part of that strip where the "
+                     "two modules agree less well.")
+        base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`. Where the "
+                 "two modules agree, each star is one round PSF; where they disagree, it doubles "
+                 "or elongates. ([how this is made](DOCROOT#stage5))")
         return base
     if n == 9:
         ni = metrics.get("n_isolated"); ac = metrics.get("aper_corr_med")

@@ -192,11 +192,12 @@ many good ones. Requiring adjacency makes the test sensitive to a coherent minor
 isolated noise (introduced in PR #54, in response to that review).
 
 <a id="glossary-reffree"></a>
-### "reference-free" inter-module tie
+### Measuring JWST against itself ("reference-free")
 
 **Reference-free** means the offset is measured by matching **JWST against itself** — module NRCA
-directly against module NRCB — using **no external catalog** (no VIRAC, no Gaia). It isolates an
-internal instrument tie from any error in the external reference. See [stage 5](#stage5).
+directly against module NRCB — using **no external catalog** (no VIRAC, no Gaia). What it measures
+is internal to the instrument, so any error in an external reference stays out of it. See
+[stage 5](#stage5).
 
 <a id="glossary-quiver"></a>
 ### The per-detector quiver, and how NRCB detectors get a vector
@@ -209,10 +210,10 @@ on the sky: the common reference is VIRAC, which covers the whole field. The arr
 detector's mean sky position; the number of matched stars behind each arrow is annotated on the
 plot.
 
-The separate **A↔B overlap** panel is the [reference-free](#glossary-reffree) measurement: during
-the dither pattern the detectors sweep across the sky, so a star that lands on an NRCA detector in
-one exposure can land on an NRCB detector in another. Those genuinely-shared stars (the NRCA∩NRCB
-overlap set) tie the two modules to each other directly.
+The separate **A↔B overlap** panel compares [JWST against itself](#glossary-reffree): during the
+dither pattern the detectors sweep across the sky, so a star that lands on an NRCA detector in one
+exposure can land on an NRCB detector in another. Those genuinely-shared stars (the NRCA∩NRCB
+overlap set) measure the two modules against each other directly.
 
 <a id="glossary-lf"></a>
 ### Luminosity function (LF) and its turnover
@@ -313,36 +314,44 @@ Source: [`data_qa/diagnostics.py` → `stage4_offsets`](../data_qa/diagnostics.p
 (cells: `_cell_offsets`; combining them: `_cell_consistency`).
 
 <a id="stage5"></a>
-## Stage 5 — inter-detector / inter-module tie
+## Stage 5 — inter-detector / inter-module agreement
 
-Stage 5 checks how well the detectors and the two modules agree, on the SW filter. The top row has
-three panels; when a field lacks flux errors the S/N>10 panel is omitted (two-panel top row).
+Stage 5 measures how far a star seen in one detector sits from the same star seen in another, on
+the SW filter. The top row has three panels; when a field lacks flux errors the S/N>10 panel is
+omitted (two-panel top row).
 
 - **TOP-LEFT** — the [per-detector residual quiver](#glossary-quiver): one arrow per SW detector,
-  each the detector's median residual **against VIRAC** with the field bulk offset removed, placed
-  at the detector's mean sky position and annotated with the **number of matched stars**. (This is
-  why an NRCB detector with no NRCA sky overlap still gets a vector — the common reference is
-  VIRAC, not NRCA. See [the quiver note](#glossary-quiver).)
-- **TOP-MIDDLE** — the [reference-free](#glossary-reffree) NRCA∩NRCB overlap tie: the offset and
-  RMS of the **same stars** seen in both modules (matched JWST-to-JWST, no external catalog), with
-  **marginal histograms** of the residual ΔRA/ΔDec. Matching is **one-to-one**: after the bulk A→B
-  shift (the xcorr histogram peak) the nearest B source within 80 mas is taken for each A source and
-  duplicate B are dropped (closest A kept), so the reported count is distinct overlap stars — NOT the
-  many-to-many pair count a fixed-radius ball match would return in a crowded field.
-- **TOP-RIGHT** — the same overlap tie restricted to [S/N > 10](#glossary-snr) stars (when the
-  field has flux errors), so the scatter reflects the tie rather than faint-source centroiding.
+  each the detector's median residual **against VIRAC** with the field offset removed, placed at
+  the detector's mean sky position and annotated with the **number of matched stars**. VIRAC covers
+  the whole field, so an NRCB detector that shares no sky with NRCA still gets a vector. See
+  [the quiver note](#glossary-quiver).
+- **TOP-MIDDLE** — NRCA against NRCB in their overlap, [JWST matched to itself with no external
+  catalog](#glossary-reffree): the offset and the scatter of the **same stars** seen in both
+  modules, with **marginal histograms** of the residual ΔRA/ΔDec. Matching is **one-to-one**: after
+  the bulk A→B shift (the xcorr histogram peak) the nearest B source within 80 mas is taken for each
+  A source and duplicate B are dropped (closest A kept), so the reported count is distinct overlap
+  stars. A fixed-radius ball match in a crowded field returns a many-to-many pair count instead,
+  which is the ~34k figure this replaced.
+- **TOP-RIGHT** — the same comparison restricted to [S/N > 10](#glossary-snr) stars (when the field
+  has flux errors), where the scatter measures how well the modules agree with the centroid noise
+  of faint stars taken out of it.
 - **FULL-WIDTH ROW (below the top panels)** — the A↔B overlap **footprint**: the overlap stars
   mapped on the sky (RA/Dec), coloured by each star's |A−B| residual, using the S/N > 10 set. The
   overlap is a thin, long strip, so this row spans the figure width (data-driven aspect) to make
-  the per-star colour readable; it verifies the shared stars trace the NRCA∩NRCB dither-overlap
-  strip (not the whole field) and flags any sub-region where the tie degrades.
-- **BOTTOM STRIP** — a cutout gallery of overlap stars from the SW merged `i2d`. A good tie shows
-  one round PSF; a mis-tie doubles or elongates the star (the same source drizzled twice at offset
-  positions).
+  the per-star colour readable. It shows the shared stars tracing the NRCA∩NRCB dither-overlap
+  strip, and flags any part of that strip where the two modules agree less well.
+- **BOTTOM STRIP** — a cutout gallery of overlap stars from the SW merged `i2d`. Where the modules
+  agree, each star is one round PSF; where they disagree it doubles or elongates, the same source
+  drizzled twice at offset positions.
 
-Consider it passing if the reference-free NRCA∩NRCB offset is small (< 15 mas) and the cutouts show
-round, single PSFs. (A genuine single-module observation, e.g. NRCB-only, has no A↔B tie to fail
-and passes by default.)
+The scatter quoted on the A↔B panels is `hypot` of the ΔRA and ΔDec `mad_std` — the **combined**
+two-axis scatter, √2 times the per-axis robust σ. [Stage 6](#stage6) plots a **per-axis** quantity
+(it divides the radial residual by √2). For isotropic scatter the stage-5 number runs ~1.7× above
+the stage-6 curve, so read them as two different statistics rather than one number measured twice.
+
+Consider it passing if the NRCA∩NRCB offset is small (< 15 mas) and the cutouts show round, single
+PSFs. A genuine single-module observation (NRCB-only, say) has no A↔B comparison to make and passes
+by default.
 
 Source: [`data_qa/diagnostics.py` → `stage5_intermodule`](../data_qa/diagnostics.py)
 (per-detector + high-S/N positions are pooled once from the per-exposure daophot catalogs and then
