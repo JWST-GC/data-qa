@@ -3288,6 +3288,7 @@ def _caption_for_impl(n, metrics):
         # to the CELL median.  Quoting it next to a same-star bulk produced "the tie is 0 mas ...
         # 3σ from zero", which reads as a contradiction.
         same_star = metrics.get("bulk_source") == "same-star"
+        # POSSIBLE BUG: can sigma ever be other than 1?  i.e., is the cell-to-cell spread the RMS?
         unc = (f", cell-to-cell spread {sp:.0f} mas"
                + (f" → {sig:.0f}σ from zero" if (sig is not None and not same_star) else "")
                ) if sp is not None else ""
@@ -3296,17 +3297,15 @@ def _caption_for_impl(n, metrics):
                 f"[**bulk** offset](DOCROOT#glossary-bulk) is the JWST catalogue "
                 f"[cross-matched to VIRAC](DOCROOT#glossary-crossmatch) and registered onto the "
                 f"Gaia/VIRAC frame, measured per spatial cell by the "
-                f"[xcorr histogram peak](DOCROOT#glossary-xcorr) (crowding-robust; a plain "
-                f"nearest-neighbour median collapses toward zero at GC density). The LEFT panel "
-                f"maps the source-weighted tie across the mosaic — filled squares are measured "
-                f"cells (colour = offset), grey squares are cells that could not be measured (too "
-                f"few VIRAC reference stars in the cell, or no clear peak), "
-                f"and a green outline marks cells that coherently deviate. The MIDDLE panel plots "
-                f"the per-cell offsets as (ΔRA, ΔDec) points sized by source count, with the "
-                f"source-weighted median tie, the 75 mas gate, and ΔRA/ΔDec marginal histograms. "
-                f"Here the tie is {om_str} mas over {nc} measured cells ({nd} without a peak){unc}; "
-                f"the [uncertainty](DOCROOT#glossary-tie-uncertainty) is the cell-to-cell standard "
-                f"error (not a per-star RMS or per-star error). ")
+                f"[xcorr histogram peak](DOCROOT#glossary-xcorr)"
+                f". \n\n LEFT "
+                f"maps the catalog-to-catalog histogram-peak offset across the mosaic, "
+                f"outlines mark cells that coherently deviate, grey are unmeasured."
+                f" \n\n MIDDLE plots "
+                f"the **per-cell** offsets as (ΔRA, ΔDec) points sized by source count, with the "
+                f"median offset in the title, a circle with r=75 mas, and ΔRA/ΔDec marginal histograms. "
+                f"\n\nThe measured median offset is {om_str} mas over {nc} measured cells ({nd} without a peak){unc}; "
+                )
         # The histogram peak is density-immune to NN collapse but NOT to a dense-reference bias
         # (it read 9-17 mas on a brick frame whose same-star tie is <2 mas), so the quoted bulk is
         # refined SAME-STAR once the cells show the tie is small.  Say which one the number is.
