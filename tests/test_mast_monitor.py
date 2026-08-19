@@ -1,5 +1,6 @@
 """Offline unit tests for data_qa.mast_monitor (state diffing; no network)."""
 import datetime
+import inspect
 import json
 import os
 
@@ -453,6 +454,54 @@ def test_actionable_groups_ordered_oldest_first():
         (10678, "003", "NIRCam")]
 
 
+def test_actionable_groups_multi_event_group_sorts_on_its_oldest():
+    """A group carries several events (NEWLY_RELEASED then CALIB_LEVEL_UP).  It
+    takes its slot priority from the OLDEST ready release it holds, so the
+    obs that has been waiting longest drains first; ``max`` would rank a group
+    by its freshest event and let an old group sit behind a new one."""
+    events = [_ready_event(obsnum="001", release=59910.0),
+              _ready_event(obsnum="001", release=59902.0,
+                           obs_id="jw10678-o001_y", event="CALIB_LEVEL_UP"),
+              _ready_event(obsnum="002", release=59905.0)]
+    assert list(mm.actionable_groups({}, events)) == [
+        (10678, "001", "NIRCam"), (10678, "002", "NIRCam")]
+
+
+def test_actionable_groups_age_ignores_unreleased_events():
+    """Only READY events date a group.  A planned row riding in the same group
+    carries a scheduled release far in the past of the real delivery; ranking
+    on it would jump the group to the head of the cap queue on the strength of
+    data that does not exist yet."""
+    events = [_ready_event(obsnum="001", release=59920.0),
+              _ready_event(obsnum="001", obs_id="jw10678-o001_planned",
+                           release=59000.0, calib_level=-1, released=False),
+              _ready_event(obsnum="002", release=59905.0)]
+    assert list(mm.actionable_groups({}, events)) == [
+        (10678, "002", "NIRCam"), (10678, "001", "NIRCam")]
+
+
+def test_actionable_groups_undated_group_sorts_last():
+    """A ready group whose release date is unknown sorts to the BACK (float
+    'inf'), so a dated backlog drains ahead of it; '-inf' would let one
+    undated row displace every dated group from the cap."""
+    events = [_ready_event(obsnum="001", release=None),
+              _ready_event(obsnum="002", release=59905.0)]
+    assert list(mm.actionable_groups({}, events)) == [
+        (10678, "002", "NIRCam"), (10678, "001", "NIRCam")]
+
+
+def test_actionable_groups_ties_break_on_group_key():
+    """One MAST delivery timestamps a whole visit set identically.  The group
+    key breaks the tie, so a capped run acts on the same groups whichever order
+    MAST returns its rows in (that order varies between polls)."""
+    same = 59905.0
+    forward = [_ready_event(obsnum=n, release=same) for n in ("001", "002", "003")]
+    assert (list(mm.actionable_groups({}, forward))
+            == list(mm.actionable_groups({}, list(reversed(forward))))
+            == [(10678, "001", "NIRCam"), (10678, "002", "NIRCam"),
+                (10678, "003", "NIRCam")])
+
+
 def test_revert_deferred_restores_baseline_records():
     """Deferred groups keep their pre-poll baseline: an obs absent from the
     baseline is popped (re-fires NEW), a changed one is restored (re-fires
@@ -670,19 +719,24 @@ def test_capped_run_does_not_drop_trigger_for_download_retired_groups(
     assert not any(ev["obsnum"] == "001" for ev in acted["report"][0])
 
 
-def test_peppar_only_run_is_seeded_and_capped(monkeypatch, tmp_path, capsys):
-    """``--peppar --execute`` with no --download/--trigger is an acting run:
-    the first-run seed guard and the --max-submit cap both apply to it.  With
-    peppar outside the `acting` test it skipped both gates and fanned the whole
-    backlog out on the very first poll."""
+@pytest.mark.parametrize("action", mm.ACTION_FLAGS)
+def test_single_action_run_is_seeded_and_capped(monkeypatch, tmp_path, capsys,
+                                                action):
+    """EACH action flag on its own makes an acting run, so the first-run seed
+    guard and the --max-submit cap both apply to it.  Dropping any one term
+    from ``acting`` (or from the seed suppression) lets that flag skip both
+    gates: the whole backlog fans out on the very first poll and commits, with
+    no later run to pick it up.  Parametrized over ACTION_FLAGS so a new action
+    is defended the day it is added."""
     rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in range(1, 6)]
     calls = _patch_poll_events(monkeypatch, rows)
     state = tmp_path / "state.json"
-    args = ["--program", "10678", "--peppar", "--execute", "--report",
-            "--commit-state", "--max-submit", "2", "--state", str(state)]
+    args = ["--program", "10678", f"--{action}", "--execute", "--report",
+            "--commit-state", "--max-submit", "2", "--state", str(state),
+            "--download-dir", str(tmp_path)]
 
     assert mm.main(args) == 0                    # ------- run 1: first run
-    assert [name for name, _evs, _kw in calls if name == "peppar"] == []
+    assert [name for name, _evs, _kw in calls if name == action] == []
     assert "SEED RUN" in capsys.readouterr().err
 
     # a second poll returns 5 MORE groups on top of the seeded baseline
@@ -691,9 +745,23 @@ def test_peppar_only_run_is_seeded_and_capped(monkeypatch, tmp_path, capsys):
     calls.clear()
     assert mm.main(args) == 0                    # ------- run 2: capped
     acted = {name: (evs, kw) for name, evs, kw in calls}
-    assert set(mm._group_by_obs(acted["peppar"][0])) == {
+    assert set(mm._group_by_obs(acted[action][0])) == {
         (10678, "006", "NIRCam"), (10678, "007", "NIRCam")}
     assert "CAPPED" in acted["report"][1]["notice"]
+
+
+def test_action_flags_match_actionable_groups_dimensions():
+    """ACTION_FLAGS is the single list main() spreads into `acting`, the seed
+    suppression and the actionable_groups call.  An action added to
+    actionable_groups without being added here would be counted but never
+    enabled; one added to argparse alone would be enabled but never counted --
+    the loss this cap exists to stop.  Pin the two together."""
+    params = inspect.signature(mm.actionable_groups).parameters
+    dimensions = tuple(name for name in params
+                       if name not in ("state", "events"))
+    assert dimensions == mm.ACTION_FLAGS
+    # the argparse side is pinned by test_single_action_run_is_seeded_and_capped,
+    # which passes --<flag> on the command line for every ACTION_FLAGS entry
 
 
 def test_exactly_at_the_cap_is_not_capped(monkeypatch, tmp_path):
@@ -765,6 +833,44 @@ def test_capped_notice_tracks_commit_state(monkeypatch, tmp_path):
     assert "commits no state" not in notice
 
 
+def test_capped_notice_counts_all_actionable_groups(monkeypatch, tmp_path):
+    """The head count in the notice is the number of ACTIONABLE groups, which
+    is the number an operator reads to size --max-submit.  Reporting the acted
+    count there renders the self-contradictory 'N group(s) exceed --max-submit
+    N: acting on the N oldest'."""
+    rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in range(1, 8)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o999_x")
+    assert mm.main(["--program", "10678", "--auto", "--max-submit", "2",
+                    "--state", str(state),
+                    "--download-dir", str(tmp_path)]) == 0
+    notice = {name: kw for name, _evs, kw in calls}["report"]["notice"]
+    assert ("CAPPED — 7 actionable group(s) exceed --max-submit 2: "
+            "acting on the 2 oldest") in notice
+
+
+def test_default_max_submit_caps_a_run_that_passes_no_flag(monkeypatch,
+                                                           tmp_path):
+    """Every other cap test passes --max-submit explicitly, which leaves the
+    SHIPPED default undefended -- and the default governs any invocation
+    lacking the flag, the live scrontab included until the owed hand-edit
+    lands.  Six groups with no flag cap at DEFAULT_MAX_SUBMIT."""
+    assert mm.DEFAULT_MAX_SUBMIT == 4
+    rows = [_nircam_row(f"{i:03d}", release=59900.0 + i) for i in range(1, 7)]
+    calls = _patch_poll_events(monkeypatch, rows)
+    monkeypatch.setattr(mm.shutil, "disk_usage", lambda p: _Usage(50e12))
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o999_x")
+    assert mm.main(["--program", "10678", "--auto", "--state", str(state),
+                    "--download-dir", str(tmp_path)]) == 0
+    acted = {name: (evs, kw) for name, evs, kw in calls}
+    assert set(mm._group_by_obs(acted["trigger"][0])) == {
+        (10678, f"{i:03d}", "NIRCam") for i in range(1, 5)}
+    assert f"--max-submit {mm.DEFAULT_MAX_SUBMIT}" in acted["report"][1]["notice"]
+
+
 def test_capped_notice_truncates_long_group_lists(monkeypatch, tmp_path):
     """100 groups against --max-submit 16 named in full is a ~2.3 kB notice in
     every issue comment that run; the tail collapses to 'and N more'."""
@@ -793,6 +899,11 @@ def test_group_label_list_truncates_beyond_the_limit():
     assert out.endswith("and 4 more")
     assert out.count("10678-o") == 10
     assert "10678-o011-NIRCam" not in out
+    # exactly AT the limit every label is named and the tail is absent: `>=`
+    # here emits a bare "and 0 more" onto the QA issue
+    exact = mm._group_label_list(keys[:mm.NOTICE_LABEL_LIMIT])
+    assert exact.count("10678-o") == mm.NOTICE_LABEL_LIMIT
+    assert "more" not in exact
 
 
 def test_negative_max_submit_is_rejected(tmp_path):

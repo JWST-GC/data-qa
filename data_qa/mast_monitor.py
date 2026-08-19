@@ -47,6 +47,13 @@ Safety gates on acting runs (--auto, or --download/--trigger/--peppar with
     action outright where a counted group would merely be postponed.  This is
     why ``--peppar --execute`` on its own also counts as an acting run: it
     would otherwise skip this whole block and fan out the entire backlog.
+    ``ACTION_FLAGS`` is the one list main() spreads into the acting gate, the
+    first-run seed suppression and the ``actionable_groups`` dimensions, so
+    those three stay in step as actions are added.
+    Groups queue strictly OLDEST-READY-FIRST: a group is dated by the earliest
+    t_obs_release among its event_ready events (an undated ready group sorts
+    last), ties broken on the group key so the acted set is stable across MAST
+    row orderings.
     Overflow acts on the N OLDEST groups and commits state for exactly those
     plus the groups that consume no slot at all (planned tiles, unmapped
     programs, retired keys); the deferred groups keep their pre-poll
@@ -753,6 +760,15 @@ def _group_by_obs(events):
     return grouped
 
 
+# The submitting actions, in one place.  Each name is simultaneously an argparse
+# dest (--download / --trigger / --peppar), a keyword of actionable_groups, and a
+# term of main()'s `acting` gate; main() spreads this list into all three so a
+# new action is enabled, seeded and counted together.  An action enabled without
+# being counted is dropped from a capped run and committed as seen, which loses
+# it outright -- the failure this module's SUBMISSION CAP block exists to stop.
+ACTION_FLAGS = ("download", "trigger", "peppar")
+
+
 def actionable_groups(state, events, download=True, trigger=True, peppar=False):
     """The (program, obsnum, instrument) groups this run would actually ACT on:
     ``{group_key: [events]}``, ordered oldest ready event first.  Pure (no
@@ -1356,14 +1372,16 @@ def main(argv=None):
                   + (f" ({len(failed_programs)} query failure(s))"
                      if failed_programs else ""))
 
-    # FIRST-RUN SEED gate: with no baseline, every observation fires as NEW --
-    # an acting run must not submit the entire backlog.  Seed instead: commit
-    # state, act on nothing.
-    # EVERY submitting action counts here (download / trigger / peppar).  A
-    # --peppar-only acting run used to leave `acting` False, which skipped both
-    # this gate and the SUBMISSION CAP below and fanned the whole backlog out
-    # on the first run.
-    acting = args.execute and (args.download or args.trigger or args.peppar)
+    # FIRST-RUN SEED gate: with no baseline, every observation fires as NEW, so
+    # an acting run would submit the entire backlog at once.  The first run
+    # seeds: commit state, act on nothing.
+    # EVERY submitting action counts here.  ACTION_FLAGS is the single list the
+    # three coupled sites read (this gate, the seed suppression below, and the
+    # actionable_groups dimensions at the SUBMISSION CAP), so an action can only
+    # be enabled on a run that also seeds it and counts it.  Each omission cost a
+    # review round: --peppar-only left `acting` False and fanned the whole
+    # backlog out on the first run.
+    acting = args.execute and any(getattr(args, flag) for flag in ACTION_FLAGS)
     seed = args.seed or (first_run and bool(all_events) and acting)
     actionable = all_events
     if seed:
@@ -1380,7 +1398,8 @@ def main(argv=None):
         # nobody -- the #71 defect inside a --seed --auto invocation.  One
         # line, since render_events_comment renders the notice as a blockquote.
         notice = f"{notice}  {seed_notice}" if notice else seed_notice
-        args.download = args.trigger = args.peppar = False
+        for flag in ACTION_FLAGS:
+            setattr(args, flag, False)
         args.commit_state = True
     elif acting:
         # PER-PROGRAM SEED: a program polled successfully for the first time
@@ -1405,15 +1424,15 @@ def main(argv=None):
         # the --max-submit OLDEST groups; the deferred groups' baselines are
         # reverted so the commit retires exactly the acted groups and the
         # deferred events re-fire (and count again) next run.  EVERY action
-        # enabled here must be a counted dimension (download/trigger/peppar):
-        # the truncated `actionable` below feeds all three, so a group an
-        # action needs but the count omits is dropped from this run AND
-        # committed as seen -- that action is lost outright, with no later run
-        # to pick it up.  `acting` above gates entry to this block, so it has
-        # to name the same three actions.
+        # enabled here must be a counted dimension: the truncated `actionable`
+        # below feeds all of them, so a group an action needs but the count
+        # omits is dropped from this run AND committed as seen -- that action is
+        # lost outright, with no later run to pick it up.  The dimensions are
+        # spread from ACTION_FLAGS, the same list `acting` above reads, so the
+        # two stay in step by construction (test_action_flags_match_dimensions).
         groups = actionable_groups(state, actionable,
-                                   download=args.download, trigger=args.trigger,
-                                   peppar=args.peppar)
+                                   **{flag: getattr(args, flag)
+                                      for flag in ACTION_FLAGS})
         if len(groups) > args.max_submit:
             keys = list(groups)
             acted_keys = keys[:args.max_submit]
