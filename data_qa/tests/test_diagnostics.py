@@ -611,6 +611,30 @@ def test_filters_with_mosaic(tmp_path, monkeypatch):
     assert D._filters_with_mosaic(o) == ["F162M", "F360M"]
 
 
+def _write_i2d(path, ny=8, nx=16):
+    from astropy.io import fits
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    hdu = fits.ImageHDU(data=np.ones((ny, nx), "float32"), name="SCI")
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+
+def test_stage1_falls_back_to_mast_i2d_never_blank(tmp_path, monkeypatch):
+    # MAST always delivers an i2d, so a delivered filter must never render a blank panel. F210M has
+    # only a MAST i2d (no reduced mosaic); stage 1 must show it from MAST, not "(no i2d)" (issue #38).
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    red = tmp_path / "cloudef" / "F162M" / "pipeline"
+    _write_i2d(str(red / "jw02092-o005_t001_nircam_clear-f162m-merged_i2d.fits"))
+    mast = tmp_path / "cloudef" / "mastDownload" / "JWST" / "jw02092-o005_t002_nircam_clear-f210m"
+    _write_i2d(str(mast / "jw02092-o005_t002_nircam_clear-f210m_i2d.fits"))
+    o = Observation(program="2092", obs="005", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F162M", "F210M"], visits=[], epoch="", notes="")
+    png, m = D.stage1_mosaics(o, "F210M", "F162M")           # SW pick = the MAST-only filter
+    assert os.path.exists(png)
+    assert m["mast_fallback_filters"] == ["F210M"]           # rendered from MAST, not blank
+    assert "F210M" in m["finite_fraction"] and "F162M" in m["finite_fraction"]
+    assert m["sw_present"] is False                          # gate still keys on the REDUCED mosaic
+
+
 def _write_skycoord_cat(path, ra, dec):
     import astropy.units as u
     from astropy.coordinates import SkyCoord

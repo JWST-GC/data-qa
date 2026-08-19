@@ -687,37 +687,53 @@ def stage1_mosaics(o: Observation, sw, lw):
     import matplotlib.pyplot as plt
     from astropy.io import fits
 
-    psw, plw = _mosaic_path(o, sw), _mosaic_path(o, lw)
-    panels = []                                   # (filt, path, aspect = ny/nx)
-    for filt, p in ((sw, psw), (lw, plw)):
+    # A panel image is our reduced science mosaic when present, else the MAST-delivered STScI L3
+    # i2d.  MAST ALWAYS ships an i2d for a delivered filter, so a filter with data is NEVER blank;
+    # only a nominal filter with nothing on disk (dropped) has no image.  (The "passed" gate below
+    # still keys on the REDUCED mosaic, so a MAST-only filter reads not-yet-complete, not delivered.)
+    def _panel_image(filt):
+        p = _mosaic_path(o, filt)
+        if p:
+            return p, "reduced"
+        m = _mast_i2d(o, filt)
+        return (m, "mast") if m else (None, None)
+
+    psw, plw = _mosaic_path(o, sw), _mosaic_path(o, lw)      # reduced-only, for the passed gate
+    panels = []                                   # (filt, path, source, aspect = ny/nx)
+    for filt in (sw, lw):
         if not filt:
             continue                              # single-filter obs: no LW row at all
+        p, src = _panel_image(filt)
         asp = 0.45
         if p:
             with fits.open(p) as h:
                 s = h["SCI"] if "SCI" in h else h[1]
                 ny, nx = s.data.shape
                 asp = ny / nx if nx else 0.45
-        panels.append((filt, p, asp))
+        panels.append((filt, p, src, asp))
 
     W = 11.0
     # per-row height from native aspect (clamp so a near-square or a razor-thin strip stays
-    # legible); a missing i2d gets a short placeholder row.
-    heights = [(0.25 if p is None else max(0.18, min(1.0, asp))) * W for _, p, asp in panels]
+    # legible); a truly imageless filter (no MAST i2d either) gets a short placeholder row.
+    heights = [(0.25 if p is None else max(0.18, min(1.0, asp))) * W for _, p, _s, asp in panels]
     fig = plt.figure(figsize=(W, sum(heights) + 0.35 * len(panels)))
     gs = fig.add_gridspec(len(panels), 1, height_ratios=heights, hspace=0.18)
     fracs = {}
     modules = {}                                   # filt -> 'NRCA'/'NRCB' when a single-module mosaic
-    for i, (filt, p, _asp) in enumerate(panels):
+    mast_shown = []                                # filters rendered from the MAST i2d (not reduced)
+    for i, (filt, p, src, _asp) in enumerate(panels):
         a = fig.add_subplot(gs[i, 0])
-        if p:
+        if p and src == "reduced":
             mod = _mosaic_module(p)
             if mod:
                 modules[filt] = mod
             title = f"{o.obsid}  {filt}" + (f"  [{mod} only]" if mod else "")
             fracs[filt] = _grayscale(a, p, title)
+        elif p:                                    # MAST-delivered i2d fallback (not yet reduced)
+            mast_shown.append(filt)
+            fracs[filt] = _grayscale(a, p, f"{o.obsid}  {filt}  [MAST i2d — not yet pipeline-reduced]")
         else:
-            a.text(0.5, 0.5, f"{filt}\n(no i2d)", ha="center", va="center")
+            a.text(0.5, 0.5, f"{filt}\n(no i2d on disk)", ha="center", va="center")
             a.set_xticks([]); a.set_yticks([])
     # Record which NOMINAL (portal) filters have NO product on disk: pick_filters selects only
     # from filters that are present, so a filter that WAS observed but is not yet reduced would
@@ -737,7 +753,7 @@ def stage1_mosaics(o: Observation, sw, lw):
                    finite_fraction=fracs, single_module_filters=modules,
                    nominal_filters=list(o.filters), available_filters=avail,
                    mosaic_filters=with_mosaic, awaiting_reduction=awaiting_reduction,
-                   dropped_filters=dropped,
+                   mast_fallback_filters=mast_shown, dropped_filters=dropped,
                    # pass on SW alone ONLY when the obs genuinely has no LW-channel filter;
                    # if an LW filter exists but its mosaic/pick is missing, that is NOT a pass.
                    passed=bool(psw and (plw or not _has_lw(o))))
