@@ -99,20 +99,22 @@ def stage_rows(o, offset_mas=None, offset_thresh=75.0):
         flagged = offset_mas >= offset_thresh
         off_status = WARN if flagged else DONE
         off_txt = (f"bulk **{offset_mas:.0f} mas** vs VIRAC2 "
-                   f"({'OFF-frame, needs re-tie' if flagged else 'within noise'})")
+                   f"({'OFF-frame, needs re-registration' if flagged else 'within noise'})")
     rows.append(("refcat comparison (vs VIRAC2/Gaia)", off_status,
                  _ts(datetime.now(tz=timezone.utc).timestamp()) if offset_mas is not None else "—",
                  off_txt))
     tbl_t, tbl_n = _newest([f"{P}/offsets/*VIRAC2locked.csv"])
     add("JWST reference-frame creation (offsets table)", tbl_t, tbl_n,
-        detail="per-exposure VIRAC2-locked tie" if tbl_t else "")
+        detail="per-exposure offsets locked to VIRAC2" if tbl_t else "")
 
     # re-alignment: crf regenerated AFTER the offsets table was written = table applied
     if crf_t and tbl_t:
         if crf_t >= tbl_t:
-            add("re-alignment of frames", crf_t, 1, status=DONE, detail="crf regenerated on current tie")
+            add("re-alignment of frames", crf_t, 1, status=DONE,
+                detail="crf regenerated on the current offsets table")
         else:
-            add("re-alignment of frames", None, 0, status=RUN, detail="tie updated; re-reduce pending/queued")
+            add("re-alignment of frames", None, 0, status=RUN,
+                detail="offsets table updated; re-reduce pending/queued")
     else:
         add("re-alignment of frames", None, 0, status=PEND)
 
