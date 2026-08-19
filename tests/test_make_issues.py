@@ -49,12 +49,24 @@ def test_sticky_checkboxes_union_never_unchecks():
     assert "- [ ] Box C" in out                  # neither -> unchecked
 
 
-def test_sticky_checkboxes_carry_a_tick_across_a_reworded_label():
+@pytest.mark.parametrize("new_label,prior", [(k, p) for k, ps in mi._CK_RENAMED.items() for p in ps])
+def test_sticky_checkboxes_carry_a_tick_across_a_reworded_label(new_label, prior):
     # The merge keys on label TEXT, so rewording a checklist item drops every tick a human put on
-    # it.  _CK_RENAMED maps a new label back to the wording it replaced.
-    new_label, old_label = next(iter(mi._CK_RENAMED.items()))
-    out = mi._sticky_checkboxes(f"- [ ] {new_label}", f"- [x] {old_label}")
+    # it.  _CK_RENAMED maps a label to every spelling it has had; a tick on ANY of them carries.
+    out = mi._sticky_checkboxes(f"- [ ] {new_label}", f"- [x] {prior}")
     assert out == f"- [x] {new_label}"
+
+
+def test_sticky_checkboxes_carry_a_tick_across_two_renames(monkeypatch):
+    # A second rewording must append to the tuple rather than replace it.  With only the
+    # immediately-previous spelling recorded, a tick placed before the FIRST rename drops on the
+    # second -- and both keys would still be live labels, so the staleness test below cannot see
+    # it.  Simulate the two-rename case rather than wait for it to happen.
+    monkeypatch.setattr(mi, "_CK_RENAMED", {"third wording": ("second wording", "first wording")})
+    assert mi._sticky_checkboxes("- [ ] third wording", "- [x] first wording") == "- [x] third wording"
+    assert mi._sticky_checkboxes("- [ ] third wording", "- [x] second wording") == "- [x] third wording"
+    # an unrelated label is still left alone
+    assert mi._sticky_checkboxes("- [ ] third wording", "- [x] unrelated") == "- [ ] third wording"
 
 
 def test_sticky_checkboxes_renamed_labels_are_labels_the_body_emits(obs):

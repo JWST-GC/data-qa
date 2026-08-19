@@ -163,12 +163,19 @@ _CK_LINE = re.compile(r"^(\s*- \[)([ xX])(\] )(.*)$")
 
 # Checklist labels that have been REWORDED.  ``_sticky_checkboxes`` keys on the label text, so a
 # reworded label reads as a new box and every tick a human put on the old one is lost across all
-# live QA issues.  Mapping new label -> the wording it replaced makes the tick carry over.  Keep an
-# entry here for the life of the issues that still carry the old wording; a body is rewritten on
-# every sync, so once an issue has been synced once it holds the new text.
+# live QA issues.  Mapping the current label -> EVERY spelling it has had makes the tick carry over.
+#
+# The value is a tuple, not a single string, so a second rewording of the same item appends rather
+# than replaces: with only the immediately-previous spelling, a tick placed before the FIRST rename
+# would drop on the second one, and both keys would still be live labels so the staleness test
+# below could not see it.  Newest prior spelling first, by convention.
+#
+# Keep an entry for the life of the issues still carrying an old wording.  A body is rewritten on
+# every sync, so an issue holds the current text after one sync.
 _CK_RENAMED = {
-    "**Astrometry**: catalogue registered onto VIRAC2/Gaia within survey noise":
+    "**Astrometry**: catalogue registered onto VIRAC2/Gaia within survey noise": (
         "**Astrometry**: absolute frame tie (VIRAC2/Gaia) within survey noise",
+    ),
 }
 
 
@@ -181,8 +188,8 @@ def _sticky_checkboxes(new_body: str, old_body: str) -> str:
     remote body stays checked (sticky/union), keyed on the checklist label text.  Never
     unchecks -- a regression is surfaced in the diagnostic reply, not by silently unticking.
 
-    A label listed in ``_CK_RENAMED`` also matches the wording it replaced, so rewording a
-    checklist item carries its ticks forward instead of dropping them.
+    A label listed in ``_CK_RENAMED`` also matches every earlier spelling of itself, so rewording
+    a checklist item carries its ticks forward instead of dropping them.
     """
     old_checked = set()
     for ln in (old_body or "").splitlines():
@@ -194,7 +201,7 @@ def _sticky_checkboxes(new_body: str, old_body: str) -> str:
         m = _CK_LINE.match(ln)
         if m and m.group(2) == " ":
             label = m.group(4).strip()
-            if label in old_checked or _CK_RENAMED.get(label) in old_checked:
+            if label in old_checked or old_checked.intersection(_CK_RENAMED.get(label, ())):
                 ln = f"{m.group(1)}x{m.group(3)}{m.group(4)}"
         out.append(ln)
     return "\n".join(out)
