@@ -3072,8 +3072,9 @@ def stage6_astrom_error(o: Observation, sw, lw):
                A formal error bar carries no systematic, so its ~0.06 mas bright-end floor is NOT
                the achieved precision; it is the noise-limited fit uncertainty.
       - dotted rms(jwst) internal -- the EMPIRICAL scatter of a star's position across exposures
-               (merged std_ra/std_dec).  This is the achieved repeatability (~1 mas floor), ~20x
-               the formal sigma; the headline `floor_mas` is this number, not the formal one.
+               (merged std_ra/std_dec).  This is the achieved repeatability (a sub-mas floor, well
+               above the formal sigma); the headline `floor_mas` is this number when available,
+               else the formal floor (floor_is_empirical flag).
       - dashed rms(offset-VIRAC) -- external scatter against the reference frame (VIRAC floor incl.)
     The faint-end rise of all three tracks S/N.  A parallel lower panel histograms the source counts
     per Vega-mag bin (the sample behind each curve point)."""
@@ -3246,8 +3247,9 @@ _HEADLINE = {
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
-# stages whose caption is NOT built in code live here (1, 3, 6).  Stages 2/4/5/7 build their caption
-# in code (variant-dependent), so no template exists for them -- avoids a dead duplicate that drifts.
+# stages whose caption is NOT built in code live here (1, 3).  Stages 2/4/5/6/7 build their caption
+# in code (variant- or availability-dependent), so no template exists for them -- avoids a dead
+# duplicate that drifts.
 CAPTIONS = {
     1: "**Stage 1 — first mosaics.** Grayscale {sw} (SW) and {lw} (LW) `i2d`. Confirms the "
        "observation was delivered and the mosaics are present and not obviously corrupt. "
@@ -3258,16 +3260,6 @@ CAPTIONS = {
        "is anchored on the densest stellar ridge; a well-calibrated catalogue lies along it. The "
        "measured slope is {slope:.2f} and the scatter about the locus is {scatter:.2f} mag. "
        "([how this is made](DOCROOT#stage3))",
-    6: "**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel. "
-       "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error "
-       "(`dra`/`ddec`); a formal error bar has no systematic in it, so its ~0.06 mas bright-end "
-       "floor is **not** the achieved precision. **rms(jwst)** (dotted) is the empirical scatter of "
-       "a star across exposures — the **achieved internal repeatability** (~1 mas floor, ≈20× the "
-       "formal σ), and the number the headline `floor_mas` reports. **rms(offset)** (dashed) is the "
-       "RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) offset (external scatter, incl. the "
-       "VIRAC floor). All three rise at the faint end with S/N; shaded band = 16–84th percentile. "
-       "The **lower panel** histograms the source counts per Vega-mag bin — the sample behind each "
-       "curve point, and where it runs out at the faint end. ([how this is made](DOCROOT#stage6))",
 }
 
 
@@ -3554,6 +3546,32 @@ def _caption_for_impl(n, metrics):
         base += ("The cloud's WIDTH is bounded by the 0.1″ cross-match radius, not the per-star "
                  "astrometric RMS — see [stage 5](DOCROOT#stage5)/[stage 6](DOCROOT#stage6) for the "
                  "actual per-star scatter. ([how this is made](DOCROOT#stage7))")
+        return base
+    if n == 6:
+        # Built in code so the rms(jwst) sentence is only stated when that curve is actually drawn:
+        # without per-exposure catalogs (e.g. w51 o002, gc2211 o046) `floor_mas` falls back to the
+        # FORMAL floor (floor_is_empirical false), and the generic template's unconditional
+        # "floor_mas is the empirical rms(jwst)" would name a curve that is absent and misattribute
+        # the metric -- the exact formal-sold-as-achieved conflation this stage was fixed to avoid.
+        sw, lw = metrics.get("sw"), metrics.get("lw")
+        emp = any(metrics.get(f"floor_is_empirical_{f.lower()}") for f in (sw, lw) if f)
+        base = ("**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel. "
+                "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error; a "
+                "formal error bar has no systematic in it, so its bright-end floor is the "
+                "noise-limited fit uncertainty, **not** the achieved precision. **rms(offset)** "
+                "(dashed) is the RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) offset "
+                "(external scatter, incl. the VIRAC floor). ")
+        if emp:
+            base += ("**rms(jwst)** (dotted) is the empirical scatter of a star across exposures — "
+                     "the **achieved internal repeatability** (sub-mas, well above the formal σ_fit), "
+                     "and the number the headline `floor_mas` reports (`floor_is_empirical` true). ")
+        else:
+            base += ("The empirical **rms(jwst)** repeatability curve needs per-exposure catalogs, "
+                     "absent for this obs, so it is not drawn and `floor_mas` falls back to the "
+                     "formal σ_fit floor (`floor_is_empirical` false). ")
+        base += ("All curves rise at the faint end with S/N; shaded band = 16–84th percentile. The "
+                 "**lower panel** histograms the source counts per Vega-mag bin — the sample behind "
+                 "each curve point. ([how this is made](DOCROOT#stage6))")
         return base
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))

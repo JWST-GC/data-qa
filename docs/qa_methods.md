@@ -300,8 +300,11 @@ lower panel of source counts:
    the achieved astrometric precision. Do not cite it as the delivered precision.
 2. **rms(jwst)** (dotted) — the empirical scatter of a star's position **across its exposures**
    (`std_ra`/`std_dec` from the merged catalog). This is the **achieved internal repeatability**:
-   a ~1 mas floor, roughly **20× the formal σ_fit**. The headline `floor_mas` metric reports this
-   number (with `floor_is_empirical` true), and `formal_sigma_floor_mas` keeps the formal value.
+   a sub-mas floor, well above the formal σ_fit (on brick jw02221-o001, `floor_mas` for F212N is
+   0.76 mas vs a 0.06 mas formal floor — ~12×; other bands 0.6–0.8 mas). The headline `floor_mas`
+   metric reports this number when per-exposure catalogs are available (with `floor_is_empirical`
+   true), and `formal_sigma_floor_mas` keeps the formal value; without them `floor_mas` falls back
+   to the formal floor and `floor_is_empirical` is false.
 3. **rms(offset)** (dashed) — the RMS of the per-star JWST−VIRAC offset per magnitude bin. The
    *external* scatter against the reference; it includes the VIRAC error floor, so it sits highest.
 

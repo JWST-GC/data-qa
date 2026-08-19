@@ -67,13 +67,19 @@ def test_caption_redflag():
 
 
 def test_caption_stage6_names_formal_vs_empirical():
-    # the formal PSF-fit sigma must NOT be sold as the achieved precision (issue #1 review):
-    # the caption names it "formal", credits the achieved floor to rms(jwst), and drops the old
-    # "systematic limit" claim; it also documents the source-count histogram panel.
-    cap = D.caption_for(6, dict(stage=6))
-    assert "systematic limit" not in cap
-    assert "formal" in cap and "rms(jwst)" in cap and "achieved" in cap.lower()
-    assert "per Vega-mag bin" in cap or "source counts per" in cap
+    # the formal PSF-fit sigma must NOT be sold as the achieved precision (issue #1 review): the
+    # caption names it "formal", drops the old "systematic limit" claim, documents the source-count
+    # histogram, and -- crucially -- only credits floor_mas to rms(jwst) WHEN that curve is drawn.
+    emp = D.caption_for(6, dict(stage=6, sw="F212N", lw="F466N",
+                                floor_is_empirical_f212n=True, floor_is_empirical_f466n=True))
+    assert "systematic limit" not in emp
+    assert "formal" in emp and "rms(jwst)" in emp and "achieved" in emp.lower()
+    assert "source counts per" in emp
+    # no per-exposure catalogs -> rms(jwst) not drawn: the caption must NOT claim floor_mas is it,
+    # and must say the fallback to the formal floor (the conflation #99 review caught).
+    noemp = D.caption_for(6, dict(stage=6, sw="F115W", lw=None, floor_is_empirical_f115w=False))
+    assert "falls back to the" in noemp and "formal" in noemp
+    assert "achieved internal repeatability" not in noemp
 
 
 def test_caption_stage5_no_overlap_two_modules():
