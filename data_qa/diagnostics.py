@@ -3324,7 +3324,7 @@ def _caption_for_impl(n, metrics):
         if metrics.get("n_stars_hi_sn") is not None:
             body += (f"A second CMD below is limited to [S/N > 10](DOCROOT#glossary-snr) in both "
                      f"bands ({metrics['n_stars_hi_sn']} stars, turnover ≈ "
-                     f"{metrics.get('lf_turnover_hi_sn', float('nan')):.1f} mag) — a cleaner locus. ")
+                     f"{metrics.get('lf_turnover_hi_sn', float('nan')):.1f} mag). ")
         if kind == "crossmatch":
             body += ("The colour width is set by the positional cross-match tolerance, not the "
                      "catalogue's colour precision. ")
