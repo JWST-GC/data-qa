@@ -2017,7 +2017,7 @@ def stage5_intermodule(o: Observation, sw):
         title_extra = (f"  ·  single module ({single_module})" if single_module
                        else "  ·  A/B overlap not measurable")
 
-    # single-module obs (sickle = NRCB only) has no A/B tie to fail -> N/A passes.
+    # a single-module obs (sickle = NRCB only) has no A/B comparison to fail -> N/A passes.
     if single_module:
         metrics["single_module"] = single_module
     nan_frac = metrics.get("nan_frac", 0.0)
