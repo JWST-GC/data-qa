@@ -66,6 +66,16 @@ def test_caption_redflag():
     assert "RED FLAG" in cap and "no catalog" in cap
 
 
+def test_caption_stage6_names_formal_vs_empirical():
+    # the formal PSF-fit sigma must NOT be sold as the achieved precision (issue #1 review):
+    # the caption names it "formal", credits the achieved floor to rms(jwst), and drops the old
+    # "systematic limit" claim; it also documents the source-count histogram panel.
+    cap = D.caption_for(6, dict(stage=6))
+    assert "systematic limit" not in cap
+    assert "formal" in cap and "rms(jwst)" in cap and "achieved" in cap.lower()
+    assert "per Vega-mag bin" in cap or "source counts per" in cap
+
+
 def test_caption_stage5_no_overlap_two_modules():
     # both modules present but no shared stars -> overlap keys absent; must NOT truncate to a
     # bare fragment and must say the tie is unverified.

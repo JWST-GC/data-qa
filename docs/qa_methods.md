@@ -291,19 +291,24 @@ filtered, in `_module_positions`).
 <a id="stage6"></a>
 ## Stage 6 — astrometric precision
 
-Stage 6 shows three per-star error curves versus Vega magnitude, one set per channel:
+Stage 6 shows per-star error curves versus Vega magnitude, one set per channel, over a parallel
+lower panel of source counts:
 
-1. **σ_pos** (solid) — the formal per-star PSF-fit position error (`dra`/`ddec` from the
-   per-exposure daophot fit, pooled). The *predicted* precision of a single measurement.
+1. **formal σ_fit** (solid) — the PSF fitter's formal per-detection 1σ position error (`dra`/`ddec`
+   from the per-exposure daophot fit, pooled). A formal error bar has **no systematic in it by
+   construction**, so its ~0.06 mas bright-end floor is the noise-limited *fit* uncertainty, **not**
+   the achieved astrometric precision. Do not cite it as the delivered precision.
 2. **rms(jwst)** (dotted) — the empirical scatter of a star's position **across its exposures**
-   (`std_ra`/`std_dec` from the merged catalog). The JWST *internal repeatability* — what σ_pos
-   predicts, actually measured.
+   (`std_ra`/`std_dec` from the merged catalog). This is the **achieved internal repeatability**:
+   a ~1 mas floor, roughly **20× the formal σ_fit**. The headline `floor_mas` metric reports this
+   number (with `floor_is_empirical` true), and `formal_sigma_floor_mas` keeps the formal value.
 3. **rms(offset)** (dashed) — the RMS of the per-star JWST−VIRAC offset per magnitude bin. The
    *external* scatter against the reference; it includes the VIRAC error floor, so it sits highest.
 
-The three separate "predicted precision" (σ_pos) from "internal repeatability" (rms(jwst)) from
-"agreement with an external frame" (rms(offset)). The bright-end σ_pos floor is the astrometric
-systematic limit; the faint-end rise tracks S/N. Shaded band = 16–84th percentile.
+The three separate the *fit uncertainty* (σ_fit) from the *achieved repeatability* (rms(jwst)) from
+*agreement with an external frame* (rms(offset)); their faint-end rise tracks S/N, shaded band =
+16–84th percentile. The **lower panel** histograms the number of sources in each 0.5-mag Vega bin —
+the sample size behind each curve point, and where it runs out at the faint end.
 
 Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnostics.py).
 

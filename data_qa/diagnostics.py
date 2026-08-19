@@ -3067,15 +3067,26 @@ def _internal_pos_rms(o, filt):
 
 
 def stage6_astrom_error(o: Observation, sw, lw):
-    """Astrometric precision curve: per-star position sigma (mas) vs Vega magnitude,
-    from the per-exposure PSF fits.  The bright-end floor is the astrometric systematic limit;
-    the faint-end rise tracks S/N.  One curve per available channel (SW / LW)."""
+    """Astrometric precision vs Vega magnitude, one set of curves per channel (SW / LW):
+      - solid  formal sigma_fit -- the PSF fitter's formal 1-sigma position error per detection.
+               A formal error bar carries no systematic, so its ~0.06 mas bright-end floor is NOT
+               the achieved precision; it is the noise-limited fit uncertainty.
+      - dotted rms(jwst) internal -- the EMPIRICAL scatter of a star's position across exposures
+               (merged std_ra/std_dec).  This is the achieved repeatability (~1 mas floor), ~20x
+               the formal sigma; the headline `floor_mas` is this number, not the formal one.
+      - dashed rms(offset-VIRAC) -- external scatter against the reference frame (VIRAC floor incl.)
+    The faint-end rise of all three tracks S/N.  A parallel lower panel histograms the source counts
+    per Vega-mag bin (the sample behind each curve point)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     metrics = dict(stage=6, sw=sw, lw=lw)
-    fig, ax = _fig(1, 1, 6.8, 5.2)
-    a = ax[0][0]
+    # Two stacked panels sharing the magnitude axis: the precision curve on top, and a parallel
+    # source-count histogram (sources per Vega-mag bin) below, so the number of stars behind each
+    # point of the curve -- and where the sample runs out at the faint end -- is visible.
+    fig, (a, ah) = plt.subplots(2, 1, sharex=True, figsize=(6.8, 6.4),
+                                gridspec_kw=dict(height_ratios=[3.0, 1.0], hspace=0.08))
+    hist_series = []                 # (mag_used, colour, filt) for the count histogram below
     any_data = False
     all_vega = True
     for filt, color in [(sw, "#3366cc"), (lw, "#cc3311")]:
@@ -3102,10 +3113,19 @@ def stage6_astrom_error(o: Observation, sw, lw):
             continue
         any_data = True
         lbl = f"{filt}  (n={int(ok.sum())}" + ("" if zp is not None else ", instr") + ")"
-        a.plot(ctr, med, "-", color=color, lw=1.7, label=lbl + r"  $\sigma_{\rm pos}$")
+        a.plot(ctr, med, "-", color=color, lw=1.7,
+               label=lbl + r"  formal $\sigma_{\rm fit}$ (not repeatability)")
         a.fill_between(ctr, lo, hi, color=color, alpha=0.20)
-        metrics[f"floor_mas_{filt.lower()}"] = float(np.nanmin(med))
+        # This solid curve is the fitter's FORMAL 1-sigma position error, per detection -- it has no
+        # systematic in it by construction, so it is NOT the achieved astrometric precision (that is
+        # the empirical rms(jwst) dotted curve below, ~20x larger).  Record it under an explicit key
+        # and make the headline `floor_mas` the EMPIRICAL floor (set in the rms(jwst) block), so a
+        # reader of the metric gets the achieved precision, not the fit error (issue #1 review).
+        metrics[f"formal_sigma_floor_mas_{filt.lower()}"] = float(np.nanmin(med))
+        metrics[f"floor_mas_{filt.lower()}"] = float(np.nanmin(med))   # provisional; empirical overrides
+        metrics[f"floor_is_empirical_{filt.lower()}"] = False
         metrics[f"nstars_{filt.lower()}"] = int(ok.sum())
+        hist_series.append((mag[ok], color, filt))    # same sample as the curve, for the count panel
         # rms(offset): the EXTERNAL scatter vs VIRAC (includes the VIRAC error floor), dashed, same
         # colour -- shown alongside sigma_pos so "how precisely measured" vs "how well it agrees
         # with the external frame" are both visible.
@@ -3137,9 +3157,12 @@ def stage6_astrom_error(o: Observation, sw, lw):
             jmag_v, jrms = jr
             med_j, _, _, ctr_j = _binned_stat(jmag_v, jrms)
             if med_j is not None:
-                a.plot(ctr_j, med_j, ":", color=color, lw=1.8, alpha=0.9,
-                       label=f"{filt}  rms(jwst) internal")
+                a.plot(ctr_j, med_j, ":", color=color, lw=2.2, alpha=0.95,
+                       label=f"{filt}  rms(jwst) internal — achieved repeatability")
                 metrics[f"rms_jwst_floor_mas_{filt.lower()}"] = float(np.nanmin(med_j))
+                # the ACHIEVED precision: promote the empirical floor to the headline metric.
+                metrics[f"floor_mas_{filt.lower()}"] = float(np.nanmin(med_j))
+                metrics[f"floor_is_empirical_{filt.lower()}"] = True
     metrics["mag_kind"] = "vega" if all_vega else "mixed"
     if not any_data:
         plt.close(fig)          # close the empty curve fig before the red-flag builds its own
@@ -3152,11 +3175,26 @@ def stage6_astrom_error(o: Observation, sw, lw):
     a.set_ylim(0.03, 300.0)          # 0.03-300 mas: floor through S/N rise incl. faint rms(offset)
     xlbl = ("Vega magnitude" if all_vega else
             "magnitude  (Vega where calibrated, else instrumental)")
-    a.set_xlabel(xlbl)
-    a.set_ylabel(r"astrometric error  $\sigma_{\rm pos}$ (mas)")
+    a.set_ylabel("astrometric error (mas)")
     a.legend(fontsize=9, loc="upper left")
     a.grid(alpha=0.25, which="both")
     a.set_title(f"{o.target} {o.obsid} — astrometric precision vs magnitude", fontsize=10)
+    # parallel panel: number of sources per Vega-mag bin (same 0.5-mag binning as the curve, same
+    # sample), one step histogram per channel.  Shows how many stars each curve point rests on and
+    # where the sample dies out at the faint end.
+    allmag = np.concatenate([m[np.isfinite(m)] for m, _c, _f in hist_series]) if hist_series else np.array([])
+    if allmag.size:
+        bins = np.arange(np.floor(allmag.min()), np.ceil(allmag.max()) + 0.5, 0.5)
+        mids = 0.5 * (bins[:-1] + bins[1:])
+        for m, color, filt in hist_series:
+            cnt, _ = np.histogram(m[np.isfinite(m)], bins=bins)
+            ah.step(mids, cnt, where="mid", color=color, lw=1.6)
+            if cnt.max() > 0:
+                metrics[f"lf_peak_mag_{filt.lower()}"] = float(mids[int(np.argmax(cnt))])
+        ah.set_yscale("log")
+        ah.set_ylabel("sources / 0.5 mag")
+        ah.grid(alpha=0.25, which="both")
+    ah.set_xlabel(xlbl)
     metrics["passed"] = True
     return _save(fig, f"{o.obsid}_stage6.png"), metrics
 
@@ -3220,13 +3258,16 @@ CAPTIONS = {
        "is anchored on the densest stellar ridge; a well-calibrated catalogue lies along it. The "
        "measured slope is {slope:.2f} and the scatter about the locus is {scatter:.2f} mag. "
        "([how this is made](DOCROOT#stage3))",
-    6: "**Stage 6 — astrometric precision.** Three per-star error curves vs Vega magnitude per "
-       "channel: σ_pos (solid — the per-exposure PSF-fit position error `dra`/`ddec`, the predicted "
-       "precision), rms(jwst) (dotted — the empirical position scatter across exposures, the "
-       "internal repeatability), and rms(offset) (dashed — the RMS of the per-star "
-       "JWST−[VIRAC](DOCROOT#glossary-virac) offset, the external scatter incl. the VIRAC floor). "
-       "The σ_pos bright-end floor is the astrometric systematic limit; the faint-end rise tracks "
-       "S/N. Shaded band = 16–84th percentile. ([how this is made](DOCROOT#stage6))",
+    6: "**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel. "
+       "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error "
+       "(`dra`/`ddec`); a formal error bar has no systematic in it, so its ~0.06 mas bright-end "
+       "floor is **not** the achieved precision. **rms(jwst)** (dotted) is the empirical scatter of "
+       "a star across exposures — the **achieved internal repeatability** (~1 mas floor, ≈20× the "
+       "formal σ), and the number the headline `floor_mas` reports. **rms(offset)** (dashed) is the "
+       "RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) offset (external scatter, incl. the "
+       "VIRAC floor). All three rise at the faint end with S/N; shaded band = 16–84th percentile. "
+       "The **lower panel** histograms the source counts per Vega-mag bin — the sample behind each "
+       "curve point, and where it runs out at the faint end. ([how this is made](DOCROOT#stage6))",
 }
 
 
