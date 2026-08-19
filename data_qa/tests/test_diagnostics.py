@@ -312,6 +312,32 @@ def test_cell_consistency_isolated_outlier_ignored():
     assert cc["n_deviating"] == 1 and cc["n_confirmed"] == 0 and cc["consistent"]
 
 
+def test_cell_consistency_rejects_spurious_low_occupancy_cells():
+    # cloudef o002 (#37): 3 dense cells consistent at ~150 mas + low-occupancy edge cells with wild,
+    # mutually-inconsistent offsets (>300 mas from consensus, each <2% of sources) = spurious per-cell
+    # xcorr peaks. A tie cannot differ by ~arcsec between cells, so these are dropped, not "measured".
+    cells = _grid_cells({
+        (3, 0): (-145.0, 38.0, 105000), (3, 1): (-143.0, 58.0, 88000), (3, 2): (-139.0, 69.0, 88000),
+        (0, 1): (-1771.0, 1482.0, 1545), (0, 2): (-529.0, -270.0, 1460),
+        (0, 3): (-787.0, -1260.0, 1133), (3, 3): (-575.0, 775.0, 558),
+    })
+    cc = D._cell_consistency(cells, [])
+    assert cc["n_spurious"] == 4 and cc["n_cells"] == 3        # 4 spurious dropped, 3 real kept
+    assert cc["n_dropped"] == 4
+    assert cc["spread"] < 30                                   # survivors agree; no 782 mas inflation
+    assert 140 < cc["off_med"] < 170                           # uniform ~150 mas field offset preserved
+
+
+def test_cell_consistency_keeps_high_weight_far_cell():
+    # a WELL-POPULATED cell far from consensus is a real discontinuity, not a spurious peak: it must
+    # be kept (and flagged by the adjacency test), never silently dropped by the spurious filter.
+    base = {(i, j): (9.0, 0.0, 40000) for i in range(4) for j in range(4)}
+    base[(0, 0)] = (409.0, 0.0, 40000)            # 400 mas off, but holds a full cell's worth of sources
+    cc = D._cell_consistency(_grid_cells(base), [])
+    assert cc["n_spurious"] == 0 and cc["n_cells"] == 16       # not dropped as spurious
+    assert cc["n_deviating"] == 1
+
+
 def test_cell_consistency_low_coverage_not_consistent():
     # most sources sit in DROPPED (no-peak) cells -> not adequately sampled to pass
     cells = _grid_cells({(0, 0): (9.0, 0.0, 500), (0, 1): (9.0, 0.0, 500),

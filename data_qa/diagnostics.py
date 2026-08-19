@@ -1157,6 +1157,14 @@ _CELL_MIN_COVERAGE = 0.5
 # peak, weight cells by SOURCE COUNT, and judge consistency by adjacency (below), which does not
 # depend on the density-biased ratio.
 _CELL_PR_FLOOR = 1.5
+# A cell offset farther than this from the source-weighted field consensus is not a believable tie
+# (a real tie, even with distortion or a sub-region discontinuity, does not jump ~arcsec between
+# cells).  Used ONLY together with the weight floor below to drop spurious low-occupancy xcorr peaks;
+# genuine high-weight discontinuities are kept and judged by the adjacency test.  4x the 75 mas gate.
+_CELL_SPURIOUS_MAX = 300.0
+# ...and only when the far cell holds less than this fraction of the measured sources (so a real,
+# well-populated deviating region is never silently discarded -- it must be flagged, not dropped).
+_CELL_SPURIOUS_WT = _CELL_BAD_FRAC
 
 
 def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=None):
@@ -1255,12 +1263,42 @@ def _cell_consistency(cells, dropped):
     Returns a dict of the numbers plus per-cell ``deviating``/``confirmed`` flags for plotting."""
     if not cells:
         return dict(n_cells=0, consistent=False)
-    dra = np.array([c["dra"] for c in cells]); dde = np.array([c["dde"] for c in cells])
-    ns = np.array([c["n"] for c in cells], float)
 
     def _wmed(v, w):
         o = np.argsort(v); vs, ws = v[o], w[o]; cw = np.cumsum(ws)
         return float(vs[np.searchsorted(cw, 0.5 * cw[-1])])
+
+    # --- reject SPURIOUS cells before any stat -------------------------------------------------
+    # A frame tie -- even with distortion or a real sub-region discontinuity -- does not jump by
+    # hundreds of mas between cells; per-cell dRA/dDec that differ that much are not a tie.  A cell
+    # far from the SOURCE-WEIGHTED consensus while holding only a tiny fraction of the sources is a
+    # spurious per-cell xcorr peak (few JWST sources against a dense reference -> an accidental
+    # histogram bump that clears the low pr floor), not a measurement.  Drop it into `dropped` so it
+    # neither pollutes the map nor inflates the cell-to-cell spread.  The consensus is source-weighted
+    # so the dense, trustworthy cells define it and the spurious low-occupancy cells cannot move it.
+    # Real, high-weight discontinuities are NOT rejected (weight floor) -- they stay and are judged by
+    # the adjacency test below.  (issue #37: cloudef o002 showed 4 edge cells at 0.6-2.3" amid 3 dense
+    # cells consistent at ~150 mas.)
+    cells, dropped = list(cells), list(dropped)
+    dra0 = np.array([c["dra"] for c in cells]); dde0 = np.array([c["dde"] for c in cells])
+    ns0 = np.array([c["n"] for c in cells], float)
+    c_dra, c_dde = _wmed(dra0, ns0), _wmed(dde0, ns0)
+    resid0 = np.hypot(dra0 - c_dra, dde0 - c_dde)
+    spurious = (resid0 > _CELL_SPURIOUS_MAX) & (ns0 / ns0.sum() < _CELL_SPURIOUS_WT)
+    n_spurious = int(spurious.sum())
+    if n_spurious and not spurious.all():         # never empty the whole set (pathological all-spurious)
+        for k in np.where(spurious)[0]:
+            c = cells[k]
+            dropped.append(dict(i=c["i"], j=c["j"], ra=c["ra"], dec=c["dec"], n=c["n"],
+                                n_ref=c.get("n_ref"),
+                                reason="spurious peak (offset inconsistent with field consensus)"))
+        cells = [c for k, c in enumerate(cells) if not spurious[k]]
+    else:
+        n_spurious = 0
+    # -------------------------------------------------------------------------------------------
+
+    dra = np.array([c["dra"] for c in cells]); dde = np.array([c["dde"] for c in cells])
+    ns = np.array([c["n"] for c in cells], float)
     mdra, mdde = _wmed(dra, ns), _wmed(dde, ns)
     off_med = float(np.hypot(mdra, mdde))
     dev = np.hypot(dra - mdra, dde - mdde)
@@ -1287,8 +1325,9 @@ def _cell_consistency(cells, dropped):
     consistent = bool(len(cells) >= 4 and bad_frac < _CELL_BAD_FRAC and coverage >= _CELL_MIN_COVERAGE)
     return dict(off_med=off_med, off_dra=mdra, off_dde=mdde, spread=spread, se=se, signif=signif,
                 n_cells=len(cells), n_dropped=len(dropped), n_deviating=int(deviating.sum()),
-                n_confirmed=int(confirmed.sum()), bad_src_frac=bad_frac, coverage=coverage,
-                consistent=consistent, deviating=deviating, confirmed=confirmed)
+                n_confirmed=int(confirmed.sum()), n_spurious=n_spurious, bad_src_frac=bad_frac,
+                coverage=coverage, consistent=consistent, deviating=deviating, confirmed=confirmed,
+                cells=cells, dropped=dropped)     # spurious-filtered; caller plots THESE, not the raw set
 
 
 def _dataset_label(metrics):
@@ -1373,6 +1412,7 @@ def stage4_offsets(o: Observation, sw):
         return png, metrics
 
     cc = _cell_consistency(cells, dropped)
+    cells, dropped = cc["cells"], cc["dropped"]      # spurious cells moved to `dropped`; plot the rest
     cell_off_med, spread, se, signif = cc["off_med"], cc["spread"], cc["se"], cc["signif"]
     io = metrics.get("intermodule_off")
     # The per-cell values are histogram peaks against a DENSE reference and carry the several-mas
@@ -1411,6 +1451,7 @@ def stage4_offsets(o: Observation, sw):
                    same_star_npairs=(ss["npairs"] if ss else None),
                    same_star_scatter_mas=(ss["scatter"] if ss else None),
                    n_cells=cc["n_cells"], n_cells_dropped=cc["n_dropped"],
+                   n_cells_spurious=cc.get("n_spurious", 0),
                    n_cells_deviating=cc["n_deviating"], n_cells_confirmed=cc["n_confirmed"],
                    bad_src_frac=cc["bad_src_frac"], cell_coverage=cc["coverage"],
                    cells_consistent=cc["consistent"], passed=passed)
@@ -1474,8 +1515,10 @@ def stage4_offsets(o: Observation, sw):
                                    re_[c["i"] + 1] - re_[c["i"]], de_[c["j"] + 1] - de_[c["j"]],
                                    fill=False, ec="#e41a1c", lw=2.0, zorder=3))
     a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
+    nsp = cc.get("n_spurious", 0)
+    drop_note = f"{cc['n_dropped']} unmeasured" + (f" ({nsp} spurious peak)" if nsp else "")
     a0.set_title(f"per-cell tie ({_dataset_label(metrics)}): {cc['n_cells']} measured, "
-                 f"{cc['n_dropped']} no-peak\nmedian {cell_off_med:.0f} mas; {cc['n_confirmed']} cells "
+                 f"{drop_note}\nmedian {cell_off_med:.0f} mas; {cc['n_confirmed']} cells "
                  f"({100 * cc['bad_src_frac']:.0f}% of sources) deviate", fontsize=8)
     # panel 2: per-cell offsets in (dRA, dDec) sized by source count (big = more sources = more
     # weight), the source-weighted median tie, and the 75 mas gate.
