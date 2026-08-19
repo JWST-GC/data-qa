@@ -231,8 +231,10 @@ Where a plot is restricted to **S/N > 10**, "S/N" is the flux measurement signal
 star. In stage 5 (per-exposure daophot) it is `flux_fit / flux_err` of a single detection,
 computed **per detection**: one value per star per exposure, from that exposure's fitted flux and
 its own formal flux error. (A mean flux over exposures divided by a mean error would be a different
-quantity.) The high-S/N cut keeps the best-measured stars, so the residual scatter that remains
-measures how well the frames agree, with photon-noise centroiding taken out of it.
+quantity.) The high-S/N cut keeps the best-measured stars, which **bounds** the centroid noise
+admitted rather than removing it: a star sitting at the cut still carries σ_pos ≈ FWHM/(2.35·S/N)
+≈ 2.8 mas for F200W, or ~4 mas into an A−B difference, against the 15 mas inter-module line drawn
+on the same panel. Above the cut the residual scatter is dominated by how well the frames agree.
 
 ---
 
@@ -272,8 +274,12 @@ line** is anchored on the densest stellar ridge (the mode of JWST−Ks); a well-
 lies along it.
 
 `stage3_calibration` anchors on VIRAC (nearest JWST source within 0.1″), then makes a robust
-linear fit with **up to 5 sigma-clip iterations** (3σ, breaking early once the clip is stable) to
-measure the slope and the scatter about the locus. The fitted slope is reported in the title and
+linear fit with **up to 5 sigma-clip iterations** (3σ) to measure the slope and the scatter about
+the locus. The loop stops on either of two conditions: the clip is stable (nothing more to
+reject), **or** the next clip would leave fewer than 30 stars. The second exit returns before the
+clipped set is adopted, so on a sparse field the reported `slope`, `scatter` and `n_locus` are
+those of the **unclipped** match set — `n_locus == n_matched` is the signature, and it reads the
+same as a locus so clean the first pass rejected nothing. The fitted slope is reported in the title and
 left undrawn: a free-slope line wanders with the red mismatch cloud and reads as a bad fit. `slope`, `scatter` (mag about the locus), `zeropoint`, `n_matched`, `n_locus`. Consider
 it passing if the slope is 0.8–1.2 and the scatter < 0.8 mag.
 

@@ -951,8 +951,16 @@ def stage3_calibration(o: Observation, sw):
     # matched to VIRAC has a red/mismatch cloud above the locus (Ks-bright, F212N-faint stars);
     # one clip pass measures the CALIBRATION scatter (is the zeropoint sane) rather than the
     # astrophysical colour spread.
-    # Iterate the 3-sigma locus clip to CONVERGENCE (a single pass is not converged -- the
-    # reported slope/scatter otherwise depend on stopping after one step at k=3).
+    # Iterate the 3-sigma locus clip to CONVERGENCE: stopping after one step at k=3 leaves the
+    # reported slope/scatter dependent on where the iteration happened to halt.
+    #
+    # NOTE the loop has TWO exits, and the second one changes what gets reported.  ``loc.all()``
+    # is convergence.  ``loc.sum() < 30`` is a floor on the surviving sample, and it breaks BEFORE
+    # ``xf, yf`` are reassigned, so a field sparse enough to hit it reports the slope, scatter and
+    # n_locus of the UNCLIPPED set.  The upstream gate admits a field at 30 matches, so a ~34-star
+    # locus carrying a red mismatch cloud takes that exit on the first pass and reports
+    # n_locus == n_matched -- which is indistinguishable from a locus so clean the clip rejected
+    # nothing.  See JWST-GC/data-qa#97.
     xf, yf = x, y
     slope, zp = np.polyfit(xf, yf, 1)
     for _ in range(5):
@@ -2363,9 +2371,15 @@ def _offset_cloud(jsc, ref_sc):
 
 def _stage7_astrom_title(mast_off, jic_off):
     """Astrometry sub-panel title, worded from the SIGN of (jicama offset − MAST offset).  It calls
-    the pipeline 'tighter' only when both offsets are measured AND jicama is the smaller; in every
-    other case it reports the number(s) it has and claims no improvement.  ``mast_off``/``jic_off``
-    are ``_offset_cloud`` results (…, bulk_mas) or None."""
+    the pipeline 'tighter' only when both offsets are measured AND jicama is STRICTLY smaller; in
+    every other case it reports the number(s) it has and claims no improvement.  ``mast_off``/
+    ``jic_off`` are ``_offset_cloud`` results (…, bulk_mas) or None.
+
+    This is a STRICTER rule than the pass gate: ``_stage7_verdict`` counts a field as improved at
+    ``jic <= mast + 5``, so a frame where jicama is up to 5 mas worse passes while this title
+    claims nothing.  The two are meant to differ -- the verdict tolerates measurement noise, the
+    title asserts an improvement -- and a caption that says nothing next to a green tick is that
+    5 mas band, not a contradiction."""
     both = mast_off is not None and jic_off is not None
     if both:
         head = (f"offset from VIRAC — jicama {jic_off[2]:.0f} mas vs MAST "
@@ -2383,8 +2397,13 @@ def _stage7_verdict(our_path, mast_off, jic_off, jic_unmeas):
 
     Failing to measure our OWN (jicama) offset while VIRAC is present is our product failing, so it
     fails AND red-flags.  A missing VIRAC reference, or only the MAST offset being unmeasurable,
-    leaves the comparison 'not measured' / 'unavailable' and says so.  Returns
-    (passed: bool, red_flag: bool, red_flag_reason: str|None)."""
+    leaves the comparison 'not measured' / 'unavailable' and says so.
+
+    ``improved`` carries a 5 mas tolerance (``jic <= mast + 5``) that the panel title does not:
+    ``_stage7_astrom_title`` says 'tighter' only on a strict ``jic < mast``.  So a field sitting in
+    that 5 mas band passes here while the title claims no improvement.
+
+    Returns (passed: bool, red_flag: bool, red_flag_reason: str|None)."""
     improved = (jic_off is not None and mast_off is not None and jic_off[2] <= mast_off[2] + 5)
     passed = bool(our_path and not jic_unmeas
                   and (improved or mast_off is None or jic_off is None))
