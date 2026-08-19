@@ -817,10 +817,18 @@ def stage2_cmd(o: Observation, sw, lw):
         a = fig.add_subplot(gs[r, 0]); amarg = fig.add_subplot(gs[r, 1], sharey=a)
         cax = fig.add_subplot(gs[r, 2])
         col = msw[sel] - mlw[sel]; mg = mlw[sel]
-        hb = a.hexbin(col, mg, gridsize=120, bins="log", cmap="viridis", mincnt=1)
+        xlo, xhi = np.nanpercentile(col, [1, 99])
+        ylo, yhi = np.nanpercentile(mg, [0.5, 99.5])
+        a.set_xlim(xlo, xhi)
+        a.set_ylim(yhi, ylo)   # brighter up
+
+        fig.canvas.draw()
+        bbox = a.get_window_extent()
+        nx = 100
+        ny = max(1, int(round(nx * bbox.height / (bbox.width * np.sqrt(3)))))
+        hb = a.hexbin(col, mg, gridsize=(nx, ny), extent=(xlo, xhi, ylo, yhi), bins="log", cmap="viridis", mincnt=1)
         a.set_xlabel(f"{sw} - {lw}"); a.set_ylabel(lw)
-        a.set_xlim(np.nanpercentile(col, [1, 99]))
-        ylo, yhi = np.nanpercentile(mg, [0.5, 99.5]); a.set_ylim(yhi, ylo)   # brighter up
+
         fig.colorbar(hb, cax=cax, label="log N")
         hh, edges = np.histogram(mg, bins=50); ctr = 0.5 * (edges[1:] + edges[:-1])
         amarg.step(hh, ctr, where="mid", color="k", lw=0.9)
