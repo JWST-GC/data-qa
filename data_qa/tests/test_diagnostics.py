@@ -582,6 +582,27 @@ def test_ab_overlap_returns_matched_positions():
     assert np.all(np.isfinite(ov["ra_arr"])) and np.all(np.isfinite(ov["dec_arr"]))
 
 
+def test_ab_overlap_rms_is_twice_the_per_axis_single_module_error():
+    # The stage-5 scatter is NOT on the same footing as a stage-6 curve, and the docstring says by
+    # how much.  Two factors: hypot combines the axes (stage 6 divides by sqrt(2) to stay
+    # per-axis), and each residual is a difference A - B of two independent measurements of one
+    # star.  Inject a known per-axis error into BOTH modules and check the returned rms lands at 2x
+    # it, so the docstring's factor fails here if the estimator changes.
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.RandomState(11)
+    n, sig_mas = 4000, 6.0
+    ra = 266.40 + rng.uniform(0, 0.02, n); dec = -28.90 + rng.uniform(0, 0.02, n)
+    cosd = np.cos(np.radians(-28.9))
+
+    def jitter(r, d):
+        return SkyCoord((r + rng.normal(0, sig_mas, n) / 3.6e6 / cosd) * u.deg,
+                        (d + rng.normal(0, sig_mas, n) / 3.6e6) * u.deg)
+    ov = D._ab_overlap(jitter(ra, dec), jitter(ra, dec))
+    assert ov is not None
+    assert 1.8 * sig_mas < ov["rms"] < 2.2 * sig_mas
+
+
 def test_ab_overlap_one_to_one_no_pair_inflation():
     # Guards the count fix: several A sources clustered inside 80 mas of ONE B source must collapse
     # to a SINGLE match (one-to-one), not one pair each -- the search_around_sky many-to-many ball

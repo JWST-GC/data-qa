@@ -1687,11 +1687,20 @@ def _ab_overlap(a_sc, b_sc):
 
     ``off`` is the bulk A->B shift, taken as the ``aa.xcorr`` histogram PEAK.  A
     search_around_sky median would fabricate pairs at this density.  ``rms`` is the scatter left in
-    the SAME stars after A is aligned onto B by that peak: ``hypot`` of the two axes' ``mad_std``,
-    so it is the COMBINED (RA, Dec) scatter, sqrt(2) times the per-axis robust sigma.  Stage 6
-    plots a per-axis-equivalent curve, which for isotropic scatter reads ~1.7x smaller than this
-    number; the two are not interchangeable.  Returns a dict with the offset/scatter/count, the
-    per-star residual arrays (for the
+    the SAME stars after A is aligned onto B by that peak: ``hypot`` of the two axes' ``mad_std``.
+
+    Two factors separate that from a stage-6 curve, and both have to be applied to compare them:
+    ``hypot`` COMBINES the axes where stage 6 divides by sqrt(2) to stay per-axis, and each
+    residual is a DIFFERENCE A - B of two independent measurements of one star, so its per-axis
+    scatter is already sqrt(2) above a single module's.  Against stage 6's ``sig_pos`` and
+    ``rms(jwst)``, both per-axis single-measurement quantities, this number therefore runs 2x
+    higher for isotropic scatter (measured: 10.00 mas per-axis single-module error -> 20.00 here,
+    10.00 there).  Aligning A onto B removes two numbers over ~1000 stars, which does not touch
+    that.  Stage 6's ``rms(offset)`` is a different quantity again -- it is against VIRAC and
+    carries VIRAC's error, and its median-radial estimator reads 0.83x a per-axis sigma -- so no
+    single factor relates this number to that curve.
+
+    Returns a dict with the offset/scatter/count, the per-star residual arrays (for the
     hexbin + marginals), and a list of overlap-star positions (for the cutout gallery), or None
     when it cannot be measured."""
     import astropy.units as u

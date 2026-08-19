@@ -344,10 +344,21 @@ omitted (two-panel top row).
   agree, each star is one round PSF; where they disagree it doubles or elongates, the same source
   drizzled twice at offset positions.
 
-The scatter quoted on the A↔B panels is `hypot` of the ΔRA and ΔDec `mad_std` — the **combined**
-two-axis scatter, √2 times the per-axis robust σ. [Stage 6](#stage6) plots a **per-axis** quantity
-(it divides the radial residual by √2). For isotropic scatter the stage-5 number runs ~1.7× above
-the stage-6 curve, so read them as two different statistics rather than one number measured twice.
+The scatter quoted on the A↔B panels is `hypot` of the ΔRA and ΔDec `mad_std`. Comparing it with a
+[stage 6](#stage6) curve takes **two** factors, not one:
+
+- `hypot` **combines** the two axes, while stage 6 divides by √2 to stay **per-axis** — √2.
+- each residual is a **difference**, A − B, of two independent measurements of the same star, so
+  its per-axis scatter is already √2 above what one module alone contributes — √2 again.
+
+So against stage 6's `σ_pos` and `rms(jwst)`, which are per-axis single-measurement quantities,
+the stage-5 number runs **2×** higher for isotropic scatter. Measured: a 10.00 mas per-axis
+single-module error gives 20.00 mas here and 10.00 mas there. (Aligning A onto B before
+differencing removes two numbers across ~1000 stars, which does not change this.)
+
+Stage 6's third curve, `rms(offset)`, is a different quantity again — it is measured against VIRAC
+and carries VIRAC's own error, and its median-radial estimator reads 0.83× a per-axis σ. No single
+factor relates the stage-5 scatter to that one.
 
 Consider it passing if the NRCA∩NRCB offset is small (< 15 mas) and the cutouts show round, single
 PSFs. A genuine single-module observation (NRCB-only, say) has no A↔B comparison to make and passes
