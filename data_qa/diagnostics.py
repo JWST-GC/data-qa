@@ -73,12 +73,35 @@ def _has_lw(o: "Observation"):
     return any(_channel(f) == "LW" for f in getattr(o, "filters", []) if f)
 
 
-def pick_filters(available, sw=None, lw=None):
-    """Choose one SW + one LW filter from those available for the obs."""
+def pick_filters(available, sw=None, lw=None, prefer=None):
+    """Choose one SW + one LW representative filter from those available for the obs.
+
+    ``prefer`` (optional) is the subset of filters that have a REDUCED science mosaic on disk.
+    Most stages (1 mosaics, 4 frame registration, 5 inter-module, 7 MAST-vs-pipeline, 9
+    PSF-vs-aper) key off the representative filter's mosaic, so a filter that has only a catalog /
+    raw MAST product but no reduced mosaic must not win the pick just because it ranks higher in the
+    preference order.  cloudef jw02092-o005 delivered F162M+F360M reduced but only raw MAST i2d for
+    F210M/F480M; F210M/F480M outrank F162M/F360M in the preference lists, so the old pick chose the
+    UNREDUCED pair and every mosaic-keyed stage blanked with 'no i2d' (issue #38).  Preferring a
+    mosaic-backed filter per channel fixes stages 1/4/5/7/9; it falls back to any available filter
+    when the channel has no reduced mosaic at all, preserving the prior behaviour."""
     up = {f.upper() for f in available}
-    sw = sw.upper() if sw else next((f for f in _SW_PREF if f in up), None)
-    lw = lw.upper() if lw else next((f for f in _LW_PREF if f in up), None)
-    return sw, lw
+    pref = {f.upper() for f in (prefer or ())} & up      # mosaic-backed AND actually available
+
+    def choose(explicit, order):
+        if explicit:
+            return explicit.upper()
+        # first preference-ranked filter with a reduced mosaic; else first available (unchanged)
+        return (next((f for f in order if f in pref), None)
+                or next((f for f in order if f in up), None))
+    return choose(sw, _SW_PREF), choose(lw, _LW_PREF)
+
+
+def _filters_with_mosaic(o: Observation):
+    """Subset of the obs's filters that have a reduced science mosaic on disk (``_mosaic_path``).
+    Feeds ``pick_filters(prefer=...)`` so the representative SW/LW filters are ones the
+    mosaic-keyed stages can actually render."""
+    return [f for f in o.filters if _mosaic_path(o, f)]
 
 
 def _available_filters(o: Observation):
@@ -664,37 +687,53 @@ def stage1_mosaics(o: Observation, sw, lw):
     import matplotlib.pyplot as plt
     from astropy.io import fits
 
-    psw, plw = _mosaic_path(o, sw), _mosaic_path(o, lw)
-    panels = []                                   # (filt, path, aspect = ny/nx)
-    for filt, p in ((sw, psw), (lw, plw)):
+    # A panel image is our reduced science mosaic when present, else the MAST-delivered STScI L3
+    # i2d.  MAST ALWAYS ships an i2d for a delivered filter, so a filter with data is NEVER blank;
+    # only a nominal filter with nothing on disk (dropped) has no image.  (The "passed" gate below
+    # still keys on the REDUCED mosaic, so a MAST-only filter reads not-yet-complete, not delivered.)
+    def _panel_image(filt):
+        p = _mosaic_path(o, filt)
+        if p:
+            return p, "reduced"
+        m = _mast_i2d(o, filt)
+        return (m, "mast") if m else (None, None)
+
+    psw, plw = _mosaic_path(o, sw), _mosaic_path(o, lw)      # reduced-only, for the passed gate
+    panels = []                                   # (filt, path, source, aspect = ny/nx)
+    for filt in (sw, lw):
         if not filt:
             continue                              # single-filter obs: no LW row at all
+        p, src = _panel_image(filt)
         asp = 0.45
         if p:
             with fits.open(p) as h:
                 s = h["SCI"] if "SCI" in h else h[1]
                 ny, nx = s.data.shape
                 asp = ny / nx if nx else 0.45
-        panels.append((filt, p, asp))
+        panels.append((filt, p, src, asp))
 
     W = 11.0
     # per-row height from native aspect (clamp so a near-square or a razor-thin strip stays
-    # legible); a missing i2d gets a short placeholder row.
-    heights = [(0.25 if p is None else max(0.18, min(1.0, asp))) * W for _, p, asp in panels]
+    # legible); a truly imageless filter (no MAST i2d either) gets a short placeholder row.
+    heights = [(0.25 if p is None else max(0.18, min(1.0, asp))) * W for _, p, _s, asp in panels]
     fig = plt.figure(figsize=(W, sum(heights) + 0.35 * len(panels)))
     gs = fig.add_gridspec(len(panels), 1, height_ratios=heights, hspace=0.18)
     fracs = {}
     modules = {}                                   # filt -> 'NRCA'/'NRCB' when a single-module mosaic
-    for i, (filt, p, _asp) in enumerate(panels):
+    mast_shown = []                                # filters rendered from the MAST i2d (not reduced)
+    for i, (filt, p, src, _asp) in enumerate(panels):
         a = fig.add_subplot(gs[i, 0])
-        if p:
+        if p and src == "reduced":
             mod = _mosaic_module(p)
             if mod:
                 modules[filt] = mod
             title = f"{o.obsid}  {filt}" + (f"  [{mod} only]" if mod else "")
             fracs[filt] = _grayscale(a, p, title)
+        elif p:                                    # MAST-delivered i2d fallback (not yet reduced)
+            mast_shown.append(filt)
+            fracs[filt] = _grayscale(a, p, f"{o.obsid}  {filt}  [MAST i2d — not yet pipeline-reduced]")
         else:
-            a.text(0.5, 0.5, f"{filt}\n(no i2d)", ha="center", va="center")
+            a.text(0.5, 0.5, f"{filt}\n(no i2d on disk)", ha="center", va="center")
             a.set_xticks([]); a.set_yticks([])
     # Record which NOMINAL (portal) filters have NO product on disk: pick_filters selects only
     # from filters that are present, so a filter that WAS observed but is not yet reduced would
@@ -702,12 +741,19 @@ def stage1_mosaics(o: Observation, sw, lw):
     # here keeps that visible.
     avail = _available_filters(o)
     dropped = [f for f in o.filters if f not in avail]
+    # Filters with a product on disk (catalog or raw MAST i2d) but NO reduced science mosaic yet:
+    # 'awaiting reduction', distinct from 'dropped' (nothing on disk at all).  A filter here reads
+    # 'no i2d' in its panel while its raw MAST product still exists -- surface it so that is not
+    # mistaken for missing data (issue #38: cloudef o005 F210M/F480M reduced later than F162M/F360M).
+    with_mosaic = _filters_with_mosaic(o)
+    awaiting_reduction = [f for f in avail if f not in with_mosaic]
     png = _save(fig, f"{o.obsid}_stage1.png")
     metrics = dict(stage=1, sw=sw, lw=lw,
                    sw_present=bool(psw), lw_present=bool(plw),
                    finite_fraction=fracs, single_module_filters=modules,
                    nominal_filters=list(o.filters), available_filters=avail,
-                   dropped_filters=dropped,
+                   mosaic_filters=with_mosaic, awaiting_reduction=awaiting_reduction,
+                   mast_fallback_filters=mast_shown, dropped_filters=dropped,
                    # pass on SW alone ONLY when the obs genuinely has no LW-channel filter;
                    # if an LW filter exists but its mosaic/pick is missing, that is NOT a pass.
                    passed=bool(psw and (plw or not _has_lw(o))))
@@ -3240,13 +3286,23 @@ def _caption_for_impl(n, metrics):
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate. "
                 f"([how this stage works](DOCROOT#stage{n}))")
-    if n == 1 and metrics.get("dropped_filters"):
-        # a nominal (proposed) filter with no product on disk must leave a trace, not vanish
-        df = ", ".join(metrics["dropped_filters"])
-        return (CAPTIONS[1].format(**{k: (v if v is not None else float("nan"))
-                                      for k, v in metrics.items() if k in ("sw", "lw")})
-                + f" NOTE: nominal filter(s) with no mosaic/catalogue on disk (observed but not "
-                  f"reduced, or not delivered): {df}.")
+    if n == 1 and (metrics.get("dropped_filters") or metrics.get("awaiting_reduction")):
+        base = CAPTIONS[1].format(**{k: (v if v is not None else float("nan"))
+                                     for k, v in metrics.items() if k in ("sw", "lw")})
+        notes = []
+        if metrics.get("awaiting_reduction"):
+            # a filter with a raw MAST i2d / catalogue but no reduced science mosaic yet: its panel
+            # reads 'no i2d' while the MAST product still exists -- say so, don't imply data loss
+            ar = ", ".join(metrics["awaiting_reduction"])
+            mf = ", ".join(metrics.get("mosaic_filters") or []) or "none"
+            notes.append(f"filter(s) with MAST/raw data but NO reduced science mosaic yet "
+                         f"(awaiting reduction): {ar} — the representative SW/LW panels use a "
+                         f"reduced filter ({mf}) instead")
+        if metrics.get("dropped_filters"):
+            # a nominal (proposed) filter with no product on disk at all must leave a trace
+            notes.append(f"nominal filter(s) with no mosaic/catalogue on disk (observed but not "
+                         f"reduced, or not delivered): {', '.join(metrics['dropped_filters'])}")
+        return base + " NOTE: " + "; ".join(notes) + "."
     if n == 2:
         # Built in code so the three CMD variants (full CMD / single-filter LF / crossmatch) each
         # read correctly and a missing lf_turnover never drops the caption to a bare fragment.
@@ -3611,8 +3667,10 @@ def main(argv=None):
     # filter list.  The portal lists all six Sgr A* filters, but only F212N+F405N have mosaics and
     # catalogs; picking blindly gave F212N+F444W -> a false "no catalog" red flag (issue #39).
     avail = _available_filters(o) or o.filters
-    sw, lw = pick_filters(avail, args.sw, args.lw)
-    print(f"{o.obsid}: SW={sw} LW={lw} filters={o.filters} (with data: {avail})")
+    with_mosaic = _filters_with_mosaic(o)
+    sw, lw = pick_filters(avail, args.sw, args.lw, prefer=with_mosaic)
+    print(f"{o.obsid}: SW={sw} LW={lw} filters={o.filters} (with data: {avail}; "
+          f"reduced mosaic: {with_mosaic})")
     # metrics json where make_issues.render_body reads checkbox state; write INCREMENTALLY
     # and isolate each stage so a corrupt FITS / photutils failure / GitHub 5xx on one stage
     # doesn't drop the metrics of the stages that succeeded or stop later stages.
