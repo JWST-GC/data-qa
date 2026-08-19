@@ -1,7 +1,7 @@
 """Unit tests for the QA diagnostics helpers that previously had ZERO coverage.
 
-Covers the pure numeric helpers (`_binned_stat`), the caption fallback that used to print
-"nanσ" (`caption_for` with the significance panel omitted), and the observation-scoping of the
+Covers the pure numeric helpers (`_binned_stat`), the caption fallback that once printed
+"nanσ" when the spread was absent (`caption_for`), and the observation-scoping of the
 per-exposure daophot glob (`_daophot_glob`) that keeps one observation's cats out of another's
 QA on multi-obs fields.  No I/O beyond touching empty files under a temporary QA_BASE.
 """
@@ -38,12 +38,12 @@ def test_binned_stat_drops_sparse_bins_to_none():
 
 
 # --------------------------------------------------------------------------- caption_for
-def test_caption_stage4_no_significance_no_nan():
-    # zero-spread / no significance -> still report the median tie over its cells, never "nanσ"
-    cap = D.caption_for(4, dict(stage=4, sw="F212N", offset_signif_med=None,
+def test_caption_stage4_no_spread_no_nan():
+    # no cell-to-cell spread -> still report the field offset over its cells, never "nan"
+    cap = D.caption_for(4, dict(stage=4, sw="F212N",
                                 offset_med_mas=7.1, n_cells=6, offset_scatter_mas=None))
     assert "nan" not in cap.lower()
-    # a small tie keeps a decimal: with the same-star refinement the bulk is routinely sub-mas,
+    # a small offset keeps a decimal: re-measured from the same stars it is routinely sub-mas,
     # and "0 mas" hid the difference between 0.4 and 4.
     assert "7.1 mas" in cap and "6 measured cells" in cap
 
@@ -51,7 +51,7 @@ def test_caption_stage4_no_significance_no_nan():
 def test_caption_stage4_flags_discontinuity():
     # an adjacency-confirmed deviating region is called out in the caption
     cap = D.caption_for(4, dict(stage=4, offset_med_mas=31, n_cells=12, offset_scatter_mas=8.0,
-                                offset_signif_med=4.0, n_cells_confirmed=3, bad_src_frac=0.08,
+                                n_cells_confirmed=3, bad_src_frac=0.08,
                                 n_cells_dropped=0))
     assert "internal discontinuity" in cap and "8%" in cap
 
@@ -151,7 +151,7 @@ def test_caption_anchors_exist_in_docs():
         2: dict(stage=2, kind="m8", n_stars=1000, lf_turnover=18.0, sw="F212N", lw="F405N"),
         3: dict(stage=3, sw="F212N", n_matched=500, slope=1.0, scatter=0.3),
         4: dict(stage=4, offset_med_mas=12.0, n_cells=14, offset_scatter_mas=6.0,
-                offset_signif_med=3.0, n_cells_dropped=2),
+                n_cells_dropped=2),
         5: dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1, intermodule_rms=6.0,
                 n_overlap=100, n_overlap_hi=50, intermodule_rms_hi=4.0),
         6: dict(red_flag=True, red_flag_reason="x"),
@@ -287,12 +287,13 @@ def test_cell_consistency_uniform_passes():
 
 
 def test_cell_consistency_source_weighted_offset():
-    # 99% of sources in cells tied at ~130, 1% at ~28 -> the CATALOG tie is ~130, not 28
-    # (the density-biased peak-ratio cut used to keep the sparse 28 mas side; #54 review 🔴1).
+    # 99% of sources sit in cells offset by ~130 mas and 1% in a cell offset by ~28, so the offset
+    # the CATALOG carries is ~130.  (The density-biased peak-ratio cut used to keep the sparse
+    # 28 mas side and report that instead; #54 review 🔴1.)
     cells = _grid_cells({**{(i, j): (130.0, 0.0, 40000) for i in range(4) for j in range(4) if not (i == 0 and j == 0)},
                          (0, 0): (28.0, 0.0, 400)})
     cc = D._cell_consistency(cells, [])
-    assert cc["off_med"] > 100            # source-weighted, not the sparse minority
+    assert cc["off_med"] > 100            # weighted by source count, so the sparse cell loses
 
 
 def test_cell_consistency_adjacent_deviation_fails():
@@ -319,6 +320,40 @@ def test_cell_consistency_low_coverage_not_consistent():
     dropped = [dict(i=2, j=2, ra=0.0, dec=0.0, n=100000)]
     cc = D._cell_consistency(cells, dropped)
     assert cc["coverage"] < 0.5 and not cc["consistent"]
+
+
+def test_cell_consistency_reports_a_spread_and_no_significance():
+    # Stage 4 reports how much the cells disagree.  It reports no significance; the next test is
+    # the measurement of why.
+    cells = _grid_cells({(i, j): (9.0 + i, 3.0 + j, 40000) for i in range(4) for j in range(4)})
+    cc = D._cell_consistency(cells, [])
+    assert cc["spread"] is not None and cc["spread"] > 0
+    assert "signif" not in cc and "se" not in cc
+
+
+@pytest.mark.parametrize("scale", [5.0, 500.0])
+def test_retired_significance_sits_at_one_when_the_true_offset_is_zero(scale):
+    # Why stage 4 quotes no sigma.  Draw 16 cells from a zero-mean scatter of `scale` mas, so the
+    # true offset is zero by construction, and evaluate the retired statistic
+    # off_med / (spread / sqrt(n_cells)) on them.  It lands near 1 at both scales: it is a length
+    # divided by the sampling error of the two medians that length is built from, so it has a floor
+    # near 1 and reads there whatever the offset is.  That is how a 780 mas offset was posted as
+    # "1 sigma from zero".
+    rng = np.random.default_rng(7)
+    vals = []
+    for _ in range(200):
+        d = rng.normal(0.0, scale, (16, 2))
+        cc = D._cell_consistency(
+            _grid_cells({(i % 4, i // 4): (d[i, 0], d[i, 1], 40000) for i in range(16)}), [])
+        vals.append(cc["off_med"] / (cc["spread"] / np.sqrt(cc["n_cells"])))
+    assert 0.8 < float(np.median(vals)) < 1.6
+
+
+def test_stage4_caption_reports_the_spread_and_quotes_no_sigma():
+    cap = D.caption_for(4, dict(stage=4, offset_med_mas=780.0, n_cells=9,
+                                offset_scatter_mas=640.0, bulk_source="histogram"))
+    assert "cells scatter by 640 mas" in cap
+    assert "σ" not in cap and "sigma" not in cap.lower()
 
 
 def test_cell_offsets_recovers_uniform_shift():
@@ -466,12 +501,12 @@ def test_stage4_caption_states_when_spatial_check_skipped():
     assessed = D.caption_for(4, dict(stage=4, offset_med_mas=5.0, n_cells=4,
                                      offset_scatter_mas=2.0, spatial_assessed=True,
                                      bulk_source="histogram"))
-    assert "spatially consistent cells" in assessed
+    assert "cells that agree with each other" in assessed
     whole = D.caption_for(4, dict(stage=4, offset_med_mas=5.0, n_cells=1,
                                   offset_scatter_mas=None, spatial_assessed=False,
                                   bulk_source="histogram"))
-    assert "WHOLE-FIELD" in whole and "NOT performed" in whole
-    assert "spatially consistent cells" not in whole
+    assert "WHOLE-FIELD" in whole and "did not run" in whole
+    assert "cells that agree with each other" not in whole
 
 
 def test_make_issues_frame_ok_untficked_when_spatial_unassessed(monkeypatch):
