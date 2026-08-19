@@ -49,6 +49,22 @@ def test_sticky_checkboxes_union_never_unchecks():
     assert "- [ ] Box C" in out                  # neither -> unchecked
 
 
+def test_sticky_checkboxes_carry_a_tick_across_a_reworded_label():
+    # The merge keys on label TEXT, so rewording a checklist item drops every tick a human put on
+    # it.  _CK_RENAMED maps a new label back to the wording it replaced.
+    new_label, old_label = next(iter(mi._CK_RENAMED.items()))
+    out = mi._sticky_checkboxes(f"- [ ] {new_label}", f"- [x] {old_label}")
+    assert out == f"- [x] {new_label}"
+
+
+def test_sticky_checkboxes_renamed_labels_are_labels_the_body_emits(obs):
+    # Every key must be a label render_body actually writes; otherwise the entry is dead and the
+    # tick it exists to carry is lost anyway.
+    body = mi.render_body(obs)
+    for new_label in mi._CK_RENAMED:
+        assert new_label in body
+
+
 def test_metrics_drive_auto_checkboxes(obs, monkeypatch):
     """PR #17/#18 feature intact post-rebase: metrics file -> checked boxes."""
     monkeypatch.setattr(mi, "_qa_metrics",

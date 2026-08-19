@@ -26,7 +26,7 @@ assignees: ''
 ### QA checklist
 - [ ] Observation delivered / retrieved
 - [ ] Per-filter mosaics (`i2d`) present and complete
-- [ ] **Astrometry**: absolute frame tie (VIRAC2/Gaia) within survey noise
+- [ ] **Astrometry**: catalogue registered onto VIRAC2/Gaia within survey noise
 - [ ] **Astrometry**: no inter-module (NRCA/NRCB) offset (proper-motion grade)
 - [ ] **Photometry**: zeropoints consistent across filters/modules
 - [ ] Background / stripes / artifacts acceptable

@@ -59,8 +59,8 @@ CURATED: Dict[str, dict] = {
     "jw01182-o004": dict(
         epoch="2022-09-14", visits=["001", "002"],
         notes="Wide-band NIRCam. LW filteroffset module-swap in the 2024 cal was fixed "
-              "2026-07; a residual ~20 mas inter-module offset is addressed by a "
-              "per-module 2-shift tie.",
+              "2026-07; a residual ~20 mas inter-module offset is addressed by shifting "
+              "each module separately.",
     ),
 }
 

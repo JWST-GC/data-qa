@@ -79,16 +79,17 @@ def render_body(o: Observation) -> str:
     from . import astrometry_audit as aa
     THRESH_ABS, THRESH_IM = aa.THRESH["absolute"], aa.THRESH["intermodule"]
     delivered = bool(s1.get("passed"))
-    # Frame tie: use stage 4's own PASS flag, which requires a small median offset AND cells that
-    # AGREE.  A bare `bulk_off < THRESH` would tick the box for a bimodal frame (gc2211 o050:
-    # median 57 mas but cell-to-cell spread 58 mas) -- exactly the "within survey noise" claim
-    # that must not be ticked for an internally-inconsistent mosaic (PR #54 review).
-    # Require BOTH a passing tie AND that the per-cell spatial-consistency check actually ran: a
-    # small/sparse field measured WHOLE-FIELD (spatial_assessed False, issue #13) has no per-cell
-    # check, so a sub-region discontinuity could hide -- do not auto-tick "within survey noise".
+    # Registration onto VIRAC: use stage 4's own PASS flag, which requires a small field offset
+    # AND cells that AGREE.  A bare `bulk_off < THRESH` ticks the box for a bimodal frame (gc2211
+    # o050: field 57 mas with a 58 mas cell-to-cell spread), which is an internally-inconsistent
+    # mosaic and must never carry the "within survey noise" claim (PR #54 review).
+    # Also require that the per-cell spatial-consistency check actually RAN: a small or sparse
+    # field measured WHOLE-FIELD (spatial_assessed False, issue #13) has no per-cell check, so a
+    # sub-region discontinuity could hide behind a passing field offset.
     frame_ok = bool(s4.get("passed")) and s4.get("spatial_assessed", True)
-    # inter-module: prefer stage 5's reference-free overlap offset, else stage 4's.  Absent =
-    # 'not yet measured' -> left unchecked (the sticky-merge won't downgrade a prior check).
+    # inter-module: prefer stage 5's overlap offset (JWST against itself), else stage 4's.
+    # Absent = 'not yet measured' -> left unchecked; the sticky merge below never downgrades a
+    # prior check.
     im = s5.get("intermodule_off", s4.get("intermodule_off"))
     interm_ok = im is not None and im < THRESH_IM
     phot_ok = bool(s3.get("passed"))
@@ -133,7 +134,7 @@ def render_body(o: Observation) -> str:
 - [{_ck(delivered)}] Observation delivered / retrieved
 - [{_ck(delivered)}] Per-filter mosaics (`i2d`) present and complete
 {filt_rows}
-- [{_ck(frame_ok)}] **Astrometry**: absolute frame tie (VIRAC2/Gaia) within survey noise
+- [{_ck(frame_ok)}] **Astrometry**: catalogue registered onto VIRAC2/Gaia within survey noise
 - [{_ck(interm_ok)}] **Astrometry**: no inter-module (NRCA/NRCB) offset (proper-motion grade)
 - [{_ck(phot_ok)}] **Photometry**: zeropoints consistent across filters/modules
 - [ ] Background / stripes / artifacts acceptable
@@ -160,6 +161,17 @@ def labels_for(o: Observation):
 _CK_LINE = re.compile(r"^(\s*- \[)([ xX])(\] )(.*)$")
 
 
+# Checklist labels that have been REWORDED.  ``_sticky_checkboxes`` keys on the label text, so a
+# reworded label reads as a new box and every tick a human put on the old one is lost across all
+# live QA issues.  Mapping new label -> the wording it replaced makes the tick carry over.  Keep an
+# entry here for the life of the issues that still carry the old wording; a body is rewritten on
+# every sync, so once an issue has been synced once it holds the new text.
+_CK_RENAMED = {
+    "**Astrometry**: catalogue registered onto VIRAC2/Gaia within survey noise":
+        "**Astrometry**: absolute frame tie (VIRAC2/Gaia) within survey noise",
+}
+
+
 def _sticky_checkboxes(new_body: str, old_body: str) -> str:
     """Carry checked marks from the CURRENT remote body into the regenerated body.
 
@@ -168,6 +180,9 @@ def _sticky_checkboxes(new_body: str, old_body: str) -> str:
     (b) clobbers boxes a human ticked.  Rule: a box CHECKED in either the new render or the
     remote body stays checked (sticky/union), keyed on the checklist label text.  Never
     unchecks -- a regression is surfaced in the diagnostic reply, not by silently unticking.
+
+    A label listed in ``_CK_RENAMED`` also matches the wording it replaced, so rewording a
+    checklist item carries its ticks forward instead of dropping them.
     """
     old_checked = set()
     for ln in (old_body or "").splitlines():
@@ -177,8 +192,10 @@ def _sticky_checkboxes(new_body: str, old_body: str) -> str:
     out = []
     for ln in new_body.splitlines():
         m = _CK_LINE.match(ln)
-        if m and m.group(2) == " " and m.group(4).strip() in old_checked:
-            ln = f"{m.group(1)}x{m.group(3)}{m.group(4)}"
+        if m and m.group(2) == " ":
+            label = m.group(4).strip()
+            if label in old_checked or _CK_RENAMED.get(label) in old_checked:
+                ln = f"{m.group(1)}x{m.group(3)}{m.group(4)}"
         out.append(ln)
     return "\n".join(out)
 
