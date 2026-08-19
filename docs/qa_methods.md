@@ -45,7 +45,7 @@ more processed; the QA always shows the **highest tier present on disk** for the
   thing that matters is the ordering above and that a **higher tier is a more processed catalog**.
 - A catalog labelled **`crossmatch`** in a caption means no single merged catalog held both
   requested filters, so the CMD was built by cross-matching the two single-band catalogs. Its
-  colour width is set by the positional match tolerance, not the catalog's colour precision.
+  colour width is set by the positional match tolerance.
 
 <a id="glossary-jicama"></a>
 ### jicama
@@ -228,10 +228,11 @@ magnitude axis is locked to the CMD.
 ### S/N and the S/N > 10 cut
 
 Where a plot is restricted to **S/N > 10**, "S/N" is the flux measurement signal-to-noise of each
-star. In stage 5 (per-exposure daophot) it is `flux_fit / flux_err` of a single detection, computed **per detection** (one
-value per star per exposure, using that exposure's fitted flux and its formal flux error) — not a
-mean flux over exposures divided by a mean error. The high-S/N cut keeps the best-measured stars,
-so a residual scatter reflects the astrometric tie rather than photon-noise centroiding.
+star. In stage 5 (per-exposure daophot) it is `flux_fit / flux_err` of a single detection,
+computed **per detection**: one value per star per exposure, from that exposure's fitted flux and
+its own formal flux error. (A mean flux over exposures divided by a mean error would be a different
+quantity.) The high-S/N cut keeps the best-measured stars, so the residual scatter that remains
+measures how well the frames agree, with photon-noise centroiding taken out of it.
 
 ---
 
@@ -271,10 +272,9 @@ line** is anchored on the densest stellar ridge (the mode of JWST−Ks); a well-
 lies along it.
 
 `stage3_calibration` anchors on VIRAC (nearest JWST source within 0.1″), then makes a robust
-linear fit with **up to 5 sigma-clip iterations** (3σ, early-break — bounded, not run to strict
-convergence) to measure the slope and the scatter about the locus. The fitted slope is reported in
-the title but not drawn (a free-slope line wanders with the red mismatch cloud and misreads as a
-bad fit). `slope`, `scatter` (mag about the locus), `zeropoint`, `n_matched`, `n_locus`. Consider
+linear fit with **up to 5 sigma-clip iterations** (3σ, breaking early once the clip is stable) to
+measure the slope and the scatter about the locus. The fitted slope is reported in the title and
+left undrawn: a free-slope line wanders with the red mismatch cloud and reads as a bad fit. `slope`, `scatter` (mag about the locus), `zeropoint`, `n_matched`, `n_locus`. Consider
 it passing if the slope is 0.8–1.2 and the scatter < 0.8 mag.
 
 Source: [`data_qa/diagnostics.py` → `stage3_calibration`](../data_qa/diagnostics.py).
@@ -372,16 +372,18 @@ Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnost
 
 The **inter-filter** position residual as a function of position across the field: filter `sw`
 minus a second JWST filter of the same field, using the **same source rows** in the merged
-catalog, [S/N > 10](#glossary-snr) in both bands, [bulk](#glossary-bulk) removed. Two filters of
-one field share the frames, the offsets table, the DVA correction and the reference tie, so the
-only thing that differs is a **per-filter WCS term** — exactly the position-dependent distortion
-residual this stage is for. There is **no external-catalog noise** (VIRAC's ~20 mas per-star PM
-error would swamp a few-mas residual). The cross-band match radius did **not** disappear: the rows
-were paired by a mutual-nearest-neighbour cross-band match at ~100 mas per band in
-`merge_catalogs.py` (visible in the data as a hard truncation of the kept separations near 100 mas).
-That blind spot survives, but at ~100× the ~1 mas signal it is far less binding than the ~0.15″
-match in a VIRAC-referenced version. The partner filter is the nearest in wavelength that has a
-`skycoord_<f>` column in the catalog.
+catalog, [S/N > 10](#glossary-snr) in both bands, [field offset](#glossary-bulk) removed. Two
+filters of one field share the frames, the offsets table, the DVA correction and the registration
+onto VIRAC, which leaves a **per-filter WCS term** as the one thing that differs between them —
+the position-dependent distortion residual this stage is for. No external catalog enters the
+measurement, which matters because VIRAC's ~20 mas per-star PM error would swamp a few-mas
+residual.
+
+The rows were paired across bands upstream, by a mutual-nearest-neighbour match at ~100 mas per
+band in `merge_catalogs.py`, visible in the data as a hard truncation of the kept separations near
+100 mas. That radius is ~100× the ~1 mas signal, so it does little to shape this map (a
+VIRAC-referenced version would carry a ~0.15″ match instead). The partner filter is the nearest in
+wavelength that has a `skycoord_<f>` column in the catalog.
 
 - **LEFT / MIDDLE** — binned-median ΔRA and ΔDec maps (12×12, diverging colour; RA bins carry
   `cos δ` so cells span equal on-sky distance).
@@ -395,16 +397,16 @@ penalty. On the brick the observed amplitude (~1.1 mas) sits at ~5–6× the nul
 per-cell standard error (per-star scatter ÷ √stars-per-cell) is reported too, but it runs ~2×
 smaller than the null because the ~7–8% of rows with |Δ| > 20 mas (nearest-neighbour ambiguity
 within the match radius) inflate the sampling noise of a cell median beyond scatter/√n; the
-null-based figure is the one to trust. This complements [stage 4](#stage4) (the *bulk* tie + cell
-consistency) by exposing *spatially-structured* residuals.
+null-based figure is the one to trust. This complements [stage 4](#stage4), which measures the
+field offset and the cell-to-cell consistency, by exposing *spatially-structured* residuals.
 
 **Pass/fail semantics.** A real ~1 mas inter-filter distortion term is an *expected measurement*,
-not a defect, so `passed` reflects only whether the measurement **succeeded** (enough populated
-cells) — it is **not** gated on the amplitude versus a self-derived noise level, so injecting noise
-cannot flip it. A single-filter or not-yet-merged obs has no second band to difference: that is a
-distinct *not-applicable* state (no `passed`, no red flag). A **red flag** is raised only on a
-**gross** absolute inter-filter offset (fixed `binned_amp90_mas` > 15 mas), which would indicate a
-genuine per-filter WCS break rather than normal distortion.
+so `passed` reflects only whether the measurement **succeeded** (enough populated cells). It is
+free of any gate on the amplitude against a self-derived noise level, which is what keeps injected
+noise from flipping it. A single-filter or not-yet-merged obs has no second band to difference and
+lands in a distinct *not-applicable* state (no `passed`, no red flag). A **red flag** is raised on
+a **gross** absolute inter-filter offset alone (fixed `binned_amp90_mas` > 15 mas), the size that
+indicates a genuine per-filter WCS break on top of the normal distortion.
 
 Metrics: `n_stars`, `resid_rms_mas` (per-star), `binned_amp90_mas` (90th-percentile cell
 amplitude), `null_amp90_mas` and `amp90_significance` (observed ÷ null; also `amp90_p_value`),
@@ -445,30 +447,30 @@ common central window of the mosaic:
   [jicama](#glossary-jicama) catalogue in the common window. The MAST catalogue is the
   MAST-delivered L3 `_cat.fits` **when it is archived** (fetched from MAST if not already local);
   when MAST did not archive one, it is **approximated** by running DAOStarFinder at 5σ over a
-  Background2D on the MAST i2d. That detection is an approximation of, not a match to, the STScI
-  `SourceCatalogStep` (which uses image segmentation with deblending), so the two source lists
-  differ — read the count as a depth indicator, not a reproduction of the STScI catalogue. jicama
-  recovers more and fainter stars by construction (the point is the count/depth; the two use
-  different zeropoints).
-- **BOTTOM-RIGHT — astrometry (main)**: the [bulk offset](#glossary-bulk) to
-  [VIRAC](#glossary-virac) for each catalogue, measured by the [xcorr histogram
-  peak](#glossary-xcorr) (crowding-robust — a nearest-neighbour-to-VIRAC distance is meaningless
-  at GC density, where VIRAC's ~250 mas source spacing swamps the tie). Shown as a 2-D (ΔRA, ΔDec)
-  cloud with marginals whose CENTRE is the bulk tie: the MAST cloud sits at its raw-WCS bulk
-  offset, the jicama cloud typically near the origin. The panel title and issue caption are derived
-  from the sign of (jicama tie − MAST tie): they assert the pipeline "tightens the tie" only when
-  both ties are measured **and** jicama is tighter, and otherwise report both numbers without
-  claiming an improvement. The cloud's **width** is bounded by the 0.1″ `search_around_sky`
-  cross-match radius — it shows the match distribution, **not** the per-star astrometric precision;
-  see [stage 5](#stage5)/[stage 6](#stage6) for the actual per-star RMS. When a tie is unmeasurable
-  (no xcorr peak within 1.5″, e.g. a grossly mis-registered product): if only the MAST tie is
-  unmeasurable the comparison is flagged as **unavailable** (a possible MAST mis-registration, not a
-  defect in our product, so the stage does not fail on that alone); if the jicama tie is
-  unmeasurable that is our product failing, so the stage does not pass and is red-flagged.
+  Background2D on the MAST i2d. The STScI `SourceCatalogStep` uses image segmentation with
+  deblending, so a DAOStarFinder run approximates it and the two source lists differ; read the
+  count as a depth indicator. jicama recovers more and fainter stars by construction (the point is
+  the count/depth; the two use different zeropoints).
+- **BOTTOM-RIGHT — astrometry (main)**: each catalogue's [offset from
+  VIRAC](#glossary-bulk), found by coarse-aligning on the [xcorr histogram
+  peak](#glossary-xcorr) and then keeping the pairs within 0.1″. The coarse alignment is what makes
+  this measurable at all: VIRAC's own ~250 mas source spacing means the distance from a JWST source
+  to its nearest VIRAC neighbour is about that spacing for any frame. Shown as a 2-D (ΔRA, ΔDec)
+  cloud with marginals whose CENTRE is the offset: the MAST cloud sits at its raw-WCS offset, the
+  jicama cloud typically near the origin. The panel title and issue caption are derived from the
+  sign of (jicama offset − MAST offset): they say the pipeline "tightens" only when both offsets
+  are measured **and** jicama is the smaller, and otherwise report both numbers and claim no
+  improvement. The cloud's **width** is bounded by the 0.1″ `search_around_sky` cross-match radius,
+  so it shows the match distribution; [stage 5](#stage5) and [stage 6](#stage6) are where the
+  per-star scatter is measured. An offset is unmeasurable when there is no xcorr peak within 1.5″,
+  which is what a grossly mis-registered product looks like. If only the MAST offset is
+  unmeasurable, the comparison is flagged **unavailable** (possibly a MAST mis-registration; it
+  says nothing about our product, so the stage does not fail on it alone). If the jicama offset is
+  unmeasurable, that is our product failing, so the stage does not pass and is red-flagged.
 
 **Source:** [`data_qa/diagnostics.py` → `stage7_mast_vs_pipeline`](../data_qa/diagnostics.py)
 (MAST catalogue: `_mast_l3_catalog`/`_load_mast_catalog`; detection fallback: `_detect_on_mosaic`;
-bulk tie: `_tie_cloud`).
+offset from VIRAC: `_offset_cloud`).
 
 
 

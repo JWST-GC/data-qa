@@ -938,9 +938,9 @@ def test_stage4_fails_on_90mas_misregistration(monkeypatch):
 
 
 # --------------------------------------------------------------------------- stage 7 (MAST vs pipeline)
-def test_tie_cloud_recovers_bulk_shift():
-    # jicama-like catalogue offset from VIRAC by a KNOWN 120 mas E; _tie_cloud must recover it as
-    # the cloud centre (crowding-robust xcorr peak, not the sparse-NN distance)
+def test_offset_cloud_recovers_bulk_shift():
+    # jicama-like catalogue offset from VIRAC by a KNOWN 120 mas E; _offset_cloud must recover it
+    # as the cloud centre, having coarse-aligned on the xcorr peak first
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     rng = np.random.RandomState(1)
@@ -948,15 +948,15 @@ def test_tie_cloud_recovers_bulk_shift():
     ref = SkyCoord(ra * u.deg, dec * u.deg)
     cosd = np.cos(np.radians(-28.9))
     jsc = SkyCoord((ra + 120.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # jsc is +120 mas E of ref
-    out = D._tie_cloud(jsc, ref)
+    out = D._offset_cloud(jsc, ref)
     assert out is not None
     dra, dde, bulk = out
     assert abs(bulk - 120.0) < 15 and abs(np.median(dra) - 120.0) < 15
 
 
-def test_tie_cloud_none_when_offset_exceeds_maxsep():
-    # a gross offset (> the 1.5" xcorr window) must return None (unmeasurable), NOT a wrong small
-    # tie -- this is what lets stage 7 flag a grossly mis-registered product instead of passing it
+def test_offset_cloud_none_when_offset_exceeds_maxsep():
+    # a gross offset (> the 1.5" xcorr window) must return None, so stage 7 flags a grossly
+    # mis-registered product; a wrong small number here would let it pass
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     rng = np.random.RandomState(2)
@@ -964,29 +964,29 @@ def test_tie_cloud_none_when_offset_exceeds_maxsep():
     ref = SkyCoord(ra * u.deg, dec * u.deg)
     cosd = np.cos(np.radians(-28.9))
     jsc = SkyCoord((ra + 5000.0 / 3.6e6 / cosd) * u.deg, dec * u.deg)   # 5" E, way past 1.5"
-    assert D._tie_cloud(jsc, ref) is None
+    assert D._offset_cloud(jsc, ref) is None
 
 
 def test_caption_stage7_full():
     cap = D.caption_for(7, dict(stage=7, n_jicama=294615, n_mast=39365,
                                 jicama_offset_med_mas=14.5, mast_offset_med_mas=134.0))
     assert "DOCROOT" not in cap and "qa_methods.md#stage7" in cap
-    assert "MAST vs pipeline" in cap and "bulk offset" in cap
+    assert "MAST vs pipeline" in cap and "offset from VIRAC" in cap
     assert "14 mas (jicama)" in cap and "134 mas (MAST)" in cap
     # jicama (14) < MAST (134): the improvement clause is present
     assert "astrometric tightening the pipeline delivers" in cap
-    # the cloud width is the match radius, not the astrometric precision -> caveat present
+    # the cloud width is set by the match radius -> the caveat is present
     assert "0.1″ cross-match radius" in cap
 
 
 def test_stage7_title_tightening_only_when_jicama_tighter():
-    # (blocker A/C) the panel title asserts 'tighter' ONLY when both ties measured AND jicama < MAST
+    # (blocker A/C) the title says 'tighter' ONLY when both offsets are measured AND jicama < MAST
     tighter = D._stage7_astrom_title((134.0,) * 3, (14.5,) * 3)   # jicama 14 < MAST 134
-    assert "tighter" in tighter and "jicama tie 14 mas vs MAST 134 mas" in tighter
+    assert "tighter" in tighter and "jicama 14 mas vs MAST 134 mas" in tighter
     # Sgr C o012 case: jicama 19.56 is WORSE than MAST 17.62 -> no 'tighter', both numbers reported
     worse = D._stage7_astrom_title((17.62,) * 3, (19.56,) * 3)
     assert "tighter" not in worse
-    assert "jicama tie 20 mas vs MAST 18 mas" in worse
+    assert "jicama 20 mas vs MAST 18 mas" in worse
     # only one side measured -> neutral wording, never 'tighter'
     assert "tighter" not in D._stage7_astrom_title(None, (14.5,) * 3)
     assert "tighter" not in D._stage7_astrom_title((17.6,) * 3, None)
@@ -997,19 +997,19 @@ def test_caption_stage7_neutral_when_jicama_not_tighter():
     cap = D.caption_for(7, dict(stage=7, jicama_offset_med_mas=19.56, mast_offset_med_mas=17.62))
     assert "20 mas (jicama)" in cap and "18 mas (MAST)" in cap
     assert "astrometric tightening the pipeline delivers" not in cap
-    assert "not tighter than MAST" in cap
+    assert "MAST is as close to VIRAC as the pipeline here" in cap
 
 
 def test_caption_stage7_drops_clause_when_mast_unavailable():
-    # (blocker B) only the MAST tie is unmeasurable: caption drops the improvement clause and states
-    # the comparison is unavailable -- it does not assert tightening.
+    # (blocker B) only the MAST offset is unmeasurable: the caption drops the improvement clause
+    # and states that the comparison is unavailable, claiming no tightening.
     cap = D.caption_for(7, dict(stage=7, jicama_offset_med_mas=14.5))
     assert "astrometric tightening the pipeline delivers" not in cap
     assert "MAST comparison is unavailable" in cap
 
 
 def test_stage7_verdict_jicama_unmeasurable_fails_and_redflags():
-    # (blocker B / test 3) our own tie unmeasurable -> passed False AND red_flag set
+    # (blocker B / test 3) our own offset unmeasurable -> passed False AND red_flag set
     passed, red_flag, reason = D._stage7_verdict("our.fits", (17.6,) * 3, None, jic_unmeas=True)
     assert passed is False and red_flag is True and reason and "jicama" in reason
     # and the caption then enters the red-flag branch (no 'tightening' claim)
@@ -1019,14 +1019,14 @@ def test_stage7_verdict_jicama_unmeasurable_fails_and_redflags():
 
 
 def test_stage7_verdict_mast_only_unmeasurable_passes_without_redflag():
-    # (blocker B / test 2) only the MAST tie unmeasurable -> comparison unavailable, NOT our defect:
-    # passed stays True and no red flag, so the boolean does not contradict the caption.
+    # (blocker B / test 2) only the MAST offset unmeasurable -> the comparison is what is
+    # unavailable, so passed stays True with no red flag and the boolean agrees with the caption.
     passed, red_flag, reason = D._stage7_verdict("our.fits", None, (14.5,) * 3, jic_unmeas=False)
     assert passed is True and red_flag is False and reason is None
 
 
-def test_stage7_verdict_pass_requires_mosaic_and_no_worse_tie():
-    # a mosaic must exist; and where both ties are measured the pipeline tie must be no worse
+def test_stage7_verdict_pass_requires_mosaic_and_no_worse_offset():
+    # a mosaic must exist; and where both offsets are measured ours must be no worse
     assert D._stage7_verdict(None, (134.0,) * 3, (14.5,) * 3, jic_unmeas=False)[0] is False
     assert D._stage7_verdict("our.fits", (134.0,) * 3, (14.5,) * 3, jic_unmeas=False)[0] is True
     # jicama much worse than MAST -> not improved -> not a pass

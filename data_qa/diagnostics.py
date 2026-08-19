@@ -2334,14 +2334,14 @@ def _load_mast_catalog(path):
     return sc[good], mag[good]
 
 
-def _tie_cloud(jsc, ref_sc):
-    """The per-star (JWST − VIRAC) offset VECTORS for genuinely-matched stars, crowding-robust.
+def _offset_cloud(jsc, ref_sc):
+    """The per-star (JWST − VIRAC) offset VECTORS for genuinely-matched stars.
 
-    A plain nearest-neighbour-to-VIRAC distance is USELESS here: VIRAC is sparse, so the nearest
-    reference to a random JWST source is ~its inter-source spacing (~250 mas at GC density) for ANY
-    frame, swamping the real tie.  Instead, coarse-align by the ``aa.xcorr`` histogram peak (finds
-    the bulk shift up to 1.5″), keep only pairs that then fall within 0.1″ (real matches), and
-    return their (ΔRA, ΔDec) in mas.  The cloud's CENTRE is the true bulk offset from VIRAC.
+    VIRAC is sparse, so the distance from a random JWST source to its nearest VIRAC neighbour is
+    about the reference's own source spacing (~250 mas at GC density) for ANY frame, and it swamps
+    the offset being looked for.  So: coarse-align by the ``aa.xcorr`` histogram peak, which finds
+    the bulk shift out to 1.5", keep the pairs that then fall within 0.1" (the real matches), and
+    return their (ΔRA, ΔDec) in mas.  The centre of that cloud is the field offset from VIRAC.
     Returns (dra_arr, dde_arr, bulk_off_mas) or None."""
     import astropy.units as u
     from astropy.coordinates import search_around_sky, SkyCoord
@@ -2361,45 +2361,46 @@ def _tie_cloud(jsc, ref_sc):
     return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
 
 
-def _stage7_astrom_title(mast_tie, jic_tie):
-    """Astrometry sub-panel title, worded from the SIGN of (jicama tie − MAST tie): it asserts the
-    pipeline is 'tighter' ONLY when both ties are measured AND jicama < MAST; otherwise it reports
-    the number(s) without claiming an improvement.  ``mast_tie``/``jic_tie`` are ``_tie_cloud``
-    results (…, bulk_mas) or None."""
-    both = mast_tie is not None and jic_tie is not None
+def _stage7_astrom_title(mast_off, jic_off):
+    """Astrometry sub-panel title, worded from the SIGN of (jicama offset − MAST offset).  It calls
+    the pipeline 'tighter' only when both offsets are measured AND jicama is the smaller; in every
+    other case it reports the number(s) it has and claims no improvement.  ``mast_off``/``jic_off``
+    are ``_offset_cloud`` results (…, bulk_mas) or None."""
+    both = mast_off is not None and jic_off is not None
     if both:
-        head = (f"astrometry vs VIRAC — jicama tie {jic_tie[2]:.0f} mas vs MAST "
-                f"{mast_tie[2]:.0f} mas")
-        return head + (" (pipeline tighter)" if jic_tie[2] < mast_tie[2] else "")
-    if jic_tie is not None:
-        return f"astrometry vs VIRAC — jicama tie {jic_tie[2]:.0f} mas (MAST tie not measured)"
-    if mast_tie is not None:
-        return f"astrometry vs VIRAC — MAST tie {mast_tie[2]:.0f} mas (pipeline tie not measured)"
+        head = (f"offset from VIRAC — jicama {jic_off[2]:.0f} mas vs MAST "
+                f"{mast_off[2]:.0f} mas")
+        return head + (" (pipeline tighter)" if jic_off[2] < mast_off[2] else "")
+    if jic_off is not None:
+        return f"offset from VIRAC — jicama {jic_off[2]:.0f} mas (MAST offset not measured)"
+    if mast_off is not None:
+        return f"offset from VIRAC — MAST {mast_off[2]:.0f} mas (pipeline offset not measured)"
     return "astrometry vs VIRAC (bulk offset)"
 
 
-def _stage7_verdict(our_path, mast_tie, jic_tie, jic_unmeas):
+def _stage7_verdict(our_path, mast_off, jic_off, jic_unmeas):
     """PASS / red-flag decision for stage 7, factored out so it can be pinned by tests.
 
-    An unmeasurable OWN (jicama) tie while VIRAC is present is OUR product failing -> fail AND
-    red-flag.  A missing VIRAC reference, or ONLY the MAST tie being unmeasurable, means the
-    comparison is 'not measured' / 'unavailable' -- not a fail on our side.  Returns
+    Failing to measure our OWN (jicama) offset while VIRAC is present is our product failing, so it
+    fails AND red-flags.  A missing VIRAC reference, or only the MAST offset being unmeasurable,
+    leaves the comparison 'not measured' / 'unavailable' and says so.  Returns
     (passed: bool, red_flag: bool, red_flag_reason: str|None)."""
-    improved = (jic_tie is not None and mast_tie is not None and jic_tie[2] <= mast_tie[2] + 5)
+    improved = (jic_off is not None and mast_off is not None and jic_off[2] <= mast_off[2] + 5)
     passed = bool(our_path and not jic_unmeas
-                  and (improved or mast_tie is None or jic_tie is None))
+                  and (improved or mast_off is None or jic_off is None))
     if jic_unmeas:
-        return False, True, ("pipeline (jicama) frame tie to VIRAC unmeasurable — no xcorr peak "
-                             "within 1.5″ (possible gross mis-registration of our product)")
+        return False, True, ("the pipeline (jicama) offset from VIRAC is unmeasurable — no xcorr "
+                             "peak within 1.5″, which can mean our product is grossly "
+                             "mis-registered")
     return passed, False, None
 
 
 def stage7_mast_vs_pipeline(o: Observation, sw):
-    """Show the pipeline's improvement over the raw MAST-delivered products:
-    (top) the MAST L3 i2d mosaic vs our pipeline mosaic over the SAME sky region;
+    """Compare the pipeline against the raw MAST-delivered products:
+    (top) the MAST L3 i2d mosaic beside our pipeline mosaic over the SAME sky region;
     (bottom-left) source-count / brightness histogram, MAST-i2d detections vs the jicama catalogue;
-    (bottom-right, MAIN) the per-star offset-to-VIRAC distribution for each -- the astrometric
-    tightening that is the pipeline's headline gain."""
+    (bottom-right, MAIN) each catalogue's per-star offset from VIRAC, which is where the pipeline's
+    astrometric gain shows up."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -2473,12 +2474,12 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     ref = _viraccache_path(o) or _refcat_path(o)
     ep = aa.epoch_of(mast_path) if mast_path else None
     ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
-    mast_tie = _tie_cloud(mast_sc, ref_sc) if mast_sc is not None else None
-    jic_tie = _tie_cloud(jsc, ref_sc) if jsc is not None else None
-    if mast_tie is not None:
-        metrics["mast_offset_med_mas"] = mast_tie[2]
-    if jic_tie is not None:
-        metrics["jicama_offset_med_mas"] = jic_tie[2]
+    mast_off = _offset_cloud(mast_sc, ref_sc) if mast_sc is not None else None
+    jic_off = _offset_cloud(jsc, ref_sc) if jsc is not None else None
+    if mast_off is not None:
+        metrics["mast_offset_med_mas"] = mast_off[2]
+    if jic_off is not None:
+        metrics["jicama_offset_med_mas"] = jic_off[2]
 
     # ---- figure: two image panels on top, two comparison panels below
     fig = plt.figure(figsize=(12.5, 10.8))
@@ -2543,26 +2544,26 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     axh.set_ylabel("N sources"); axh.legend(fontsize=7.5, loc="upper left")
     axh.set_title("source counts in the common window — MAST vs pipeline", fontsize=9)
 
-    # bottom-right (MAIN): the crowding-robust bulk offset to VIRAC for each catalogue, as a 2-D
-    # (ΔRA, ΔDec) cloud with marginals.  A nearest-neighbour-to-VIRAC distance is USELESS here
-    # (VIRAC is sparse -> ~250 mas NN spacing swamps the tie), so this uses the xcorr histogram
-    # peak: the cloud CENTRE is the true bulk offset (MAST far from 0, jicama near 0).
+    # bottom-right (MAIN): each catalogue's offset from VIRAC, as a 2-D (ΔRA, ΔDec) cloud with
+    # marginals.  VIRAC's own ~250 mas source spacing swamps a nearest-neighbour distance, so this
+    # coarse-aligns by the xcorr histogram peak first; the cloud CENTRE is then the field offset
+    # (MAST far from 0, jicama near 0).
     axo = fig.add_subplot(gs[1, 1])
-    # Wording is DERIVED from the sign of (jicama tie − MAST tie): only claim the pipeline "tightens
-    # the tie" when BOTH ties are measured AND jicama < MAST.  When jicama is wider/equal, or one
-    # side is unmeasurable, report the numbers without asserting an improvement.
-    both_measured = mast_tie is not None and jic_tie is not None
-    jic_tighter = bool(both_measured and jic_tie[2] < mast_tie[2])
+    # Wording is DERIVED from the sign of (jicama offset − MAST offset): claim the pipeline
+    # "tightens" only when BOTH are measured AND jicama is the smaller.  When jicama is wider or
+    # equal, or one side is unmeasurable, report the numbers and assert no improvement.
+    both_measured = mast_off is not None and jic_off is not None
+    jic_tighter = bool(both_measured and jic_off[2] < mast_off[2])
     metrics["astrom_improved"] = jic_tighter
     lim = 60.0
-    for tie, col, lab in ((mast_tie, "#ee6677", mast_kind or "MAST"),
-                          (jic_tie, "#4477aa", jic_label)):
-        if tie is not None:
-            dra, dde, bulk = tie
+    for cloud, col, lab in ((mast_off, "#ee6677", mast_kind or "MAST"),
+                            (jic_off, "#4477aa", jic_label)):
+        if cloud is not None:
+            dra, dde, bulk = cloud
             axo.scatter(dra, dde, s=3, alpha=0.25, color=col,
                         label=f"{lab}  (bulk {bulk:.0f} mas)")
             lim = max(lim, 1.3 * float(np.nanpercentile(np.hypot(dra, dde), 95)))
-    if mast_tie is not None or jic_tie is not None:
+    if mast_off is not None or jic_off is not None:
         axo.axhline(0, color="k", lw=0.4); axo.axvline(0, color="k", lw=0.4)
         axo.plot(0, 0, "k+", ms=12, mew=2, label="VIRAC (target)")
         axo.set_xlim(-lim, lim); axo.set_ylim(-lim, lim); axo.set_aspect("equal")
@@ -2571,46 +2572,46 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
         # combined marginals (both catalogues in ONE pair of inset axes, so they don't overplot);
         # the panel title goes on the TOP marginal so it can't collide with the histograms.
         axt = axo.inset_axes([0.0, 1.02, 1.0, 0.16]); axr = axo.inset_axes([1.02, 0.0, 0.16, 1.0])
-        for tie, col in ((mast_tie, "#ee6677"), (jic_tie, "#4477aa")):
-            if tie is not None:
-                axt.hist(tie[0], bins=40, range=(-lim, lim), histtype="step", color=col, lw=1.1)
-                axr.hist(tie[1], bins=40, range=(-lim, lim), orientation="horizontal",
+        for cloud, col in ((mast_off, "#ee6677"), (jic_off, "#4477aa")):
+            if cloud is not None:
+                axt.hist(cloud[0], bins=40, range=(-lim, lim), histtype="step", color=col, lw=1.1)
+                axr.hist(cloud[1], bins=40, range=(-lim, lim), orientation="horizontal",
                          histtype="step", color=col, lw=1.1)
         axt.set_xlim(-lim, lim); axt.axis("off"); axr.set_ylim(-lim, lim); axr.axis("off")
-        axt.set_title(_stage7_astrom_title(mast_tie, jic_tie), fontsize=8)
-    # UNMEASURABLE (data + VIRAC present but no xcorr peak within 1.5") must be distinguishable from
-    # measured-and-fine -- a grossly mis-registered product (e.g. the ~20" jw01182-v001 class) would
-    # otherwise render as a clean one-cloud pass.
-    mast_unmeas = mast_sc is not None and ref_sc is not None and mast_tie is None
-    jic_unmeas = jsc is not None and ref_sc is not None and jic_tie is None
-    metrics.update(mast_tie_unmeasurable=bool(mast_unmeas), jicama_tie_unmeasurable=bool(jic_unmeas))
-    if mast_tie is None and jic_tie is None:
+        axt.set_title(_stage7_astrom_title(mast_off, jic_off), fontsize=8)
+    # UNMEASURABLE (data + VIRAC present but no xcorr peak within 1.5") must be distinguishable
+    # from measured-and-fine: left undistinguished, a grossly mis-registered product (the ~20"
+    # jw01182-v001 class) renders as a clean one-cloud pass.
+    mast_unmeas = mast_sc is not None and ref_sc is not None and mast_off is None
+    jic_unmeas = jsc is not None and ref_sc is not None and jic_off is None
+    metrics.update(mast_offset_unmeasurable=bool(mast_unmeas), jicama_offset_unmeasurable=bool(jic_unmeas))
+    if mast_off is None and jic_off is None:
         axo.axis("off")
         if ref_sc is None:
             axo.text(0.5, 0.5, "no VIRAC reference for the offset comparison",
                      ha="center", va="center", fontsize=9)
         else:
-            axo.text(0.5, 0.5, "BOTH ties unmeasurable: no xcorr peak within 1.5″\n"
+            axo.text(0.5, 0.5, "NEITHER offset measurable: no xcorr peak within 1.5″\n"
                      "→ likely gross mis-registration; investigate",
                      ha="center", va="center", fontsize=9, color="#c33", weight="bold")
     elif jic_unmeas:
-        # OUR product cannot be tied to VIRAC -> a defect on our side (handled by passed/red_flag).
-        axo.text(0.5, -0.16, "⚠ pipeline (jicama) tie unmeasurable (>1.5″ or no xcorr peak) — "
+        # OUR product cannot be placed against VIRAC -> a defect on our side (passed/red_flag).
+        axo.text(0.5, -0.16, "⚠ pipeline (jicama) offset unmeasurable (>1.5″ or no xcorr peak) — "
                  "possible gross mis-registration of our product; not a clean pass",
                  transform=axo.transAxes, ha="center", va="top", fontsize=8, color="#c33")
     elif mast_unmeas:
-        # only the MAST tie is unmeasurable: the COMPARISON is unavailable, which is not by itself a
-        # defect in OUR product -- so state that, do NOT say "not a clean pass", and (below) the
-        # stage does not fail solely on this.
-        axo.text(0.5, -0.16, "⚠ MAST comparison unavailable (MAST tie >1.5″ or no xcorr peak) — "
-                 "possible MAST mis-registration; the pipeline tie is measured",
+        # Only the MAST offset is unmeasurable, so the COMPARISON is what is unavailable.  That
+        # says nothing about our product, so the wording stays neutral and the stage does not fail
+        # on it alone (below).
+        axo.text(0.5, -0.16, "⚠ MAST comparison unavailable (MAST offset >1.5″ or no xcorr peak) — "
+                 "possible MAST mis-registration; the pipeline offset is measured",
                  transform=axo.transAxes, ha="center", va="top", fontsize=8, color="#c33")
 
-    # PASS / red-flag decision (factored into _stage7_verdict so it is pinned by tests): the pipeline
-    # must be TIEABLE, a mosaic must exist, and where MAST is also measurable the pipeline tie must be
-    # no worse.  A missing VIRAC ref, or ONLY the MAST tie being unmeasurable, is "not measured" /
-    # "comparison unavailable" -> not a fail on our side; an unmeasurable OWN tie fails AND red-flags.
-    passed, red_flag, red_flag_reason = _stage7_verdict(our_path, mast_tie, jic_tie, jic_unmeas)
+    # PASS / red-flag decision (factored into _stage7_verdict so tests can pin it): our offset must
+    # be measurable, a mosaic must exist, and where MAST is also measurable our offset must be no
+    # worse.  A missing VIRAC ref, or only the MAST offset being unmeasurable, leaves the comparison
+    # "not measured" / "unavailable"; failing to measure our OWN offset fails AND red-flags.
+    passed, red_flag, red_flag_reason = _stage7_verdict(our_path, mast_off, jic_off, jic_unmeas)
     metrics["passed"] = passed
     if red_flag:
         metrics["red_flag"] = True
@@ -3253,16 +3254,16 @@ def caption_for(n, metrics):
 
 
 def _caption_stage8(metrics):
-    """Stage-8 caption.  Handles three states: not-applicable (no second band -> no pass/fail, not
-    a red flag), a normal measured residual (amplitude + null-based significance), and a gross
-    inter-filter offset (red-flagged).  Kept out of the generic red-flag branch so a red-flagged
-    gross offset still describes a rendered map, not an empty plot."""
+    """Stage-8 caption.  Handles three states: not-applicable (no second band, so no pass/fail is
+    set), a normal measured residual (amplitude + null-based significance), and a gross
+    inter-filter offset (red-flagged).  Kept out of the generic red-flag branch, whose wording
+    describes an empty plot; a red-flagged gross offset still renders a full map."""
     sw = metrics.get("sw", "SW")
     if metrics.get("measurable") is False:
         return ("**Stage 8 — inter-filter distortion residual: not applicable.** No second-filter "
                 f"positions for {sw} in a merged catalogue, so there is no band to difference (a "
-                "single-filter or not-yet-merged obs). This is not a defect and not a failed "
-                "measurement, so no pass/fail is set. ([how this is made](DOCROOT#stage8))")
+                "single-filter or not-yet-merged obs). No pass/fail is set. "
+                "([how this is made](DOCROOT#stage8))")
     f2 = metrics.get("f2", "a 2nd filter")
     nS = metrics.get("n_stars"); rms = metrics.get("resid_rms_mas")
     amp = metrics.get("binned_amp90_mas"); null = metrics.get("null_amp90_mas")
@@ -3270,23 +3271,24 @@ def _caption_stage8(metrics):
     base = (f"**Stage 8 — inter-filter distortion residual ({sw} − {f2}).** The per-star position "
             f"difference between two JWST filters of the same field (the SAME source rows, "
             f"[S/N > 10](DOCROOT#glossary-snr) in both, field [bulk](DOCROOT#glossary-bulk) "
-            f"removed) as a function of position. Two filters share the frames, offsets table, DVA "
-            f"and tie, so the residual is a per-filter WCS (distortion) term with **no "
-            f"external-catalogue noise**. The cross-band match radius is not zero — it moved "
-            f"upstream to ~100 mas per band (mutual-NN in `merge_catalogs`, visible as truncation "
-            f"near 100 mas), ~100× the ~1 mas signal, so far less binding than a VIRAC-referenced "
-            f"version. LEFT/MIDDLE: binned-median ΔRA/ΔDec maps; RIGHT: per-cell quiver. A flat "
-            f"map = the two solutions agree; a coherent gradient/swirl = a differential distortion "
-            f"residual. ")
+            f"removed) as a function of position. The two filters share the frames, the offsets "
+            f"table, the DVA correction and the registration onto VIRAC, which leaves a per-filter "
+            f"WCS (distortion) term measured **with no external catalogue in it**. Sources are "
+            f"paired across bands upstream, by mutual nearest neighbour within ~100 mas in "
+            f"`merge_catalogs` (visible as truncation near 100 mas) — ~100× the ~1 mas signal, so "
+            f"the radius does little to shape this map. LEFT/MIDDLE: binned-median ΔRA/ΔDec maps; "
+            f"RIGHT: per-cell quiver. A flat map = the two solutions agree; a coherent "
+            f"gradient/swirl = a differential distortion residual. ")
     if nS is not None and rms is not None:
         base += f"Here: {nS} stars, {rms:.2f} mas per-star"
         if amp is not None and null is not None and signif is not None:
-            base += (f"; the map's 90th-percentile cell amplitude is {amp:.2f} mas vs a "
-                     f"shuffled-position null of {null:.2f} mas ({signif:.1f}× — the significance, "
-                     f"in place of the ~2×-optimistic per-cell SEM)")
+            base += (f"; the map's 90th-percentile cell amplitude is {amp:.2f} mas against a "
+                     f"shuffled-position null of {null:.2f} mas, so {signif:.1f}× the null. That "
+                     f"ratio is the significance quoted here; a per-cell standard error reads "
+                     f"about 2× more optimistic and is not used")
         if frac is not None:
-            base += (f"; {100 * frac:.1f}% of kept rows have |Δ| > 20 mas (nearest-neighbour "
-                     f"ambiguity within the match radius, which inflates the SEM)")
+            base += (f"; {100 * frac:.1f}% of kept rows have |Δ| > 20 mas, from nearest-neighbour "
+                     f"ambiguity inside the match radius, which inflates a standard error")
         base += ". "
     if metrics.get("red_flag"):
         base += f"🚩 {metrics.get('red_flag_reason', 'gross inter-filter offset')}. "
@@ -3343,8 +3345,7 @@ def _caption_for_impl(n, metrics):
                      f"bands ({metrics['n_stars_hi_sn']} stars, turnover ≈ "
                      f"{metrics.get('lf_turnover_hi_sn', float('nan')):.1f} mag). ")
         if kind == "crossmatch":
-            body += ("The colour width is set by the positional cross-match tolerance, not the "
-                     "catalogue's colour precision. ")
+            body += ("The colour width here is set by the positional cross-match tolerance. ")
         return body + "([how this is made](DOCROOT#stage2))"
     if n == 4:
         # Built in code so it renders cleanly whatever was measured, and gated on the CELL COUNT:
@@ -3493,36 +3494,37 @@ def _caption_for_impl(n, metrics):
                 "same sky region. The BOTTOM-LEFT panel compares source counts — the "
                 "[jicama](DOCROOT#glossary-jicama) catalogue vs the MAST catalogue "
                 "(the MAST-delivered `_cat.fits` when archived, else approximated by running "
-                "DAOStarFinder at 5σ on the MAST i2d — an approximation of, not a match to, the "
-                "STScI L3 catalogue step, which uses segmentation with deblending). ")
+                "DAOStarFinder at 5σ on the MAST i2d — an approximation of the STScI L3 catalogue "
+                "step, which uses segmentation with deblending). ")
         if nj is not None and nm is not None:
             base += f"jicama holds {nj} vs {nm} (MAST) in the compared window. "
         if metrics.get("jicama_is_release") is False:
             base += ("(NOTE: no merged/release jicama catalogue exists yet for this obs, so the "
-                     "pipeline side falls back to the per-i2d MAST catalogue — the comparison is "
-                     "MAST-vs-MAST here, not pipeline-vs-MAST.) ")
-        base += ("The BOTTOM-RIGHT panel (the main result) is the "
-                 "[bulk offset to VIRAC](DOCROOT#glossary-bulk) (xcorr histogram peak, "
-                 "crowding-robust) for each catalogue")
-        # Improvement clause is CONDITIONAL: assert tightening only when both ties are measured AND
-        # jicama < MAST.  Otherwise report the numbers (or state the comparison is unavailable)
-        # without claiming an improvement.
+                     "pipeline side falls back to the per-i2d MAST catalogue — both sides of this "
+                     "comparison are MAST.) ")
+        base += ("The BOTTOM-RIGHT panel (the main result) is each catalogue's "
+                 "[offset from VIRAC](DOCROOT#glossary-bulk), found by coarse-aligning on the "
+                 "[xcorr histogram peak](DOCROOT#glossary-xcorr) and taking the centre of the "
+                 "per-star cloud")
+        # Improvement clause is CONDITIONAL: assert tightening only when both offsets are measured
+        # AND jicama is the smaller.  Otherwise report the numbers, or state that the comparison is
+        # unavailable, and claim no improvement.
         if mo is not None and jo is not None:
             base += f" — {jo:.0f} mas (jicama) vs {mo:.0f} mas (MAST)"
             if jo < mo:
                 base += ", the astrometric tightening the pipeline delivers over MAST. "
             else:
-                base += " (the pipeline tie is not tighter than MAST here). "
+                base += " (MAST is as close to VIRAC as the pipeline here). "
         elif jo is not None:
             base += (f" — {jo:.0f} mas (jicama); the MAST comparison is unavailable "
-                     f"(MAST tie unmeasurable, possible MAST mis-registration). ")
+                     f"(the MAST offset is unmeasurable, possibly MAST mis-registration). ")
         elif mo is not None:
-            base += f" — {mo:.0f} mas (MAST); the pipeline tie is not measurable here. "
+            base += f" — {mo:.0f} mas (MAST); the pipeline offset is unmeasurable here. "
         else:
             base += ". "
-        base += ("The cloud's WIDTH is bounded by the 0.1″ cross-match radius, not the per-star "
-                 "astrometric RMS — see [stage 5](DOCROOT#stage5)/[stage 6](DOCROOT#stage6) for the "
-                 "actual per-star scatter. ([how this is made](DOCROOT#stage7))")
+        base += ("The cloud's WIDTH is bounded by the 0.1″ cross-match radius; "
+                 "[stage 5](DOCROOT#stage5) and [stage 6](DOCROOT#stage6) are where the per-star "
+                 "scatter is measured. ([how this is made](DOCROOT#stage7))")
         return base
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
