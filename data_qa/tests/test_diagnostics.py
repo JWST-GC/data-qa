@@ -583,6 +583,34 @@ def test_available_filters_only_present(tmp_path, monkeypatch):
     assert D._available_filters(o) == ["F212N"]                          # F444W (no data) dropped
 
 
+def test_pick_filters_prefers_mosaic_backed_over_higher_ranked():
+    # cloudef jw02092-o005: all four available, but only F162M/F360M have a reduced mosaic.
+    # F210M/F480M rank HIGHER in the preference lists, so the naive pick chose the unreduced pair
+    # and every mosaic-keyed stage blanked (issue #38).  prefer= must flip the pick to the reduced
+    # filters WITHOUT changing behaviour when the top-ranked filter already has a mosaic.
+    avail = ["F162M", "F210M", "F360M", "F480M"]
+    # no prefer: unchanged legacy behaviour -> highest-ranked available (F210M / F480M)
+    assert D.pick_filters(avail) == ("F210M", "F480M")
+    # prefer only the reduced pair -> pick flips to them
+    assert D.pick_filters(avail, prefer=["F162M", "F360M"]) == ("F162M", "F360M")
+    # explicit args always win over prefer
+    assert D.pick_filters(avail, sw="F210M", lw="F480M", prefer=["F162M", "F360M"]) == ("F210M", "F480M")
+    # a channel with NO mosaic-backed filter falls back to any available (does not return None)
+    assert D.pick_filters(avail, prefer=["F162M"]) == ("F162M", "F480M")
+
+
+def test_filters_with_mosaic(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    for filt in ("F162M", "F360M"):
+        d = tmp_path / "cloudef" / filt / "pipeline"; d.mkdir(parents=True)
+        _touch(d, f"jw02092-o005_t001_nircam_clear-{filt.lower()}-merged_i2d.fits")
+    o = Observation(program="2092", obs="005", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F162M", "F210M", "F360M", "F480M"],
+                    visits=[], epoch="", notes="")
+    # only the two reduced filters are mosaic-backed; F210M/F480M (no mosaic) are excluded
+    assert D._filters_with_mosaic(o) == ["F162M", "F360M"]
+
+
 def _write_skycoord_cat(path, ra, dec):
     import astropy.units as u
     from astropy.coordinates import SkyCoord
