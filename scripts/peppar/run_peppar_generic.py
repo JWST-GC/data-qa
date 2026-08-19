@@ -13,8 +13,13 @@ The PSF / detection / fitting parameters are copied verbatim from Matt Hosek's w
 ``run_peppar_f212n_nrca4_01.py`` -- do not retune here without checking with him.
 
 Environment variables:
-    PEPPAR_DATA_DIR   required  dir holding the per-exposure ``*_cal.fits`` (our layout:
-                                /orange/adamginsburg/jwst/<field>/<FILT>/)
+    PEPPAR_DATA_DIR   required  dir holding the per-exposure ``*_cal.fits``, globbed FLAT.
+                                Our layout has two forms and ``data_qa.peppar_trigger``
+                                passes the one holding THIS detector's files -- the side
+                                holding more of them when both do:
+                                /orange/adamginsburg/jwst/<field>/<FILT>/pipeline/ (what
+                                the reduction writes) or the legacy flat
+                                /orange/adamginsburg/jwst/<field>/<FILT>/
     PEPPAR_STF_DIR    required  output dir for this (filter, detector)
     PEPPAR_FILT       required  filter, e.g. F212N
     PEPPAR_DET        required  detector, e.g. NRCA4 (or NRCALONG); 'i2d' to run on i2d mosaics

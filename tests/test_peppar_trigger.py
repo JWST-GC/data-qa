@@ -1,0 +1,302 @@
+"""Offline unit tests for data_qa.peppar_trigger cal-file discovery (no sbatch is ever
+run).  Pins the two on-disk layouts of issue #73: the reduction writes
+``<field>/<FILT>/pipeline/*_cal.fits`` while older reductions left them flat at
+``<field>/<FILT>/*_cal.fits``, and fields such as brick / gc2211 / ngc6334 hold both --
+so both layouts, their union, and the per-detector ``PEPPAR_DATA_DIR`` are pinned."""
+import glob
+
+import pytest
+
+from data_qa import peppar_trigger as ppt
+
+PROGRAM, OBS = "10678", "001"
+
+
+def _touch(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+
+
+def make_field(base, field, filt, dets, layout, nexp=1, program_obs="10678001"):
+    """Create empty cal files for one filter dir in the given layout."""
+    fdir = base / field / filt
+    caldir = fdir / "pipeline" if layout == "pipeline" else fdir
+    for n in range(1, nexp + 1):
+        for det in dets:
+            _touch(caldir / f"jw{program_obs}001_02101_0000{n}_{det}_cal.fits")
+    return fdir
+
+
+# ---------------------------------------------------------------- pipeline/ layout
+
+def test_field_for_finds_pipeline_layout(tmp_path):
+    make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline")
+    assert ppt.field_for(PROGRAM, OBS, base=str(tmp_path)) == "gc-treasury"
+
+
+def test_enumerate_finds_pipeline_layout(tmp_path):
+    make_field(tmp_path, "gc-treasury", "F212N", ["nrca1", "nrcblong"], "pipeline")
+    make_field(tmp_path, "gc-treasury", "F480M", ["nrcalong"], "pipeline")
+    assert ppt.enumerate_filt_det("gc-treasury", base=str(tmp_path)) == {
+        "F212N": ["NRCA1", "NRCBLONG"], "F480M": ["NRCALONG"]}
+
+
+def test_build_jobs_data_dir_points_at_pipeline(tmp_path):
+    """The runner globs PEPPAR_DATA_DIR flat, so it must be the pipeline/ subdir when
+    that layout holds the cal files; outputs (stf_dir) stay at the filter level."""
+    make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline")
+    (job,) = ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    assert job["data_dir"] == f"{tmp_path}/gc-treasury/F212N/pipeline"
+    assert job["stf_dir"] == f"{tmp_path}/gc-treasury/F212N/peppar_nrca1"
+
+
+# ---------------------------------------------------------------- legacy flat layout
+
+def test_flat_layout_regression(tmp_path):
+    """A flat-only (brick-like) field enumerates exactly as before the pipeline/ glob
+    was added, including the golden job dict."""
+    make_field(tmp_path, "brick", "F212N", ["nrca1", "nrca2"], "flat",
+               program_obs="02221001")
+    assert ppt.field_for("2221", "001", base=str(tmp_path)) == "brick"
+    assert ppt.enumerate_filt_det("brick", base=str(tmp_path)) == {
+        "F212N": ["NRCA1", "NRCA2"]}
+    jobs = ppt.build_jobs("2221", "001", base=str(tmp_path))
+    assert jobs[0] == dict(field="brick", filt="F212N", det="NRCA1",
+                           data_dir=f"{tmp_path}/brick/F212N",
+                           stf_dir=f"{tmp_path}/brick/F212N/peppar_nrca1",
+                           name="peppar-brick-f212n-nrca1")
+
+
+def test_non_filter_dirs_still_skipped(tmp_path):
+    """A pipeline/ subdir under a non-filter dir (e.g. mosaics/) never enumerates."""
+    make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline")
+    make_field(tmp_path, "gc-treasury", "mosaics", ["nrca1"], "pipeline")
+    assert list(ppt.enumerate_filt_det("gc-treasury", base=str(tmp_path))) == ["F212N"]
+
+
+# ---------------------------------------------------------------- mixed layouts
+
+def test_mixed_fields_each_program_resolves(tmp_path):
+    """One base holding a flat (brick-like) field AND a pipeline/ field: each program
+    finds its own field."""
+    make_field(tmp_path, "brick", "F212N", ["nrca1"], "flat", program_obs="02221001")
+    make_field(tmp_path, "gc-treasury", "F480M", ["nrcalong"], "pipeline")
+    assert ppt.field_for("2221", "001", base=str(tmp_path)) == "brick"
+    assert ppt.field_for(PROGRAM, OBS, base=str(tmp_path)) == "gc-treasury"
+
+
+def test_pipeline_layout_is_obs_stem_scoped(tmp_path):
+    """Two pipeline/-layout fields for different programs: the pipeline/ glob is scoped
+    by the jw<program><obs> stem exactly as the flat one is.  Dropping the stem there
+    makes every field match every program, so field_for answers whichever holds the most
+    cal files -- a tie here, resolved alphabetically to 'brick' -- and fans every peppar
+    job out over the wrong field."""
+    make_field(tmp_path, "brick", "F212N", ["nrca1"], "pipeline", program_obs="02221001")
+    make_field(tmp_path, "gc-treasury", "F480M", ["nrcalong"], "pipeline")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["brick", "gc-treasury"]
+    assert ppt.field_for("2221", "001", base=str(tmp_path)) == "brick"
+    assert ppt.field_for(PROGRAM, OBS, base=str(tmp_path)) == "gc-treasury"
+    assert ppt.field_for("1182", "001", base=str(tmp_path)) is None
+
+
+def test_stem_is_obs_scoped_in_both_layouts(tmp_path):
+    """The OBS half of the ``jw<program><obs>`` stem discriminates too, in both layouts.
+
+    Three real programs have cal files under more than one field dir.  For two of them the
+    obs token is the only discriminator, each field holding exactly one observation:
+    jw02045 o001 is arches while o003 is quintuplet, jw01979 o001 is ngc6397 while o002 is
+    m4.  Dropping ``{obs}`` from the stem makes both fields of the program match on equal
+    counts, so the alphabetical tie-break answers arches for 2045/003 and m4 for 1979/001
+    and fans every peppar job out over the wrong field with no error and a populated
+    data_dir.  (jw02221 is the third, and each of its fields holds frames of BOTH
+    observations -- see test_field_for_picks_the_field_holding_most_of_the_obs.)
+
+    Both fixtures mirror that live geometry: the pipeline-layout pair for the pipeline
+    glob, the flat-layout pair for the flat one.
+    """
+    make_field(tmp_path, "arches", "F212N", ["nrca1"], "pipeline", program_obs="02045001")
+    make_field(tmp_path, "quintuplet", "F212N", ["nrca1"], "pipeline",
+               program_obs="02045003")
+    make_field(tmp_path, "m4", "F212N", ["nrca1"], "flat", program_obs="01979002")
+    make_field(tmp_path, "ngc6397", "F212N", ["nrca1"], "flat", program_obs="01979001")
+    # sorted() order is what an unscoped glob would return, so pin it
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "arches", "m4", "ngc6397", "quintuplet"]
+    # pipeline layout: same program, obs alone decides
+    assert ppt.field_for("2045", "001", base=str(tmp_path)) == "arches"
+    assert ppt.field_for("2045", "003", base=str(tmp_path)) == "quintuplet"
+    # flat layout: same program, obs alone decides
+    assert ppt.field_for("1979", "002", base=str(tmp_path)) == "m4"
+    assert ppt.field_for("1979", "001", base=str(tmp_path)) == "ngc6397"
+    # an obs of a program that is present resolves to nothing when that obs is not
+    assert ppt.field_for("2045", "007", base=str(tmp_path)) is None
+
+
+def test_field_for_picks_the_field_holding_most_of_the_obs(tmp_path, capsys):
+    """jw02221 reduces obs 001 into brick and obs 002 into cloudc, and BOTH field dirs
+    hold frames of BOTH observations (brick's LW dirs carry 96 obs-002 frames, cloudc's
+    F2550W carries 72 obs-001 frames).  Returning the first sorted match therefore answered
+    brick for both, leaving cloudc's 480 obs-002 cal files -- 30 (filter, detector) jobs --
+    unreachable from --peppar for every observation of the only program that reaches them.
+    The field holding the most of an obs is the one that reduced it."""
+    make_field(tmp_path, "brick", "F212N", ["nrca1", "nrca2"], "pipeline", nexp=2,
+               program_obs="02221001")                              # brick/001: 4
+    make_field(tmp_path, "brick", "F405N", ["nrcalong"], "pipeline",
+               program_obs="02221002")                              # brick/002: 1
+    make_field(tmp_path, "cloudc", "F212N", ["nrca1", "nrca2"], "pipeline", nexp=2,
+               program_obs="02221002")                              # cloudc/002: 4
+    make_field(tmp_path, "cloudc", "F2550W", ["mirimage"], "pipeline",
+               program_obs="02221001")                              # cloudc/001: 1 (MIRI)
+    # sorted() order is what a first-match resolver returns, so pin it: brick comes first
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["brick", "cloudc"]
+    assert ppt.field_cal_counts("2221", "001", base=str(tmp_path)) == {"brick": 4,
+                                                                      "cloudc": 1}
+    assert ppt.field_cal_counts("2221", "002", base=str(tmp_path)) == {"brick": 1,
+                                                                      "cloudc": 4}
+    assert ppt.field_for("2221", "001", base=str(tmp_path)) == "brick"
+    assert ppt.field_for("2221", "002", base=str(tmp_path)) == "cloudc"
+    # and the jobs really fan out over cloudc's filter dirs
+    jobs = ppt.build_jobs("2221", "002", base=str(tmp_path))
+    assert {j["field"] for j in jobs} == {"cloudc"}
+    # F2550W is MIRI, so _DET_RE contributes no detector from it and it emits no job
+    assert {j["filt"] for j in jobs} == {"F212N"}
+    # the contested obs is reported, with both counts
+    capsys.readouterr()
+    ppt.field_for("2221", "002", base=str(tmp_path))
+    err = capsys.readouterr().err
+    assert "jw02221-o002 has cal files under 2 fields" in err
+    assert "running cloudc (4 cal files)" in err and "brick 1" in err
+
+
+def test_field_for_tie_is_stable_and_uncontested_is_quiet(tmp_path, capsys):
+    """An exact tie resolves alphabetically, so repeated polls agree; a single holder
+    emits no warning."""
+    make_field(tmp_path, "quintuplet", "F212N", ["nrca1"], "pipeline",
+               program_obs="02045003")
+    make_field(tmp_path, "arches", "F212N", ["nrca1"], "pipeline", program_obs="02045003")
+    capsys.readouterr()
+    assert ppt.field_for("2045", "003", base=str(tmp_path)) == "arches"
+    assert ppt.field_for("2045", "003", base=str(tmp_path)) == "arches"
+    assert "has cal files under 2 fields" in capsys.readouterr().err
+    make_field(tmp_path, "sgrb2", "F212N", ["nrca1"], "pipeline", program_obs="05365001")
+    capsys.readouterr()
+    assert ppt.field_for("5365", "001", base=str(tmp_path)) == "sgrb2"
+    assert capsys.readouterr().err == ""
+
+
+def test_mixed_within_filter_dir_dedupes_and_unions(tmp_path):
+    """Both layouts inside ONE filter dir: a file in both (same basename) is counted
+    once, and a flat-only file still contributes its detector."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline")
+    # the same exposure also present flat (partial migration) + a flat-only detector
+    _touch(fdir / "jw10678001001_02101_00001_nrca1_cal.fits")
+    _touch(fdir / "jw10678001001_02101_00001_nrca2_cal.fits")
+    files = ppt._cal_files(str(fdir))
+    assert len(files) == 2                       # nrca1 deduped by basename
+    assert f"{fdir}/pipeline/jw10678001001_02101_00001_nrca1_cal.fits" in files
+    assert ppt.enumerate_filt_det("gc-treasury", base=str(tmp_path)) == {
+        "F212N": ["NRCA1", "NRCA2"]}
+    # per-detector answer: NRCA1 migrated, NRCA2 is still flat-only
+    assert ppt.cal_data_dir(str(fdir), "NRCA1") == f"{fdir}/pipeline"
+    assert ppt.cal_data_dir(str(fdir), "NRCA2") == str(fdir)
+    # filter-level answer: flat serves both exposures here, pipeline/ only one
+    assert ppt.cal_data_dir(str(fdir)) == str(fdir)
+
+
+def test_detector_split_across_layouts_serves_the_larger_side(tmp_path, capsys):
+    """One detector's exposures SPLIT across the two layouts.  The runner globs
+    PEPPAR_DATA_DIR flat, so it sees exactly one layout; discovery counted the union.
+    Picking the side that holds more removes the loss whenever one layout is a superset,
+    which is the ordinary half-migrated shape (a re-reduction rewrites some exposures)."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline", nexp=3)
+    # the flat dir holds one older exposure of the same detector
+    _touch(fdir / "jw10678001001_02101_00009_nrca1_cal.fits")
+    assert len(ppt._cal_files(str(fdir))) == 4
+    (job,) = ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    assert job["data_dir"] == f"{fdir}/pipeline"          # 3 files beats the flat 1
+    # the reverse split picks flat
+    fdir2 = make_field(tmp_path, "gc-treasury", "F480M", ["nrcalong"], "flat", nexp=3)
+    _touch(fdir2 / "pipeline" / "jw10678001001_02101_00009_nrcalong_cal.fits")
+    assert ppt.cal_data_dir(str(fdir2), "NRCALONG") == str(fdir2)
+
+
+def test_disjoint_split_warns_instead_of_running_quiet_on_a_subset(tmp_path, capsys):
+    """When neither layout is a superset the chosen dir still misses the remainder, and
+    the runner's "no images" guard passes on the files it does see.  That must say so."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline", nexp=2)
+    _touch(fdir / "jw10678001001_02101_00007_nrca1_cal.fits")
+    capsys.readouterr()
+    assert ppt.cal_data_dir(str(fdir), "NRCA1") == f"{fdir}/pipeline"
+    err = capsys.readouterr().err
+    assert "splits across both layouts" in err
+    assert "serves 2 of 3 cal files" in err
+
+
+def test_no_warning_when_one_layout_is_a_superset(tmp_path, capsys):
+    """Every (filter, detector) pair on the real archive today has flat as a subset of
+    pipeline/ by basename, so the ordinary case stays silent."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline", nexp=2)
+    _touch(fdir / "jw10678001001_02101_00001_nrca1_cal.fits")
+    capsys.readouterr()
+    assert ppt.cal_data_dir(str(fdir), "NRCA1") == f"{fdir}/pipeline"
+    assert capsys.readouterr().err == ""
+
+
+def test_mixed_within_filter_dir_data_dir_is_per_detector(tmp_path):
+    """A flat-only detector in a half-migrated filter dir gets the FLAT dir while its
+    migrated sibling gets pipeline/.  Handing it {FILT}/pipeline would clear the runner's
+    "no images" guard on NRCA1's files and then KeyError in
+    peppar.setup_dict_images_for_run (dict_images[filt][det]) after taking a queue slot."""
+    fdir = make_field(tmp_path, "gc-treasury", "F212N", ["nrca1"], "pipeline")
+    _touch(fdir / "jw10678001001_02101_00001_nrca2_cal.fits")
+    jobs = {j["det"]: j for j in ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))}
+    assert sorted(jobs) == ["NRCA1", "NRCA2"]
+    assert jobs["NRCA1"]["data_dir"] == f"{fdir}/pipeline"
+    assert jobs["NRCA2"]["data_dir"] == str(fdir)
+    # every job's data_dir really holds that detector's cal files
+    for det, job in jobs.items():
+        assert glob.glob(f"{job['data_dir']}/*_{det.lower()}_cal.fits")
+    # outputs still stay at the filter level for both
+    assert jobs["NRCA2"]["stf_dir"] == f"{fdir}/peppar_nrca2"
+
+
+def test_empty_field_raises(tmp_path):
+    (tmp_path / "gc-treasury" / "F212N").mkdir(parents=True)
+    with pytest.raises(SystemExit):
+        ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+
+
+def test_field_with_cal_files_only_outside_filter_dirs_raises(tmp_path):
+    """field_for matches on ANY subdir, enumerate_filt_det only on filter dirs, so a
+    field whose cal files sit in e.g. dolphot/ resolves and then yields no jobs.  That
+    must raise (mast_monitor.act_peppar reports the SystemExit) instead of silently
+    reporting 0 jobs for a field that was never scanned."""
+    make_field(tmp_path, "w51", "dolphot", ["nrca1"], "flat")
+    assert ppt.field_for(PROGRAM, OBS, base=str(tmp_path)) == "w51"
+    assert ppt.enumerate_filt_det("w51", base=str(tmp_path)) == {}
+    with pytest.raises(SystemExit):
+        ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    # an explicit --filters/--dets subset that matches nothing stays a quiet empty list
+    assert ppt.build_jobs(PROGRAM, OBS, field="w51", filters=["F212N"],
+                          base=str(tmp_path)) == []
+
+
+def test_no_jobs_error_names_the_skipped_dirs(tmp_path):
+    """m4 and ngc6397 keep their cal files in F150W2/ and F322W2/; the trailing "2" fails
+    the filter-dir pattern, so they resolve as fields and enumerate nothing.  The error
+    must name those dirs and the pattern -- otherwise it reads as "no data on disk" while
+    the data is there."""
+    make_field(tmp_path, "m4", "F150W2", ["nrca1"], "pipeline")
+    make_field(tmp_path, "m4", "F322W2", ["nrcalong"], "flat")
+    assert ppt.enumerate_filt_det("m4", base=str(tmp_path)) == {}
+    assert ppt.nonfilter_cal_dirs("m4", base=str(tmp_path)) == ["F150W2", "F322W2"]
+    with pytest.raises(SystemExit) as ei:
+        ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    msg = str(ei.value)
+    assert "F150W2" in msg and "F322W2" in msg
+    assert ppt._FILT_RE.pattern in msg
+    # it reports only the dirs the pattern rejects: a real filter dir alongside a
+    # dolphot/ one leaves just dolphot
+    make_field(tmp_path, "brick", "F212N", ["nrca1"], "pipeline")
+    make_field(tmp_path, "brick", "dolphot", ["nrca1"], "flat")
+    assert ppt.nonfilter_cal_dirs("brick", base=str(tmp_path)) == ["dolphot"]
