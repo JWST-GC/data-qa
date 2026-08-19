@@ -169,6 +169,28 @@ cell, so it does not shrink with more cells. [Stage 8](#stage8) measures its sig
 shuffled-position null instead, which is the shape a significance for this kind of measurement has
 to take.
 
+<a id="glossary-adjacency"></a>
+### "deviate together": the adjacency rule for outlined cells
+
+A cell is **deviating** when its per-cell offset sits more than `_CELL_SPREAD_MAX` (30 mas) from the
+[source-weighted field offset](#glossary-bulk). But a single deviating cell is not, on its own,
+evidence that the *frame* is wrong — it is usually just a mis-measurement in that one cell (a
+[histogram peak](#glossary-xcorr) that landed on the wrong bump). So a deviating cell is **confirmed**
+(and drawn with an outline) **only when an orthogonally-adjacent cell also deviates**. That is what
+"deviate together" means: outlined cells form a coherent block of neighbours that share the
+deviation, which is the signature of a real sub-region registered differently from the rest of the
+field — an [inter-module](#glossary-reffree) seam, a bad detector, a local distortion residual. A
+lone deviating cell amid agreeing neighbours stays unoutlined and does **not** fail the frame.
+
+The frame's spatial-consistency check fails when the adjacency-confirmed cells hold more than 2% of
+the measured sources (a real block, not a speck), or when less than 50% of the field could be
+measured at all.
+
+Why adjacency rather than a spread statistic: an earlier version used `mad_std` of the cell offsets,
+which cannot see a *minority* discontinuity — a defect covering a few cells is averaged away by the
+many good ones. Requiring adjacency makes the test sensitive to a coherent minority while ignoring
+isolated noise (introduced in PR #54, in response to that review).
+
 <a id="glossary-reffree"></a>
 ### "reference-free" inter-module tie
 
