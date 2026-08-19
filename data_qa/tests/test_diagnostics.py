@@ -313,6 +313,20 @@ def test_cell_consistency_isolated_outlier_ignored():
     assert cc["n_deviating"] == 1 and cc["n_confirmed"] == 0 and cc["consistent"]
 
 
+def test_cell_consistency_componentwise_median_can_read_zero_on_a_bad_field():
+    # The worked example in _cell_consistency's docstring and in docs/qa_methods.md.  off_dra and
+    # off_dde are weighted medians taken SEPARATELY, so four cells at (+50,0), (-50,0), (0,+50),
+    # (0,-50) mas cancel to a field offset of 0 while every cell sits 50 mas from it.  The
+    # magnitude gate alone would pass this field; the adjacency test is what fails it.
+    cells = _grid_cells({(0, 0): (50.0, 0.0, 40000), (1, 0): (-50.0, 0.0, 40000),
+                         (0, 1): (0.0, 50.0, 40000), (1, 1): (0.0, -50.0, 40000)})
+    cc = D._cell_consistency(cells, [])
+    assert cc["off_med"] == 0.0                     # the field offset reads clean...
+    assert all(abs(c["off"] - 50.0) < 1e-9 for c in cells)   # ...while no cell is
+    assert cc["n_deviating"] == 4 and cc["n_confirmed"] == 4
+    assert cc["consistent"] is False                # adjacency catches what the magnitude misses
+
+
 def test_cell_consistency_low_coverage_not_consistent():
     # most sources sit in DROPPED (no-peak) cells -> not adequately sampled to pass
     cells = _grid_cells({(0, 0): (9.0, 0.0, 500), (0, 1): (9.0, 0.0, 500),
