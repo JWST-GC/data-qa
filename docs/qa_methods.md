@@ -79,11 +79,11 @@ PM-propagated VIRAC reference. The **selection criteria** differ by what is bein
   take each one's nearest JWST catalog source within **0.1″**. Anchoring on VIRAC (not the much
   deeper JWST catalog) prevents faint JWST sources from being paired with the wrong bright VIRAC
   star. A sigma-clipped locus (below) then isolates the stellar ridge from the red mismatch cloud.
-- **Frame tie** ([stage 4](#stage4)): the offset is measured by an
-  [x-correlation histogram peak](#glossary-xcorr) **per spatial cell**, not by nearest-neighbour
-  pairing (see why under [bulk offset](#glossary-bulk)).
-- **Inter-module / per-detector tie** ([stage 5](#stage5)): the per-detector residual uses
-  VIRAC matches within **0.15″**; the reference-free A↔B tie uses no external catalog at all.
+- **JWST−VIRAC offset** ([stage 4](#stage4)): measured by an
+  [x-correlation histogram peak](#glossary-xcorr) **per spatial cell**. Nearest-neighbour pairing
+  fails at this density; see [field offset](#glossary-bulk).
+- **Inter-module / per-detector offset** ([stage 5](#stage5)): the per-detector residual uses
+  VIRAC matches within **0.15″**; the A↔B comparison uses no external catalog at all.
 
 <a id="glossary-xcorr"></a>
 ### x-correlation histogram peak (`aa.xcorr`)
@@ -94,42 +94,102 @@ brick F212N field), and their median offset **collapses toward zero the further 
 actually displaced** — it reads ~1–2 mas even at a real 2″ shift. So QA instead builds the 2-D
 histogram of all JWST−reference separation vectors and takes its **peak**: the displacement at
 which real matched pairs pile up. `peak_ratio` = peak height ÷ background density; a match is
-accepted only when `peak_ratio ≥ MIN_PEAK_RATIO` with enough pairs. This is crowding-robust where
-a median is not. (When both catalogs are dense — the JWST-NRCA↔JWST-NRCB case in [stage 5](#stage5)
-— the chance-pair count is far higher, ~400,000, which is why that tie also uses the peak.)
+accepted only when `peak_ratio ≥ MIN_PEAK_RATIO` with enough pairs. The peak survives crowding
+because the wrong pairs spread out over the whole search window while the right ones stack at one
+displacement. (When both catalogs are dense — the JWST-NRCA↔JWST-NRCB case in [stage 5](#stage5) —
+the chance-pair count is far higher, ~400,000, so that comparison uses the peak as well.)
+
+The peak has a bias of its own worth knowing about: two catalogs tracing the same clustered field
+make a wrong-pair background that is itself clumpy, and it pulls the peak by several mas. On brick
+2221-o001 the peak reads 9–17 mas where the same stars, matched one to one, are 0.4–1.6 mas apart.
+So the peak is what detects that an offset is small, and the [same-star](#glossary-bulk)
+measurement is what reports how small.
 
 <a id="glossary-bulk"></a>
-### "bulk" offset and the per-cell tie
+### The field offset, and the per-cell offsets behind it
 
-The **bulk offset** is the single field-wide shift between the JWST catalog and VIRAC — the number
-you would apply to the whole frame to register it onto the Gaia/VIRAC frame. Because a field can
-have an **internal discontinuity** (one sub-region tied differently — e.g. a stale visit block),
-QA does not report a single scalar. Instead ([`_cell_offsets`](../data_qa/diagnostics.py)):
+The **field offset** is the single shift between the JWST catalog and VIRAC — the number you would
+apply to the whole frame to register it onto the Gaia/VIRAC frame. A field can have an **internal
+discontinuity**, where one sub-region is registered differently from the rest (a stale visit block,
+say), and one scalar hides that, so QA measures the offset region by region
+([`_cell_offsets`](../data_qa/diagnostics.py)):
 
 1. Split the JWST footprint into a **4×4 grid (up to 16 cells)**.
-2. In each cell, measure the JWST↔VIRAC offset by the [xcorr peak](#glossary-xcorr) against the
+2. In each cell, measure the JWST−VIRAC offset by the [xcorr peak](#glossary-xcorr) against the
    local VIRAC reference (that cell + a 2″ margin). Cells with enough sources but **no clear peak**
-   are recorded as *dropped* (drawn as a solid grey cell).
-3. The reported field offset is the **source-count-weighted median of the measured cell offsets** (up to 16 — a sparse cell that never reaches the minimum source count is skipped, so the count can be lower) — the
-   offset the catalog as a whole experiences, not the offset of whichever cell had the sharpest
-   peak.
+   are recorded as *dropped* (drawn as a solid grey cell). A cell too sparse to reach the minimum
+   source count is skipped, so fewer than 16 cells may survive.
+3. Take the **weighted median over cells** of ΔRA, and separately of ΔDec, each cell weighted by
+   its source count. A weighted median sorts the cells by that component and reads off the value at
+   which the running source count passes half the total, so a cell holding a tenth of the catalog
+   counts for a tenth of the catalog. The reported field offset is the length of the resulting
+   (ΔRA, ΔDec) vector.
 
-This is a QA **cross-check** of a tie the jicama pipeline has already applied per exposure; it
-measures the residual whole-catalog offset that survives in the delivered catalog, not the
-pipeline's internal per-exposure solution.
+The two components are taken separately, so the result is the length of the median vector. Four
+cells at (+50, 0), (−50, 0), (0, +50) and (0, −50) mas therefore give a field offset of 0 while
+every cell sits 50 mas from it. The spatial-consistency test in
+[`_cell_consistency`](../data_qa/diagnostics.py) is what catches that arrangement, by flagging each
+cell that differs from the field value by more than 30 mas.
+
+When the cells show the field offset is small, the reported value is re-measured from **the same
+star seen in both catalogs** (mutual nearest pairs within 0.05″, median of their separations). That
+measurement is only meaningful once a small offset is established: if the frame were really 2″ out,
+the nearest VIRAC star to a JWST source would not be the same star, and its median would be
+meaningless. The **pass gate tests the larger of the two values**, so a real mis-registration that
+the histogram sees survives the re-measurement — every same-star pair is matched within 0.05″, so
+that median alone can never exceed the 75 mas gate.
+
+Stage 4 is a QA **cross-check** of a registration the jicama pipeline has already applied per
+exposure. It measures the offset left over in the delivered catalog, reading the catalog alone.
 
 <a id="glossary-tie-uncertainty"></a>
-### The stage-4 tie offset and its uncertainty (what "σ" means)
+### What the stage-4 cell-to-cell spread means (and why no "σ" is quoted)
 
-For the stage-4 tie, the "offset significance" is **offset ÷ (its uncertainty)**, where the
-uncertainty is the **cell-to-cell standard error**:
+Alongside the field offset, stage 4 reports the **cell-to-cell spread**: the `mad_std` of the
+per-cell ΔRA and ΔDec, combined in quadrature. It says how much the cells disagree with each other.
+[Stage 6](#stage6) shows the per-star scatter separately, as rms(offset).
 
-- spread = `mad_std` of the 16 per-cell offset vectors (how much the cells disagree),
-- uncertainty (standard error) = spread ÷ √(number of measured cells),
-- significance σ = tie offset ÷ standard error.
+Stage 4 used to divide the field offset by spread ÷ √(number of cells) and report the result as
+"N σ from zero". That number carried no information and has been removed. The field offset is a
+length built from the same two medians whose sampling error is the denominator, so when the true
+offset is zero the ratio still lands at ≈1.1 for 9 or more cells (≈1.5 for 4) — whatever the scale
+of the scatter, and whatever the size of the field offset. A 780 mas offset reported at "1σ" was
+the statistic sitting at its floor. In simulation, with the true offset set to zero:
 
-This is the uncertainty on the *field-average tie*, driven by how consistently the cells agree —
-distinct from the per-star scatter, which [stage 6](#stage6) shows directly as rms(offset).
+| cells | cell scatter | quoted σ (median) | fraction reading > 3σ |
+|------:|-------------:|------------------:|----------------------:|
+| 4     | 5–500 mas    | 1.5               | 11% |
+| 9     | 5–500 mas    | 1.1               | 3% |
+| 16    | 5–500 mas    | 1.1               | 2% |
+
+Dividing by √(number of cells) also assumes the cells are independent measurements of the same
+quantity, and the error that dominates here is common to all of them: the several-mas pull that a
+dense reference puts on every cell's [histogram peak](#glossary-xcorr) is the same pull in every
+cell, so it does not shrink with more cells. [Stage 8](#stage8) measures its significance against a
+shuffled-position null instead, which is the shape a significance for this kind of measurement has
+to take.
+
+<a id="glossary-adjacency"></a>
+### "deviate together": the adjacency rule for outlined cells
+
+A cell is **deviating** when its per-cell offset sits more than `_CELL_SPREAD_MAX` (30 mas) from the
+[source-weighted field offset](#glossary-bulk). But a single deviating cell is not, on its own,
+evidence that the *frame* is wrong — it is usually just a mis-measurement in that one cell (a
+[histogram peak](#glossary-xcorr) that landed on the wrong bump). So a deviating cell is **confirmed**
+(and drawn with an outline) **only when an orthogonally-adjacent cell also deviates**. That is what
+"deviate together" means: outlined cells form a coherent block of neighbours that share the
+deviation, which is the signature of a real sub-region registered differently from the rest of the
+field — an [inter-module](#glossary-reffree) seam, a bad detector, a local distortion residual. A
+lone deviating cell amid agreeing neighbours stays unoutlined and does **not** fail the frame.
+
+The frame's spatial-consistency check fails when the adjacency-confirmed cells hold more than 2% of
+the measured sources (a real block, not a speck), or when less than 50% of the field could be
+measured at all.
+
+Why adjacency rather than a spread statistic: an earlier version used `mad_std` of the cell offsets,
+which cannot see a *minority* discontinuity — a defect covering a few cells is averaged away by the
+many good ones. Requiring adjacency makes the test sensitive to a coherent minority while ignoring
+isolated noise (introduced in PR #54, in response to that review).
 
 <a id="glossary-reffree"></a>
 ### "reference-free" inter-module tie
@@ -220,37 +280,37 @@ it passing if the slope is 0.8–1.2 and the scatter < 0.8 mag.
 Source: [`data_qa/diagnostics.py` → `stage3_calibration`](../data_qa/diagnostics.py).
 
 <a id="stage4"></a>
-## Stage 4 — positional offsets (JWST ↔ VIRAC frame tie)
+## Stage 4 — positional offsets (JWST catalog − VIRAC)
 
-Stage 4 checks how well the JWST catalog — the **jicama `mN` catalog**, the same one stages 2/3
-use, not the MAST products — is registered onto the [VIRAC/Gaia frame](#glossary-virac). The
-offset is measured in each cell of a **4×4 grid (up to 16 cells)** over the footprint by the
-[xcorr histogram peak](#glossary-xcorr) against the local VIRAC reference, and the reported field
-offset is the source-count-weighted median across those cells (see [bulk offset](#glossary-bulk)).
+Stage 4 measures how far a star in the JWST catalog sits from the same star in VIRAC, and so how
+well the catalog is registered onto the [VIRAC/Gaia frame](#glossary-virac). The catalog it reads
+is the **jicama `mN` catalog**, the same one stages 2 and 3 use. The offset is measured in each cell
+of a **4×4 grid (up to 16 cells)** over the footprint by the [xcorr histogram peak](#glossary-xcorr)
+against the local VIRAC reference; the [field offset](#glossary-bulk) is the source-count-weighted
+median over those cells.
 
 - **LEFT** — the 4×4 grid, each cell filled with its offset colour (a contiguous map, so a coherent
-  patch stands out). Cells with sources but no clear [xcorr peak](#glossary-xcorr) are a solid grey fill;
-  a **red outline** marks cells that coherently deviate (an adjacency-confirmed sub-region tied
-  differently from the rest of the field).
-- **MIDDLE** — the same per-cell offsets (up to 16) as (ΔRA, ΔDec) hollow-circle points sized by source count, with the
-  source-weighted median tie (black +), the 75 mas gate (dotted circle), and ΔRA/ΔDec marginal
-  histograms.
-- **RIGHT** (when both modules are present) — the [reference-free](#glossary-reffree) NRCA-vs-NRCB
-  inter-module offset, printed as its two numbers (ΔRA, ΔDec).
+  patch stands out). Cells with sources but no clear [xcorr peak](#glossary-xcorr) are a solid grey
+  fill; a **red outline** marks a group of adjacent cells that each deviate from the field value
+  by more than 30 mas — a sub-region registered differently from the rest of the field. A lone
+  deviating cell is a mis-measurement in that one cell and is left unoutlined.
+- **MIDDLE** — the same per-cell offsets (up to 16) as (ΔRA, ΔDec) hollow-circle points sized by
+  source count, with the field offset (black +), the 75 mas gate (dotted circle), the cell-to-cell
+  spread (dashed circle), and ΔRA/ΔDec marginal histograms.
+- **RIGHT** (when both modules are present) — the NRCA-minus-NRCB offset, measured
+  [without any external catalog](#glossary-reffree) and printed as its two numbers (ΔRA, ΔDec).
 
-The reported **tie** is the [bulk offset](#glossary-bulk); its
-[uncertainty](#glossary-tie-uncertainty) is the cell-to-cell standard error and "Nσ" = tie ÷ that
-standard error. When the cells confirm a small tie, the reported value is refined to a same-star
-(mutual nearest-pair) median, but the **pass gate always tests the per-cell histogram median** (the
-larger of the two), so a real bulk mis-registration the histogram sees cannot be masked by the
-refinement — every same-star pair is matched within 0.05", so its median alone could never exceed
-the 75 mas gate. Consider it passing if: the tie is small (< 75 mas); the cells are spatially
-consistent — no adjacency-confirmed sub-region is off by more than 30 mas while holding more than
-2% of the stars (a lone mis-peaked cell does not count; a coherent block does); at least 4 cells
-were measurable with ≥ 50% coverage of the sources; and the inter-module offset is < 15 mas.
+The reported number is the [field offset](#glossary-bulk), re-measured from the same stars matched
+one to one once the cells establish that it is small; the pass gate tests the larger of the two
+values. Beside it is the [cell-to-cell spread](#glossary-tie-uncertainty), which says how much the
+cells disagree with each other. Consider it passing if: the field offset is small (< 75 mas); the
+cells are spatially consistent — no adjacency-confirmed sub-region is off by more than 30 mas while
+holding more than 2% of the stars (a coherent block counts, a lone mis-peaked cell does not); at
+least 4 cells were measurable, covering ≥ 50% of the sources; and the inter-module offset is
+< 15 mas.
 
 Source: [`data_qa/diagnostics.py` → `stage4_offsets`](../data_qa/diagnostics.py)
-(cells: `_cell_offsets`; aggregation/uncertainty: `_cell_consistency`).
+(cells: `_cell_offsets`; combining them: `_cell_consistency`).
 
 <a id="stage5"></a>
 ## Stage 5 — inter-detector / inter-module tie
