@@ -3360,7 +3360,7 @@ def _caption_for_impl(n, metrics):
         om_str = f"{om:.1f}" if abs(om) < 10 else f"{om:.0f}"
         base = (f"**Stage 4 — positional offsets (JWST catalogue − VIRAC).** How far a star in the "
                 f"JWST catalogue sits from the same star in [VIRAC](DOCROOT#glossary-virac), which "
-                f"carries the Gaia frame. The [**field** offset](DOCROOT#glossary-bulk) is "
+                f"is in the Gaia frame. The [**field** offset](DOCROOT#glossary-bulk) is "
                 f"measured separately in each spatial cell, from the peak of the histogram of "
                 f"[all JWST−VIRAC pair separations](DOCROOT#glossary-xcorr) in that cell.\n\n"
                 f"LEFT maps that offset across the mosaic; outlined cells deviate together from "
