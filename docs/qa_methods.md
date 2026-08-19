@@ -269,8 +269,9 @@ median over those cells.
 
 - **LEFT** — the 4×4 grid, each cell filled with its offset colour (a contiguous map, so a coherent
   patch stands out). Cells with sources but no clear [xcorr peak](#glossary-xcorr) are a solid grey
-  fill; a **red outline** marks cells that deviate together (an adjacency-confirmed sub-region
-  registered differently from the rest of the field).
+  fill; a **red outline** marks a group of adjacent cells that each deviate from the field value
+  by more than 30 mas — a sub-region registered differently from the rest of the field. A lone
+  deviating cell is a mis-measurement in that one cell and is left unoutlined.
 - **MIDDLE** — the same per-cell offsets (up to 16) as (ΔRA, ΔDec) hollow-circle points sized by
   source count, with the field offset (black +), the 75 mas gate (dotted circle), the cell-to-cell
   spread (dashed circle), and ΔRA/ΔDec marginal histograms.
