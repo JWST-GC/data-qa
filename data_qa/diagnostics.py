@@ -1162,6 +1162,14 @@ _CELL_MIN_COVERAGE = 0.5
 # floor accepts any real peak; the cells are then weighted by SOURCE COUNT and judged for
 # consistency by adjacency (below), neither of which depends on the density-biased ratio.
 _CELL_PR_FLOOR = 1.5
+# A cell offset farther than this from the source-weighted field consensus is not a believable tie
+# (a real tie, even with distortion or a sub-region discontinuity, does not jump ~arcsec between
+# cells).  Used ONLY together with the weight floor below to drop spurious low-occupancy xcorr peaks;
+# a genuine, well-populated discontinuity is kept and judged by the adjacency test.  4x the 75 mas gate.
+_CELL_SPURIOUS_MAX = 300.0
+# ...and only when the far cell holds less than this fraction of the measured sources, so a real,
+# well-populated deviating region is flagged (adjacency test), never silently discarded.
+_CELL_SPURIOUS_WT = _CELL_BAD_FRAC
 
 
 def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=None):
@@ -1267,12 +1275,39 @@ def _cell_consistency(cells, dropped):
     Returns a dict of the numbers plus per-cell ``deviating``/``confirmed`` flags for plotting."""
     if not cells:
         return dict(n_cells=0, consistent=False)
-    dra = np.array([c["dra"] for c in cells]); dde = np.array([c["dde"] for c in cells])
-    ns = np.array([c["n"] for c in cells], float)
-
     def _wmed(v, w):
         o = np.argsort(v); vs, ws = v[o], w[o]; cw = np.cumsum(ws)
         return float(vs[np.searchsorted(cw, 0.5 * cw[-1])])
+
+    # Reject SPURIOUS cells before any stat.  A frame tie -- even with distortion or a real
+    # sub-region discontinuity -- does not jump hundreds of mas between cells; per-cell dRA/dDec that
+    # differ that much are not a tie.  A cell far from the SOURCE-WEIGHTED consensus while holding
+    # only a tiny fraction of the sources is a spurious per-cell xcorr peak (few JWST sources against
+    # a dense reference -> an accidental histogram bump that clears the low pr floor), not a
+    # measurement.  Drop it into ``dropped`` so it neither pollutes the map nor inflates the spread;
+    # the consensus is source-weighted, so the dense trustworthy cells define it and the spurious
+    # low-occupancy cells cannot move it.  A real, high-weight discontinuity is NOT rejected (weight
+    # floor) -- it stays and is judged by the adjacency test.  (issue #37: cloudef o002 had 4 edge
+    # cells at 0.6-2.3" amid 3 dense cells consistent at ~150 mas.)
+    cells, dropped = list(cells), list(dropped)
+    dra0 = np.array([c["dra"] for c in cells]); dde0 = np.array([c["dde"] for c in cells])
+    ns0 = np.array([c["n"] for c in cells], float)
+    cdra, cdde = _wmed(dra0, ns0), _wmed(dde0, ns0)
+    resid0 = np.hypot(dra0 - cdra, dde0 - cdde)
+    spurious = (resid0 > _CELL_SPURIOUS_MAX) & (ns0 / ns0.sum() < _CELL_SPURIOUS_WT)
+    n_spurious = int(spurious.sum())
+    if n_spurious and not spurious.all():         # never empty the whole set (pathological)
+        for k in np.where(spurious)[0]:
+            c = cells[k]
+            dropped.append(dict(i=c["i"], j=c["j"], ra=c["ra"], dec=c["dec"], n=c["n"],
+                                n_ref=c.get("n_ref"),
+                                reason="spurious peak (offset inconsistent with field consensus)"))
+        cells = [c for k, c in enumerate(cells) if not spurious[k]]
+    else:
+        n_spurious = 0
+
+    dra = np.array([c["dra"] for c in cells]); dde = np.array([c["dde"] for c in cells])
+    ns = np.array([c["n"] for c in cells], float)
     mdra, mdde = _wmed(dra, ns), _wmed(dde, ns)
     off_med = float(np.hypot(mdra, mdde))
     dev = np.hypot(dra - mdra, dde - mdde)
@@ -1308,8 +1343,9 @@ def _cell_consistency(cells, dropped):
     consistent = bool(len(cells) >= 4 and bad_frac < _CELL_BAD_FRAC and coverage >= _CELL_MIN_COVERAGE)
     return dict(off_med=off_med, off_dra=mdra, off_dde=mdde, spread=spread,
                 n_cells=len(cells), n_dropped=len(dropped), n_deviating=int(deviating.sum()),
-                n_confirmed=int(confirmed.sum()), bad_src_frac=bad_frac, coverage=coverage,
-                consistent=consistent, deviating=deviating, confirmed=confirmed)
+                n_confirmed=int(confirmed.sum()), n_spurious=n_spurious, bad_src_frac=bad_frac,
+                coverage=coverage, consistent=consistent, deviating=deviating, confirmed=confirmed,
+                cells=cells, dropped=dropped)     # spurious-filtered; caller plots THESE
 
 
 def _dataset_label(metrics):
@@ -1344,6 +1380,65 @@ def _add_marginals(ax, x, y, color="#4477aa", bins=40, weights=None):
                  weights=(w[gy] if w is not None else None))
     axr.set_ylim(ax.get_ylim()); axr.axis("off")
     return axt, axr
+
+
+# A confident histogram-peak field offset that sits farther than this from the clean isolated-star
+# offset is not the true bulk: at GC density against a SPARSE reference the pairwise-offset histogram
+# grows spurious lobes, and the peak can land on one (cloudef o002: peak 153 mas at (-142,+57) while
+# unambiguous isolated matches sit at (+68,-39), ~78 mas -- opposite direction).  Flagged low-confidence.
+_BULK_DISAGREE_MAX = 50.0
+
+
+def _isolated_bulk(jsc, ref_sc, iso_arcsec=0.5, match_arcsec=0.15, ambig_arcsec=0.4):
+    """Bulk JWST−VIRAC offset from CLEAN matches only, as an independent check on the histogram peak:
+    isolated JWST stars (nearest other JWST > ``iso_arcsec``) with an unambiguous VIRAC match (nearest
+    < ``match_arcsec``, second-nearest > ``ambig_arcsec``).  These do not suffer the nearest-neighbour
+    collapse (they are isolated) nor the spurious-peak failure (they are matched one-to-one), so their
+    median offset is the true bulk where enough of them exist.  Returns (median_dRA, median_dDec, n) in
+    mas, or None if too few clean matches (VIRAC too sparse to check)."""
+    import astropy.units as u
+    if jsc is None or ref_sc is None or len(jsc) < 100 or len(ref_sc) < 50:
+        return None
+    _i, ss, _d = jsc.match_to_catalog_sky(jsc, nthneighbor=2)
+    j = jsc[ss > iso_arcsec * u.arcsec]
+    if len(j) < 20:
+        return None
+    i1, s1, _ = j.match_to_catalog_sky(ref_sc, nthneighbor=1)
+    _i2, s2, _ = j.match_to_catalog_sky(ref_sc, nthneighbor=2)
+    keep = (s1 < match_arcsec * u.arcsec) & (s2 > ambig_arcsec * u.arcsec)
+    n = int(keep.sum())
+    if n < 15:
+        return None
+    jm, rm = j[keep], ref_sc[i1[keep]]
+    cosd = float(np.cos(np.radians(float(np.median(jm.dec.deg)))))
+    dra = (jm.ra - rm.ra).to(u.mas).value * cosd
+    dde = (jm.dec - rm.dec).to(u.mas).value
+    return float(np.median(dra)), float(np.median(dde)), n
+
+
+def _catalog_vs_alignment_age(o: Observation, src):
+    """(catalog_date, alignment_date, catalog_name) ISO strings for the staleness check, or Nones.
+
+    Stage 4 reads a merged/release catalog whose ``skycoord_ref`` bakes in whatever frame tie was
+    current WHEN THE MERGE RAN.  If that catalog is older than the field's current alignment (the
+    VIRAC2-locked offsets table the reduction now uses), the merge predates the re-tie, so the
+    absolute offset it shows is the OLD tie -- not the data on disk (cloudef: the read merged catalog
+    is 2026-07-01, the offsets table 2026-08; the per-filter August products are ~16 mas off VIRAC
+    while this stale merge reads ~150).  Reduction fix: re-run the cross-band merge."""
+    import datetime
+    if not src or "release:" not in src:
+        return None, None, None
+    name = src.split("release:", 1)[1].split(" [", 1)[0].strip()
+    cpath = os.path.join(BASE, o.field, "catalogs", name)
+    offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*.csv"))
+    if not (os.path.exists(cpath) and offs):
+        return None, None, None
+    cm = os.path.getmtime(cpath)
+    am = max(os.path.getmtime(p) for p in offs)
+    if cm >= am - 86400.0:                        # within a day -> not meaningfully stale
+        return None, None, None
+    iso = lambda t: datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+    return iso(cm), iso(am), name
 
 
 def stage4_offsets(o: Observation, sw):
@@ -1397,6 +1492,7 @@ def stage4_offsets(o: Observation, sw):
         return png, metrics
 
     cc = _cell_consistency(cells, dropped)
+    cells, dropped = cc["cells"], cc["dropped"]      # spurious cells moved to `dropped`; plot the rest
     cell_off_med, spread = cc["off_med"], cc["spread"]
     io = metrics.get("intermodule_off")
     # Each cell's value is a histogram peak against a DENSE reference, which carries a several-mas
@@ -1437,9 +1533,28 @@ def stage4_offsets(o: Observation, sw):
                    same_star_npairs=(ss["npairs"] if ss else None),
                    same_star_scatter_mas=(ss["scatter"] if ss else None),
                    n_cells=cc["n_cells"], n_cells_dropped=cc["n_dropped"],
+                   n_cells_spurious=cc.get("n_spurious", 0),
                    n_cells_deviating=cc["n_deviating"], n_cells_confirmed=cc["n_confirmed"],
                    bad_src_frac=cc["bad_src_frac"], cell_coverage=cc["coverage"],
                    cells_consistent=cc["consistent"], passed=passed)
+
+    # Guard A -- cross-check the histogram-peak bulk against CLEAN isolated matches, which suffer
+    # neither the nearest-neighbour collapse nor the spurious-peak failure.  A large disagreement
+    # means the reported peak is not the true bulk (sparse reference / spurious lobe), so the number
+    # is low-confidence even when its peak_ratio looks strong.
+    ib = _isolated_bulk(jsc, ref_sc)
+    if ib is not None:
+        mdra, mdde, nclean = ib
+        disagree = float(np.hypot(cc["off_dra"] - mdra, cc["off_dde"] - mdde))
+        metrics.update(isolated_bulk_off_mas=float(np.hypot(mdra, mdde)),
+                       isolated_bulk_n=nclean, bulk_vs_isolated_disagree_mas=disagree,
+                       bulk_low_confidence=bool(disagree > _BULK_DISAGREE_MAX))
+    # Guard B -- did we measure a catalog OLDER than the field's current alignment?  Then its
+    # absolute offset is the pre-re-tie frame, not the reduction on disk.
+    cdate, adate, cname = _catalog_vs_alignment_age(o, src)
+    if cdate:
+        metrics.update(catalog_stale=True, catalog_date=cdate,
+                       alignment_date=adate, stale_catalog_name=cname)
 
     from matplotlib.patches import Circle
     cdra = np.array([c["dra"] for c in cells]); cdde = np.array([c["dde"] for c in cells])
@@ -1499,8 +1614,10 @@ def stage4_offsets(o: Observation, sw):
                                    re_[c["i"] + 1] - re_[c["i"]], de_[c["j"] + 1] - de_[c["j"]],
                                    fill=False, ec="#e41a1c", lw=2.0, zorder=3))
     a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
+    _nsp = cc.get("n_spurious", 0)
+    _dropnote = f"{cc['n_dropped']} unmeasured" + (f" ({_nsp} spurious)" if _nsp else "")
     a0.set_title(f"JWST−VIRAC offset per cell ({_dataset_label(metrics)}): {cc['n_cells']} measured, "
-                 f"{cc['n_dropped']} no-peak\nfield {cell_off_med:.0f} mas; {cc['n_confirmed']} cells "
+                 f"{_dropnote}\nfield {cell_off_med:.0f} mas; {cc['n_confirmed']} cells "
                  f"({100 * cc['bad_src_frac']:.0f}% of sources) deviate", fontsize=8)
     # panel 2: the same per-cell offsets as (dRA, dDec) points sized by source count (big = more
     # sources = more weight in the median), the field value, and the 75 mas gate.
@@ -3403,9 +3520,14 @@ def _caption_for_impl(n, metrics):
         om_str = f"{om:.1f}" if abs(om) < 10 else f"{om:.0f}"
         base = (f"**Stage 4 — positional offsets (JWST catalogue − VIRAC).** How far a star in the "
                 f"JWST catalogue sits from the same star in [VIRAC](DOCROOT#glossary-virac), which "
-                f"is in the Gaia frame. The [**field** offset](DOCROOT#glossary-bulk) is "
-                f"measured separately in each spatial cell, from the peak of the histogram of "
-                f"[all JWST−VIRAC pair separations](DOCROOT#glossary-xcorr) in that cell.\n\n"
+                f"is in the Gaia frame — the **absolute** tie to the external reference. This is a "
+                f"different quantity from the *internal* ties in stages [5](DOCROOT#stage5)/"
+                f"[6](DOCROOT#stage6) (module-to-module, exposure-to-exposure), which can be small "
+                f"even when this is large: a large value here means the frame needs re-tying to the "
+                f"reference, not that the data are internally bad. The [**field** "
+                f"offset](DOCROOT#glossary-bulk) is measured separately in each spatial cell, from "
+                f"the peak of the histogram of [all JWST−VIRAC pair "
+                f"separations](DOCROOT#glossary-xcorr) in that cell.\n\n"
                 f"LEFT maps that offset across the mosaic; outlined cells "
                 f"[deviate together](DOCROOT#glossary-adjacency) from the field value, grey cells "
                 f"were not measurable.\n\n"
@@ -3414,6 +3536,21 @@ def _caption_for_impl(n, metrics):
                 f"ΔRA/ΔDec marginal histograms.\n\n"
                 f"The field offset is {om_str} mas over {nc} measured cells ({nd} without a "
                 f"peak){unc}. ")
+        # Reliability + provenance guards (issue #37/#38): say plainly when the number is measured
+        # on a pre-re-tie catalogue, or when the histogram peak disagrees with clean isolated matches.
+        if metrics.get("catalog_stale"):
+            base += (f"⚠️ **Measured on a stale catalogue.** The merged catalogue read "
+                     f"(`{metrics.get('stale_catalog_name', '?')}`, dated {metrics.get('catalog_date')}) "
+                     f"predates this field's current alignment ({metrics.get('alignment_date')}), so "
+                     f"the offset shown is the **pre-re-tie** frame, not the reduction now on disk — "
+                     f"re-run the cross-band merge and re-measure. ")
+        if metrics.get("bulk_low_confidence"):
+            ib = metrics.get("isolated_bulk_off_mas"); ibn = metrics.get("isolated_bulk_n")
+            dg = metrics.get("bulk_vs_isolated_disagree_mas")
+            base += (f"⚠️ **Low confidence.** The histogram-peak offset disagrees with clean, "
+                     f"unambiguous isolated-star matches ({ib:.0f} mas, n={ibn}) by {dg:.0f} mas — "
+                     f"VIRAC is sparse over this field and the peak may sit on a spurious lobe rather "
+                     f"than the true bulk, so read the quoted value as indicative only. ")
         # Which of the two measurements the quoted number came from.  They differ: see the comment
         # in stage4_offsets on the dense-reference pull on the histogram peak.
         if metrics.get("bulk_source") == "same-star":

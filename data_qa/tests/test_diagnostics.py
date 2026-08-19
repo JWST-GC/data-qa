@@ -313,6 +313,53 @@ def test_cell_consistency_isolated_outlier_ignored():
     assert cc["n_deviating"] == 1 and cc["n_confirmed"] == 0 and cc["consistent"]
 
 
+def test_cell_consistency_rejects_spurious_low_occupancy_cells():
+    # cloudef o002 (#37): 3 dense cells consistent at ~150 mas + 4 low-occupancy edge cells with
+    # wild, mutually-inconsistent offsets (>300 mas from consensus, each <2% of the sources) =
+    # spurious per-cell xcorr peaks.  A tie cannot differ by ~arcsec between cells, so they are
+    # dropped, not shown as "measured".
+    cells = _grid_cells({
+        (3, 0): (-145.0, 38.0, 105000), (3, 1): (-143.0, 58.0, 88000), (3, 2): (-139.0, 69.0, 88000),
+        (0, 1): (-1771.0, 1482.0, 1545), (0, 2): (-529.0, -270.0, 1460),
+        (0, 3): (-787.0, -1260.0, 1133), (3, 3): (-575.0, 775.0, 558),
+    })
+    cc = D._cell_consistency(cells, [])
+    assert cc["n_spurious"] == 4 and cc["n_cells"] == 3 and cc["n_dropped"] == 4
+    assert cc["spread"] < 30                       # survivors agree; no 782 mas inflation
+    assert 140 < cc["off_med"] < 170               # uniform ~150 mas field offset preserved
+
+
+def test_cell_consistency_keeps_high_weight_far_cell():
+    # a WELL-POPULATED cell far from consensus is a real discontinuity, not a spurious peak: it must
+    # be kept (and flagged by adjacency), never dropped by the spurious filter.
+    base = {(i, j): (9.0, 0.0, 40000) for i in range(4) for j in range(4)}
+    base[(0, 0)] = (409.0, 0.0, 40000)             # 400 mas off, full cell's worth of sources
+    cc = D._cell_consistency(_grid_cells(base), [])
+    assert cc["n_spurious"] == 0 and cc["n_cells"] == 16 and cc["n_deviating"] == 1
+
+
+def test_isolated_bulk_recovers_known_offset():
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    # 120 well-separated (2") stars; VIRAC = same shifted +30 mas in RA, no decoys -> clean match set
+    ra = 266.4 + np.arange(120) * (2.0 / 3600.0)
+    dec = np.full(120, -28.5)
+    jsc = SkyCoord(ra * u.deg, dec * u.deg)
+    # VIRAC placed 30 mas east of JWST; the function returns JWST−VIRAC, so dRA should be −30
+    ref = SkyCoord((ra + 30.0 / 3.6e6 / np.cos(np.radians(-28.5))) * u.deg, dec * u.deg)
+    out = D._isolated_bulk(jsc, ref)
+    assert out is not None
+    mdra, mdde, n = out
+    assert n >= 100 and abs(mdra - (-30.0)) < 3.0 and abs(mdde) < 3.0
+
+
+def test_isolated_bulk_none_when_too_sparse():
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    jsc = SkyCoord(np.array([266.4, 266.5]) * u.deg, np.array([-28.5, -28.5]) * u.deg)  # <100
+    assert D._isolated_bulk(jsc, jsc) is None
+
+
 def test_cell_consistency_componentwise_median_can_read_zero_on_a_bad_field():
     # The worked example in _cell_consistency's docstring and in docs/qa_methods.md.  off_dra and
     # off_dde are weighted medians taken SEPARATELY, so four cells at (+50,0), (-50,0), (0,+50),
