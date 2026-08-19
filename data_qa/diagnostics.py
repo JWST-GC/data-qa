@@ -2634,15 +2634,16 @@ def _interfilter_residuals(o, f1):
     rows -- bulk-removed.
 
     This is the distortion reference the way #60's review asks for: two filters share the frames,
-    the offsets table, the DVA correction and the reference tie, so the ONLY thing that differs is
-    a per-filter WCS term -- exactly the position-dependent distortion residual we want, with no
-    external-catalogue noise (VIRAC's ~20 mas per-star PM error would swamp a few-mas residual).
-    The match radius is not zero: the rows were paired by a mutual-nearest-neighbour cross-band
-    match at ~100 mas per band in ``merge_catalogs.py`` (visible as a hard truncation of the kept
-    separations near 100 mas), so a blind spot survives at ~100 mas.  That is ~100x the ~1 mas
-    signal, so it is far less binding than the VIRAC-referenced version -- but it is a cut, not the
-    absence of one, and it leaves a tail of nearest-neighbour-ambiguous rows (see ``frac_gt_20mas``
-    in the stage metrics) that inflates the per-cell sampling noise.
+    the offsets table, the DVA correction and the registration onto VIRAC, which leaves a per-filter
+    WCS term as the ONLY thing that differs -- the position-dependent distortion residual this is
+    for, with no external catalogue in the measurement (VIRAC's ~20 mas per-star PM error would
+    swamp a few-mas residual).
+    The rows were paired across bands upstream, by a mutual-nearest-neighbour match at ~100 mas per
+    band in ``merge_catalogs.py`` (visible as a hard truncation of the kept separations near
+    100 mas), so a blind spot survives at ~100 mas.  That is ~100x the ~1 mas signal, well above
+    where the VIRAC-referenced version would cut.  It is still a cut, and it leaves a tail of
+    nearest-neighbour-ambiguous rows (see ``frac_gt_20mas`` in the stage metrics) that inflates the
+    per-cell sampling noise.
 
     The partner filter is the nearest in wavelength that has a ``skycoord_<f>`` column in the same
     catalogue.  Returns (ra, dec, dra_mas, dde_mas, f2, catname) or None."""
@@ -2750,9 +2751,10 @@ def _shuffled_null_amp90(ra, dec, dra, dde, nb, cosd, minn=3, n_perm=20, seed=0)
 def stage8_distortion(o: Observation, sw):
     """Distortion diagnostic: the INTER-FILTER position residual (bulk-removed) as a function of
     position across the field -- ``sw`` minus a second JWST filter of the same field, same source
-    rows.  Two filters share the frames/offsets/DVA/tie, so the residual is a per-filter WCS
-    (distortion) term with no external-catalogue noise (the cross-band match radius moved upstream
-    to ~100 mas per band -- far above the ~1 mas signal; see ``_interfilter_residuals``).
+    rows.  Two filters share the frames, the offsets table, the DVA correction and the
+    registration onto VIRAC, so the residual is a per-filter WCS (distortion) term measured with no
+    external catalogue in it (rows are paired across bands upstream at ~100 mas per band, far above
+    the ~1 mas signal; see ``_interfilter_residuals``).
     LEFT/MIDDLE are binned-median ΔRA/ΔDec maps; RIGHT is a per-cell quiver.  A flat map = no
     differential distortion; a coherent gradient/swirl = a distortion residual between the two
     filters' solutions, whose significance is quoted against a shuffled-position null."""

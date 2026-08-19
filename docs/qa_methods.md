@@ -60,7 +60,7 @@ source catalog, and from the `peppar` and `STARFINDER` catalogs used in method c
 **VIRAC2** = the VISTA Variables in the Vía Láctea Infrared Astrometric Catalogue, version 2
 (VizieR `II/387`). It is **tied to the Gaia DR3 frame at epoch 2014.0** and carries near-IR
 **Ks**-band (~2.15 µm) magnitudes and per-star **proper motions (PM)**. QA uses it as the
-external reference for both astrometry (frame tie, stages 4/5) and photometry (zeropoint,
+external reference for both astrometry (stages 4/5) and photometry (zeropoint,
 stage 3). Ks (~2.15 µm) is the VIRAC band closest to JWST F212N/F210M, which is why those are
 the SW filters compared against it.
 
