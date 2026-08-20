@@ -1962,6 +1962,40 @@ def _cutout_mosaic(o, filt):
     return pick("merged") or pick("nrcb") or pick("nrca") or _mosaic_path(o, filt)
 
 
+def _mosaic_covering(o, filt, ra, dec):
+    """From the cutout-mosaic candidates (merged / per-module tiles), the path whose footprint
+    contains the MOST of the given sky positions, plus that count.  A fixed 'prefer merged' pick can
+    land on a tile the overlap stars are not on: cloudef o005's -merged tile covers RA 266.44-266.49
+    while the module catalogs (and the A-B overlap zone) sit at 266.65-266.69, so every cutout fell
+    off the mosaic and the gallery was empty (issue #38).  Returns (path, n_covered) or (None, 0)."""
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    if not filt or ra is None or len(ra) == 0:
+        return None, 0
+    cands = []
+    for tag in ("merged", "nrcb", "nrca"):
+        for d in (f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"):
+            cands += [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
+                      if not any(s in p.lower() for s in ("residual", "model", "resbgsub", "bg_i2d"))]
+    seen = set(); cands = [c for c in cands if not (c in seen or seen.add(c))]
+    sc = SkyCoord(np.asarray(ra) * u.deg, np.asarray(dec) * u.deg)
+    best, best_n = None, 0
+    for p in cands:
+        try:
+            with fits.open(p) as h:
+                sci = h["SCI"] if "SCI" in h else h[1]
+                wc = WCS(sci.header); H, W = int(sci.header["NAXIS2"]), int(sci.header["NAXIS1"])
+        except (OSError, ValueError, KeyError):
+            continue
+        x, y = wc.world_to_pixel(sc)
+        inb = int(np.sum(np.isfinite(x) & np.isfinite(y) & (x >= 0) & (x < W) & (y >= 0) & (y < H)))
+        if inb > best_n:
+            best, best_n = p, inb
+    return best, best_n
+
+
 def _finite_sc(sc):
     """SkyCoord subset with finite RA/Dec.  NaN centroids crash astropy's KDTree matchers
     (xcorr / search_around_sky / match_to_catalog_sky reject ANY NaN), so every per-detector
@@ -2291,9 +2325,16 @@ def stage5_intermodule(o: Observation, sw):
         _draw_ab_footprint(axfp, fp_ov, "S/N > 10" if ov_hi else "all stars")
         metrics["n_overlap_footprint"] = int(len(fp_ov["ra_arr"]))
 
-        # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
+        # (3) doubled-star cutout gallery.  Pick the mosaic that actually COVERS the overlap-star
+        # positions (a -merged tile can cover a different sub-region than the module catalogues), not
+        # a fixed 'prefer merged' that may leave every cutout off-frame (issue #38 cloudef o005).
         ncut = 6
-        if mpath and os.path.exists(mpath):
+        _ovpos = np.asarray(ov["pos"]) if ov.get("pos") is not None and len(ov["pos"]) else None
+        cut_path, _ncov = (_mosaic_covering(o, filt, _ovpos[:, 0], _ovpos[:, 1])
+                           if _ovpos is not None else (None, 0))
+        cut_path = cut_path or mpath                       # fall back to the default pick
+        if cut_path and os.path.exists(cut_path):
+            mpath = cut_path
             with fits.open(_used(mpath, f"{filt} mosaic (cutout gallery)")) as hdul:
                 sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
                 data = sci.data.astype("float32"); w = WCS(sci.header)
@@ -2336,8 +2377,14 @@ def stage5_intermodule(o: Observation, sw):
                     a.imshow(cdata, origin="lower", cmap="gray", norm=norm)
                     a.set_xticks([]); a.set_yticks([]); a.set_title(f"{i + 1}", fontsize=7)
             else:
-                strip.text(0.5, 0.5, "no usable overlap-star cutouts on the mosaic",
-                           ha="center", va="center", fontsize=9, style="italic")
+                # Distinguish "no drizzled mosaic covers the overlap zone" (a footprint mismatch --
+                # the module catalogues and the mosaics are on disjoint sky, a real reduction problem)
+                # from a generic empty result, so the message is a diagnostic, not a shrug.
+                msg = ("the drizzled mosaic does not cover the module-overlap zone — the catalogue "
+                       "and the mosaic are on disjoint footprints (reduction mismatch)"
+                       if _ncov == 0 else "no usable overlap-star cutouts on the mosaic")
+                strip.text(0.5, 0.5, msg, ha="center", va="center", fontsize=9, style="italic")
+                metrics["cutout_footprint_mismatch"] = bool(_ncov == 0)
             from astropy.wcs.utils import proj_plane_pixel_scales
             pscale = float(np.mean(proj_plane_pixel_scales(w))) * 3600.0     # arcsec/pix from WCS
             fig.text(0.5, 0.02,
@@ -2400,6 +2447,12 @@ def _psf_flux_positions(o, filt):
     sc = t[sccol]; flux = np.asarray(t[fcol], float); name = os.path.basename(best_path)
     g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(flux) & (flux > 0)
     return (sc[g], flux[g], name) if int(g.sum()) >= 50 else (None, None, None)
+
+
+# Minimum aperture SNR for a star to enter the PSF-vs-aperture comparison.  Set high: the point is
+# a CLEAN locus of well-measured stars, not completeness, and in a crowded field a low-SNR aperture
+# is background-dominated and scatters by magnitudes.
+_APER_SNR_MIN = 30.0
 
 
 def _recentroid_com(data, x, y, box=11):
@@ -2496,7 +2549,9 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     # ApertureStats is NaN-aware -- feed it the RAW data so a coverage-gap NaN in the annulus is
     # ignored (nan_to_num(0) would bias the median low).  The aperture SUM needs finite pixels, so
     # zero-fill only there; the `good` mask below drops any star whose aperture still went bad.
-    bkg = ApertureStats(data, ann).median                    # local background per pixel (NaN-aware)
+    apstats = ApertureStats(data, ann)                       # NaN-aware annulus stats
+    bkg = apstats.median                                     # local background per pixel
+    bkg_std = np.asarray(apstats.std, float)                 # its scatter (inflated by any neighbour)
     raw = aperture_photometry(np.nan_to_num(data, nan=0.0), ap)["aperture_sum"]
     aper_flux = np.asarray(raw, float) - np.asarray(bkg, float) * ap.area
     # DROP apertures that contain a NaN pixel (usually a saturated core or coverage gap): zero-fill
@@ -2505,7 +2560,26 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     nan_in_ap = np.asarray(aperture_photometry(nanmask, ap)["aperture_sum"], float) > 0.5
     metrics["n_aper_with_nan"] = int(nan_in_ap.sum())
     pf = psf_flux[idx]
-    good = np.isfinite(aper_flux) & (aper_flux > 0) & np.isfinite(pf) & (pf > 0) & (~nan_in_ap)
+    # STAR-QUALITY GATE.  A simple aperture is only meaningful on a star that dominates its aperture:
+    # in a crowded field the annulus fills with neighbour light (large bkg_std), the background
+    # subtraction goes wrong, and aper-minus-PSF scatters by magnitudes even for nominally "isolated"
+    # stars (cloudef o005: 2 mag).  Keep only stars whose aperture flux is well above the local
+    # background noise (SNR) and whose recentroid landed confidently (a large move = blended/ambiguous).
+    aper_noise = bkg_std * np.sqrt(float(ap.area))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        snr = aper_flux / aper_noise
+    metrics["aper_snr_min"] = float(_APER_SNR_MIN)
+    good = (np.isfinite(aper_flux) & (aper_flux > 0) & np.isfinite(pf) & (pf > 0) & (~nan_in_ap)
+            & np.isfinite(snr) & (snr > _APER_SNR_MIN) & (moved < 3.0))
+    metrics["n_after_quality_gate"] = int(good.sum())
+    if int(good.sum()) < 50:                                 # gate removed too many -> not measurable
+        png = _red_flag_figure(o, "stage9", "TOO FEW CLEAN STARS",
+                               f"Only {int(good.sum())} isolated stars pass the aperture SNR/"
+                               f"recentroid quality gate (crowding or a catalog-mosaic frame "
+                               f"mismatch) — not enough for a PSF-vs-aperture comparison.")
+        metrics.update(red_flag=True, red_flag_reason="too few clean stars after quality gate",
+                       passed=False)
+        return png, metrics
     m_psf = -2.5 * np.log10(pf[good]); m_aper = -2.5 * np.log10(aper_flux[good])
     dmag = m_aper - m_psf
     apcorr = float(np.median(dmag)); scat = float(aa.mad_std(dmag))

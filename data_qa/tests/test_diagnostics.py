@@ -863,6 +863,39 @@ def _write_i2d(path, ny=8, nx=16):
     fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
 
 
+def _write_i2d_wcs(path, ra0, dec0, npix=100, scale_arcsec=0.03):
+    from astropy.io import fits
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    hdr = fits.Header()
+    hdr["NAXIS"] = 2; hdr["NAXIS1"] = npix; hdr["NAXIS2"] = npix
+    hdr["CTYPE1"] = "RA---TAN"; hdr["CTYPE2"] = "DEC--TAN"
+    hdr["CRPIX1"] = npix / 2; hdr["CRPIX2"] = npix / 2
+    hdr["CRVAL1"] = ra0; hdr["CRVAL2"] = dec0
+    hdr["CD1_1"] = -scale_arcsec / 3600.0; hdr["CD2_2"] = scale_arcsec / 3600.0
+    hdr["CD1_2"] = 0.0; hdr["CD2_1"] = 0.0
+    hdu = fits.ImageHDU(data=np.ones((npix, npix), "float32"), header=hdr, name="SCI")
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+
+def test_mosaic_covering_picks_the_tile_that_contains_the_positions(tmp_path, monkeypatch):
+    # two -merged tiles on DISJOINT sky (cloudef o005: the tile the 'prefer merged' rule picks does
+    # NOT contain the overlap stars).  _mosaic_covering must return the one that actually covers them.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "cloudef" / "F162M" / "pipeline"
+    _write_i2d_wcs(str(d / "jw02092-o005_t001_nircam_clear-f162m-merged_i2d.fits"),
+                   ra0=266.45, dec0=-28.50, npix=1000)
+    _write_i2d_wcs(str(d / "jw02092-o005_t001_nircam_clear-f162m-nrca_i2d.fits"),
+                   ra0=266.66, dec0=-28.51, npix=1000)
+    o = Observation(program="2092", obs="005", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F162M"], visits=[], epoch="", notes="")
+    ra = np.array([266.6600, 266.6603, 266.6597]); dec = np.array([-28.5100, -28.5103, -28.5097])
+    p, n = D._mosaic_covering(o, "F162M", ra, dec)
+    assert p is not None and p.endswith("-nrca_i2d.fits") and n == 3      # the covering tile, not merged
+    # positions on NEITHER tile -> (None, 0)
+    p2, n2 = D._mosaic_covering(o, "F162M", np.array([10.0]), np.array([10.0]))
+    assert p2 is None and n2 == 0
+
+
 def test_stage1_falls_back_to_mast_i2d_never_blank(tmp_path, monkeypatch):
     # MAST always delivers an i2d, so a delivered filter must never render a blank panel. F210M has
     # only a MAST i2d (no reduced mosaic); stage 1 must show it from MAST, not "(no i2d)" (issue #38).
