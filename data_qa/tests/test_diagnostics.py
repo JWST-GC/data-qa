@@ -516,8 +516,10 @@ def test_stage4_low_coverage_grid_does_not_pass(monkeypatch):
     # wrongly pass it (#13 review).
     cells = [dict(i=i, j=0, ra=266.41 + 0.001 * i, dec=-28.89, dra=5.0, dde=0.0, off=5.0,
                   peak_ratio=8.0, n=400, n_ref=400, npairs=400) for i in range(3)]
-    dropped = [dict(i=i % 4, j=1 + i // 4, ra=266.41, dec=-28.89, n=400, n_ref=100,
-                    reason="too few reference stars") for i in range(13)]
+    # the 13 grid positions of a 4x4 that are NOT the three measured (0..2, 0)
+    dropped = [dict(i=i, j=j, ra=266.41, dec=-28.89, n=400, n_ref=100,
+                    reason="too few reference stars")
+               for i in range(4) for j in range(4) if not (i < 3 and j == 0)]
     _stage4_seams(monkeypatch, cells, dropped, grid_used=4)
     _png, m = D.stage4_offsets(_obs(), "F210M")
     assert m["cell_coverage"] < 0.5 and m["passed"] is False

@@ -1589,16 +1589,29 @@ def stage4_offsets(o: Observation, sw):
         NCELL = 1
     re_ = np.linspace(np.nanmin(ra_all), np.nanmax(ra_all), NCELL + 1)
     de_ = np.linspace(np.nanmin(dec_all), np.nanmax(dec_all), NCELL + 1)
-    grid = np.full((NCELL, NCELL), np.nan)          # NaN = cell never measured (dropped or skipped)
+    grid = np.full((NCELL, NCELL), np.nan)
     for c in cells:
         grid[c["i"], c["j"]] = c["off"]
     ext = [re_[0], re_[-1], de_[0], de_[-1]]
     import matplotlib as mpl
-    cmap = mpl.colormaps["inferno"].copy(); cmap.set_bad("0.7")     # dropped/absent cells -> grey
+    # Two DIFFERENT empty states, drawn differently so the map is not a sea of grey:
+    #  * a cell with no JWST sources (outside the mosaic footprint -- most of a diagonal strip's
+    #    bounding box) is NOT a measurement failure and stays WHITE;
+    #  * a cell that HAD sources but produced no usable peak (in `dropped`, incl. spurious-rejected)
+    #    is a genuine "unmeasured" square and is drawn GREY below.  These are rare when they occur.
+    cmap = mpl.colormaps["inferno"].copy(); cmap.set_bad("white")
     gmax = float(np.nanmax(grid)) if np.isfinite(grid).any() else 0.0
-    vmax = min(2.0 * aa.THRESH["absolute"], max(10.0, 1.1 * gmax))
+    # Scale the colour ramp to the DATA (+10% headroom), so a uniform field near 150 mas is not
+    # clipped flat against a fixed cap and pegged to the top of the bar; keep a high sanity ceiling.
+    vmax = min(3.0 * aa.THRESH["absolute"], max(10.0, 1.1 * gmax))
     im0 = a0.imshow(grid.T, origin="lower", extent=ext, aspect="auto", cmap=cmap,
                     vmin=0, vmax=vmax)
+    for d in dropped:                               # grey ONLY the had-sources-but-no-peak cells
+        di, dj = d["i"], d["j"]
+        if not (0 <= di < NCELL and 0 <= dj < NCELL):
+            continue                                # a coarser-grid drop cannot be placed on this grid
+        a0.add_patch(Rectangle((re_[di], de_[dj]), re_[di + 1] - re_[di], de_[dj + 1] - de_[dj],
+                               facecolor="0.7", edgecolor="none", zorder=1))
     cb0 = fig.colorbar(im0, ax=a0, label="JWST−VIRAC offset in cell [mas]", shrink=0.85)
     if aa.THRESH["absolute"] <= vmax:
         cb0.ax.axhline(aa.THRESH["absolute"], color="#39ff14", lw=1.6)
