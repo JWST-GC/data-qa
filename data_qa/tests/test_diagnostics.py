@@ -1986,9 +1986,10 @@ def _good_rows(n=200):
 def test_read_matchup_xymeee_drops_sentinels_and_unmeasured(tmp_path):
     p = tmp_path / "MATCHUP.XYMEEE"
     rows = _good_rows(120) + [
-        (0.0, 0.0, 0.0, 0.01, 0.01, 0.02, 0.13, 1, 1, 1),       # mbar==0 unmeasured
-        (5.0, 5.0, -6.0, 9.0, 9.0, 9.0, 9.99, 6, 6, 6),         # RMS sentinels
-        (7.0, 7.0, -6.0, 0.01, 0.01, 0.02, 0.13, 1, 1, 1),      # Ng<2 single exposure
+        (0.0, 0.0, 0.0, 0.01, 0.01, 0.02, 0.13, 1, 1, 1),        # mbar==0 unmeasured
+        (5.0, 5.0, -6.0, 9.0, 9.0, 9.0, 9.999, 6, 6, 6),         # position/mag RMS sentinels
+        (6.0, 6.0, -6.0, 0.01, 0.01, 0.02, 9.999, 6, 6, 6),      # qfit-only sentinel (good X/Y/mag)
+        (7.0, 7.0, -6.0, 0.01, 0.01, 0.02, 0.13, 1, 1, 1),       # Ng<2 single exposure
     ]
     _write_matchup(str(p), rows)
     d = D._read_matchup_xymeee(str(p))
@@ -1996,6 +1997,7 @@ def test_read_matchup_xymeee_drops_sentinels_and_unmeasured(tmp_path):
     assert d["m"].size == 120                                    # only the good rows survive
     assert (d["m"] < 0).all() and (d["Ng"] >= 2).all()
     assert d["ex"].max() < D._XYMEEE_SENTINEL
+    assert d["q"].max() < D._XYMEEE_QFIT_SENTINEL                # qfit 9.999 rows dropped too
 
 
 def test_read_matchup_xymeee_none_when_too_few(tmp_path):
@@ -2041,3 +2043,15 @@ def test_stage10_measures_consistency(tmp_path, monkeypatch):
     assert abs(m["mag_rms_floor"] - 0.02) < 0.01
     cap = D.caption_for(10, m)
     assert "across-exposure consistency (F182M)" in cap and "mas/META-pixel" in cap
+    assert "meta_scale_assumed_sw" not in m                       # SW filter -> no LW-scale warning
+
+
+def test_stage10_flags_sw_meta_scale_on_lw_filter(tmp_path, monkeypatch):
+    # _META_PIX_MAS is the SW grid; an LW MATCHUP must be flagged, not silently converted 2x small.
+    monkeypatch.setenv("QA_JWST1PASS_DIR", str(tmp_path))
+    _write_matchup(str(tmp_path / "MATCHUP.XYMEEE"), _good_rows(300))
+    o = _obs(field="brick", filt="F405N")
+    png, m = D.stage10_photometric_consistency(o, "F405N", None)
+    assert m["passed"] and m["filter"] == "F405N"
+    assert m.get("meta_scale_assumed_sw") is True
+    assert "unconfirmed" in D.caption_for(10, m) and "SW" in D.caption_for(10, m)

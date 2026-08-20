@@ -2631,7 +2631,12 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
 # and instrumental magnitude in the reference frame and the RMS of each across the exposures it was
 # found in.  Those RMS columns are the "is everything in family?" photometric+astrometric check --
 # reproduced here as the four panels of Jay's show_matchup.sm (XRMS / YRMS / MAG-RMS / QFIT vs mag).
-_META_PIX_MAS = 32.0            # Jay's META reference frame is 32 mas/pixel (position RMS -> mas)
+# Jay's META reference grid is 32 mas/pixel for the F182M (SW) products in hand -- it is the grid
+# the map2avg transforms resample every chip onto, the SW native scale.  An LW MATCHUP would be
+# built on a coarser grid, so this SW constant would make its position RMS ~2x too small; the stage
+# flags that case (meta_scale_assumed_sw) rather than silently converting, since no LW product
+# exists yet to read the true scale from.
+_META_PIX_MAS = 32.0
 # Products live under the per-field reduction tree; brick and cloudc are on /blue, the rest on
 # /orange (the same split the peppar products use).
 _JWST1PASS_ROOTS = {"brick": "/blue/adamginsburg/adamginsburg/jwst",
@@ -2639,9 +2644,13 @@ _JWST1PASS_ROOTS = {"brick": "/blue/adamginsburg/adamginsburg/jwst",
 _JWST1PASS_DEFAULT_ROOT = "/orange/adamginsburg/jwst"
 # MATCHUP.XYMEEE columns (1-indexed in the header): xbar ybar mbar xsig ysig msig qbar Nf Ng Nm ...
 _XYMEEE_COLS = dict(x=0, y=1, m=2, ex=3, ey=4, em=5, q=6, Nf=7, Ng=8, Nm=9)
-# 9.0 (position/mag RMS) and 9.999 (qfit) are jwst1pass "no valid measurement" sentinels, and mbar
-# == 0 marks an unmeasured star; all three must be dropped or they pile up as a false floor/ceiling.
+# jwst1pass "no valid measurement" sentinels: 9.0 on the position/mag RMS columns and 9.999 on
+# qfit (a different value -- they must be filtered separately), and mbar == 0 marks an unmeasured
+# star.  All pile up as a false floor/ceiling if kept: on the real F182M file 197 rows carry
+# q == 9.999, which without the qfit cut draw a hard line at the top of the QFIT panel three orders
+# of magnitude from the data (its 99.9th percentile is 0.35).
 _XYMEEE_SENTINEL = 9.0
+_XYMEEE_QFIT_SENTINEL = 9.999
 
 
 def _read_matchup_xymeee(path):
@@ -2654,7 +2663,8 @@ def _read_matchup_xymeee(path):
         return None
     x, y, m, ex, ey, em, q, Nf, Ng, Nm = arr.T
     good = (np.isfinite(m) & (m < 0) & (Ng >= 2)
-            & (ex < _XYMEEE_SENTINEL) & (ey < _XYMEEE_SENTINEL) & (em < _XYMEEE_SENTINEL))
+            & (ex < _XYMEEE_SENTINEL) & (ey < _XYMEEE_SENTINEL) & (em < _XYMEEE_SENTINEL)
+            & (q < _XYMEEE_QFIT_SENTINEL))
     if int(good.sum()) < 50:
         return None
     keys = ("x", "y", "m", "ex", "ey", "em", "q", "Nf", "Ng", "Nm")
@@ -2718,11 +2728,15 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
         return png, metrics
 
     m = d["m"]
-    exm = d["ex"] * _META_PIX_MAS         # position RMS: META pixels -> mas
+    exm = d["ex"] * _META_PIX_MAS         # position RMS: META pixels -> mas (SW grid, see constant)
     eym = d["ey"] * _META_PIX_MAS
     metrics["n_stars"] = int(m.size)
     metrics["n_exposures"] = int(np.nanmax(d["Nf"]))
     metrics["meta_pix_mas"] = _META_PIX_MAS
+    # _META_PIX_MAS is the SW grid scale; an LW MATCHUP would sit on a coarser grid, so flag the
+    # position-RMS-in-mas as unconfirmed rather than converting it silently 2x too small.
+    if filt.upper() in _LW_PREF:
+        metrics["meta_scale_assumed_sw"] = True
 
     fig, ax = _fig(2, 2, 5.4, 4.3)
     panels = [
@@ -4370,6 +4384,10 @@ def _caption_for_impl(n, metrics):
                 f"({metrics.get('meta_pix_mas', _META_PIX_MAS):.0f} mas/META-pixel). ")
         if xf is not None and mf is not None:
             base += (f"Bright-end floors: {xf:.2f} mas in X, {mf:.3f} mag. ")
+        if metrics.get("meta_scale_assumed_sw"):
+            base += ("⚠️ Position RMS assumes the 32 mas/pixel **SW** META grid; this is an LW "
+                     "filter, whose META grid is coarser — read the X/Y-RMS-in-mas as unconfirmed "
+                     "until the LW grid scale is applied. ")
         if metrics.get("saturation_turnover_mag") is not None:
             base += (f"The mag-RMS doubles above its floor brighter than "
                      f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation onset). ")
