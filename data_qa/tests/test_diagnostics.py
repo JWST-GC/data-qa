@@ -66,6 +66,24 @@ def test_caption_redflag():
     assert "RED FLAG" in cap and "no catalog" in cap
 
 
+def test_caption_stage6_names_formal_vs_empirical():
+    # the formal PSF-fit sigma must NOT be sold as the achieved precision (issue #1 review): the
+    # caption names it "formal", drops the old "systematic limit" claim, documents the source-count
+    # histogram, and -- crucially -- only credits floor_mas to rms(jwst) WHEN that curve is drawn.
+    emp = D.caption_for(6, dict(stage=6, sw="F212N", lw="F466N",
+                                floor_is_empirical_f212n=True, floor_is_empirical_f466n=True))
+    assert "systematic limit" not in emp
+    # pin the POSITIVE branch on the phrase UNIQUE to it (not the "achieved" that also appears in the
+    # shared "not the achieved precision" base text), so collapsing the emp condition is caught (#99).
+    assert "formal" in emp and "rms(jwst)" in emp and "achieved internal repeatability" in emp
+    assert "source counts per" in emp
+    # no per-exposure catalogs -> rms(jwst) not drawn: the caption must NOT claim floor_mas is it,
+    # and must say the fallback to the formal floor (the conflation #99 review caught).
+    noemp = D.caption_for(6, dict(stage=6, sw="F115W", lw=None, floor_is_empirical_f115w=False))
+    assert "falls back to the" in noemp and "formal" in noemp
+    assert "achieved internal repeatability" not in noemp
+
+
 def test_caption_stage5_no_overlap_two_modules():
     # both modules present but no shared stars -> overlap keys absent; must NOT truncate to a
     # bare fragment and must say the tie is unverified.
