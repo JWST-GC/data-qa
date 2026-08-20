@@ -809,6 +809,32 @@ def test_available_filters_only_present(tmp_path, monkeypatch):
     assert D._available_filters(o) == ["F212N"]                          # F444W (no data) dropped
 
 
+def test_peppar_precision_prefers_combo_else_perframe(tmp_path, monkeypatch):
+    from astropy.table import Table
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    pdir = tmp_path / "brick" / "peppar" / "F212N"
+    det = pdir / "NRCA1"; det.mkdir(parents=True)
+    Table({"m": np.linspace(-5.0, 5.0, 120), "x_err": np.full(120, 0.1), "y_err": np.full(120, 0.1)}
+          ).write(str(det / "jw02221001001_00001_nrca1_cal_brick_iter1_cat.fits"), overwrite=True)
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    m, prec, kind = D._peppar_precision(o, "F212N")
+    assert "formal" in kind                                    # per-frame path (no combo yet)
+    assert abs(float(np.median(prec)) - 3.1) < 0.5   # hypot(.1,.1)/sqrt2 = .1 px * 31 mas = 3.1
+    # a combined starlist (empirical across-frame scatter) takes precedence when present
+    Table({"m": np.linspace(-5.0, 5.0, 120), "x_wcs_std": np.full(120, 1e-8),
+           "y_wcs_std": np.full(120, 1e-8)}).write(
+        str(pdir / "combo_starlist_F212N_NRCA1.fits"), overwrite=True)
+    assert "empirical" in D._peppar_precision(o, "F212N")[2]
+
+
+def test_peppar_precision_none_without_products(tmp_path, monkeypatch):
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    assert D._peppar_precision(o, "F212N") is None
+
+
 def test_pick_filters_prefers_mosaic_backed_over_higher_ranked():
     # cloudef jw02092-o005: all four available, but only F162M/F360M have a reduced mosaic.
     # F210M/F480M rank HIGHER in the preference lists, so the naive pick chose the unreduced pair
