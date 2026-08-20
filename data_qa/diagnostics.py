@@ -3489,7 +3489,10 @@ def _peppar_precision(o: Observation, filt, max_frames=48):
 
     combos = glob.glob(f"{pdir}/combo_starlist_{filt}_*.fits")
     if combos:
-        emp = _pool(combos, "m", "x_wcs_std", "y_wcs_std", 3.6e6)   # WCS deg -> mas
+        # x_wcs/y_wcs are tangent-plane offsets in ARCSEC, not degrees: x_wcs spans 70.5" over a
+        # 2227 px detector = 0.0317"/px = the SW pixel scale, so x_wcs_std is arcsec and the factor
+        # to mas is 1e3 (a median x_wcs_std of 0.004" -> 4.0 mas, matching xe's 0.074 px -> 2.3 mas).
+        emp = _pool(combos, "m", "x_wcs_std", "y_wcs_std", 1.0e3)   # arcsec -> mas
         if emp is not None:
             return emp[0], emp[1], "empirical (across-frame rms)"
     cats = sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits"))[:max_frames]

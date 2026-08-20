@@ -821,11 +821,16 @@ def test_peppar_precision_prefers_combo_else_perframe(tmp_path, monkeypatch):
     m, prec, kind = D._peppar_precision(o, "F212N")
     assert "formal" in kind                                    # per-frame path (no combo yet)
     assert abs(float(np.median(prec)) - 3.1) < 0.5   # hypot(.1,.1)/sqrt2 = .1 px * 31 mas = 3.1
-    # a combined starlist (empirical across-frame scatter) takes precedence when present
-    Table({"m": np.linspace(-5.0, 5.0, 120), "x_wcs_std": np.full(120, 1e-8),
-           "y_wcs_std": np.full(120, 1e-8)}).write(
+    # a combined starlist (empirical across-frame scatter) takes precedence when present.
+    # x_wcs_std is ARCSEC (tangent-plane offset), so 0.004" must convert to ~4 mas -- this pins the
+    # factor at 1e3; the old deg->mas 3.6e6 would read this same table as 14416 mas (3600x high).
+    Table({"m": np.linspace(-5.0, 5.0, 120), "x_wcs_std": np.full(120, 0.004),
+           "y_wcs_std": np.full(120, 0.004)}).write(
         str(pdir / "combo_starlist_F212N_NRCA1.fits"), overwrite=True)
-    assert "empirical" in D._peppar_precision(o, "F212N")[2]
+    m2, prec2, kind2 = D._peppar_precision(o, "F212N")
+    assert "empirical" in kind2
+    # hypot(0.004,0.004)/sqrt2 arcsec = 0.004" -> 4.0 mas
+    assert abs(float(np.median(prec2)) - 4.0) < 0.2
 
 
 def test_peppar_precision_none_without_products(tmp_path, monkeypatch):
