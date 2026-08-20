@@ -113,6 +113,15 @@ def test_caption_stage5_full_when_overlap_present():
     assert "NRCB2" in cap and "shares no sky with NRCA" in cap
 
 
+def test_caption_stage5_surfaces_cutout_footprint_mismatch():
+    base = dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1, intermodule_rms=6.2, n_overlap=137)
+    # no drizzled mosaic covers the overlap zone -> the caption says so, not the normal cutout blurb
+    cap = D.caption_for(5, dict(base, cutout_footprint_mismatch=True))
+    assert "disjoint footprints" in cap and "one round PSF" not in cap
+    # normal case keeps the cutout description
+    assert "one round PSF" in D.caption_for(5, dict(base, cutout_footprint_mismatch=False))
+
+
 def test_caption_stage5_overlap_without_hi_sn_panel():
     # overlap present but no S/N>10 panel (field lacks flux errors) -> no S/N promise; the all-stars
     # panel is TOP-RIGHT (2-column top row), and the footprint is its own full-width row below
@@ -179,6 +188,25 @@ def test_caption_anchors_exist_in_docs():
         cap = D.caption_for(n, m)
         for anc in re.findall(r"qa_methods\.md#([A-Za-z0-9\-]+)", cap):
             assert anc in ids, f"stage {n} caption links #{anc} but no <a id> exists in the doc"
+
+
+def test_recentroid_com_snaps_to_offset_star():
+    # a star ~3 px from the catalog position (a stale catalogue vs a re-tied mosaic) must be
+    # recovered so the aperture lands on it, not on blank sky (issue #38 stage 9).
+    ny = nx = 41
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    cx0, cy0 = 25.0, 18.0                                   # true star centre
+    img = 100.0 * np.exp(-(((xx - cx0) ** 2 + (yy - cy0) ** 2) / (2 * 1.5 ** 2))) + 1.0
+    xn, yn, moved = D._recentroid_com(img, np.array([22.0]), np.array([16.0]), box=11)
+    assert abs(xn[0] - cx0) < 0.5 and abs(yn[0] - cy0) < 0.5   # snapped onto the star
+    assert moved[0] > 2.0                                   # and it reports the shift it made
+
+
+def test_recentroid_com_keeps_edge_star_put():
+    # a catalog position whose stamp runs off the image keeps its original position (moved = 0)
+    img = np.ones((41, 41)) + 0.0
+    xn, yn, moved = D._recentroid_com(img, np.array([2.0]), np.array([2.0]), box=11)
+    assert xn[0] == 2.0 and yn[0] == 2.0 and moved[0] == 0.0
 
 
 def test_caption_stage9_psf_vs_aper():
@@ -842,6 +870,39 @@ def _write_i2d(path, ny=8, nx=16):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     hdu = fits.ImageHDU(data=np.ones((ny, nx), "float32"), name="SCI")
     fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+
+def _write_i2d_wcs(path, ra0, dec0, npix=100, scale_arcsec=0.03):
+    from astropy.io import fits
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    hdr = fits.Header()
+    hdr["NAXIS"] = 2; hdr["NAXIS1"] = npix; hdr["NAXIS2"] = npix
+    hdr["CTYPE1"] = "RA---TAN"; hdr["CTYPE2"] = "DEC--TAN"
+    hdr["CRPIX1"] = npix / 2; hdr["CRPIX2"] = npix / 2
+    hdr["CRVAL1"] = ra0; hdr["CRVAL2"] = dec0
+    hdr["CD1_1"] = -scale_arcsec / 3600.0; hdr["CD2_2"] = scale_arcsec / 3600.0
+    hdr["CD1_2"] = 0.0; hdr["CD2_1"] = 0.0
+    hdu = fits.ImageHDU(data=np.ones((npix, npix), "float32"), header=hdr, name="SCI")
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+
+def test_mosaic_covering_picks_the_tile_that_contains_the_positions(tmp_path, monkeypatch):
+    # two -merged tiles on DISJOINT sky (cloudef o005: the tile the 'prefer merged' rule picks does
+    # NOT contain the overlap stars).  _mosaic_covering must return the one that actually covers them.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "cloudef" / "F162M" / "pipeline"
+    _write_i2d_wcs(str(d / "jw02092-o005_t001_nircam_clear-f162m-merged_i2d.fits"),
+                   ra0=266.45, dec0=-28.50, npix=1000)
+    _write_i2d_wcs(str(d / "jw02092-o005_t001_nircam_clear-f162m-nrca_i2d.fits"),
+                   ra0=266.66, dec0=-28.51, npix=1000)
+    o = Observation(program="2092", obs="005", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F162M"], visits=[], epoch="", notes="")
+    ra = np.array([266.6600, 266.6603, 266.6597]); dec = np.array([-28.5100, -28.5103, -28.5097])
+    p, n = D._mosaic_covering(o, "F162M", ra, dec)
+    assert p is not None and p.endswith("-nrca_i2d.fits") and n == 3      # the covering tile, not merged
+    # positions on NEITHER tile -> (None, 0)
+    p2, n2 = D._mosaic_covering(o, "F162M", np.array([10.0]), np.array([10.0]))
+    assert p2 is None and n2 == 0
 
 
 def test_stage1_falls_back_to_mast_i2d_never_blank(tmp_path, monkeypatch):
