@@ -219,16 +219,11 @@ __marimo__/
 
 # runtime QA artifacts (generated on the cluster, not committed)
 data_qa/metrics/
-# Ad-hoc astrometry/QA probe scripts must never be committed (PR #101 review):
-/*probe.py
-/*dbg*.py
-/mnn.py
-/capsweep.py
-/brightvet.py
-/brighttight.py
-/cellmast.py
-/usepipe.py
-/valwrap.py
-/xctry.py
-/mastfoot.py
+# Ad-hoc astrometry/QA probe & debug scripts must never be committed.  Ignore EVERY root-level
+# .py by construction (a by-name list kept missing the next batch -- PR #101/#102 review), and
+# whitelist the few that legitimately live at the repo root.  The package code is under data_qa/,
+# unaffected by this root-only rule; add a `!`-exception here if a real root-level script appears.
+/*.py
+!/setup.py
+!/conftest.py
 /scratch/
