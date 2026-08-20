@@ -41,6 +41,16 @@ import numpy as np
 from . import astrometry_audit as aa
 from .observations import Observation, registry
 
+# The sanctioned, validated GC offset estimator: offset-histogram stacking with window sweep +
+# contrast gate + window-edge-alias rejection (memory: dataqa-astrometry-offset-method).  A light,
+# import-clean module of jwst_gc_pipeline (no jwst/crds/stpipe pulled -- verified).  Reused rather
+# than re-implemented so data-qa measures offsets the same way the pipeline does.  Graceful None if
+# the package is absent so the rest of data-qa still imports; callers fall back to aa.xcorr.
+try:
+    from jwst_gc_pipeline.photometry.astrometry_offsets import measure_offset as _pipe_measure_offset
+except ImportError:
+    _pipe_measure_offset = None
+
 BASE = os.environ.get("QA_BASE", "/orange/adamginsburg/jwst")
 OUTDIR = os.environ.get("QA_OUTDIR", "/tmp/data_qa_figures")
 
@@ -1389,6 +1399,88 @@ def _add_marginals(ax, x, y, color="#4477aa", bins=40, weights=None):
 _BULK_DISAGREE_MAX = 50.0
 
 
+def _mast_catalog_positions(o: Observation, filt):
+    """(SkyCoord, flux) from the MAST-delivered STScI L3 source catalogue (``*_<filt>_cat.ecsv`` or
+    ``.fits``), the pipeline-independent reference.  Handles the pupil-filter naming (F162M ships as
+    ``f150w2-f162m``) and any tile token (t001/t002).  None if not on disk (download separately)."""
+    import astropy.units as u
+    from astropy.table import Table
+    from astropy.coordinates import SkyCoord
+    if not filt:
+        return None
+    fl = filt.lower()
+    hits = []
+    for ext in ("ecsv", "fits"):
+        # TARGETED patterns (NOT a recursive ``**`` walk of the whole mastDownload tree, which is
+        # enormous and made stage 4 hang): the MAST L3 catalogue sits one product-dir deep.
+        pats = (f"{BASE}/{o.field}/mastDownload/JWST/{o.obsid}_t*_nircam_*{fl}*/"
+                f"{o.obsid}_t*_nircam_*{fl}*_cat.{ext}",
+                f"{BASE}/{o.field}/MAST_FITS/{o.obsid}_t*_nircam_*{fl}*_cat.{ext}")
+        for pat in pats:
+            hits += [p for p in glob.glob(pat)
+                     if not any(s in os.path.basename(p).lower()
+                                for s in ("nrca", "nrcb", "destreak", "segm"))]
+        if hits:
+            break
+    if not hits:
+        return None
+    try:
+        t = Table.read(sorted(hits)[-1])
+    except (OSError, ValueError):
+        return None
+    if "sky_centroid" in t.colnames:
+        sc = SkyCoord(t["sky_centroid"])
+    elif "sky_centroid.ra" in t.colnames:
+        sc = SkyCoord(np.asarray(t["sky_centroid.ra"], float) * u.deg,
+                      np.asarray(t["sky_centroid.dec"], float) * u.deg)
+    else:
+        return None
+    fcol = next((c for c in ("aper_total_flux", "aper70_flux", "aper50_flux", "aper30_flux")
+                 if c in t.colnames), None)
+    flux = np.asarray(t[fcol], float) if fcol else np.ones(len(sc))
+    g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)
+    return (sc[g], flux[g]) if int(g.sum()) >= 50 else None
+
+
+def _crossmatch_offset(jsc, ref_sc, restrict_footprint=False):
+    """Bulk JWST−VIRAC offset via the pipeline's validated histogram-stacking `measure_offset`
+    (sweep + contrast + edge-alias rejection).  Falls back to `aa.xcorr` when the pipeline is not
+    installed.  When ``restrict_footprint``, VIRAC is cropped to the JWST footprint first (a small
+    single-tile MAST catalogue against the full VIRAC tile otherwise aliases on the footprint-slide
+    ridge).  Returns dict(off, dra, dde, contrast, ok, edge, n, source) or None.  Sign convention:
+    (JWST − VIRAC), matching stage 4's per-cell offsets."""
+    if jsc is None or ref_sc is None or len(jsc) < 50:
+        return None
+    ref = ref_sc
+    if restrict_footprint:
+        mrg = 2.0 / 3600.0
+        ra, dec = jsc.ra.deg, jsc.dec.deg
+        box = ((ref_sc.ra.deg >= ra.min() - mrg) & (ref_sc.ra.deg <= ra.max() + mrg) &
+               (ref_sc.dec.deg >= dec.min() - mrg) & (ref_sc.dec.deg <= dec.max() + mrg))
+        ref = ref_sc[box]
+        if len(ref) < 50:
+            return None
+    if _pipe_measure_offset is not None:
+        import astropy.units as u
+        r = _pipe_measure_offset(jsc, ref, confirm_windows=True)   # (JWST − VIRAC) at the peak
+        if r is None:
+            return None
+        edge = float(r.get("window_edge_fraction", 0.0))
+        # a peak riding the search-window edge is a footprint-slide alias, not a tie (issue #158);
+        # treat it as not-ok even if measure_offset's own gate passed it.
+        ok = bool(r["ok"]) and edge < 0.5
+        return dict(off=float(r["off"]), dra=float(r["dra"]), dde=float(r["ddec"]),
+                    contrast=float(r["contrast"]), ok=ok, edge=edge,
+                    window=float(r["window_arcsec"]), n=int(r["npairs"]), source="measure_offset")
+    xc = aa.xcorr(jsc, ref)                                        # fallback: single-window histogram
+    if xc is None:
+        return None
+    return dict(off=float(xc["off"]), dra=float(xc["dra"]), dde=float(xc["ddec"]),
+                contrast=float(xc["peak_ratio"]), ok=bool(xc["peak_ratio"] >= aa.MIN_PEAK_RATIO),
+                edge=0.0, window=float(aa.XMAXSEP.to("arcsec").value), n=int(xc["npairs"]),
+                source="xcorr")
+
+
 def _isolated_bulk(jsc, ref_sc, iso_arcsec=0.5, match_arcsec=0.15, ambig_arcsec=0.4):
     """Bulk JWST−VIRAC offset from CLEAN matches only, as an independent check on the histogram peak:
     isolated JWST stars (nearest other JWST > ``iso_arcsec``) with an unambiguous VIRAC match (nearest
@@ -1556,6 +1648,21 @@ def stage4_offsets(o: Observation, sw):
         metrics.update(catalog_stale=True, catalog_date=cdate,
                        alignment_date=adate, stale_catalog_name=cname)
 
+    # Whole-field crossmatch offset from BOTH catalogues, via the pipeline's validated histogram-
+    # stacking (sweep + contrast + edge-alias rejection): the jicama product AND the pipeline-
+    # independent raw MAST L3 catalogue.  Shown side by side so a jicama-reduction offset the raw
+    # MAST does not share is visible, and each carries its own confidence (contrast/ok).
+    jic_x = _crossmatch_offset(jsc, ref_sc)
+    if jic_x is not None:
+        metrics.update(jicama_xoff_mas=jic_x["off"], jicama_xoff_contrast=jic_x["contrast"],
+                       jicama_xoff_ok=jic_x["ok"])
+    mastpos = _mast_catalog_positions(o, sw)
+    mast_x = _crossmatch_offset(mastpos[0], ref_sc, restrict_footprint=True) if mastpos else None
+    if mast_x is not None:
+        metrics.update(mast_xoff_mas=mast_x["off"], mast_xoff_dra=mast_x["dra"],
+                       mast_xoff_dde=mast_x["dde"], mast_xoff_contrast=mast_x["contrast"],
+                       mast_xoff_ok=mast_x["ok"], mast_xoff_n=mast_x["n"])
+
     from matplotlib.patches import Circle
     cdra = np.array([c["dra"] for c in cells]); cdde = np.array([c["dde"] for c in cells])
     cra = np.array([c["ra"] for c in cells]); cdec = np.array([c["dec"] for c in cells])
@@ -1661,13 +1768,30 @@ def stage4_offsets(o: Observation, sw):
                 a1.scatter(cdra[m], cdde[m], s=sz[m], facecolors=QCOL[q], alpha=0.55,
                            edgecolors="#e41a1c", linewidths=1.8,
                            label=f"{q} (deviating)")
-    a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2)
+    a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2, label="per-cell field offset")
+    # Whole-field crossmatch offsets (validated histogram-stacking): jicama catalogue and the raw
+    # MAST L3 catalogue.  A hollow marker = low confidence (contrast/edge failed).  When both land
+    # near each other the field is well-registered; a jicama marker far from the MAST one is a
+    # jicama-reduction offset the raw data do not share.
+    if jic_x is not None:
+        a1.plot(jic_x["dra"], jic_x["dde"], "o", mfc=("#3366cc" if jic_x["ok"] else "none"),
+                mec="#3366cc", ms=10, mew=1.6,
+                label=f"jicama xmatch {jic_x['off']:.0f} mas (C={jic_x['contrast']:.0f})")
+    if mast_x is not None:
+        a1.plot(mast_x["dra"], mast_x["dde"], "*", mfc=("#ee7733" if mast_x["ok"] else "none"),
+                mec="#ee7733", ms=15, mew=1.4,
+                label=f"raw MAST xmatch {mast_x['off']:.0f} mas (C={mast_x['contrast']:.0f})")
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
     # Frame the DATA.  A limit floored at 1.2*THRESH (=90 mas) drew a field whose cells all sit
     # inside 20 mas as a few dots lost inside a 75 mas gate circle that dominated the panel.  Zoom
     # to the cells; draw the gate ring when it is near them, and otherwise say how far outside
     # the view it falls.
     dmax = float(np.max(np.hypot(cdra, cdde))) if len(cells) else 0.0
+    # include the crossmatch markers so they are in view, but cap each at 400 mas so an edge-alias
+    # (drawn hollow) cannot blow the panel scale.
+    for _x in (jic_x, mast_x):
+        if _x is not None:
+            dmax = max(dmax, min(400.0, float(np.hypot(_x["dra"], _x["dde"]))))
     lim = max(5.0, 1.5 * dmax)
     if aa.THRESH["absolute"] <= 1.05 * lim:
         a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))

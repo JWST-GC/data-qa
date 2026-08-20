@@ -353,6 +353,35 @@ def test_isolated_bulk_recovers_known_offset():
     assert n >= 100 and abs(mdra - (-30.0)) < 3.0 and abs(mdde) < 3.0
 
 
+def test_crossmatch_offset_normalises_and_rejects_edge_alias(monkeypatch):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    a = SkyCoord(np.linspace(266.40, 266.42, 100) * u.deg, np.full(100, -28.9) * u.deg)
+    # a clean peak passes through
+    monkeypatch.setattr(D, "_pipe_measure_offset", lambda x, y, confirm_windows=True: dict(
+        off=8.0, dra=6.0, ddec=5.0, contrast=40.0, ok=True, window_edge_fraction=0.02,
+        window_arcsec=3.0, npairs=500))
+    r = D._crossmatch_offset(a, a)
+    assert r["off"] == 8.0 and r["ok"] and r["source"] == "measure_offset"
+    # a window-edge alias is forced not-ok even though the pipeline gate passed it
+    monkeypatch.setattr(D, "_pipe_measure_offset", lambda x, y, confirm_windows=True: dict(
+        off=7000.0, dra=-1000.0, ddec=-6900.0, contrast=200.0, ok=True,
+        window_edge_fraction=0.75, window_arcsec=10.0, npairs=9))
+    r2 = D._crossmatch_offset(a, a)
+    assert r2["ok"] is False and r2["edge"] == 0.75
+
+
+def test_crossmatch_offset_falls_back_to_xcorr(monkeypatch):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    monkeypatch.setattr(D, "_pipe_measure_offset", None)          # pipeline unavailable (CI path)
+    ra = 266.40 + np.arange(400) * (0.5 / 3600.0); dec = np.full(400, -28.9)
+    a = SkyCoord(ra * u.deg, dec * u.deg)
+    b = SkyCoord((ra + 30.0 / 3.6e6 / np.cos(np.radians(-28.9))) * u.deg, dec * u.deg)
+    r = D._crossmatch_offset(a, b)
+    assert r is not None and r["source"] == "xcorr" and np.isfinite(r["off"])
+
+
 def test_isolated_bulk_none_when_too_sparse():
     import astropy.units as u
     from astropy.coordinates import SkyCoord
@@ -495,6 +524,8 @@ def _stage4_seams(monkeypatch, cells, dropped, grid_used):
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
     monkeypatch.setattr(D, "_cell_offsets", lambda j, r: (cells, dropped, grid_used))
     monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: None)   # -> off_med = cell_off_med
+    monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, f: None)
     monkeypatch.setattr(D, "_save", lambda fig, name: name)
 
 
@@ -1017,6 +1048,8 @@ def _stage4_injection(monkeypatch, shift_mas):
     monkeypatch.setattr(aa, "load_reference", lambda ref, ep: (ref_sc, None))
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
+    monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: None)
     _png, metrics = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
     return metrics
 
