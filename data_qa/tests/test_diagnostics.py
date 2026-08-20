@@ -181,6 +181,25 @@ def test_caption_anchors_exist_in_docs():
             assert anc in ids, f"stage {n} caption links #{anc} but no <a id> exists in the doc"
 
 
+def test_recentroid_com_snaps_to_offset_star():
+    # a star ~3 px from the catalog position (a stale catalogue vs a re-tied mosaic) must be
+    # recovered so the aperture lands on it, not on blank sky (issue #38 stage 9).
+    ny = nx = 41
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    cx0, cy0 = 25.0, 18.0                                   # true star centre
+    img = 100.0 * np.exp(-(((xx - cx0) ** 2 + (yy - cy0) ** 2) / (2 * 1.5 ** 2))) + 1.0
+    xn, yn, moved = D._recentroid_com(img, np.array([22.0]), np.array([16.0]), box=11)
+    assert abs(xn[0] - cx0) < 0.5 and abs(yn[0] - cy0) < 0.5   # snapped onto the star
+    assert moved[0] > 2.0                                   # and it reports the shift it made
+
+
+def test_recentroid_com_keeps_edge_star_put():
+    # a catalog position whose stamp runs off the image keeps its original position (moved = 0)
+    img = np.ones((41, 41)) + 0.0
+    xn, yn, moved = D._recentroid_com(img, np.array([2.0]), np.array([2.0]), box=11)
+    assert xn[0] == 2.0 and yn[0] == 2.0 and moved[0] == 0.0
+
+
 def test_caption_stage9_psf_vs_aper():
     cap = D.caption_for(9, dict(stage=9, n_isolated=19812, aper_corr_med=0.45,
                                 aper_psf_scatter=0.073, frac_gt_0p3mag=0.01))

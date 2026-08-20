@@ -2402,6 +2402,36 @@ def _psf_flux_positions(o, filt):
     return (sc[g], flux[g], name) if int(g.sum()) >= 50 else (None, None, None)
 
 
+def _recentroid_com(data, x, y, box=11):
+    """Snap each (x, y) to the local intensity centroid within a ``box``x``box`` stamp (background
+    removed as the stamp minimum).  The catalog positions can sit several pixels off the star on the
+    mosaic when the catalog and the mosaic are on DIFFERENT frames (a stale catalogue vs a re-tied
+    mosaic: cloudef's ~150 mas ~= 5 px), which would place a small aperture on blank sky.  Recentring
+    within a box larger than the plausible shift but smaller than the isolation radius puts the
+    aperture back on the star.  Returns (x_new, y_new, moved_px) with the per-star shift; stars whose
+    stamp runs off the image or has no positive flux keep their original position (moved = 0)."""
+    half = box // 2
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    xn, yn = x.copy(), y.copy()
+    ny, nx = data.shape
+    xi = np.round(x).astype(int); yi = np.round(y).astype(int)
+    ok = (xi - half >= 0) & (xi + half < nx) & (yi - half >= 0) & (yi + half < ny)
+    if ok.any():
+        oy, ox = np.mgrid[-half:half + 1, -half:half + 1]
+        stamps = data[yi[ok, None, None] + oy[None], xi[ok, None, None] + ox[None]]
+        stamps = np.where(np.isfinite(stamps), stamps, 0.0).astype(float)
+        stamps = stamps - stamps.min(axis=(1, 2), keepdims=True)
+        w = stamps.sum(axis=(1, 2))
+        wpos = w > 0
+        cx = np.zeros(int(ok.sum())); cy = np.zeros(int(ok.sum()))
+        cx[wpos] = (stamps * ox[None]).sum(axis=(1, 2))[wpos] / w[wpos]
+        cy[wpos] = (stamps * oy[None]).sum(axis=(1, 2))[wpos] / w[wpos]
+        xn[ok] = np.where(wpos, xi[ok] + cx, x[ok])
+        yn[ok] = np.where(wpos, yi[ok] + cy, y[ok])
+    moved = np.hypot(xn - x, yn - y)
+    return xn, yn, moved
+
+
 def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px=12.0, maxn=20000):
     """PSF vs aperture photometry check.  The jicama catalog reports PSF-fit fluxes; here we
     RE-MEASURE simple aperture photometry (local-annulus background) on the mosaic at the catalog
@@ -2451,7 +2481,16 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     idx = np.where(keep)[0]
     if idx.size > maxn:                         # cap cost: brightest maxn isolated stars
         idx = idx[np.argsort(psf_flux[idx])[::-1][:maxn]]
-    pos = np.c_[x[idx], y[idx]]
+    # Snap to the star on the MOSAIC before measuring: the catalog can be on a different frame than
+    # the mosaic (stale catalogue vs re-tied mosaic), which would otherwise put the aperture on blank
+    # sky and manufacture a huge, scattered aperture-minus-PSF "offset" (cloudef o005).  The box
+    # (11 px) exceeds a plausible frame shift yet stays inside the isolation radius, so it cannot snap
+    # to a neighbour.  The median shift is itself a catalog-vs-mosaic registration diagnostic.
+    xr, yr, moved = _recentroid_com(data, x[idx], y[idx], box=11)
+    med_shift = float(np.median(moved)) if len(moved) else 0.0
+    metrics["recentroid_shift_px_med"] = med_shift
+    metrics["catalog_mosaic_mismatch"] = bool(med_shift > 2.0)   # ~half the F162M PSF FWHM
+    pos = np.c_[xr, yr]
     ap = CircularAperture(pos, r=r_ap)
     ann = CircularAnnulus(pos, r_in=r_in, r_out=r_out)
     # ApertureStats is NaN-aware -- feed it the RAW data so a coverage-gap NaN in the annulus is
@@ -2802,9 +2841,23 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     # MAST per-i2d _cat.fits when no release/merged catalogue exists yet -- in that case the
     # "pipeline" side is NOT actually the jicama product, so label it as such (else the panel
     # silently becomes MAST-vs-MAST).
-    jsc, jmag, jsrc = _jwst_sources(o, sw)
+    # Use the INSTRUMENTAL magnitude from flux_<filt>, which is populated for the FULL catalogue, so
+    # the depth histogram reaches the catalogue's real faint limit.  mag_vega_<filt> (what
+    # _jwst_sources returns) is filled only for the bright stars that cross-matched to VIRAC for the
+    # zeropoint (~1700 for cloudef), which truncated this histogram at ~16.5 mag instead of ~24 and
+    # made the pipeline product look orders of magnitude shallower than it is (issue #38).  Fall back
+    # to _jwst_sources only when no flux catalogue exists (then it is the MAST per-i2d cat, labelled).
+    jsc, jflux, jname = _psf_flux_positions(o, sw)
+    if jsc is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            jmag = -2.5 * np.log10(jflux)
+        fin = np.isfinite(jmag)
+        jsc, jmag = jsc[fin], jmag[fin]
+        jsrc = f"release:{jname}"; jic_is_release = True
+    else:
+        jsc, jmag, jsrc = _jwst_sources(o, sw)
+        jic_is_release = str(jsrc).startswith("release")
     metrics["jicama_source"] = jsrc
-    jic_is_release = str(jsrc).startswith("release")
     metrics["jicama_is_release"] = bool(jic_is_release)
     jic_label = "jicama catalogue" if jic_is_release else "pipeline (no merged catalogue yet)"
     if jsc is not None:
@@ -2819,10 +2872,24 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     except (OSError, ValueError, KeyError):
         mwcs = None; mny = mnx = 0
     crop = min(5000, mny, mnx) if mwcs is not None else 0
-    cen = mwcs.pixel_to_world(mnx / 2, mny / 2) if mwcs is not None else None
+    cx, cy = (mnx / 2.0, mny / 2.0)
+    # Center the common window where the PIPELINE catalogue actually has sources, not on the
+    # geometric centre of the MAST single-visit i2d.  The MAST i2d is one visit's wide strip; its
+    # centre can fall in a shallow-coverage edge of the deep merged mosaic, so a centred crop shows
+    # the pipeline as nearly empty while MAST re-detects thousands there (cloudef o005: 0 vs ~1e5).
+    # Use the jicama median position, clipped so the crop stays inside the MAST frame.
+    if mwcs is not None and jsc is not None and crop > 0:
+        try:
+            jx, jy = mwcs.world_to_pixel(jsc)
+            infoot = np.isfinite(jx) & np.isfinite(jy) & (jx > 0) & (jx < mnx) & (jy > 0) & (jy < mny)
+            if int(infoot.sum()) >= 100:
+                cx = float(np.clip(np.median(jx[infoot]), crop / 2, mnx - crop / 2))
+                cy = float(np.clip(np.median(jy[infoot]), crop / 2, mny - crop / 2))
+        except (ValueError, IndexError):
+            pass
+    cen = mwcs.pixel_to_world(cx, cy) if mwcs is not None else None
     if mwcs is not None:
-        cw = mwcs.pixel_to_world([mnx / 2 - crop / 2, mnx / 2 + crop / 2],
-                                 [mny / 2 - crop / 2, mny / 2 + crop / 2])
+        cw = mwcs.pixel_to_world([cx - crop / 2, cx + crop / 2], [cy - crop / 2, cy + crop / 2])
         ra_lo, ra_hi = sorted(cw.ra.deg); de_lo, de_hi = sorted(cw.dec.deg)
 
         def _inbox(sc):
