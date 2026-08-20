@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -59,6 +60,58 @@ PM_ERR_FLOOR = 2.0
 # A module with more than this fraction of NaN daophot centroids is an astrometry DEFECT to
 # surface, not a few diverged fits to silently drop (real fields sit at ~0.01%).
 _NAN_FRAC_FLAG = 0.05
+
+
+# --------------------------------------------------------------------------- input provenance
+# Every stage records the FULL PATH of each file it reads, so the posted comment and the metrics
+# JSON both say exactly which data produced the numbers.  A stage that quietly read a stale
+# generation, a different observation's catalog, or the wrong module used to be indistinguishable
+# from one that read the right thing.
+#
+# ``_used`` is called at the point of the READ, not where a path is resolved.  Those differ: the
+# catalog pickers header-peek every candidate before choosing one, ``_mosaic_path`` is called for
+# filters whose panel is then skipped, and several resolvers return a path that a later existence
+# check rejects.  Recording at resolve time would list files the analysis never opened, which is
+# the failure this exists to prevent.
+_INPUTS = []
+
+
+@contextlib.contextmanager
+def _recording_inputs():
+    """Collect the files read inside the block, as a list of ``(role, absolute path)`` in read
+    order.  Restores the previous collector on exit, so a nested build cannot lose the outer
+    stage's record."""
+    global _INPUTS
+    prev = _INPUTS
+    _INPUTS = []
+    try:
+        yield _INPUTS
+    finally:
+        _INPUTS = prev
+
+
+def _used(path, role):
+    """Record ``path`` as a file this stage read, and return it unchanged so it can wrap the read:
+
+        with fits.open(_used(p, "SW mosaic")) as hdul:
+
+    Absolutised, de-duplicated, and skipped when the path is falsy or absent from disk.  Recording
+    a file that was never opened would be a false provenance claim, which is worse than none."""
+    if not path:
+        return path
+    ap = os.path.abspath(path)
+    if os.path.exists(ap) and (role, ap) not in _INPUTS:
+        _INPUTS.append((role, ap))
+    return path
+
+
+def _used_many(paths, role):
+    """``_used`` over an iterable, returning the list unchanged -- for the ``vstack`` reads that
+    pool hundreds of per-exposure catalogs."""
+    paths = list(paths)
+    for p in paths:
+        _used(p, role)
+    return paths
 
 
 def _channel(filt):
@@ -312,7 +365,7 @@ def _vega_zeropoint(o: Observation, filt, sc, instr):
     cat, magcol, sccol = _catalog_with_vega(o, filt)
     if not cat:
         return None
-    m = Table.read(cat)
+    m = Table.read(_used(cat, f"Vega zeropoint catalogue ({filt})"))
     if sccol not in m.colnames or magcol not in m.colnames:
         return None
     vg = np.asarray(m[magcol], float)
@@ -357,7 +410,7 @@ def _jwst_sources(o: Observation, filt, position_valid=False):
     # 1) release merged catalog
     cat, magcol, sccol = _catalog_with_vega(o, filt)
     if cat:
-        m = Table.read(cat)
+        m = Table.read(_used(cat, f"JWST catalogue, release merged ({filt})"))
         if sccol in m.colnames and magcol in m.colnames:
             sc = m[sccol]
             mag = np.asarray(m[magcol], float)
@@ -371,7 +424,7 @@ def _jwst_sources(o: Observation, filt, position_valid=False):
     # 2) MAST-delivered per-i2d source catalog
     mp = _mast_source_catalog(o, filt)
     if mp:
-        m = Table.read(mp)
+        m = Table.read(_used(mp, f"JWST catalogue, MAST per-i2d ({filt})"))
         magc = next((c for c in ("aper_total_abmag", "aper50_abmag", "aper70_abmag",
                                  "aper30_abmag") if c in m.colnames), None)
         if "sky_centroid" in m.colnames and magc:
@@ -465,7 +518,7 @@ def _jwst_positions(o: Observation, filt):
         return sc, src
     dp = _dao_position_catalog(o, filt)
     if dp:
-        m = Table.read(dp)
+        m = Table.read(_used(dp, f"JWST positions, per-filter DAO ({filt})"))
         if "skycoord" in m.colnames:
             sc = _finite_sc(m["skycoord"])
             if len(sc) >= 30:
@@ -592,7 +645,7 @@ def _virac_with_errors(o: Observation, epoch):
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     from astropy.table import Table
-    t = Table.read(p)
+    t = Table.read(_used(p, "VIRAC2 refcache (per-star errors)"))
     need = {"RAJ2000", "DEJ2000", "e_RAJ2000", "e_DEJ2000", "pmRA", "pmDE"}
     if not need.issubset(set(t.colnames)):
         return None
@@ -626,11 +679,11 @@ def _fig(nrows=1, ncols=1, w=5.0, h=5.0):
     return plt.subplots(nrows, ncols, figsize=(w * ncols, h * nrows), squeeze=False)
 
 
-def _grayscale(ax, path, title):
+def _grayscale(ax, path, title, role="mosaic (displayed)"):
     from astropy.io import fits
     from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
     from astropy.wcs import WCS
-    with fits.open(path) as hdul:
+    with fits.open(_used(path, role)) as hdul:
         sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
         data = sci.data.astype("float32")
     norm = ImageNormalize(data, interval=ZScaleInterval(), stretch=AsinhStretch())
@@ -706,7 +759,8 @@ def stage1_mosaics(o: Observation, sw, lw):
         p, src = _panel_image(filt)
         asp = 0.45
         if p:
-            with fits.open(p) as h:
+            kind = "reduced mosaic" if src == "reduced" else "MAST i2d"
+            with fits.open(_used(p, f"{filt} {kind}")) as h:
                 s = h["SCI"] if "SCI" in h else h[1]
                 ny, nx = s.data.shape
                 asp = ny / nx if nx else 0.45
@@ -728,10 +782,11 @@ def stage1_mosaics(o: Observation, sw, lw):
             if mod:
                 modules[filt] = mod
             title = f"{o.obsid}  {filt}" + (f"  [{mod} only]" if mod else "")
-            fracs[filt] = _grayscale(a, p, title)
+            fracs[filt] = _grayscale(a, p, title, role=f"{filt} reduced mosaic")
         elif p:                                    # MAST-delivered i2d fallback (not yet reduced)
             mast_shown.append(filt)
-            fracs[filt] = _grayscale(a, p, f"{o.obsid}  {filt}  [MAST i2d — not yet pipeline-reduced]")
+            fracs[filt] = _grayscale(a, p, f"{o.obsid}  {filt}  [MAST i2d — not yet pipeline-reduced]",
+                                     role=f"{filt} MAST i2d")
         else:
             a.text(0.5, 0.5, f"{filt}\n(no i2d on disk)", ha="center", va="center")
             a.set_xticks([]); a.set_yticks([])
@@ -814,7 +869,7 @@ def stage2_cmd(o: Observation, sw, lw):
                                f"The CMD is empty: {reason}.")
         metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
         return png, metrics
-    t = Table.read(cat)
+    t = Table.read(_used(cat, f"CMD catalogue ({kind})"))
 
     # LF-only fallback ONLY for a genuine single-channel obs (no LW filter at all).  If lw is
     # None but the obs DOES carry an LW-channel filter, that is a PREF-gap / missing-mosaic
@@ -913,7 +968,8 @@ def stage3_calibration(o: Observation, sw):
     path = _mosaic_path(o, sw)
     ref = _viraccache_path(o) or _refcat_path(o)   # cache has real Ksmag
     ep = _obs_epoch(o, path)
-    ref_sc, ref_mag = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+    ref_sc, ref_mag = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
+                       if (ref and ep) else (None, None))
     # Read the JWST catalog (release -> MAST) -- do NOT re-detect on the mosaic.
     jsc, jmag, src = _jwst_sources(o, sw)
     metrics["source"] = src
@@ -1029,7 +1085,7 @@ def _pooled_daophot(o: Observation, filt, max_files=64):
     tabs = []
     for c in cats:
         try:
-            t = Table.read(c)
+            t = Table.read(_used(c, f"per-exposure daophot ({filt})"))
         except (OSError, ValueError):
             continue
         if need.issubset(set(t.colnames)):
@@ -1360,7 +1416,8 @@ def stage4_offsets(o: Observation, sw):
     path = _mosaic_path(o, sw)
     ref = _refcat_path(o)
     ep = _obs_epoch(o, path)
-    ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+    ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
+                 if (ref and ep) else (None, None))
     # Positions come from the catalog (release -> MAST -> per-filter DAO).  Stage 4 needs only
     # positions, so an obs that has been detected but not yet merged (gc2211 o046) falls back to
     # its per-filter DAO catalog and is still measurable.
@@ -1606,7 +1663,9 @@ def _per_detector_offsets(o, filt, ref_sc):
         if not cats:
             continue
         try:
-            T = vstack([Table.read(c) for c in cats], metadata_conflicts='silent')
+            T = vstack([Table.read(c) for c in
+                        _used_many(cats, f"per-detector daophot, {d} ({filt})")],
+                       metadata_conflicts='silent')
         except (OSError, ValueError):
             continue
         if "skycoord_centroid" not in T.colnames:
@@ -1671,7 +1730,9 @@ def _module_positions(o, filt):
         if not cats:
             return None, dict(present=False, n_raw=0, n_nan=0, nan_frac=0.0, dead=False)
         try:
-            T = vstack([Table.read(c) for c in cats], metadata_conflicts="silent")
+            T = vstack([Table.read(c) for c in
+                        _used_many(cats, f"per-detector daophot, module positions ({filt})")],
+                       metadata_conflicts="silent")
         except (OSError, ValueError):
             return None, dict(present=True, n_raw=0, n_nan=0, nan_frac=0.0, dead=True)
         if "skycoord_centroid" not in T.colnames:
@@ -1802,7 +1863,7 @@ def _module_hi_sn(o, filt, snmin=10.0):
         tabs = []
         for c in cats:
             try:
-                t = Table.read(c)
+                t = Table.read(_used(c, f"per-detector daophot, S/N cut ({filt})"))
             except (OSError, ValueError):
                 continue
             if {"skycoord_centroid", "flux_fit", "flux_err"}.issubset(set(t.colnames)):
@@ -1835,8 +1896,9 @@ def stage5_intermodule(o: Observation, sw):
     metrics = dict(stage=5, filt=filt)
     ref = _viraccache_path(o) or _refcat_path(o)
     mpath = _cutout_mosaic(o, filt)                       # full mosaic for the cutout gallery
-    ep = aa.epoch_of(mpath) if mpath else None
-    ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+    ep = aa.epoch_of(_used(mpath, f"{filt} mosaic (cutout gallery)")) if mpath else None
+    ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
+                 if (ref and ep) else (None, None))
 
     # (2) A vs B overlap from the per-detector cats (primary source), using no external catalog.
     # The bulk A-B offset is the peak of the pair-separation histogram (aa.xcorr).  A direct
@@ -1972,7 +2034,7 @@ def stage5_intermodule(o: Observation, sw):
         # (3) doubled-star cutout gallery from the merged mosaic at overlap-star positions
         ncut = 6
         if mpath and os.path.exists(mpath):
-            with fits.open(mpath) as hdul:
+            with fits.open(_used(mpath, f"{filt} mosaic (cutout gallery)")) as hdul:
                 sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
                 data = sci.data.astype("float32"); w = WCS(sci.header)
             from astropy.coordinates import SkyCoord
@@ -2072,7 +2134,7 @@ def _psf_flux_positions(o, filt):
     if best_path is None:
         return None, None, None
     try:
-        t = Table.read(best_path)
+        t = Table.read(_used(best_path, f"PSF-flux catalogue ({filt})"))
     except (OSError, ValueError):
         return None, None, None
     sc = t[sccol]; flux = np.asarray(t[fcol], float); name = os.path.basename(best_path)
@@ -2105,7 +2167,7 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
         return png, metrics
     metrics["catalog"] = src
     try:
-        with fits.open(mpath) as h:
+        with fits.open(_used(mpath, f"{sw} mosaic (aperture photometry)")) as h:
             sci = h["SCI"] if "SCI" in h else h[1]
             data = sci.data.astype("float32"); w = WCS(sci.header)
     except (OSError, ValueError, KeyError):
@@ -2238,7 +2300,7 @@ def _detect_on_mosaic(path, crop=5000, fwhm_pix=2.5, nsigma=5.0, maxn=500000):
     from photutils.detection import DAOStarFinder
     from astropy.stats import SigmaClip
     try:
-        with fits.open(path) as hdul:
+        with fits.open(_used(path, "MAST i2d (DAOStarFinder fallback detection)")) as hdul:
             sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
             data = sci.data.astype("float32"); w = WCS(sci.header)
     except (OSError, ValueError, KeyError):
@@ -2345,7 +2407,7 @@ def _load_mast_catalog(path):
     from astropy.coordinates import SkyCoord
     import astropy.units as u
     try:
-        t = Table.read(path)
+        t = Table.read(_used(path, "MAST L3 source catalogue"))
     except (OSError, ValueError):
         return None, None
     if "sky_centroid" in t.colnames:
@@ -2491,7 +2553,7 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     # display + count window: central crop of the MAST i2d (so both image panels show the SAME sky,
     # and the source-count comparison is over one common region, not full-field vs a crop).
     try:
-        with fits.open(mast_path) as h:
+        with fits.open(_used(mast_path, f"{sw} MAST i2d (before panel)")) as h:
             mh = (h["SCI"] if "SCI" in h else h[1]).header
         mwcs = WCS(mh); mny, mnx = int(mh["NAXIS2"]), int(mh["NAXIS1"])
     except (OSError, ValueError, KeyError):
@@ -2513,7 +2575,8 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     # VIRAC reference (PM-propagated) for the crowding-robust bulk-offset comparison
     ref = _viraccache_path(o) or _refcat_path(o)
     ep = aa.epoch_of(mast_path) if mast_path else None
-    ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+    ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
+                 if (ref and ep) else (None, None))
     mast_off = _offset_cloud(mast_sc, ref_sc) if mast_sc is not None else None
     jic_off = _offset_cloud(jsc, ref_sc) if jsc is not None else None
     if mast_off is not None:
@@ -2525,9 +2588,9 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     fig = plt.figure(figsize=(12.5, 10.8))
     gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 0.95], hspace=0.3, wspace=0.28)
 
-    def _show(ax, path, title):
+    def _show(ax, path, title, role="mosaic (displayed)"):
         try:
-            with fits.open(path) as hdul:
+            with fits.open(_used(path, role)) as hdul:
                 sci = hdul["SCI"] if "SCI" in hdul else hdul[1]
                 d = sci.data.astype("float32"); wv = WCS(sci.header)
         except (OSError, ValueError, KeyError):
@@ -2542,10 +2605,11 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
         ax.imshow(d, origin="lower", cmap="gray", norm=norm)
         ax.set_xticks([]); ax.set_yticks([]); ax.set_title(title, fontsize=10)
 
-    ax_m = fig.add_subplot(gs[0, 0]); _show(ax_m, mast_path, f"MAST L3 i2d — {sw} (before)")
+    ax_m = fig.add_subplot(gs[0, 0])
+    _show(ax_m, mast_path, f"MAST L3 i2d — {sw} (before)", role=f"{sw} MAST i2d (before panel)")
     ax_o = fig.add_subplot(gs[0, 1])
     if our_path:
-        _show(ax_o, our_path, f"pipeline i2d — {sw} (after)")
+        _show(ax_o, our_path, f"pipeline i2d — {sw} (after)", role=f"{sw} pipeline mosaic (after panel)")
     else:
         ax_o.text(0.5, 0.5, "no pipeline mosaic yet", ha="center", va="center"); ax_o.axis("off")
 
@@ -2714,7 +2778,7 @@ def _interfilter_residuals(o, f1):
         m = re.search(r"f(\d{3})", name); return int(m.group(1)) if m else 9999
     f2 = min(others, key=lambda c: abs(_wl(c) - _wl(f1.lower())))
     try:
-        t = Table.read(p)
+        t = Table.read(_used(p, f"cross-band catalogue ({f1} + {f2})"))
     except (OSError, ValueError):
         return None
     sc1 = t[sc1col]; sc2 = t[f"skycoord_{f2}"]
@@ -2951,7 +3015,7 @@ def _saturation_mask(o):
         fracs = []      # (frac, mask, name) per readable frame of this product type
         for p in sorted(glob.glob(pat, recursive=True)):
             try:
-                with fits.open(p) as h:
+                with fits.open(_used(p, f"MIRI {kind.lstrip('_')} frame (DQ)")) as h:
                     if "DQ" not in h:
                         continue
                     dq = h["DQ"].data
@@ -2994,7 +3058,7 @@ def miri_overview(o: Observation, filt=None):
         metrics.update(red_flag=True, red_flag_reason="no MIRI i2d on disk", passed=False)
         return png, metrics
 
-    with fits.open(mpath) as h:
+    with fits.open(_used(mpath, f"MIRI {filt} mosaic")) as h:
         sci = h["SCI"] if "SCI" in h else h[1]
         mdata = sci.data.astype("float32"); mwcs = WCS(sci.header)
     spz = _spitzer_for_miri(filt)
@@ -3020,7 +3084,7 @@ def miri_overview(o: Observation, filt=None):
         lbl, spath = spz
         a1 = ax[0][col]; col += 1
         try:
-            with fits.open(spath) as h:
+            with fits.open(_used(spath, "Spitzer comparison image")) as h:
                 hd = h[0] if h[0].data is not None else h[1]
                 sd = hd.data.astype("float32"); swcs = WCS(hd.header)
             cen = mwcs.pixel_to_world(mdata.shape[1] / 2, mdata.shape[0] / 2)
@@ -3107,7 +3171,7 @@ def _internal_pos_rms(o, filt):
     if best is None:
         return None
     try:
-        t = Table.read(best)
+        t = Table.read(_used(best, f"merged catalogue, per-star position scatter ({filt})"))
     except (OSError, ValueError):
         return None
     ra_std = np.asarray(t[sr], float); de_std = np.asarray(t[sd], float)
@@ -3172,7 +3236,8 @@ def stage6_astrom_error(o: Observation, sw, lw):
         import astropy.units as u
         ref = _viraccache_path(o) or _refcat_path(o)
         ep = _obs_epoch(o, _mosaic_path(o, filt))
-        ref_sc, _ = aa.load_reference(ref, ep) if (ref and ep) else (None, None)
+        ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
+                     if (ref and ep) else (None, None))
         if ref_sc is not None:
             idx, sep, _ = ref_sc.match_to_catalog_sky(_sc)      # anchor on sparse VIRAC
             keep = (sep < 0.15 * u.arcsec).nonzero()[0]
@@ -3221,7 +3286,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
     return _save(fig, f"{o.obsid}_stage6.png"), metrics
 
 
-def build_stage(o, n, sw, lw):
+def _dispatch_stage(o, n, sw, lw):
     if n == 1:
         return stage1_mosaics(o, sw, lw)
     if n == 2:
@@ -3241,6 +3306,28 @@ def build_stage(o, n, sw, lw):
     if n == 9:
         return stage9_psf_vs_aper(o, sw)
     raise ValueError(n)
+
+
+def build_stage(o, n, sw, lw):
+    """Build stage ``n`` and attach the full path of every file it read as ``metrics['inputs']``.
+
+    The single choke point for all nine stages, so no stage can be added without its provenance
+    coming with it.  ``record_inputs`` runs even when the stage red-flags or raises partway: what
+    it read up to that point is exactly what a reader needs to see."""
+    with _recording_inputs() as rec:
+        try:
+            png, metrics = _dispatch_stage(o, n, sw, lw)
+        except BaseException:
+            # the caller turns this into a stage error record; the paths read before it failed are
+            # the most useful thing about that record, so do not lose them
+            _LAST_FAILED_INPUTS[:] = [dict(role=r, path=q) for r, q in rec]
+            raise
+    metrics["inputs"] = [dict(role=r, path=q) for r, q in rec]
+    return png, metrics
+
+
+# Paths read by the most recent stage that raised, so the error record in ``main`` can carry them.
+_LAST_FAILED_INPUTS = []
 
 
 # Every posted caption links its shorthand to docs/qa_methods.md so no term is left undefined.
@@ -3290,9 +3377,85 @@ CAPTIONS = {
 }
 
 
+# A directory holding more filenames than this is rendered as its path, its count and a sample.
+# The per-exposure daophot sets are the reason: gc2211 F200W pools 592 catalogs, and at ~101
+# characters a path that one role alone is ~60 kB against GitHub's 65 kB comment limit.  The
+# COMPLETE list is always in the metrics JSON, which is where a script should read it from.
+_INPUTS_SAMPLE_AT = 12
+_INPUTS_SAMPLE_HEAD = 3
+# Hard ceiling on the whole block.  The per-directory sampling above bounds each directory, but the
+# number of ROLES is not bounded (stage 5 already emits 11), so a many-filter or many-detector field
+# could in principle still grow past what GitHub accepts.  Past this size the block drops to one
+# line per role.  A comment that fails to post carries no provenance at all.
+_INPUTS_BLOCK_MAX = 20000
+
+
+def _inputs_block_compact(by_role, distinct):
+    """One line per role: its count and the directories it read from.  The fallback when the full
+    listing would be too large to post."""
+    lines = []
+    for role, paths in by_role.items():
+        dirs = sorted({os.path.dirname(q) for q in paths})
+        shown = ", ".join(f"`{d}/`" for d in dirs[:3]) + (f" +{len(dirs) - 3} more" if len(dirs) > 3 else "")
+        lines.append(f"- **{role}** — {len(paths)} file{'s' if len(paths) != 1 else ''} in {shown}")
+    return (f"\n\n<details><summary>Files read for this stage ({len(distinct)})</summary>\n\n"
+            + "\n".join(lines)
+            + "\n\nToo many to list individually here. The complete list of full paths is the "
+              "`inputs` key of this stage in `data_qa/metrics/<obsid>.json`.\n\n</details>")
+
+
+def _inputs_block(metrics):
+    """A collapsed ``<details>`` listing the full path of every file the stage read.
+
+    Grouped by role, then by directory, so every path is reconstructible as
+    ``<directory>/<filename>``.  A directory holding more than ``_INPUTS_SAMPLE_AT`` files is
+    summarised (count + first few + last), and the block SAYS it summarised and points at the
+    metrics JSON holding the complete list -- a silent truncation would read as "these are all the
+    files the stage used", which is the claim this exists to make honestly."""
+    inputs = metrics.get("inputs") or []
+    if not inputs:
+        return ""
+    # A file read for two purposes is two entries (one per role), so the per-role counts below can
+    # sum to more than the number of distinct files -- stage 5 reads the same 192 per-exposure
+    # catalogs for the module positions, the S/N cut and the per-detector quiver.  The headline is
+    # the DISTINCT count, since that is what "which files did this use" means, and the block says
+    # so when the two differ.
+    distinct = {d.get("path", "") for d in inputs}
+    by_role = {}
+    for d in inputs:
+        by_role.setdefault(d.get("role", "input"), []).append(d.get("path", ""))
+    lines, summarised = [], False
+    for role, paths in by_role.items():
+        lines.append(f"**{role}** — {len(paths)} file{'s' if len(paths) != 1 else ''}")
+        by_dir = {}
+        for q in paths:
+            by_dir.setdefault(os.path.dirname(q), []).append(os.path.basename(q))
+        for d, names in by_dir.items():
+            lines.append(f"- `{d}/`")
+            if len(names) > _INPUTS_SAMPLE_AT:
+                summarised = True
+                lines += [f"  - `{x}`" for x in names[:_INPUTS_SAMPLE_HEAD]]
+                lines.append(f"  - … {len(names) - _INPUTS_SAMPLE_HEAD - 1} more not listed here …")
+                lines += [f"  - `{names[-1]}`"]
+            else:
+                lines += [f"  - `{x}`" for x in names]
+        lines.append("")
+    tail = ""
+    if len(inputs) > len(distinct):
+        tail += (f"\n{len(inputs) - len(distinct)} of the entries above are the same file read for "
+                 f"a second purpose, so the per-role counts sum to more than {len(distinct)}.")
+    if summarised:
+        tail += ("\nThe complete list, with nothing summarised, is the `inputs` key of this stage "
+                 "in `data_qa/metrics/<obsid>.json`.")
+    block = (f"\n\n<details><summary>Files read for this stage ({len(distinct)})</summary>\n\n"
+             + "\n".join(lines) + tail + "\n\n</details>")
+    return block if len(block) <= _INPUTS_BLOCK_MAX else _inputs_block_compact(by_role, distinct)
+
+
 def caption_for(n, metrics):
-    """Public entry: build the stage caption and swap the DOCROOT sentinel for the live doc URL."""
-    return _linkify(_caption_for_impl(n, metrics))
+    """Public entry: build the stage caption, swap the DOCROOT sentinel for the live doc URL, and
+    append the full path of every file the stage read."""
+    return _linkify(_caption_for_impl(n, metrics)) + _inputs_block(metrics)
 
 
 def _caption_stage8(metrics):
@@ -3664,7 +3827,9 @@ def _run_miri(args):
         return 1
     if args.target:
         o = replace(o, target=args.target)
-    png, metrics = miri_overview(o)
+    with _recording_inputs() as rec:
+        png, metrics = miri_overview(o)
+    metrics["inputs"] = [dict(role=r, path=q) for r, q in rec]
     print(f"{o.obsid}: MIRI overview -> {png}  passed={metrics.get('passed')}")
     mdir = os.path.join(os.path.dirname(__file__), "metrics")
     os.makedirs(mdir, exist_ok=True)
@@ -3744,7 +3909,8 @@ def main(argv=None):
         # stage, not a data problem (the real None-attr data cases are guarded at the source).
         except (OSError, ValueError, IndexError, KeyError, RuntimeError) as e:
             print(f"  stage {n}: FAILED to build: {type(e).__name__}: {e}", file=sys.stderr)
-            all_metrics[f"stage{n}"] = dict(stage=n, error=f"{type(e).__name__}: {e}", passed=False)
+            all_metrics[f"stage{n}"] = dict(stage=n, error=f"{type(e).__name__}: {e}",
+                                            passed=False, inputs=list(_LAST_FAILED_INPUTS))
             with open(mpath, "w") as fh:
                 json.dump(all_metrics, fh, indent=2, default=_json_default)
             continue

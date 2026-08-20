@@ -1624,3 +1624,134 @@ def test_miri_overview_red_flag_no_i2d(tmp_path, monkeypatch):
     png, metrics = D.miri_overview(o)
     assert os.path.exists(png)
     assert metrics.get("red_flag") is True and metrics.get("passed") is False
+
+
+# --------------------------------------------------------------------------- input provenance
+def test_used_records_absolute_paths_and_dedupes(tmp_path):
+    a = tmp_path / "one.fits"; a.write_text("x")
+    with D._recording_inputs() as rec:
+        D._used(str(a), "role A")
+        D._used(str(a), "role A")            # same (role, path) -> recorded once
+        D._used(str(a), "role B")            # a second role for the same file is its own entry
+    assert rec == [("role A", os.path.abspath(str(a))), ("role B", os.path.abspath(str(a)))]
+
+
+def test_used_skips_paths_that_do_not_exist(tmp_path):
+    # Recording a file that was never opened is a false provenance claim.  _used is called at the
+    # READ, and several read sites are inside a try/except that a missing file lands in.
+    with D._recording_inputs() as rec:
+        D._used(str(tmp_path / "absent.fits"), "role")
+        D._used(None, "role")
+        D._used("", "role")
+    assert rec == []
+
+
+def test_used_returns_the_path_unchanged(tmp_path):
+    # _used wraps a read in place, so it must be transparent.
+    a = tmp_path / "one.fits"; a.write_text("x")
+    with D._recording_inputs():
+        assert D._used(str(a), "role") == str(a)
+        assert D._used(None, "role") is None
+
+
+def test_recording_inputs_restores_the_outer_collector(tmp_path):
+    a = tmp_path / "one.fits"; a.write_text("x")
+    b = tmp_path / "two.fits"; b.write_text("x")
+    with D._recording_inputs() as outer:
+        D._used(str(a), "outer")
+        with D._recording_inputs() as inner:
+            D._used(str(b), "inner")
+        assert [r for r, _ in inner] == ["inner"]
+        D._used(str(b), "outer again")
+    assert [r for r, _ in outer] == ["outer", "outer again"]
+
+
+def test_build_stage_attaches_inputs(monkeypatch, tmp_path):
+    # The choke point must attach provenance whatever the stage returns.
+    a = tmp_path / "m.fits"; a.write_text("x")
+
+    def fake(o, sw, lw):
+        D._used(str(a), "SW mosaic")
+        return "fig.png", dict(stage=1, passed=True)
+    monkeypatch.setattr(D, "stage1_mosaics", fake)
+    png, m = D.build_stage(_obs(), 1, "F212N", "F405N")
+    assert m["inputs"] == [dict(role="SW mosaic", path=os.path.abspath(str(a)))]
+
+
+def test_build_stage_keeps_inputs_when_the_stage_raises(monkeypatch, tmp_path):
+    # A stage that dies partway is exactly when "which files did it read" matters most.
+    a = tmp_path / "m.fits"; a.write_text("x")
+
+    def boom(o, sw, lw):
+        D._used(str(a), "SW mosaic")
+        raise ValueError("nope")
+    monkeypatch.setattr(D, "stage1_mosaics", boom)
+    with pytest.raises(ValueError):
+        D.build_stage(_obs(), 1, "F212N", "F405N")
+    assert D._LAST_FAILED_INPUTS == [dict(role="SW mosaic", path=os.path.abspath(str(a)))]
+
+
+def test_inputs_block_lists_every_path_when_the_set_is_small():
+    inputs = [dict(role="reference", path="/data/brick/catalogs/refcat.fits"),
+              dict(role="mosaic", path="/data/brick/F212N/pipeline/f212n_i2d.fits")]
+    blk = D._inputs_block(dict(inputs=inputs))
+    assert "Files read for this stage (2)" in blk
+    for d in inputs:                                  # dir + name reconstructs the full path
+        assert f"`{os.path.dirname(d['path'])}/`" in blk
+        assert f"`{os.path.basename(d['path'])}`" in blk
+    assert "not listed here" not in blk               # nothing summarised at this size
+    assert "metrics/<obsid>.json" not in blk
+
+
+def test_inputs_block_says_so_when_it_summarises():
+    # A silent truncation would read as "these are all the files the stage used".
+    inputs = [dict(role="per-exposure daophot", path=f"/data/brick/F212N/exp{i:05d}.fits")
+              for i in range(200)]
+    blk = D._inputs_block(dict(inputs=inputs))
+    assert "Files read for this stage (200)" in blk   # the COUNT is never truncated
+    assert "per-exposure daophot** — 200 files" in blk
+    assert "196 more not listed here" in blk
+    assert "metrics/<obsid>.json" in blk              # where the complete list lives
+    assert "`exp00000.fits`" in blk and "`exp00199.fits`" in blk   # first and last shown
+    assert len(blk) < 2000                            # and it stays small enough to post
+
+
+def test_inputs_block_is_empty_without_inputs():
+    assert D._inputs_block(dict(stage=4)) == ""
+    assert D._inputs_block(dict(stage=4, inputs=[])) == ""
+
+
+def test_caption_for_appends_the_inputs_block():
+    m = dict(stage=4, offset_med_mas=1.0, n_cells=16, offset_scatter_mas=2.0,
+             bulk_source="histogram", inputs=[dict(role="reference", path="/data/ref.fits")])
+    cap = D.caption_for(4, m)
+    assert "Files read for this stage (1)" in cap and "`/data/`" in cap
+
+
+def test_inputs_block_headline_counts_distinct_files_not_reads():
+    # Stage 5 reads the same 192 per-exposure catalogs for three different purposes.  "Files read
+    # for this stage" must be the number of FILES; the per-role counts then sum to more, and the
+    # block says why rather than leaving the reader to notice the mismatch.
+    inputs = ([dict(role="module positions", path=f"/d/exp{i}.fits") for i in range(5)]
+              + [dict(role="S/N cut", path=f"/d/exp{i}.fits") for i in range(5)])
+    blk = D._inputs_block(dict(inputs=inputs))
+    assert "Files read for this stage (5)" in blk
+    assert "module positions** — 5 files" in blk and "S/N cut** — 5 files" in blk
+    assert "5 of the entries above are the same file read for a second purpose" in blk
+    # and a set with no repeats says nothing about it
+    solo = D._inputs_block(dict(inputs=[dict(role="a", path="/d/x.fits")]))
+    assert "same file read for a second purpose" not in solo
+
+
+def test_inputs_block_falls_back_to_one_line_per_role_when_it_would_be_too_large():
+    # The per-directory sampling bounds each directory, not the number of ROLES.  A comment that
+    # exceeds GitHub's limit fails to post and carries no provenance at all, so past a ceiling the
+    # block drops to one line per role and says where the full list is.
+    inputs = [dict(role=f"role {r}", path=f"/data/field/dir{r}/file{i}.fits")
+              for r in range(400) for i in range(3)]
+    blk = D._inputs_block(dict(inputs=inputs))
+    assert len(blk) < 65536
+    assert "Files read for this stage (1200)" in blk
+    assert "Too many to list individually here" in blk
+    assert "metrics/<obsid>.json" in blk
+    assert "- **role 0** — 3 files in `/data/field/dir0/`" in blk
