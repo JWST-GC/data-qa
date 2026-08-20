@@ -73,7 +73,9 @@ def test_caption_stage6_names_formal_vs_empirical():
     emp = D.caption_for(6, dict(stage=6, sw="F212N", lw="F466N",
                                 floor_is_empirical_f212n=True, floor_is_empirical_f466n=True))
     assert "systematic limit" not in emp
-    assert "formal" in emp and "rms(jwst)" in emp and "achieved" in emp.lower()
+    # pin the POSITIVE branch on the phrase UNIQUE to it (not the "achieved" that also appears in the
+    # shared "not the achieved precision" base text), so collapsing the emp condition is caught (#99).
+    assert "formal" in emp and "rms(jwst)" in emp and "achieved internal repeatability" in emp
     assert "source counts per" in emp
     # no per-exposure catalogs -> rms(jwst) not drawn: the caption must NOT claim floor_mas is it,
     # and must say the fallback to the formal floor (the conflation #99 review caught).
