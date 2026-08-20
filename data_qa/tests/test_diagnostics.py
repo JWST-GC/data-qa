@@ -113,6 +113,15 @@ def test_caption_stage5_full_when_overlap_present():
     assert "NRCB2" in cap and "shares no sky with NRCA" in cap
 
 
+def test_caption_stage5_surfaces_cutout_footprint_mismatch():
+    base = dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1, intermodule_rms=6.2, n_overlap=137)
+    # no drizzled mosaic covers the overlap zone -> the caption says so, not the normal cutout blurb
+    cap = D.caption_for(5, dict(base, cutout_footprint_mismatch=True))
+    assert "disjoint footprints" in cap and "one round PSF" not in cap
+    # normal case keeps the cutout description
+    assert "one round PSF" in D.caption_for(5, dict(base, cutout_footprint_mismatch=False))
+
+
 def test_caption_stage5_overlap_without_hi_sn_panel():
     # overlap present but no S/N>10 panel (field lacks flux errors) -> no S/N promise; the all-stars
     # panel is TOP-RIGHT (2-column top row), and the footprint is its own full-width row below

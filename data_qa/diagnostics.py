@@ -2537,9 +2537,13 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     # Snap to the star on the MOSAIC before measuring: the catalog can be on a different frame than
     # the mosaic (stale catalogue vs re-tied mosaic), which would otherwise put the aperture on blank
     # sky and manufacture a huge, scattered aperture-minus-PSF "offset" (cloudef o005).  The box
-    # (11 px) exceeds a plausible frame shift yet stays inside the isolation radius, so it cannot snap
-    # to a neighbour.  The median shift is itself a catalog-vs-mosaic registration diagnostic.
+    # (11 px) exceeds a plausible frame shift and stays inside the isolation radius, so no CATALOGUED
+    # neighbour sits in it -- but uncatalogued flux can still pull the centroid several px in a
+    # crowded field, which the ``moved < 3`` quality gate below keeps out of the comparison.
     xr, yr, moved = _recentroid_com(data, x[idx], y[idx], box=11)
+    # med_shift is measured over ALL isolated stars (including the far-moved ones the gate will drop),
+    # so a genuine whole-frame shift still shows; in a crowded field the uncatalogued-flux drag makes
+    # it an UPPER BOUND on the true catalog-vs-mosaic registration offset, not an exact value.
     med_shift = float(np.median(moved)) if len(moved) else 0.0
     metrics["recentroid_shift_px_med"] = med_shift
     metrics["catalog_mosaic_mismatch"] = bool(med_shift > 2.0)   # ~half the F162M PSF FWHM
@@ -4112,9 +4116,14 @@ def _caption_for_impl(n, metrics):
                      "coloured by per-star |A−B|. It shows the shared stars tracing the thin "
                      "NRCA∩NRCB dither-overlap strip, and flags any part of that strip where the "
                      "two modules agree less well.")
-        base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`. Where the "
-                 "two modules agree, each star is one round PSF; where they disagree, it doubles "
-                 "or elongates. ([how this is made](DOCROOT#stage5))")
+        if metrics.get("cutout_footprint_mismatch"):
+            base += (" ⚠️ The BOTTOM cutout strip is empty because **no drizzled mosaic covers the "
+                     "module-overlap zone — the catalogue and the mosaic are on disjoint footprints** "
+                     "(a reduction mismatch, not a QA gap). ([how this is made](DOCROOT#stage5))")
+        else:
+            base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`. Where "
+                     "the two modules agree, each star is one round PSF; where they disagree, it "
+                     "doubles or elongates. ([how this is made](DOCROOT#stage5))")
         return base
     if n == 9:
         ni = metrics.get("n_isolated"); ac = metrics.get("aper_corr_med")
