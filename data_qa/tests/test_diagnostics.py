@@ -403,6 +403,27 @@ def test_crossmatch_offset_restricts_virac_to_jwst_footprint(monkeypatch):
     assert seen["n"] > 5000                          # full refcat passed through
 
 
+def test_catalog_staleness_only_uses_the_virac2locked_table(tmp_path, monkeypatch):
+    # A catalogue NEWER than the operative VIRAC2locked table but OLDER than a newer legacy table
+    # (VVV/consensus/per-filter) must NOT read as stale -- the check compares only against the
+    # operative table.  Fails if the glob widens back to Offsets_*.csv (PR #101 review).
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    cats = tmp_path / "brick" / "catalogs"; offs = tmp_path / "brick" / "offsets"
+    cats.mkdir(parents=True); offs.mkdir(parents=True)
+    name = "merged_cat.fits"
+    _touch(cats, name)
+    _touch(offs, "Offsets_JWST_Brick2221_VIRAC2locked.csv")
+    _touch(offs, "Offsets_JWST_Brick2221_VVV_average.csv")
+    t0 = 1_000_000_000.0
+    os.utime(str(offs / "Offsets_JWST_Brick2221_VIRAC2locked.csv"), (t0, t0))          # operative
+    os.utime(str(cats / name), (t0 + 5 * 86400, t0 + 5 * 86400))                       # catalogue newer
+    os.utime(str(offs / "Offsets_JWST_Brick2221_VVV_average.csv"), (t0 + 10 * 86400, t0 + 10 * 86400))  # newer legacy
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    cdate, adate, cname = D._catalog_vs_alignment_age(o, f"release:{name}")
+    assert cdate is None                              # NOT stale vs the VIRAC2locked table
+
+
 def test_isolated_bulk_none_when_too_sparse():
     import astropy.units as u
     from astropy.coordinates import SkyCoord
