@@ -219,3 +219,16 @@ __marimo__/
 
 # runtime QA artifacts (generated on the cluster, not committed)
 data_qa/metrics/
+# Ad-hoc astrometry/QA probe scripts must never be committed (PR #101 review):
+/*probe.py
+/*dbg*.py
+/mnn.py
+/capsweep.py
+/brightvet.py
+/brighttight.py
+/cellmast.py
+/usepipe.py
+/valwrap.py
+/xctry.py
+/mastfoot.py
+/scratch/

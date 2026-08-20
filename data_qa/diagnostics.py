@@ -1179,7 +1179,10 @@ _CELL_PR_FLOOR = 1.5
 _CELL_SPURIOUS_MAX = 300.0
 # ...and only when the far cell holds less than this fraction of the measured sources, so a real,
 # well-populated deviating region is flagged (adjacency test), never silently discarded.
-_CELL_SPURIOUS_WT = _CELL_BAD_FRAC
+# Separate constant from the pass-gate tolerance (_CELL_BAD_FRAC): this is the pre-statistics
+# discard threshold for a low-occupancy spurious cell, a different decision that happens to share a
+# value today (PR #101 review -- do not re-collapse them onto one name).
+_CELL_SPURIOUS_WT = 0.02
 
 
 def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=None):
@@ -1522,7 +1525,10 @@ def _catalog_vs_alignment_age(o: Observation, src):
         return None, None, None
     name = src.split("release:", 1)[1].split(" [", 1)[0].strip()
     cpath = os.path.join(BASE, o.field, "catalogs", name)
-    offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*.csv"))
+    # Compare against the OPERATIVE alignment table only -- the VIRAC2-locked offsets the reduction
+    # applies -- not the newest of every CSV in the dir (older per-filter/VVV/consensus tables would
+    # otherwise set the bar; PR #101 review).
+    offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*VIRAC2locked.csv"))
     if not (os.path.exists(cpath) and offs):
         return None, None, None
     cm = os.path.getmtime(cpath)

@@ -382,6 +382,27 @@ def test_crossmatch_offset_falls_back_to_xcorr(monkeypatch):
     assert r is not None and r["source"] == "xcorr" and np.isfinite(r["off"])
 
 
+def test_crossmatch_offset_restricts_virac_to_jwst_footprint(monkeypatch):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    jwst = SkyCoord(np.linspace(266.40, 266.41, 200) * u.deg, np.full(200, -28.90) * u.deg)
+    # VIRAC: 200 stars in the JWST region + 5000 far away (a full-tile refcat)
+    ra = np.concatenate([np.linspace(266.40, 266.41, 200), np.linspace(200.0, 260.0, 5000)])
+    dec = np.concatenate([np.full(200, -28.90), np.full(5000, 10.0)])
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    seen = {}
+
+    def spy(a, b, confirm_windows=True):
+        seen["n"] = len(b)
+        return dict(off=1.0, dra=1.0, ddec=0.0, contrast=50.0, ok=True,
+                    window_edge_fraction=0.01, window_arcsec=3.0, npairs=100)
+    monkeypatch.setattr(D, "_pipe_measure_offset", spy)
+    D._crossmatch_offset(jwst, ref, restrict_footprint=True)
+    assert seen["n"] < 300                          # far VIRAC cropped out
+    D._crossmatch_offset(jwst, ref, restrict_footprint=False)
+    assert seen["n"] > 5000                          # full refcat passed through
+
+
 def test_isolated_bulk_none_when_too_sparse():
     import astropy.units as u
     from astropy.coordinates import SkyCoord
