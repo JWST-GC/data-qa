@@ -3595,6 +3595,56 @@ def _internal_pos_rms(o, filt):
     return (m[g], rms[g]) if int(g.sum()) >= 50 else None
 
 
+# peppar (Matt Hosek's WebbPSF PSF photometry/astrometry) products live under a DIFFERENT root than
+# BASE for brick/cloudc (/blue), everything else on /orange -- mirrors fields.yaml.
+_PEPPAR_ROOTS = {"brick": "/blue/adamginsburg/adamginsburg/jwst",
+                 "cloudc": "/blue/adamginsburg/adamginsburg/jwst"}
+_PEPPAR_DEFAULT_ROOT = "/orange/adamginsburg/jwst"
+
+
+def _peppar_precision(o: Observation, filt, max_frames=48):
+    """(instrumental mag, per-axis astrometric precision [mas], kind) from the peppar catalogues --
+    an independent PSF-photometry measurement, NOT jicama.  Prefers the combined starlist's
+    ACROSS-FRAME position scatter (``x_wcs_std``/``y_wcs_std`` -- the achieved repeatability); else
+    the per-frame ``*_iter1_cat.fits`` FORMAL PSF-fit position error (``x_err``/``y_err``).  Peppar
+    mags are instrumental (no Vega zero-point).  None if no peppar products for this obs's field/filt."""
+    from astropy.table import Table
+    if not filt:
+        return None
+    pdir = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar/{filt}"
+    if not os.path.isdir(pdir):
+        return None
+    pixscale = 63.0 if filt.upper() in _LW_PREF else 31.0        # NIRCam LW / SW mas per pixel
+
+    def _pool(paths, mcol, xcol, ycol, scale):
+        rows = []
+        for p in paths:
+            try:
+                t = Table.read(p)
+            except (OSError, ValueError):
+                continue
+            if all(k in t.colnames for k in (mcol, xcol, ycol)):
+                prec = np.hypot(np.asarray(t[xcol], float), np.asarray(t[ycol], float)) * scale / np.sqrt(2.0)
+                rows.append((np.asarray(t[mcol], float), prec))
+        if not rows:
+            return None
+        m = np.concatenate([r[0] for r in rows]); pr = np.concatenate([r[1] for r in rows])
+        g = np.isfinite(m) & np.isfinite(pr) & (pr > 0)
+        return (m[g], pr[g]) if int(g.sum()) >= 50 else None
+
+    combos = glob.glob(f"{pdir}/combo_starlist_{filt}_*.fits")
+    if combos:
+        # x_wcs/y_wcs are tangent-plane offsets in ARCSEC, not degrees: x_wcs spans 70.5" over a
+        # 2227 px detector = 0.0317"/px = the SW pixel scale, so x_wcs_std is arcsec and the factor
+        # to mas is 1e3 (a median x_wcs_std of 0.004" -> 4.0 mas, matching xe's 0.074 px -> 2.3 mas).
+        emp = _pool(combos, "m", "x_wcs_std", "y_wcs_std", 1.0e3)   # arcsec -> mas
+        if emp is not None:
+            return emp[0], emp[1], "empirical (across-frame rms)"
+    cats = sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits"))[:max_frames]
+    frm = _pool(cats, "m", "x_err", "y_err", pixscale)             # px -> mas
+    return (frm[0], frm[1], "formal σ_fit (per-frame)") if frm is not None else None
+
+
 def stage6_astrom_error(o: Observation, sw, lw):
     """Astrometric precision vs Vega magnitude, one set of curves per channel (SW / LW):
       - solid  formal sigma_fit -- the PSF fitter's formal 1-sigma position error per detection.
@@ -3611,11 +3661,16 @@ def stage6_astrom_error(o: Observation, sw, lw):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     metrics = dict(stage=6, sw=sw, lw=lw)
-    # Two stacked panels sharing the magnitude axis: the precision curve on top, and a parallel
-    # source-count histogram (sources per Vega-mag bin) below, so the number of stars behind each
-    # point of the curve -- and where the sample runs out at the faint end -- is visible.
-    fig, (a, ah) = plt.subplots(2, 1, sharex=True, figsize=(6.8, 6.4),
-                                gridspec_kw=dict(height_ratios=[3.0, 1.0], hspace=0.08))
+    # LEFT column: two stacked panels sharing the magnitude axis -- the jicama precision curve on top
+    # (a) and a parallel source-count histogram (sources per Vega-mag bin) below (ah), so the number
+    # of stars behind each curve point -- and where the sample runs out at the faint end -- is visible.
+    # RIGHT column: the same precision-vs-magnitude from the INDEPENDENT peppar catalogues (a2).
+    fig = plt.figure(figsize=(11.2, 6.4))
+    gs = fig.add_gridspec(2, 2, height_ratios=[3.0, 1.0], width_ratios=[1.0, 1.0],
+                          hspace=0.08, wspace=0.28)
+    a = fig.add_subplot(gs[0, 0])
+    ah = fig.add_subplot(gs[1, 0], sharex=a)
+    a2 = fig.add_subplot(gs[:, 1])
     hist_series = []                 # (mag_used, colour, filt) for the count histogram below
     any_data = False
     all_vega = True
@@ -3709,8 +3764,8 @@ def stage6_astrom_error(o: Observation, sw, lw):
     a.set_ylabel("astrometric error (mas)")
     a.legend(fontsize=9, loc="upper left")
     a.grid(alpha=0.25, which="both")
-    a.set_title(f"{o.target} {o.obsid} — astrometric precision vs magnitude", fontsize=10)
-    # parallel panel: number of sources per Vega-mag bin (same 0.5-mag binning as the curve, same
+    a.set_title(f"{o.target} {o.obsid} — jicama astrometric precision", fontsize=10)
+    # LEFT-BOTTOM panel: number of sources per Vega-mag bin (same 0.5-mag binning as the curve, same
     # sample), one step histogram per channel.  Shows how many stars each curve point rests on and
     # where the sample dies out at the faint end.
     allmag = np.concatenate([m[np.isfinite(m)] for m, _c, _f in hist_series]) if hist_series else np.array([])
@@ -3726,6 +3781,37 @@ def stage6_astrom_error(o: Observation, sw, lw):
         ah.set_ylabel("sources / 0.5 mag")
         ah.grid(alpha=0.25, which="both")
     ah.set_xlabel(xlbl)
+
+    # RIGHT panel: the SAME astrometric-precision-vs-magnitude, but from the INDEPENDENT peppar
+    # (Hosek WebbPSF) catalogues instead of jicama -- a cross-check that does not share jicama's
+    # detection/fit choices.  Peppar mags are instrumental (no Vega ZP), so its x-axis is instrumental.
+    pep_any = False; pep_kind = None
+    for filt, color in [(sw, "#3366cc"), (lw, "#cc3311")]:
+        if not filt:
+            continue
+        pp = _peppar_precision(o, filt)
+        if pp is None:
+            continue
+        pmag, pprec, pep_kind = pp
+        ok = pprec < 500.0
+        med, lo, hi, ctr = _binned_stat(pmag[ok], pprec[ok])
+        if med is None:
+            continue
+        pep_any = True
+        a2.plot(ctr, med, "-", color=color, lw=1.7, label=f"{filt}  (n={int(ok.sum())})")
+        a2.fill_between(ctr, lo, hi, color=color, alpha=0.20)
+        metrics[f"peppar_floor_mas_{filt.lower()}"] = float(np.nanmin(med))
+    if pep_any:
+        a2.set_yscale("log"); a2.set_ylim(0.03, 300.0)
+        a2.set_xlabel("instrumental magnitude (peppar; no ZP)")
+        a2.set_ylabel("astrometric precision (mas)")
+        a2.legend(fontsize=9, loc="upper left"); a2.grid(alpha=0.25, which="both")
+        a2.set_title(f"peppar {pep_kind}", fontsize=10)
+        metrics["peppar_kind"] = pep_kind
+    else:
+        a2.text(0.5, 0.5, "no peppar catalogues\nfor this obs/filter", ha="center", va="center",
+                fontsize=10, style="italic", transform=a2.transAxes)
+        a2.set_xticks([]); a2.set_yticks([])
     metrics["passed"] = True
     return _save(fig, f"{o.obsid}_stage6.png"), metrics
 
@@ -4216,8 +4302,12 @@ def _caption_for_impl(n, metrics):
                      "absent for this obs, so it is not drawn and `floor_mas` falls back to the "
                      "formal σ_fit floor (`floor_is_empirical` false). ")
         base += ("All curves rise at the faint end with S/N; shaded band = 16–84th percentile. The "
-                 "**lower panel** histograms the source counts per Vega-mag bin — the sample behind "
-                 "each curve point. ([how this is made](DOCROOT#stage6))")
+                 "**lower-left panel** histograms the source counts per Vega-mag bin — the sample "
+                 "behind each curve point. The **RIGHT panel** repeats the precision-vs-magnitude "
+                 "from the INDEPENDENT peppar (Hosek WebbPSF) catalogues — the combined starlist's "
+                 "across-exposure scatter when present, else the per-frame formal PSF-fit error — a "
+                 "jicama-independent cross-check (peppar mags are instrumental, no zero-point). "
+                 "([how this is made](DOCROOT#stage6))")
         return base
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
