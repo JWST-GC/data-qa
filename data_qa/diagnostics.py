@@ -2623,6 +2623,138 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     return _save(fig, f"{o.obsid}_stage9.png"), metrics
 
 
+# --------------------------------------------------------------------------- STAGE 10
+# Jay Anderson's JWST1PASS across-exposure consistency product.  jwst1pass fits every _cal frame
+# with an empirical library PSF (STDPSF) + geometric-distortion correction (STDGDC), the per-chip
+# .xympqsuvw catalogues are combined into a per-exposure META frame, matched across exposures
+# (xym2mat) and collated (xym2bar) into MATCHUP.XYMEEE: one row per star carrying the mean position
+# and instrumental magnitude in the reference frame and the RMS of each across the exposures it was
+# found in.  Those RMS columns are the "is everything in family?" photometric+astrometric check --
+# reproduced here as the four panels of Jay's show_matchup.sm (XRMS / YRMS / MAG-RMS / QFIT vs mag).
+_META_PIX_MAS = 32.0            # Jay's META reference frame is 32 mas/pixel (position RMS -> mas)
+# Products live under the per-field reduction tree; brick and cloudc are on /blue, the rest on
+# /orange (the same split the peppar products use).
+_JWST1PASS_ROOTS = {"brick": "/blue/adamginsburg/adamginsburg/jwst",
+                    "cloudc": "/blue/adamginsburg/adamginsburg/jwst"}
+_JWST1PASS_DEFAULT_ROOT = "/orange/adamginsburg/jwst"
+# MATCHUP.XYMEEE columns (1-indexed in the header): xbar ybar mbar xsig ysig msig qbar Nf Ng Nm ...
+_XYMEEE_COLS = dict(x=0, y=1, m=2, ex=3, ey=4, em=5, q=6, Nf=7, Ng=8, Nm=9)
+# 9.0 (position/mag RMS) and 9.999 (qfit) are jwst1pass "no valid measurement" sentinels, and mbar
+# == 0 marks an unmeasured star; all three must be dropped or they pile up as a false floor/ceiling.
+_XYMEEE_SENTINEL = 9.0
+
+
+def _read_matchup_xymeee(path):
+    """Parse a JWST1PASS ``MATCHUP.XYMEEE`` into a column dict (numpy arrays), keeping only rows a
+    star was actually measured in: found in >= 2 exposures (``Ng``), a real instrumental magnitude
+    (``mbar`` < 0), and no RMS/qfit sentinel.  Returns None if the file has no usable rows."""
+    cols = tuple(_XYMEEE_COLS[k] for k in ("x", "y", "m", "ex", "ey", "em", "q", "Nf", "Ng", "Nm"))
+    arr = np.loadtxt(_used(path, "JWST1PASS MATCHUP.XYMEEE"), usecols=cols, comments="#", ndmin=2)
+    if arr.size == 0:
+        return None
+    x, y, m, ex, ey, em, q, Nf, Ng, Nm = arr.T
+    good = (np.isfinite(m) & (m < 0) & (Ng >= 2)
+            & (ex < _XYMEEE_SENTINEL) & (ey < _XYMEEE_SENTINEL) & (em < _XYMEEE_SENTINEL))
+    if int(good.sum()) < 50:
+        return None
+    keys = ("x", "y", "m", "ex", "ey", "em", "q", "Nf", "Ng", "Nm")
+    return {k: v[good] for k, v in zip(keys, (x, y, m, ex, ey, em, q, Nf, Ng, Nm))}
+
+
+def _jwst1pass_matchup(o: Observation, filt):
+    """Path to the ``MATCHUP.XYMEEE`` for this obs's field+filter, or None if jwst1pass has not been
+    run for it.  Convention ``{root}/{field}/jwst1pass/{FILT}/MATCHUP.XYMEEE`` (shallow globs only --
+    no recursive ``**`` over the products tree).  ``QA_JWST1PASS_DIR`` overrides the lookup wholesale
+    (used to point the stage at a one-off product directory)."""
+    if not filt:
+        return None
+    override = os.environ.get("QA_JWST1PASS_DIR")
+    roots = [override] if override else [
+        f"{_JWST1PASS_ROOTS.get(o.field, _JWST1PASS_DEFAULT_ROOT)}/{o.field}/jwst1pass/{filt}"]
+    for base in roots:
+        for cand in (f"{base}/MATCHUP.XYMEEE", f"{base}/03.MATCHUP/MATCHUP.XYMEEE"):
+            if os.path.isfile(cand):
+                return cand
+        hits = sorted(glob.glob(f"{base}/*/MATCHUP.XYMEEE"))
+        if hits:
+            return hits[0]
+    return None
+
+
+def _saturation_turnover(m, sig, floor):
+    """Brightest magnitude at which the binned RMS has climbed to 2x the faint-side floor -- the
+    onset of the saturation/bright-star degradation Jay notes.  None if it never does."""
+    med, _, _, ctr = _binned_stat(m, sig)
+    if med is None:
+        return None
+    over = ctr[(med > 2.0 * floor) & (ctr < np.median(ctr))]     # bright half only
+    return float(over.min()) if over.size else None
+
+
+def stage10_photometric_consistency(o: Observation, sw, lw):
+    """JWST1PASS across-exposure consistency (Jay Anderson's ``MATCHUP.XYMEEE``): for every star the
+    RMS of its position (X, Y) and instrumental magnitude across the exposures it was found in, plus
+    the mean quality-of-fit, all versus instrumental magnitude.  The four panels reproduce Jay's
+    ``show_matchup.sm``.  A tight, flat bright-end floor that rises only at the faint (S/N) and
+    saturated (bright) ends is "in family"; a raised or structured floor flags a photometric or
+    distortion problem in that filter's frames."""
+    import matplotlib
+    matplotlib.use("Agg")
+    metrics = dict(stage=10, sw=sw, lw=lw)
+    # jwst1pass is run per filter; prefer the SW channel (Jay's F182M example), fall back to LW.
+    filt = next((f for f in (sw, lw) if f and _jwst1pass_matchup(o, f)), None)
+    if filt is None:
+        reason = "no JWST1PASS MATCHUP.XYMEEE product on disk for this obs/filter"
+        png = _red_flag_figure(o, "stage10", "JWST1PASS CONSISTENCY UNAVAILABLE",
+                               f"Cannot build the across-exposure consistency panels: {reason}.")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        return png, metrics
+    metrics["filter"] = filt
+    d = _read_matchup_xymeee(_jwst1pass_matchup(o, filt))
+    if d is None:
+        reason = "MATCHUP.XYMEEE has too few multiply-measured stars (Ng>=2) to assess consistency"
+        png = _red_flag_figure(o, "stage10", "JWST1PASS CONSISTENCY UNAVAILABLE", reason + ".")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        return png, metrics
+
+    m = d["m"]
+    exm = d["ex"] * _META_PIX_MAS         # position RMS: META pixels -> mas
+    eym = d["ey"] * _META_PIX_MAS
+    metrics["n_stars"] = int(m.size)
+    metrics["n_exposures"] = int(np.nanmax(d["Nf"]))
+    metrics["meta_pix_mas"] = _META_PIX_MAS
+
+    fig, ax = _fig(2, 2, 5.4, 4.3)
+    panels = [
+        (ax[0][0], exm, "X RMS (mas)", "x_rms_floor_mas", 3.0 * _META_PIX_MAS),
+        (ax[0][1], eym, "Y RMS (mas)", "y_rms_floor_mas", 3.0 * _META_PIX_MAS),
+        (ax[1][0], d["em"], "magnitude RMS (mag)", "mag_rms_floor", 0.25),
+        (ax[1][1], d["q"], "quality of fit", "qfit_floor", 0.25),
+    ]
+    for a, y, ylab, mkey, ytop in panels:
+        a.plot(m, y, ".", ms=1.4, color="#666666", alpha=0.35, rasterized=True)
+        med, lo, hi, ctr = _binned_stat(m, y)
+        if med is not None:
+            a.plot(ctr, med, "-", color="#cc3311", lw=1.8)
+            a.fill_between(ctr, lo, hi, color="#cc3311", alpha=0.20)
+            metrics[mkey] = float(np.nanmin(med))            # faint/bright-safe bright-end floor
+        a.set_xlim(-16, -3)
+        a.set_ylim(0, ytop)
+        a.set_xlabel("instrumental magnitude")
+        a.set_ylabel(ylab)
+        a.grid(alpha=0.25)
+    # onset of the bright-star (saturation) degradation Jay flags, from the mag-RMS curve
+    if metrics.get("mag_rms_floor") is not None:
+        turn = _saturation_turnover(m, d["em"], metrics["mag_rms_floor"])
+        if turn is not None:
+            metrics["saturation_turnover_mag"] = turn
+            ax[1][0].axvline(turn, color="#3366cc", ls="--", lw=1.0)
+    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency ({filt}, "
+                 f"n={metrics['n_stars']}, {metrics['n_exposures']} exp)", fontsize=11, y=0.99)
+    metrics["passed"] = True
+    return _save(fig, f"{o.obsid}_stage10.png"), metrics
+
+
 STAGES = {1: stage1_mosaics, 2: stage2_cmd, 3: stage3_calibration, 4: stage4_offsets,
           5: stage5_intermodule}
 
@@ -3749,6 +3881,8 @@ def _dispatch_stage(o, n, sw, lw):
         return stage8_distortion(o, sw)
     if n == 9:
         return stage9_psf_vs_aper(o, sw)
+    if n == 10:
+        return stage10_photometric_consistency(o, sw, lw)
     raise ValueError(n)
 
 
@@ -3796,6 +3930,7 @@ _HEADLINE = {
     7: "**Stage 7 — MAST vs pipeline.**",
     8: "**Stage 8 — distortion residual map.**",
     9: "**Stage 9 — PSF vs aperture photometry.**",
+    10: "**Stage 10 — JWST1PASS across-exposure consistency.**",
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
@@ -4219,6 +4354,26 @@ def _caption_for_impl(n, metrics):
                  "**lower panel** histograms the source counts per Vega-mag bin — the sample behind "
                  "each curve point. ([how this is made](DOCROOT#stage6))")
         return base
+    if n == 10:
+        # Built in code so the floors are only quoted when a curve was actually drawn.  The
+        # no-product case is handled by the generic red-flag branch above (n != 7).
+        filt = metrics.get("filter", "?")
+        xf = metrics.get("x_rms_floor_mas"); mf = metrics.get("mag_rms_floor")
+        base = (f"**Stage 10 — JWST1PASS across-exposure consistency ({filt}).** From Jay Anderson's "
+                f"`MATCHUP.XYMEEE`: for each of {metrics.get('n_stars', 0)} stars found in ≥2 of the "
+                f"{metrics.get('n_exposures', 0)} exposures, the RMS of its position (X, Y) and "
+                f"instrumental magnitude across those exposures, plus mean quality-of-fit, all vs "
+                f"instrumental magnitude — the four panels of Jay's `show_matchup.sm`. A tight, flat "
+                f"bright-end floor that rises only at the faint (S/N) and saturated (bright) ends is "
+                f"\"in family\"; a raised or structured floor flags a photometric or distortion "
+                f"problem in that filter's frames. Position RMS is in mas "
+                f"({metrics.get('meta_pix_mas', _META_PIX_MAS):.0f} mas/META-pixel). ")
+        if xf is not None and mf is not None:
+            base += (f"Bright-end floors: {xf:.2f} mas in X, {mf:.3f} mag. ")
+        if metrics.get("saturation_turnover_mag") is not None:
+            base += (f"The mag-RMS doubles above its floor brighter than "
+                     f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation onset). ")
+        return base + "([how this is made](DOCROOT#stage10))"
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
@@ -4346,7 +4501,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 8, 9])
+    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")

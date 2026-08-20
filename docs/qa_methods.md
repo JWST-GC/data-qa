@@ -502,6 +502,42 @@ crowding problem.
 Source: [`data_qa/diagnostics.py` → `stage9_psf_vs_aper`](../data_qa/diagnostics.py)
 (`_psf_flux_positions`).
 
+<a id="stage10"></a>
+## Stage 10 — JWST1PASS across-exposure consistency
+
+**What it shows.** Whether every exposure of one filter is "in family" — measuring the same star's
+position and brightness to the same value — from Jay Anderson's **JWST1PASS** pipeline, independent
+of jicama and of the STScI level-3 products.
+
+**How JWST1PASS gets there** (run outside data-qa, per filter; this stage consumes the result). For
+each `_cal` frame, `jwst1pass` fits an empirical library PSF in the **STDPSF** format (a 5×5 grid of
+PSFs across each NIRCam chip) with a **STDGDC** geometric-distortion correction, and — with `PERT=1`
+— derives a single **perturbation PSF** from the fit residuals of bright isolated stars and adds it
+to the whole 5×5 grid (temporal PSF variation is usually orthogonal to the spatial variation). The
+per-chip `.xympqsuvw` catalogues are combined into one **META** frame per exposure
+(`convert_nrcab2nrczz_meta` with the `map2avg` linear transforms), matched across exposures
+(`xym2mat`, first exposure as the reference frame) and collated (`xym2bar`, a star must appear in
+≥2 exposures) into **`MATCHUP.XYMEEE`**: one row per star holding the mean position (`xbar`, `ybar`)
+and instrumental magnitude (`mbar`) in the reference frame and the RMS of each across the exposures
+it was found in (`xsig`, `ysig`, `msig`), plus the mean quality-of-fit (`qbar`).
+
+**The panels** reproduce Jay's `show_matchup.sm`, each versus instrumental magnitude: **X RMS** and
+**Y RMS** (position repeatability, META pixels → mas at 32 mas/pixel), **magnitude RMS**
+(photometric repeatability), and **quality of fit**. A tight, flat bright-end floor that rises only
+at the **faint** (S/N) and **bright** (saturation) ends is in family; a raised or structured floor
+flags a photometric or distortion problem in that filter's frames. Metrics: `x_rms_floor_mas`,
+`y_rms_floor_mas`, `mag_rms_floor`, `qfit_floor`, `n_stars`, `n_exposures`, `saturation_turnover_mag`
+(brightest magnitude where the mag-RMS has doubled above its floor — the saturation onset). Saturated
+stars are recovered to ≈0.05 mag RMS up to a few magnitudes above saturation.
+
+The stage reads `{root}/{field}/jwst1pass/{FILT}/MATCHUP.XYMEEE` (`QA_JWST1PASS_DIR` overrides the
+lookup for a one-off product directory); it red-flags when JWST1PASS has not been run for the
+obs/filter. The perturbation-PSF `LOG.psfperts.fits` per chip is a further check Jay notes (small,
+exposure-to-exposure consistent variations); a per-exposure panel for it is a planned follow-up.
+
+Source: [`data_qa/diagnostics.py` → `stage10_photometric_consistency`](../data_qa/diagnostics.py)
+(`_read_matchup_xymeee`, `_jwst1pass_matchup`).
+
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 

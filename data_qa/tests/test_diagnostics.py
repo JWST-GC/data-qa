@@ -1958,3 +1958,86 @@ def test_inputs_block_falls_back_to_one_line_per_role_when_it_would_be_too_large
     assert "Too many to list individually here" in blk
     assert "metrics/<obsid>.json" in blk
     assert "- **role 0** — 3 files in `/data/field/dir0/`" in blk
+
+
+# --------------------------------------------------------------------- STAGE 10 (JWST1PASS)
+_XYMEEE_HEADER = (
+    "#    xbar        ybar        mbar        xsig        ysig        msig        qbar    Nf  Ng  Nm\n")
+
+
+def _write_matchup(path, rows):
+    """Write a MATCHUP.XYMEEE with a comment header and whitespace columns
+    (x y m ex ey em q Nf Ng Nm)."""
+    with open(path, "w") as fh:
+        fh.write(_XYMEEE_HEADER)
+        for r in rows:
+            fh.write("  " + "  ".join(f"{v:.4f}" if i < 7 else f"{int(v):d}"
+                                      for i, v in enumerate(r)) + "\n")
+
+
+def _good_rows(n=200):
+    # bright-to-faint instrumental mags, small position/mag RMS, found in all 6 exposures
+    import numpy as _np
+    mags = _np.linspace(-14.0, -4.0, n)
+    return [(1000.0 + i, 2000.0 + i, float(mm), 0.01, 0.011, 0.02, 0.13, 6, 6, 6)
+            for i, mm in enumerate(mags)]
+
+
+def test_read_matchup_xymeee_drops_sentinels_and_unmeasured(tmp_path):
+    p = tmp_path / "MATCHUP.XYMEEE"
+    rows = _good_rows(120) + [
+        (0.0, 0.0, 0.0, 0.01, 0.01, 0.02, 0.13, 1, 1, 1),       # mbar==0 unmeasured
+        (5.0, 5.0, -6.0, 9.0, 9.0, 9.0, 9.99, 6, 6, 6),         # RMS sentinels
+        (7.0, 7.0, -6.0, 0.01, 0.01, 0.02, 0.13, 1, 1, 1),      # Ng<2 single exposure
+    ]
+    _write_matchup(str(p), rows)
+    d = D._read_matchup_xymeee(str(p))
+    assert d is not None
+    assert d["m"].size == 120                                    # only the good rows survive
+    assert (d["m"] < 0).all() and (d["Ng"] >= 2).all()
+    assert d["ex"].max() < D._XYMEEE_SENTINEL
+
+
+def test_read_matchup_xymeee_none_when_too_few(tmp_path):
+    p = tmp_path / "MATCHUP.XYMEEE"
+    _write_matchup(str(p), _good_rows(10))                       # < 50 usable rows
+    assert D._read_matchup_xymeee(str(p)) is None
+
+
+def test_jwst1pass_matchup_locator(tmp_path, monkeypatch):
+    monkeypatch.setitem(D._JWST1PASS_ROOTS, "brick", str(tmp_path))
+    o = _obs(field="brick", filt="F182M")
+    assert D._jwst1pass_matchup(o, "F182M") is None             # nothing on disk yet
+    d = tmp_path / "brick" / "jwst1pass" / "F182M"; d.mkdir(parents=True)
+    (d / "MATCHUP.XYMEEE").write_text("# empty\n")
+    assert D._jwst1pass_matchup(o, "F182M") == str(d / "MATCHUP.XYMEEE")
+
+
+def test_jwst1pass_matchup_env_override(tmp_path, monkeypatch):
+    (tmp_path / "MATCHUP.XYMEEE").write_text("# here\n")
+    monkeypatch.setenv("QA_JWST1PASS_DIR", str(tmp_path))
+    assert D._jwst1pass_matchup(_obs(field="brick", filt="F182M"), "F182M") == \
+        str(tmp_path / "MATCHUP.XYMEEE")
+
+
+def test_stage10_red_flags_without_product(tmp_path, monkeypatch):
+    monkeypatch.setitem(D._JWST1PASS_ROOTS, "brick", str(tmp_path))
+    monkeypatch.delenv("QA_JWST1PASS_DIR", raising=False)
+    png, m = D.stage10_photometric_consistency(_obs(field="brick", filt="F182M"), "F182M", None)
+    assert m["red_flag"] and m["passed"] is False
+    assert "MATCHUP" in m["red_flag_reason"] or "no JWST1PASS" in m["red_flag_reason"]
+    cap = D.caption_for(10, m)
+    assert "RED FLAG" in cap and "measurement could not be made" in cap
+
+
+def test_stage10_measures_consistency(tmp_path, monkeypatch):
+    monkeypatch.setenv("QA_JWST1PASS_DIR", str(tmp_path))
+    _write_matchup(str(tmp_path / "MATCHUP.XYMEEE"), _good_rows(300))
+    png, m = D.stage10_photometric_consistency(_obs(field="brick", filt="F182M"), "F182M", None)
+    assert m["passed"] and m["filter"] == "F182M"
+    assert m["n_stars"] == 300 and m["n_exposures"] == 6
+    # x RMS 0.01 META-pixel * 32 mas = 0.32 mas floor; mag RMS floor ~0.02
+    assert abs(m["x_rms_floor_mas"] - 0.32) < 0.05
+    assert abs(m["mag_rms_floor"] - 0.02) < 0.01
+    cap = D.caption_for(10, m)
+    assert "across-exposure consistency (F182M)" in cap and "mas/META-pixel" in cap
