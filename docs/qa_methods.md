@@ -11,12 +11,42 @@ the exact source function that built it, so no shorthand on a plot is left undef
   marker-keyed comment per stage, so re-running **updates in place** — it never duplicates.
 - **None of these stages is an automated gate.** The `passed` flag is a suggestion for the human
   reviewer, not an enforced pass/fail; each stage below says what "consider it passing" means.
+- Every stage reports the **full path of every file it read** — see
+  [which files a stage used](#inputs).
 
 Jump to: [Glossary](#glossary) ·
 [Stage 1](#stage1) · [Stage 2](#stage2) · [Stage 3](#stage3) · [Stage 4](#stage4) ·
 [Stage 5](#stage5) · [Stage 6](#stage6) · [Stage 7](#stage7)
 
 ---
+
+<a id="inputs"></a>
+## Which files a stage used
+
+Each posted comment ends with a collapsed **Files read for this stage** block giving the **full
+path** of every file that stage opened, grouped by what it was used for and then by directory, so
+a path always reads as `<directory>/<filename>`. The same list is the `inputs` key of that stage in
+`data_qa/metrics/<obsid>.json`.
+
+This answers the question the numbers cannot: *which* catalogue, *which* reference, *which*
+generation of the per-exposure products. A stage that quietly read a stale generation, a different
+observation's catalogue, or one module's detectors used to look exactly like a stage that read the
+right thing.
+
+A file is recorded at the point it is **opened**, not where its path is worked out. Those differ:
+the catalogue pickers header-peek every candidate before choosing one, `_mosaic_path` gets called
+for filters whose panel is then skipped, and several resolvers hand back a path that a later check
+rejects. Recording at resolve time would list files the analysis never read.
+
+The record survives a stage that fails partway — what it read before it died is usually the most
+useful thing about the failure — and it appears on red-flagged stages, where "the plot is empty"
+is much easier to act on with the list of what was and was not there.
+
+**On large sets.** The per-exposure daophot catalogues run to hundreds of files (brick F212N: 192;
+gc2211 F200W: 592). At ~100 characters a path, one such role approaches GitHub's 65 kB comment
+limit on its own, so a directory holding more than 12 files is rendered as its full path, its
+count, the first three filenames and the last. The block **says** it did that and points at the
+metrics JSON, which always holds the complete list. The file *count* is never abbreviated.
 
 <a id="glossary"></a>
 ## Glossary
