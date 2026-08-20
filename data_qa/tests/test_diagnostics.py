@@ -331,6 +331,124 @@ def test_cell_consistency_isolated_outlier_ignored():
     assert cc["n_deviating"] == 1 and cc["n_confirmed"] == 0 and cc["consistent"]
 
 
+def test_cell_consistency_rejects_spurious_low_occupancy_cells():
+    # cloudef o002 (#37): 3 dense cells consistent at ~150 mas + 4 low-occupancy edge cells with
+    # wild, mutually-inconsistent offsets (>300 mas from consensus, each <2% of the sources) =
+    # spurious per-cell xcorr peaks.  A tie cannot differ by ~arcsec between cells, so they are
+    # dropped, not shown as "measured".
+    cells = _grid_cells({
+        (3, 0): (-145.0, 38.0, 105000), (3, 1): (-143.0, 58.0, 88000), (3, 2): (-139.0, 69.0, 88000),
+        (0, 1): (-1771.0, 1482.0, 1545), (0, 2): (-529.0, -270.0, 1460),
+        (0, 3): (-787.0, -1260.0, 1133), (3, 3): (-575.0, 775.0, 558),
+    })
+    cc = D._cell_consistency(cells, [])
+    assert cc["n_spurious"] == 4 and cc["n_cells"] == 3 and cc["n_dropped"] == 4
+    assert cc["spread"] < 30                       # survivors agree; no 782 mas inflation
+    assert 140 < cc["off_med"] < 170               # uniform ~150 mas field offset preserved
+
+
+def test_cell_consistency_keeps_high_weight_far_cell():
+    # a WELL-POPULATED cell far from consensus is a real discontinuity, not a spurious peak: it must
+    # be kept (and flagged by adjacency), never dropped by the spurious filter.
+    base = {(i, j): (9.0, 0.0, 40000) for i in range(4) for j in range(4)}
+    base[(0, 0)] = (409.0, 0.0, 40000)             # 400 mas off, full cell's worth of sources
+    cc = D._cell_consistency(_grid_cells(base), [])
+    assert cc["n_spurious"] == 0 and cc["n_cells"] == 16 and cc["n_deviating"] == 1
+
+
+def test_isolated_bulk_recovers_known_offset():
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    # 120 well-separated (2") stars; VIRAC = same shifted +30 mas in RA, no decoys -> clean match set
+    ra = 266.4 + np.arange(120) * (2.0 / 3600.0)
+    dec = np.full(120, -28.5)
+    jsc = SkyCoord(ra * u.deg, dec * u.deg)
+    # VIRAC placed 30 mas east of JWST; the function returns JWST−VIRAC, so dRA should be −30
+    ref = SkyCoord((ra + 30.0 / 3.6e6 / np.cos(np.radians(-28.5))) * u.deg, dec * u.deg)
+    out = D._isolated_bulk(jsc, ref)
+    assert out is not None
+    mdra, mdde, n = out
+    assert n >= 100 and abs(mdra - (-30.0)) < 3.0 and abs(mdde) < 3.0
+
+
+def test_crossmatch_offset_normalises_and_rejects_edge_alias(monkeypatch):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    a = SkyCoord(np.linspace(266.40, 266.42, 100) * u.deg, np.full(100, -28.9) * u.deg)
+    # a clean peak passes through
+    monkeypatch.setattr(D, "_pipe_measure_offset", lambda x, y, confirm_windows=True: dict(
+        off=8.0, dra=6.0, ddec=5.0, contrast=40.0, ok=True, window_edge_fraction=0.02,
+        window_arcsec=3.0, npairs=500))
+    r = D._crossmatch_offset(a, a)
+    assert r["off"] == 8.0 and r["ok"] and r["source"] == "measure_offset"
+    # a window-edge alias is forced not-ok even though the pipeline gate passed it
+    monkeypatch.setattr(D, "_pipe_measure_offset", lambda x, y, confirm_windows=True: dict(
+        off=7000.0, dra=-1000.0, ddec=-6900.0, contrast=200.0, ok=True,
+        window_edge_fraction=0.75, window_arcsec=10.0, npairs=9))
+    r2 = D._crossmatch_offset(a, a)
+    assert r2["ok"] is False and r2["edge"] == 0.75
+
+
+def test_crossmatch_offset_falls_back_to_xcorr(monkeypatch):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    monkeypatch.setattr(D, "_pipe_measure_offset", None)          # pipeline unavailable (CI path)
+    ra = 266.40 + np.arange(400) * (0.5 / 3600.0); dec = np.full(400, -28.9)
+    a = SkyCoord(ra * u.deg, dec * u.deg)
+    b = SkyCoord((ra + 30.0 / 3.6e6 / np.cos(np.radians(-28.9))) * u.deg, dec * u.deg)
+    r = D._crossmatch_offset(a, b)
+    assert r is not None and r["source"] == "xcorr" and np.isfinite(r["off"])
+
+
+def test_crossmatch_offset_restricts_virac_to_jwst_footprint(monkeypatch):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    jwst = SkyCoord(np.linspace(266.40, 266.41, 200) * u.deg, np.full(200, -28.90) * u.deg)
+    # VIRAC: 200 stars in the JWST region + 5000 far away (a full-tile refcat)
+    ra = np.concatenate([np.linspace(266.40, 266.41, 200), np.linspace(200.0, 260.0, 5000)])
+    dec = np.concatenate([np.full(200, -28.90), np.full(5000, 10.0)])
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    seen = {}
+
+    def spy(a, b, confirm_windows=True):
+        seen["n"] = len(b)
+        return dict(off=1.0, dra=1.0, ddec=0.0, contrast=50.0, ok=True,
+                    window_edge_fraction=0.01, window_arcsec=3.0, npairs=100)
+    monkeypatch.setattr(D, "_pipe_measure_offset", spy)
+    D._crossmatch_offset(jwst, ref, restrict_footprint=True)
+    assert seen["n"] < 300                          # far VIRAC cropped out
+    D._crossmatch_offset(jwst, ref, restrict_footprint=False)
+    assert seen["n"] > 5000                          # full refcat passed through
+
+
+def test_catalog_staleness_only_uses_the_virac2locked_table(tmp_path, monkeypatch):
+    # A catalogue NEWER than the operative VIRAC2locked table but OLDER than a newer legacy table
+    # (VVV/consensus/per-filter) must NOT read as stale -- the check compares only against the
+    # operative table.  Fails if the glob widens back to Offsets_*.csv (PR #101 review).
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    cats = tmp_path / "brick" / "catalogs"; offs = tmp_path / "brick" / "offsets"
+    cats.mkdir(parents=True); offs.mkdir(parents=True)
+    name = "merged_cat.fits"
+    _touch(cats, name)
+    _touch(offs, "Offsets_JWST_Brick2221_VIRAC2locked.csv")
+    _touch(offs, "Offsets_JWST_Brick2221_VVV_average.csv")
+    t0 = 1_000_000_000.0
+    os.utime(str(offs / "Offsets_JWST_Brick2221_VIRAC2locked.csv"), (t0, t0))          # operative
+    os.utime(str(cats / name), (t0 + 5 * 86400, t0 + 5 * 86400))                       # catalogue newer
+    os.utime(str(offs / "Offsets_JWST_Brick2221_VVV_average.csv"), (t0 + 10 * 86400, t0 + 10 * 86400))  # newer legacy
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    cdate, adate, cname = D._catalog_vs_alignment_age(o, f"release:{name}")
+    assert cdate is None                              # NOT stale vs the VIRAC2locked table
+
+
+def test_isolated_bulk_none_when_too_sparse():
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    jsc = SkyCoord(np.array([266.4, 266.5]) * u.deg, np.array([-28.5, -28.5]) * u.deg)  # <100
+    assert D._isolated_bulk(jsc, jsc) is None
+
+
 def test_cell_consistency_componentwise_median_can_read_zero_on_a_bad_field():
     # The worked example in _cell_consistency's docstring and in docs/qa_methods.md.  off_dra and
     # off_dde are weighted medians taken SEPARATELY, so four cells at (+50,0), (-50,0), (0,+50),
@@ -466,6 +584,8 @@ def _stage4_seams(monkeypatch, cells, dropped, grid_used):
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
     monkeypatch.setattr(D, "_cell_offsets", lambda j, r: (cells, dropped, grid_used))
     monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: None)   # -> off_med = cell_off_med
+    monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, f: None)
     monkeypatch.setattr(D, "_save", lambda fig, name: name)
 
 
@@ -487,8 +607,10 @@ def test_stage4_low_coverage_grid_does_not_pass(monkeypatch):
     # wrongly pass it (#13 review).
     cells = [dict(i=i, j=0, ra=266.41 + 0.001 * i, dec=-28.89, dra=5.0, dde=0.0, off=5.0,
                   peak_ratio=8.0, n=400, n_ref=400, npairs=400) for i in range(3)]
-    dropped = [dict(i=i % 4, j=1 + i // 4, ra=266.41, dec=-28.89, n=400, n_ref=100,
-                    reason="too few reference stars") for i in range(13)]
+    # the 13 grid positions of a 4x4 that are NOT the three measured (0..2, 0)
+    dropped = [dict(i=i, j=j, ra=266.41, dec=-28.89, n=400, n_ref=100,
+                    reason="too few reference stars")
+               for i in range(4) for j in range(4) if not (i < 3 and j == 0)]
     _stage4_seams(monkeypatch, cells, dropped, grid_used=4)
     _png, m = D.stage4_offsets(_obs(), "F210M")
     assert m["cell_coverage"] < 0.5 and m["passed"] is False
@@ -986,6 +1108,8 @@ def _stage4_injection(monkeypatch, shift_mas):
     monkeypatch.setattr(aa, "load_reference", lambda ref, ep: (ref_sc, None))
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
+    monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: None)
     _png, metrics = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
     return metrics
 
