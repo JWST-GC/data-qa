@@ -4237,6 +4237,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
 # per-frame catalogues + the cal images) -- no JWST1PASS run required.
 _EPSF_HALF = 11                      # ePSF stamp half-size (px) -> 23x23
 _EPSF_QFIT_STREAK_FACTOR = 2.0       # exposure qfit > this x the median-of-exposures = streak flag
+_EPSF_LOG_VMIN = 0.003               # log-stretch floor (fraction of the peak) for the ePSF stamps
 
 
 def _exposure_qfit(o: Observation, filt):
@@ -4248,8 +4249,14 @@ def _exposure_qfit(o: Observation, filt):
     pdir = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar/{filt}"
     if not os.path.isdir(pdir):
         return {}
+    # SCOPE to this observation: a peppar filter dir can hold the frames of several observations
+    # (gc2211 o023 sits beside o046/o049; cloudef o002 beside o005), so filter the exposure token to
+    # this obs -- an unscoped glob would grid a DIFFERENT obs's exposures under this one's issue.
+    pref = f"jw{int(o.program):05d}{o.obs}"
     per_exp = {}
     for c in sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits")):
+        if not os.path.basename(c).startswith(pref):
+            continue
         mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
         if not mo:
             continue
@@ -4316,13 +4323,31 @@ def _effective_psf(cal_path, half=_EPSF_HALF, nbright=40, thresh_sigma=30.0):
         if (dq[yi - 2:yi + 3, xi - 2:xi + 3] & _DQ_SATURATED).any():  # drop saturated cores
             continue
         c = (img - med)[yi - half:yi + half + 1, xi - half:xi + half + 1]
-        if np.isfinite(c).all() and c.max() > 0:
-            stamps.append(c / c.max())
+        if not (np.isfinite(c).all() and c.max() > 0):
+            continue
+        # peak must sit at the stamp centre: a cosmic ray in the corner would otherwise contribute a
+        # full-amplitude off-centre pixel to the peak-normalised mean (the median used to absorb it).
+        py, px = np.unravel_index(int(np.argmax(c)), c.shape)
+        if abs(py - half) > 1 or abs(px - half) > 1:
+            continue
+        stamps.append(c / c.max())
         if len(stamps) >= nbright:
             break
     if len(stamps) < 10:
         return None, len(stamps)
     return np.mean(stamps, axis=0), len(stamps)
+
+
+def _epsf_rms_radius(stamp):
+    """Flux-weighted rms radius (px) of an ePSF stamp -- a size/breadth measure that separates a
+    broadened (streaked) exposure from the sharp ones even when the axis ratio does not."""
+    s = np.clip(np.asarray(stamp, float), 0, None)
+    tot = s.sum()
+    if tot <= 0:
+        return None
+    yy, xx = np.mgrid[0:s.shape[0], 0:s.shape[1]]
+    cx = (xx * s).sum() / tot; cy = (yy * s).sum() / tot
+    return float(np.sqrt((((xx - cx) ** 2 + (yy - cy) ** 2) * s).sum() / tot))
 
 
 def stage11_effective_psf(o: Observation, sw, lw):
@@ -4350,7 +4375,9 @@ def stage11_effective_psf(o: Observation, sw, lw):
     pdir = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar/{filt}"
     dets = sorted(os.path.basename(d) for d in glob.glob(f"{pdir}/NRC*"))
     det = "NRCA1" if "NRCA1" in dets else (dets[0] if dets else None)
-    cats = sorted(glob.glob(f"{pdir}/{det}/*_iter1_cat.fits")) if det else []
+    pref = f"jw{int(o.program):05d}{o.obs}"          # scope to THIS obs (see _exposure_qfit)
+    cats = (sorted(c for c in glob.glob(f"{pdir}/{det}/*_iter1_cat.fits")
+                   if os.path.basename(c).startswith(pref)) if det else [])
     exps = []
     for c in cats:
         mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
@@ -4368,21 +4395,24 @@ def stage11_effective_psf(o: Observation, sw, lw):
     streak_thresh = _EPSF_QFIT_STREAK_FACTOR * qbase if qbase else None
     streaked = []
 
-    from astropy.visualization import AsinhStretch, ImageNormalize
-    # asinh stretch: compress the bright core so the faint WINGS (and a streak's trailing structure)
-    # are visible -- a linear/sqrt stretch buries them under the peak.
-    norm = ImageNormalize(vmin=0.0, vmax=1.0, stretch=AsinhStretch(0.06))
+    from astropy.visualization import LogStretch, ImageNormalize
+    # LOG stretch: compress the bright core hardest so the faint WINGS -- the six diffraction spikes,
+    # and the broadened halo a streaked exposure grows -- are visible; asinh/sqrt still buried them.
+    # Floor at _EPSF_LOG_VMIN of the peak (stamps are peak-normalised to 1).
+    norm = ImageNormalize(vmin=_EPSF_LOG_VMIN, vmax=1.0, stretch=LogStretch())
     n = len(exps)
     ncol = min(6, n); nrow = int(np.ceil(n / ncol))
     fig, ax = plt.subplots(nrow, ncol, figsize=(2.35 * ncol, 2.9 * nrow), squeeze=False)
     for a in ax.flat:
         a.set_xticks([]); a.set_yticks([]); a.set_axis_off()
-    nstars_by_exp = {}
+    nstars_by_exp = {}; rms_by_exp = {}
     for k, exp in enumerate(exps):
         a = ax.flat[k]; a.set_axis_on(); a.set_xticks([]); a.set_yticks([])
         cal = _peppar_cal_for_cat(f"{pdir}/{det}/{exp}_{det.lower()}_cal_{o.field}_iter1_cat.fits")
         e, ns = (_effective_psf(cal) if cal else (None, 0))
         nstars_by_exp[exp] = int(ns)
+        rr = _epsf_rms_radius(e) if e is not None else None
+        rms_by_exp[exp] = rr
         if e is not None:
             a.imshow(np.clip(e, 0, None), origin="lower", cmap="inferno", norm=norm)
         else:
@@ -4394,20 +4424,23 @@ def stage11_effective_psf(o: Observation, sw, lw):
             streaked.append(exp)
         lbl = exp.split("_")[-1]                       # the exposure number
         qtxt = f"qfit={q:.1f}" if q is not None else "qfit —"
-        a.set_title(f"exp {lbl}  {qtxt}\n{ns} stars" + ("  ⚠STREAK" if bad else ""),
+        rtxt = f"  r={rr:.1f}px" if rr is not None else ""
+        a.set_title(f"exp {lbl}  {qtxt}\n{ns} stars{rtxt}" + ("  ⚠STREAK" if bad else ""),
                     fontsize=8.5, color=("#c33" if bad else "black"))
     ntot = sum(nstars_by_exp.values())
     metrics.update(n_exposures=n, detector_shown=det,
                    qfit_baseline=qbase, qfit_by_exposure={e: qf[e][0] for e in exps if e in qf},
                    epsf_nstars_by_exposure={e.split("_")[-1]: nstars_by_exp[e] for e in exps},
                    epsf_nstars_total=ntot, epsf_nstars_median=int(np.median(list(nstars_by_exp.values()))),
+                   epsf_rms_radius_by_exposure={e.split("_")[-1]: rms_by_exp[e] for e in exps
+                                                if rms_by_exp[e] is not None},
                    streaked_exposures=[e.split("_")[-1] for e in streaked],
                    n_streaked=len(streaked))
     metrics["passed"] = (len(streaked) == 0)
     ttl = (f"{o.target} {o.obsid} — effective PSF per exposure ({filt}, {det}); each stamp is the "
-           f"mean of bright, isolated, unsaturated stars")
+           f"mean of bright, isolated, unsaturated stars (log stretch)")
     if streaked:
-        ttl += f"  —  {len(streaked)} streaked exposure(s) flagged"
+        ttl += f"  —  {len(streaked)} flagged exposure(s) (high qfit / broadened PSF)"
     fig.suptitle(ttl, fontsize=10, y=0.995)
     return _save(fig, f"{o.obsid}_stage11.png"), metrics
 
@@ -4972,18 +5005,21 @@ def _caption_for_impl(n, metrics):
         filt = metrics.get("filter", "?"); det = metrics.get("detector_shown", "?")
         ne = metrics.get("n_exposures", 0)
         base = (f"**Stage 11 — effective PSF per exposure ({filt}, {det}).** Each panel is the "
-                f"empirical PSF of one exposure, built by stacking its bright, isolated stars from "
-                f"the cal image; a momentary tracking failure or guide-star glitch makes that "
-                f"exposure's stars streak or broaden, so its stamp looks fat and washed-out next to "
-                f"the sharp, six-spike NIRCam PSF of the good exposures. Each stamp is labelled with "
+                f"empirical PSF of one exposure — the mean of its bright, isolated, **unsaturated** "
+                f"stars stacked from the cal image (log stretch, so the wings show). A momentary "
+                f"tracking failure or guide-star glitch **broadens** that exposure's stars, so its "
+                f"stamp is fatter and more washed-out — a larger halo and a lower, less-peaked core — "
+                f"than the sharp, six-spike NIRCam PSF of the good exposures. (The broadening is "
+                f"roughly symmetric, not a clean elongation, so the flag is not an axis-ratio.) Each "
+                f"stamp is labelled with its star count, its ePSF rms radius (`r`, the breadth), and "
                 f"the exposure's peppar PSF-fit **quality-of-fit** (`qfit`), which spikes when the "
-                f"empirical PSF no longer fits — the objective streak signal. Built from our own "
-                f"data (peppar catalogues + cal images), independent of JWST1PASS. ")
+                f"empirical PSF no longer fits — the objective flag. Built from our own data (peppar "
+                f"catalogues + cal images), independent of JWST1PASS. ")
         ns = metrics.get("n_streaked") or 0
         if ns:
             exps = ", ".join(metrics.get("streaked_exposures") or [])
             qb = metrics.get("qfit_baseline")
-            base += (f"⚠️ **{ns} exposure(s) flagged as streaked:** {exps} — qfit above "
+            base += (f"⚠️ **{ns} exposure(s) flagged:** {exps} — qfit above "
                      f"{_EPSF_QFIT_STREAK_FACTOR:.0f}× the run baseline"
                      + (f" ({qb:.1f})" if qb is not None else "") + ". Those exposures degrade the "
                      f"PSF-fit astrometry/photometry and are candidates to down-weight or drop. ")

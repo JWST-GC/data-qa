@@ -2269,7 +2269,8 @@ def test_exposure_qfit_flags_the_streaked_exposure(tmp_path, monkeypatch):
     for k, q in enumerate([5.5, 5.6, 16.0, 5.4, 5.5], start=1):     # exp 3 is the streaked one
         _write_peppar_frame(det / f"jw02221001001_02101_0000{k}_nrca1_cal_brick_iter1_cat.fits",
                             qfit=q, seed=k)
-    o = _obs(field="brick", filt="F212N")
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
     qf = D._exposure_qfit(o, "F212N")
     assert len(qf) == 5
     meds = {e.split("_")[-1]: v[0] for e, v in qf.items()}
@@ -2327,3 +2328,39 @@ def test_stage11_red_flags_without_peppar(tmp_path, monkeypatch):
     assert m["red_flag"] and m["passed"] is False
     assert "no peppar" in m["red_flag_reason"]
     assert "RED FLAG" in D.caption_for(11, m)
+
+
+def _write_o_frames(det_dir, prog, obs, qfits):
+    # peppar frames for one observation: filenames jw<prog><obs>001_02101_0000k_nrca1_cal_..._iter1_cat
+    for k, q in enumerate(qfits, start=1):
+        _write_peppar_frame(det_dir / f"jw{int(prog):05d}{obs}001_02101_0000{k}_nrca1_cal_"
+                                      f"brick_iter1_cat.fits", qfit=q, seed=int(obs) * 10 + k)
+
+
+def test_stage11_flags_streak_and_pins_passed(tmp_path, monkeypatch):
+    # A streaked exposure (qfit spike) must set passed=False -- and the grid must be SCOPED to this
+    # obs, not pull a neighbouring obs's exposures from the same peppar filter directory.
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    monkeypatch.setattr(D, "_effective_psf", lambda cal, **kw: (np.ones((23, 23)), 30))  # skip cal I/O
+    det = tmp_path / "brick" / "peppar" / "F212N" / "NRCA1"; det.mkdir(parents=True)
+    _write_o_frames(det, 2221, "001", [5.5, 5.6, 16.0, 5.4])        # THIS obs: exp3 streaked
+    _write_o_frames(det, 2221, "002", [5.5, 5.5, 5.5, 5.5, 5.5])    # a DIFFERENT obs, must be ignored
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    png, m = D.stage11_effective_psf(o, "F212N", None)
+    assert m["n_exposures"] == 4                                    # only o001's four, not o002's five
+    assert m["streaked_exposures"] == ["00003"] and m["n_streaked"] == 1
+    assert m["passed"] is False
+    assert "flagged" in D.caption_for(11, m)
+
+
+def test_exposure_qfit_scoped_to_obs(tmp_path, monkeypatch):
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    det = tmp_path / "brick" / "peppar" / "F212N" / "NRCA1"; det.mkdir(parents=True)
+    _write_o_frames(det, 2221, "001", [5.5, 5.6])
+    _write_o_frames(det, 2221, "002", [5.5, 5.5, 5.5])
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    qf = D._exposure_qfit(o, "F212N")
+    assert len(qf) == 2                                             # only o001's two exposures
+    assert all(e.startswith("jw02221001") for e in qf)

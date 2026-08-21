@@ -563,11 +563,14 @@ failure or guide-star glitch (e.g. arches jw02045-o001 exposure 4, "tracking fai
 For each exposure of a representative detector, the **empirical (effective) PSF** is the **mean** of
 the peak-normalised cutouts of its bright, isolated, **unsaturated** stars detected directly on the
 cal image. Saturated stars are excluded via the **DQ** plane (their flat-topped cores are the
-brightest and hide the trail, so they would otherwise dominate), and the mean — not the median —
-keeps the asymmetric structure a streak leaves. The stamps use an **asinh** stretch so the faint
-wings (and a streak's trail) show. A good exposure gives a sharp core with the six-spike NIRCam
-diffraction pattern; a streaked exposure gives an elongated/washed-out stamp that has lost it. Each
-panel is labelled with the **number of stars** that went into it.
+brightest and hide the effect, so they would otherwise dominate); a cosmic-ray-dominated cutout is
+skipped by requiring the peak at the stamp centre; and the mean — not the median — keeps the
+structure. The stamps use a **log** stretch so the faint wings (and the broadened halo) show. A good
+exposure gives a sharp core with the six-spike NIRCam diffraction pattern; a glitched exposure gives
+a **broadened, washed-out** stamp — a larger halo and a lower, less-peaked core (the broadening is
+roughly symmetric, so it is a *breadth* change, not a clean elongation). Each panel is labelled with
+its **star count**, its ePSF **rms radius** (`r`, the breadth), and its `qfit`. The frames are
+**scoped to this observation** (a peppar filter directory can hold several observations' exposures).
 
 **The objective flag.** Each stamp is labelled with that exposure's peppar PSF-fit
 **quality-of-fit** (`qfit`, median over its bright stars): a streaked exposure fits the empirical PSF
