@@ -1365,6 +1365,28 @@ def test_depth_hist_guards_empty_and_all_nan():
     plt.close(fig)
 
 
+def test_vega_zeropoint_drops_nan_catalog_coords(tmp_path, monkeypatch):
+    # REGRESSION: stage 6 crashed "Catalog coordinates cannot contain NaN entries" (quintuplet
+    # o003, sickle o007) because _vega_zeropoint fed a merged catalogue's skycoord_<filt> straight
+    # into match_to_catalog_sky, and some rows carry NaN positions.
+    from astropy.table import Table
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    n = 80
+    ra = np.append(266.40 + np.arange(n) * 1e-4, [np.nan, np.nan])     # 80 finite + 2 NaN rows
+    dec = np.append(-28.90 + np.arange(n) * 1e-4, [np.nan, -28.9])
+    vega = np.append(18.0 + np.arange(n) * 0.02, [20.0, 20.0])
+    cat = tmp_path / "merged.fits"
+    Table({"skycoord_f212n": SkyCoord(ra * u.deg, dec * u.deg),
+           "mag_vega_f212n": vega}).write(str(cat), overwrite=True)
+    monkeypatch.setattr(D, "_catalog_with_vega",
+                        lambda o, f: (str(cat), "mag_vega_f212n", "skycoord_f212n"))
+    o = _obs(field="quintuplet", filt="F212N")
+    sc = SkyCoord(ra[:n] * u.deg, dec[:n] * u.deg)                     # detections at finite positions
+    zp = D._vega_zeropoint(o, "F212N", sc, vega[:n] - 5.0)             # instr = vega - 5 -> ZP +5
+    assert zp is not None and abs(zp - 5.0) < 0.01                     # no crash; correct ZP
+
+
 def test_stage7_verdict_pass_requires_mosaic_and_no_worse_offset():
     # a mosaic must exist; and where both offsets are measured ours must be no worse
     assert D._stage7_verdict(None, (134.0,) * 3, (14.5,) * 3, jic_unmeas=False)[0] is False

@@ -379,7 +379,16 @@ def _vega_zeropoint(o: Observation, filt, sc, instr):
     if sccol not in m.colnames or magcol not in m.colnames:
         return None
     vg = np.asarray(m[magcol], float)
-    idx, sep, _ = sc.match_to_catalog_sky(m[sccol])
+    # DROP catalogue rows with a NaN sky position before matching: match_to_catalog_sky builds a
+    # kd-tree of the catalogue and raises "Catalog coordinates cannot contain NaN entries" on any
+    # NaN (quintuplet o003, sickle o007 carry NaN skycoord_<filt> rows).  Filter coords AND the
+    # vega mag together so the indices stay aligned.
+    csc = m[sccol]
+    cfin = np.isfinite(csc.ra.deg) & np.isfinite(csc.dec.deg) & np.isfinite(vg)
+    if int(cfin.sum()) < 50:
+        return None
+    csc, vg = csc[cfin], vg[cfin]
+    idx, sep, _ = sc.match_to_catalog_sky(csc)
     good = (sep < 0.05 * u.arcsec) & np.isfinite(instr) & np.isfinite(vg[idx])
     if good.sum() < 50:
         return None
