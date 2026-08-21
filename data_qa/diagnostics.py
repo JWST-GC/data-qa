@@ -4009,7 +4009,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
         any_data = True
         lbl = f"{filt}  (n={int(ok.sum())}" + ("" if zp is not None else ", instr") + ")"
         a.plot(ctr, med, "-", color=color, lw=1.7,
-               label=lbl + r"  formal $\sigma_{\rm fit}$ (not repeatability)")
+               label=lbl + r"  formal $\sigma_{\rm fit}$")
         a.fill_between(ctr, lo, hi, color=color, alpha=0.20)
         # This solid curve is the fitter's FORMAL 1-sigma position error, per detection -- it has no
         # systematic in it by construction, so it is NOT the achieved astrometric precision (that is
