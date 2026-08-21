@@ -42,7 +42,7 @@ def test_field_mapping():
 
 def test_programs_cross_check_release_fields():
     """Every mapped field that has a public release page is a known FIELDS key."""
-    unreleased = {"cloudef", "sgra", "ngc6334",
+    unreleased = {"cloudef", "cloudef_controlfield", "sgra", "ngc6334",
                   "arches", "quintuplet"}          # no release page yet
     for prog, obsmap in mm.PROGRAMS.items():
         for field in obsmap.values():
