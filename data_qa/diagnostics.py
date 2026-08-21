@@ -1808,10 +1808,13 @@ def stage4_offsets(o: Observation, sw):
     coff = np.array([c["off"] for c in cells])
     confirmed = cc["confirmed"]; deviating = cc["deviating"]
     ncols = 2 + (1 if im else 0)
-    fig, ax = _fig(1, ncols, 6.2, 5.4)
-    # extra column gap + top room so the middle panel's marginal histograms (which hang above and
-    # to the right of the axes) don't overlap the neighbouring panel or the suptitle.
-    fig.subplots_adjust(wspace=0.62, top=0.80, bottom=0.12)
+    fig, ax = _fig(1, ncols, 6.2, 6.1)
+    # extra column gap + top room so the middle panel's marginal histograms (which hang above the
+    # axes) AND their multi-line title clear the suptitle: the top marginal reaches ~1.18x the axes
+    # height and carries a 4-line title above that, so top must sit well below the suptitle at 0.99
+    # (top=0.80 was too high -- the title collided with the suptitle, issue #35).  Taller figure
+    # keeps the panels from shrinking.
+    fig.subplots_adjust(wspace=0.62, top=0.70, bottom=0.10)
     col = 0
     # panel 1: contiguous 4x4 map of the per-cell offset (colour = offset).  Confirmed-deviating
     # cells get a RED outline; DROPPED cells (sources present, no clear peak) render grey, so a
