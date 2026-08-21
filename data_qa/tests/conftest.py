@@ -8,6 +8,14 @@ import numpy as np
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_mast_network(monkeypatch):
+    """The MAST catalogue resolvers now DOWNLOAD a genuinely-missing product instead of red-flagging.
+    Keep that network reach out of the test suite: force QA_MAST_DOWNLOAD=0 for every test so a
+    tmp-dir obs with no local catalogue fast-fails to None rather than querying MAST."""
+    monkeypatch.setenv("QA_MAST_DOWNLOAD", "0")
+
+
 def _make_wcs(crval, crpix, scale_deg, pa_deg):
     from astropy.wcs import WCS
     w = WCS(naxis=2)
