@@ -1260,6 +1260,16 @@ _CELL_SPURIOUS_MAX = 300.0
 # discard threshold for a low-occupancy spurious cell, a different decision that happens to share a
 # value today (PR #101 review -- do not re-collapse them onto one name).
 _CELL_SPURIOUS_WT = 0.02
+# When the SURVIVING cells (after spurious rejection) still scatter by more than this, the per-cell
+# histogram-peak method has broken down wholesale -- not a real spatial discontinuity (which spans a
+# few cells at ~tens of mas) but noise, ~arcsec of it (cloudef o005: 16 cells scatter 1783 mas while
+# clean isolated stars tie the field to 12 mas).  A field that scatters this far between cells is not
+# measuring a tie; defer to the clean isolated-star bulk instead of reporting the garbage and failing
+# on a phantom discontinuity.  Well above any real mis-registration + distortion (gc2211 o050's real
+# discontinuity is ~58 mas), well below the breakdown regime.
+_CELL_SPREAD_ABSURD = 300.0
+# Trust the isolated-star bulk as the override only when it rests on a solid clean sample.
+_ISO_OVERRIDE_MIN_N = 50
 
 
 def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=None):
@@ -1564,6 +1574,15 @@ def _crossmatch_offset(jsc, ref_sc, restrict_footprint=False):
                 source="xcorr")
 
 
+def _cell_map_broke_down(spread, iso_off, iso_n):
+    """True when the per-cell offset map has broken down wholesale (surviving cells scatter by more
+    than ``_CELL_SPREAD_ABSURD``) AND a solid clean isolated-star bulk exists to fall back on.  In
+    that state the per-cell histogram peaks are noise, not a tie, and the isolated bulk is the
+    trustworthy field offset (cloudef o005: 1783 mas cell scatter vs a 12 mas isolated tie)."""
+    return bool(spread is not None and spread > _CELL_SPREAD_ABSURD
+                and iso_off is not None and iso_n >= _ISO_OVERRIDE_MIN_N)
+
+
 def _isolated_bulk(jsc, ref_sc, iso_arcsec=0.5, match_arcsec=0.15, ambig_arcsec=0.4):
     """Bulk JWST−VIRAC offset from CLEAN matches only, as an independent check on the histogram peak:
     isolated JWST stars (nearest other JWST > ``iso_arcsec``) with an unambiguous VIRAC match (nearest
@@ -1680,16 +1699,32 @@ def stage4_offsets(o: Observation, sw):
     # matched one to one, are 0.4-1.6 mas apart).  So once the cells have established that the
     # field offset is small, re-measure the reported value from the SAME STARS.  The per-cell map
     # goes on doing the job it exists for, which is finding a spatial discontinuity.
+    # Clean isolated-star bulk: independent of the histogram peak (no nearest-neighbour collapse, no
+    # spurious-peak failure).  Computed HERE (not after the verdict) because it is the fallback when
+    # the per-cell map has broken down.
+    ib = _isolated_bulk(jsc, ref_sc)
+    iso_off = float(np.hypot(ib[0], ib[1])) if ib is not None else None
+    iso_n = int(ib[2]) if ib is not None else 0
+    # Cell-method breakdown: the surviving cells still scatter by ~arcsec, so the per-cell offsets are
+    # noise, not a tie.  When a solid clean isolated bulk exists, report IT and drop the phantom
+    # spatial-discontinuity verdict the garbage cells would otherwise raise (cloudef o005).
+    cell_map_unreliable = _cell_map_broke_down(spread, iso_off, iso_n)
+
     ss = aa.same_star_tie(jsc, ref_sc)
-    off_med = ss["off"] if ss else cell_off_med
-    bulk_source = "same-star" if ss else "histogram"
+    if cell_map_unreliable:
+        off_med = iso_off
+        bulk_source = "isolated (cell map unreliable)"
+    else:
+        off_med = ss["off"] if ss else cell_off_med
+        bulk_source = "same-star" if ss else "histogram"
     # The magnitude gate tests the per-cell histogram median (``cell_off_med``), which tracks a real
     # mis-registration out to XMAXSEP.  The same-star value is a refinement reported once a small
     # offset is confirmed: every same-star pair is matched inside 0.05", so that median is always
     # < 50 mas < THRESH["absolute"] and can never fail -- gating on it would pass a real 90 mas
     # offset (cell_off_med ~= 87, same-star ~= 13).  Gate on the LARGER of the two so a genuine
-    # mis-registration the histogram sees survives the refinement.
-    gate_off = max(cell_off_med, off_med)
+    # mis-registration the histogram sees survives the refinement.  When the cell map is unreliable,
+    # gate on the isolated bulk instead (the cell histogram is noise).
+    gate_off = iso_off if cell_map_unreliable else max(cell_off_med, off_med)
     # PASS needs a small offset, enough COVERAGE, spatially CONSISTENT cells (no adjacency-confirmed
     # sub-region off by >30 mas holding >2% of sources; catches a minority a robust spread cannot),
     # and a small inter-module offset.  The adjacency test needs a real grid, so the WHOLE-FIELD
@@ -1697,16 +1732,18 @@ def stage4_offsets(o: Observation, sw):
     # large field with 3/16 measurable cells is 21% coverage and must fail (issue #13 review).
     # Coverage is enforced in EVERY branch.
     whole_field = (grid_used == 1)
-    spatial_assessed = not whole_field
+    spatial_assessed = not whole_field and not cell_map_unreliable
     coverage_ok = cc["coverage"] >= _CELL_MIN_COVERAGE
-    spatial_ok = True if whole_field else cc["consistent"]
+    # A garbage cell map cannot pronounce a spatial discontinuity: its adjacency-confirmed "deviating"
+    # cells are noise agreeing with noise, so do not fail the field on them.
+    spatial_ok = True if (whole_field or cell_map_unreliable) else cc["consistent"]
     passed = bool(gate_off < aa.THRESH["absolute"] and spatial_ok and coverage_ok and
                   (io is None or io < aa.THRESH["intermodule"]))
     metrics.update(offset_med_mas=off_med, offset_scatter_mas=spread,
                    bulk_off=off_med,                        # reported offset (same-star when available)
                    gate_off_mas=gate_off,                   # value the magnitude gate tests (cell histogram)
                    spatial_assessed=spatial_assessed,       # False -> whole-field fallback, no per-cell map
-                   grid_used=grid_used,
+                   grid_used=grid_used, cell_map_unreliable=cell_map_unreliable,
                    bulk_source=bulk_source, cell_off_med=cell_off_med,
                    same_star_off=(ss["off"] if ss else None),
                    same_star_npairs=(ss["npairs"] if ss else None),
@@ -1717,17 +1754,17 @@ def stage4_offsets(o: Observation, sw):
                    bad_src_frac=cc["bad_src_frac"], cell_coverage=cc["coverage"],
                    cells_consistent=cc["consistent"], passed=passed)
 
-    # Guard A -- cross-check the histogram-peak bulk against CLEAN isolated matches, which suffer
-    # neither the nearest-neighbour collapse nor the spurious-peak failure.  A large disagreement
-    # means the reported peak is not the true bulk (sparse reference / spurious lobe), so the number
-    # is low-confidence even when its peak_ratio looks strong.
-    ib = _isolated_bulk(jsc, ref_sc)
+    # Guard A -- cross-check the histogram-peak bulk against the CLEAN isolated matches (computed
+    # above), which suffer neither the nearest-neighbour collapse nor the spurious-peak failure.  A
+    # large disagreement means the reported peak is not the true bulk (sparse reference / spurious
+    # lobe), so the number is low-confidence even when its peak_ratio looks strong.  When the cell map
+    # is already declared unreliable the isolated bulk IS the reported value, so no disagreement.
     if ib is not None:
         mdra, mdde, nclean = ib
-        disagree = float(np.hypot(cc["off_dra"] - mdra, cc["off_dde"] - mdde))
+        disagree = 0.0 if cell_map_unreliable else float(np.hypot(cc["off_dra"] - mdra, cc["off_dde"] - mdde))
         metrics.update(isolated_bulk_off_mas=float(np.hypot(mdra, mdde)),
                        isolated_bulk_n=nclean, bulk_vs_isolated_disagree_mas=disagree,
-                       bulk_low_confidence=bool(disagree > _BULK_DISAGREE_MAX))
+                       bulk_low_confidence=bool(not cell_map_unreliable and disagree > _BULK_DISAGREE_MAX))
     # Guard B -- did we measure a catalog OLDER than the field's current alignment?  Then its
     # absolute offset is the pre-re-tie frame, not the reduction on disk.
     cdate, adate, cname = _catalog_vs_alignment_age(o, src)
@@ -4438,7 +4475,8 @@ def _caption_for_impl(n, metrics):
         sp = metrics.get("offset_scatter_mas")
         nd = metrics.get("n_cells_dropped") or 0; ncf = metrics.get("n_cells_confirmed") or 0
         badf = metrics.get("bad_src_frac")
-        unc = f", and the cells scatter by {sp:.0f} mas about it" if sp is not None else ""
+        unc = ("" if metrics.get("cell_map_unreliable") or sp is None
+               else f", and the cells scatter by {sp:.0f} mas about it")
         om_str = f"{om:.1f}" if abs(om) < 10 else f"{om:.0f}"
         base = (f"**Stage 4 — positional offsets (JWST catalogue − VIRAC).** How far a star in the "
                 f"JWST catalogue sits from the same star in [VIRAC](DOCROOT#glossary-virac), which "
@@ -4458,6 +4496,18 @@ def _caption_for_impl(n, metrics):
                 f"ΔRA/ΔDec marginal histograms.\n\n"
                 f"The field offset is {om_str} mas over {nc} measured cells ({nd} without a "
                 f"peak){unc}. ")
+        # Cell-method breakdown (issue #38, cloudef o005): the cells scatter by ~arcsec, so the
+        # per-cell histogram peaks are noise, not a tie or a real discontinuity.  Say the map failed
+        # and that the quoted offset is the clean isolated-star bulk instead.
+        if metrics.get("cell_map_unreliable"):
+            ibn = metrics.get("isolated_bulk_n")
+            base += (f"⚠️ **The per-cell map is unreliable here.** The cells scatter by "
+                     f"{(sp or 0):.0f} mas (≈{(sp or 0) / 1000:.1f}″) — far more than any real tie or "
+                     f"sub-region discontinuity — so the per-cell histogram peaks are spurious (VIRAC "
+                     f"is too sparse over this field to peak reliably per cell). The offset quoted "
+                     f"above is instead the **clean isolated-star bulk** ({om_str} mas, "
+                     f"n={ibn}), matched one-to-one: the field IS well tied — the per-cell map, not "
+                     f"the frame, is what failed, so no spatial-discontinuity verdict is drawn. ")
         # Reliability + provenance guards (issue #37/#38): say plainly when the number is measured
         # on a pre-re-tie catalogue, or when the histogram peak disagrees with clean isolated matches.
         if metrics.get("catalog_stale"):
@@ -4486,13 +4536,19 @@ def _caption_for_impl(n, metrics):
                         f"the wrong pairs pile up in a way that pulls its peak by several mas. The "
                         f"pass gate tests the larger of the two" if cellm is not None
                         else "") + ". ")
-        if ncf:
+        if ncf and not metrics.get("cell_map_unreliable"):
             base += (f"{ncf} adjacent cell(s) holding {100 * (badf or 0):.0f}% of the sources sit "
                      f"at a different offset from the rest of the field — an internal "
                      f"discontinuity, so this observation does NOT pass. ")
         base += ("The RIGHT panel, when present, is the NRCA-minus-NRCB offset, measured "
                  "[without any external catalogue](DOCROOT#glossary-reffree). ")
-        if metrics.get("spatial_assessed", True):
+        if metrics.get("cell_map_unreliable"):
+            # cells exist but are noise; the pass rests on the isolated-star bulk, and the per-cell
+            # spatial-consistency check is void (not skipped for lack of cells).
+            base += ("A pass here needs a small isolated-star offset; the per-cell "
+                     "spatial-consistency check is void because the cell map broke down, so a subtle "
+                     "sub-region discontinuity could go unseen. ([how this is made](DOCROOT#stage4))")
+        elif metrics.get("spatial_assessed", True):
             base += ("A pass needs a small field offset AND cells that agree with each other. "
                      "([how this is made](DOCROOT#stage4))")
         else:
