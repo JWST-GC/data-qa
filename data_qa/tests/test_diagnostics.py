@@ -1310,6 +1310,19 @@ def test_stage7_verdict_mast_only_unmeasurable_passes_without_redflag():
     assert passed is True and red_flag is False and reason is None
 
 
+def test_depth_hist_guards_empty_and_all_nan():
+    # REGRESSION: stage 7's depth histogram crashed with "autodetected range of [nan, nan] is not
+    # finite" when the common-window selection was EMPTY or the MAST abmag column was all NaN.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots()
+    assert D._depth_hist(ax, np.array([]), "empty", "#000000") == 0          # empty: no crash
+    assert D._depth_hist(ax, np.full(40, np.nan), "all-nan", "#000000") == 0  # all NaN: no crash
+    assert D._depth_hist(ax, np.array([1.0, np.nan, 2.0, 3.0]), "mixed", "#000000") == 3
+    plt.close(fig)
+
+
 def test_stage7_verdict_pass_requires_mosaic_and_no_worse_offset():
     # a mosaic must exist; and where both offsets are measured ours must be no worse
     assert D._stage7_verdict(None, (134.0,) * 3, (14.5,) * 3, jic_unmeas=False)[0] is False

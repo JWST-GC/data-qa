@@ -3056,6 +3056,19 @@ def _stage7_verdict(our_path, mast_off, jic_off, jic_unmeas):
     return passed, False, None
 
 
+def _depth_hist(ax, mags, label, color):
+    """Draw one step magnitude-histogram of the FINITE entries of ``mags`` and return that count.
+    Guards the two ways ``np.histogram`` raises "autodetected range of [nan, nan] is not finite":
+    an EMPTY selection (no sources in the common window) and an all-NaN column (MAST abmag carries
+    NaN rows).  A count of 0 draws nothing -- the panel simply omits that series."""
+    m = np.asarray(mags, float)
+    m = m[np.isfinite(m)]
+    n = int(m.size)
+    if n:
+        ax.hist(m, bins=50, histtype="step", color=color, lw=1.4, label=f"{label} (n={n})")
+    return n
+
+
 def stage7_mast_vs_pipeline(o: Observation, sw):
     """Compare the pipeline against the raw MAST-delivered products:
     (top) the MAST L3 i2d mosaic beside our pipeline mosaic over the SAME sky region;
@@ -3216,15 +3229,10 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
             metrics["mast_to_jicama_zp"] = mast_zp
     if mast_sc is not None and mast_mag is not None:
         mm = mast_mag[_inbox(mast_sc)] + (mast_zp or 0.0)      # on jicama ZP when calibrated
-        n_mast_win = int(len(mm))
         zlab = "" if mast_zp is not None else " (own ZP)"
-        axh.hist(mm, bins=50, histtype="step", color="#ee6677", lw=1.4,
-                 label=f"{mast_kind}{zlab} (n={n_mast_win})")
+        n_mast_win = _depth_hist(axh, mm, f"{mast_kind}{zlab}", "#ee6677")
     if jsc is not None and jmag is not None:
-        jm = jmag[_inbox(jsc)]
-        n_jic_win = int(len(jm))
-        axh.hist(jm, bins=50, histtype="step", color="#4477aa", lw=1.4,
-                 label=f"{jic_label} (n={n_jic_win})")
+        n_jic_win = _depth_hist(axh, jmag[_inbox(jsc)], jic_label, "#4477aa")
     if n_mast_win is not None:
         metrics["n_mast_window"] = n_mast_win
     if n_jic_win is not None:
