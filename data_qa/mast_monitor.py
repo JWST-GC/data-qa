@@ -168,7 +168,7 @@ PROGRAMS: Dict[int, Dict[str, str]] = {
     6151: {"001": "w51"},
     2045: {"001": "arches", "003": "quintuplet"},
     3958: {"001": "sickle", "002": "sickle", "007": "sickle"},
-    2092: {"002": "cloudef", "005": "cloudef"},
+    2092: {"002": "cloudef", "005": "cloudef_controlfield"},   # o005 = the control/offset pointing
     1939: {"001": "sgra"},
     1905: {"001": "wd1", "003": "wd1"},
     3523: {"003": "wd2", "005": "wd2"},

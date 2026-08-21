@@ -34,6 +34,7 @@ FIELDS: Dict[str, str] = {
     "brick": "Brick",
     "cloudc": "Cloud C",
     "cloudef": "Cloud E/F",
+    "cloudef_controlfield": "Cloud E/F control field",
     "gc2211": "GC 2211",
     "gc-treasury": "GC Treasury",
     "arches": "Arches",
