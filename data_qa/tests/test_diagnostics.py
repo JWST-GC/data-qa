@@ -2298,3 +2298,117 @@ def test_stage10_flags_sw_meta_scale_on_lw_filter(tmp_path, monkeypatch):
     assert m["passed"] and m["filter"] == "F405N"
     assert m.get("meta_scale_assumed_sw") is True
     assert "unconfirmed" in D.caption_for(10, m) and "SW" in D.caption_for(10, m)
+
+
+# --------------------------------------------------------------------- STAGE 11 (effective PSF)
+def _write_peppar_frame(path, n=400, qfit=5.5, seed=0):
+    """A peppar per-frame *_iter1_cat.fits with m/x_fit/y_fit/qfit; qfit constant per exposure."""
+    from astropy.table import Table
+    rng = np.random.default_rng(seed)
+    Table({"m": np.linspace(-9.0, -3.0, n),
+           "x_fit": rng.uniform(20, 2020, n), "y_fit": rng.uniform(20, 2020, n),
+           "qfit": np.full(n, qfit)}).write(str(path), overwrite=True)
+
+
+def test_exposure_qfit_flags_the_streaked_exposure(tmp_path, monkeypatch):
+    # A streaked exposure fits the PSF far worse -> its qfit spikes above the run baseline.
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    det = tmp_path / "brick" / "peppar" / "F212N" / "NRCA1"; det.mkdir(parents=True)
+    for k, q in enumerate([5.5, 5.6, 16.0, 5.4, 5.5], start=1):     # exp 3 is the streaked one
+        _write_peppar_frame(det / f"jw02221001001_02101_0000{k}_nrca1_cal_brick_iter1_cat.fits",
+                            qfit=q, seed=k)
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    qf = D._exposure_qfit(o, "F212N")
+    assert len(qf) == 5
+    meds = {e.split("_")[-1]: v[0] for e, v in qf.items()}
+    assert abs(meds["00003"] - 16.0) < 0.1 and abs(meds["00001"] - 5.5) < 0.1
+    # baseline is the median across exposures (~5.5); only exp 3 exceeds 2x it
+    base = float(np.median([v[0] for v in qf.values()]))
+    over = [e for e, v in meds.items() if v > D._EPSF_QFIT_STREAK_FACTOR * base]
+    assert over == ["00003"]
+
+
+def test_effective_psf_builds_stamp_and_guards(tmp_path):
+    from astropy.io import fits
+    rng = np.random.default_rng(1)
+    img = rng.normal(0.0, 1.0, (400, 400)).astype("float32")
+    yy, xx = np.mgrid[0:23, 0:23]
+    g = np.exp(-((xx - 11) ** 2 + (yy - 11) ** 2) / (2 * 1.5 ** 2))
+    for _ in range(40):                                            # plant 40 well-separated bright stars
+        cx, cy = rng.integers(40, 360), rng.integers(40, 360)
+        img[cy - 11:cy + 12, cx - 11:cx + 12] += 500.0 * g
+    cal = tmp_path / "exp_cal.fits"
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.ImageHDU(img, name="SCI")]).writeto(str(cal), overwrite=True)
+    stamp, n = D._effective_psf(str(cal))
+    assert stamp is not None and n >= 10
+    assert stamp.shape == (2 * D._EPSF_HALF + 1, 2 * D._EPSF_HALF + 1)
+    assert np.unravel_index(int(np.argmax(stamp)), stamp.shape) == (D._EPSF_HALF, D._EPSF_HALF)
+    # a blank frame yields no stamp, not a crash
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.ImageHDU(np.zeros((400, 400), "float32"), name="SCI")]).writeto(
+        str(tmp_path / "blank.fits"), overwrite=True)
+    assert D._effective_psf(str(tmp_path / "blank.fits")) == (None, 0)
+
+
+def test_effective_psf_excludes_saturated_via_dq(tmp_path):
+    # Every star's core flagged SATURATED in the DQ plane -> all excluded -> no stamp (not a crash).
+    from astropy.io import fits
+    rng = np.random.default_rng(2)
+    img = rng.normal(0.0, 1.0, (400, 400)).astype("float32")
+    dq = np.zeros((400, 400), "int32")
+    yy, xx = np.mgrid[0:23, 0:23]
+    g = np.exp(-((xx - 11) ** 2 + (yy - 11) ** 2) / (2 * 1.5 ** 2))
+    centres = [(rng.integers(40, 360), rng.integers(40, 360)) for _ in range(40)]
+    for cx, cy in centres:
+        img[cy - 11:cy + 12, cx - 11:cx + 12] += 500.0 * g
+        dq[cy - 1:cy + 2, cx - 1:cx + 2] |= D._DQ_SATURATED          # flag the core saturated
+    fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(img, name="SCI"),
+                  fits.ImageHDU(dq, name="DQ")]).writeto(str(tmp_path / "sat.fits"), overwrite=True)
+    stamp, n = D._effective_psf(str(tmp_path / "sat.fits"))
+    assert stamp is None and n < 10                                  # saturated cores all dropped
+
+
+def test_stage11_red_flags_without_peppar(tmp_path, monkeypatch):
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    png, m = D.stage11_effective_psf(_obs(field="brick", filt="F212N"), "F212N", None)
+    assert m["red_flag"] and m["passed"] is False
+    assert "no peppar" in m["red_flag_reason"]
+    assert "RED FLAG" in D.caption_for(11, m)
+
+
+def _write_o_frames(det_dir, prog, obs, qfits):
+    # peppar frames for one observation: filenames jw<prog><obs>001_02101_0000k_nrca1_cal_..._iter1_cat
+    for k, q in enumerate(qfits, start=1):
+        _write_peppar_frame(det_dir / f"jw{int(prog):05d}{obs}001_02101_0000{k}_nrca1_cal_"
+                                      f"brick_iter1_cat.fits", qfit=q, seed=int(obs) * 10 + k)
+
+
+def test_stage11_flags_streak_and_pins_passed(tmp_path, monkeypatch):
+    # A streaked exposure (qfit spike) must set passed=False -- and the grid must be SCOPED to this
+    # obs, not pull a neighbouring obs's exposures from the same peppar filter directory.
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    monkeypatch.setattr(D, "_effective_psf", lambda cal, **kw: (np.ones((23, 23)), 30))  # skip cal I/O
+    det = tmp_path / "brick" / "peppar" / "F212N" / "NRCA1"; det.mkdir(parents=True)
+    _write_o_frames(det, 2221, "001", [5.5, 5.6, 16.0, 5.4])        # THIS obs: exp3 streaked
+    _write_o_frames(det, 2221, "002", [5.5, 5.5, 5.5, 5.5, 5.5])    # a DIFFERENT obs, must be ignored
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    png, m = D.stage11_effective_psf(o, "F212N", None)
+    assert m["n_exposures"] == 4                                    # only o001's four, not o002's five
+    assert m["streaked_exposures"] == ["00003"] and m["n_streaked"] == 1
+    assert m["passed"] is False
+    assert "flagged" in D.caption_for(11, m)
+
+
+def test_exposure_qfit_scoped_to_obs(tmp_path, monkeypatch):
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    det = tmp_path / "brick" / "peppar" / "F212N" / "NRCA1"; det.mkdir(parents=True)
+    _write_o_frames(det, 2221, "001", [5.5, 5.6])
+    _write_o_frames(det, 2221, "002", [5.5, 5.5, 5.5])
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    qf = D._exposure_qfit(o, "F212N")
+    assert len(qf) == 2                                             # only o001's two exposures
+    assert all(e.startswith("jw02221001") for e in qf)
