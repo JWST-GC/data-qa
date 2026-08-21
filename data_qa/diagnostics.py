@@ -1633,10 +1633,25 @@ def _catalog_vs_alignment_age(o: Observation, src):
         return None, None, None
     name = src.split("release:", 1)[1].split(" [", 1)[0].strip()
     cpath = os.path.join(BASE, o.field, "catalogs", name)
-    # Compare against the OPERATIVE alignment table only -- the VIRAC2-locked offsets the reduction
-    # applies -- not the newest of every CSV in the dir (older per-filter/VVV/consensus tables would
-    # otherwise set the bar; PR #101 review).
+    # Compare against the OPERATIVE alignment table only -- not the newest of every CSV in the dir,
+    # since an older per-filter/VVV table would otherwise set the bar (PR #101 review).
+    #
+    # Which table is operative depends on the field.  `alignment_config` dispatches each field to
+    # either a VIRAC2-locked table (TABLE_LOCKED) or a checkpoint-written consensus table
+    # (TABLE_CONSENSUS).  Globbing only for VIRAC2locked made this check a no-op for every
+    # consensus-source field -- arches and w51 have no locked table at all, so `offs` was empty and
+    # the function returned "not stale" for anything.
+    #
+    # arches is what this cost: its release catalogue is 2026-06-30 and its consensus table
+    # 2026-08-16, so stage 4 reported a 14.8 mas offset and stage 7 an `astrom_improved: False`
+    # against a catalogue built seven weeks before the field had any alignment at all.
+    #
+    # Preference, not union: where a locked table exists it is the operative one and a stale
+    # consensus table beside it must not set the bar, which is the PR #101 finding.  The consensus
+    # table is consulted only when no locked table exists.
     offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*VIRAC2locked.csv"))
+    if not offs:
+        offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*_consensus.csv"))
     if not (os.path.exists(cpath) and offs):
         return None, None, None
     cm = os.path.getmtime(cpath)
