@@ -555,6 +555,31 @@ exposure-to-exposure consistent variations); a per-exposure panel for it is a pl
 Source: [`data_qa/diagnostics.py` → `stage10_photometric_consistency`](../data_qa/diagnostics.py)
 (`_read_matchup_xymeee`, `_jwst1pass_matchup`).
 
+<a id="stage11"></a>
+## Stage 11 — effective PSF per exposure
+
+**What it shows.** Whether any exposure has a **streaked or broadened PSF** — a momentary tracking
+failure or guide-star glitch (e.g. arches jw02045-o001 exposure 4, "tracking failed for a second").
+For each exposure of a representative detector, the **empirical (effective) PSF** is built by
+stacking the peak-normalised cutouts of its bright, isolated stars detected directly on the cal
+image. A good exposure gives a sharp core with the six-spike NIRCam diffraction pattern; a streaked
+exposure gives a fat, washed-out stamp that has lost that structure.
+
+**The objective flag.** Each stamp is labelled with that exposure's peppar PSF-fit
+**quality-of-fit** (`qfit`, median over its bright stars): a streaked exposure fits the empirical PSF
+far worse, so its `qfit` spikes. An exposure whose `qfit` exceeds **`_EPSF_QFIT_STREAK_FACTOR`
+(2×)** the median across the run's exposures is flagged as streaked (arches o001: exposure 4 reads
+`qfit≈16` against a `~5.5` baseline; the other eleven, including exposure 12, sit at the baseline).
+Flagged exposures degrade the PSF-fit astrometry/photometry and are candidates to down-weight or drop.
+
+This is built from **our own data** (peppar per-frame catalogues + cal images), independent of
+JWST1PASS (stage 10), so it works on every field with peppar products. Metrics: `n_exposures`,
+`detector_shown`, `qfit_baseline`, `qfit_by_exposure`, `streaked_exposures`, `n_streaked`. Red-flags
+when no peppar catalogues exist for the obs/filter.
+
+Source: [`data_qa/diagnostics.py` → `stage11_effective_psf`](../data_qa/diagnostics.py)
+(`_exposure_qfit`, `_effective_psf`).
+
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 

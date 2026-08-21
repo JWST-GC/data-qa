@@ -4229,6 +4229,170 @@ def stage6_astrom_error(o: Observation, sw, lw):
     return _save(fig, f"{o.obsid}_stage6.png"), metrics
 
 
+# --------------------------------------------------------------------------- STAGE 11
+# A streaked/broadened PSF (e.g. arches jw02045-o001 exposure 4, "tracking failed for a second")
+# shows two ways in the peppar products: the per-frame PSF-fit quality-of-fit (qfit) jumps for that
+# exposure's bright stars (the empirical PSF no longer fits), and the effective PSF built from that
+# exposure's own stars is visibly fatter/washed-out.  Stage 11 shows BOTH, from OUR data (peppar
+# per-frame catalogues + the cal images) -- no JWST1PASS run required.
+_EPSF_HALF = 11                      # ePSF stamp half-size (px) -> 23x23
+_EPSF_QFIT_STREAK_FACTOR = 2.0       # exposure qfit > this x the median-of-exposures = streak flag
+
+
+def _exposure_qfit(o: Observation, filt):
+    """Median PSF-fit quality-of-fit of the bright stars in each exposure, pooled over detectors, from
+    the peppar per-frame catalogues.  A streaked/broadened exposure fits the empirical PSF far worse,
+    so its qfit spikes above the run's baseline.  Returns {exposure_token: (median_qfit, n_bright)}
+    or {} if no peppar catalogues."""
+    from astropy.table import Table
+    pdir = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar/{filt}"
+    if not os.path.isdir(pdir):
+        return {}
+    per_exp = {}
+    for c in sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits")):
+        mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
+        if not mo:
+            continue
+        try:
+            t = Table.read(_used(c, f"peppar per-frame catalogue ({filt})"))
+        except (OSError, ValueError):
+            continue
+        if not {"m", "qfit"} <= set(t.colnames):
+            continue
+        m = np.asarray(t["m"], float); q = np.asarray(t["qfit"], float)
+        g = np.isfinite(m) & np.isfinite(q)
+        if g.sum() < 50:
+            continue
+        bright = g & (m < np.nanpercentile(m[g], 20))     # brightest 20% -- cleanest fit regime
+        per_exp.setdefault(mo.group(1), []).append(q[bright])
+    out = {}
+    for exp, arrs in per_exp.items():
+        qq = np.concatenate(arrs)
+        qq = qq[np.isfinite(qq)]
+        if qq.size >= 30:
+            out[exp] = (float(np.median(qq)), int(qq.size))
+    return out
+
+
+def _effective_psf(cal_path, half=_EPSF_HALF, nbright=60, thresh_sigma=30.0):
+    """The effective PSF of one exposure/detector: median of the peak-normalised cutouts of its
+    bright, isolated stars, detected directly on the cal image (independent of any fit).  A streaked
+    exposure yields a fat, washed-out stamp.  Returns (stamp, n_stars) or (None, 0)."""
+    from astropy.io import fits
+    from astropy.stats import sigma_clipped_stats
+    try:
+        from photutils.detection import DAOStarFinder
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return None, 0
+    try:
+        with fits.open(cal_path) as hd:
+            img = np.asarray((hd["SCI"] if "SCI" in hd else hd[1]).data, float)
+    except (OSError, ValueError, KeyError):
+        return None, 0
+    fin = np.isfinite(img)
+    if fin.sum() < 1000:
+        return None, 0
+    _mean, med, std = sigma_clipped_stats(img[fin], sigma=3.0)
+    tb = DAOStarFinder(fwhm=2.5, threshold=thresh_sigma * std)(img - med)
+    if tb is None or len(tb) < 20:
+        return None, 0
+    x = np.asarray(tb["xcentroid"]); y = np.asarray(tb["ycentroid"]); flux = np.asarray(tb["flux"])
+    xy = np.column_stack([x, y])
+    d, _ = cKDTree(xy).query(xy, k=2)
+    iso = d[:, 1] > 2.3 * half                          # isolated: no neighbour inside the stamp
+    idx = np.where(iso)[0]
+    idx = idx[np.argsort(-flux[idx])][:nbright]         # brightest isolated
+    stamps = []
+    for i in idx:
+        xi, yi = int(round(x[i])), int(round(y[i]))
+        if xi - half < 0 or yi - half < 0 or xi + half + 1 > img.shape[1] or yi + half + 1 > img.shape[0]:
+            continue
+        c = (img - med)[yi - half:yi + half + 1, xi - half:xi + half + 1]
+        if np.isfinite(c).all() and c.max() > 0:
+            stamps.append(c / c.max())
+    if len(stamps) < 10:
+        return None, len(stamps)
+    return np.median(stamps, axis=0), len(stamps)
+
+
+def stage11_effective_psf(o: Observation, sw, lw):
+    """Effective PSF per exposure, to catch a streaked/broadened PSF (e.g. a momentary tracking
+    failure).  For each exposure of a representative detector the empirical PSF is built by stacking
+    its bright isolated stars (from the cal image), shown as a stamp; the exposure's peppar
+    quality-of-fit -- which spikes when the PSF no longer fits -- labels each stamp and flags the bad
+    exposures.  Independent of JWST1PASS (uses our peppar catalogues + cal images)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    metrics = dict(stage=11, sw=sw, lw=lw)
+    filt = next((f for f in (sw, lw)
+                 if f and os.path.isdir(f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}"
+                                        f"/{o.field}/peppar/{f}")), None)
+    if filt is None:
+        reason = "no peppar per-frame catalogues on disk for this obs/filter"
+        png = _red_flag_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE",
+                               f"Cannot build the per-exposure effective PSF: {reason}.")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        return png, metrics
+    metrics["filter"] = filt
+    qf = _exposure_qfit(o, filt)          # {exp_token: (median_qfit, n)} pooled over detectors
+    # a representative detector to show the ePSF stamps for (NRCA1 if present, else the first)
+    pdir = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar/{filt}"
+    dets = sorted(os.path.basename(d) for d in glob.glob(f"{pdir}/NRC*"))
+    det = "NRCA1" if "NRCA1" in dets else (dets[0] if dets else None)
+    cats = sorted(glob.glob(f"{pdir}/{det}/*_iter1_cat.fits")) if det else []
+    exps = []
+    for c in cats:
+        mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
+        if mo and mo.group(1) not in exps:
+            exps.append(mo.group(1))
+    if not exps:
+        reason = f"no exposures found under peppar {filt}/{det}"
+        png = _red_flag_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE", reason + ".")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        return png, metrics
+
+    # streak flag: an exposure whose qfit exceeds _EPSF_QFIT_STREAK_FACTOR x the median across exposures
+    qvals = np.array([qf[e][0] for e in exps if e in qf], float)
+    qbase = float(np.median(qvals)) if qvals.size else None
+    streak_thresh = _EPSF_QFIT_STREAK_FACTOR * qbase if qbase else None
+    streaked = []
+
+    n = len(exps)
+    ncol = min(6, n); nrow = int(np.ceil(n / ncol))
+    fig, ax = plt.subplots(nrow, ncol, figsize=(2.35 * ncol, 2.7 * nrow), squeeze=False)
+    for a in ax.flat:
+        a.set_xticks([]); a.set_yticks([]); a.set_axis_off()
+    for k, exp in enumerate(exps):
+        a = ax.flat[k]; a.set_axis_on(); a.set_xticks([]); a.set_yticks([])
+        cal = _peppar_cal_for_cat(f"{pdir}/{det}/{exp}_{det.lower()}_cal_{o.field}_iter1_cat.fits")
+        e, ns = (_effective_psf(cal) if cal else (None, 0))
+        if e is not None:
+            a.imshow(np.power(np.clip(e, 0, None), 0.4), origin="lower", cmap="inferno")
+        else:
+            a.text(0.5, 0.5, "no ePSF", ha="center", va="center", fontsize=8,
+                   style="italic", transform=a.transAxes)
+        q = qf.get(exp, (None, 0))[0]
+        bad = bool(streak_thresh and q is not None and q > streak_thresh)
+        if bad:
+            streaked.append(exp)
+        lbl = exp.split("_")[-1]                       # the exposure number
+        qtxt = f"qfit={q:.1f}" if q is not None else "qfit —"
+        a.set_title(f"exp {lbl}  {qtxt}" + ("  ⚠STREAK" if bad else ""),
+                    fontsize=8.5, color=("#c33" if bad else "black"))
+    metrics.update(n_exposures=n, detector_shown=det,
+                   qfit_baseline=qbase, qfit_by_exposure={e: qf[e][0] for e in exps if e in qf},
+                   streaked_exposures=[e.split("_")[-1] for e in streaked],
+                   n_streaked=len(streaked))
+    metrics["passed"] = (len(streaked) == 0)
+    ttl = f"{o.target} {o.obsid} — effective PSF per exposure ({filt}, {det})"
+    if streaked:
+        ttl += f"  —  {len(streaked)} streaked exposure(s) flagged"
+    fig.suptitle(ttl, fontsize=11, y=0.99)
+    return _save(fig, f"{o.obsid}_stage11.png"), metrics
+
+
 def _dispatch_stage(o, n, sw, lw):
     if n == 1:
         return stage1_mosaics(o, sw, lw)
@@ -4250,6 +4414,8 @@ def _dispatch_stage(o, n, sw, lw):
         return stage9_psf_vs_aper(o, sw)
     if n == 10:
         return stage10_photometric_consistency(o, sw, lw)
+    if n == 11:
+        return stage11_effective_psf(o, sw, lw)
     raise ValueError(n)
 
 
@@ -4298,6 +4464,7 @@ _HEADLINE = {
     8: "**Stage 8 — distortion residual map.**",
     9: "**Stage 9 — PSF vs aperture photometry.**",
     10: "**Stage 10 — JWST1PASS across-exposure consistency.**",
+    11: "**Stage 11 — effective PSF per exposure.**",
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
@@ -4780,6 +4947,30 @@ def _caption_for_impl(n, metrics):
             base += (f"The mag-RMS doubles above its floor brighter than "
                      f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation onset). ")
         return base + "([how this is made](DOCROOT#stage10))"
+    if n == 11:
+        # Built in code so the streak-flag sentence is only stated when an exposure is actually
+        # flagged.  The no-product case is the generic red-flag branch above.
+        filt = metrics.get("filter", "?"); det = metrics.get("detector_shown", "?")
+        ne = metrics.get("n_exposures", 0)
+        base = (f"**Stage 11 — effective PSF per exposure ({filt}, {det}).** Each panel is the "
+                f"empirical PSF of one exposure, built by stacking its bright, isolated stars from "
+                f"the cal image; a momentary tracking failure or guide-star glitch makes that "
+                f"exposure's stars streak or broaden, so its stamp looks fat and washed-out next to "
+                f"the sharp, six-spike NIRCam PSF of the good exposures. Each stamp is labelled with "
+                f"the exposure's peppar PSF-fit **quality-of-fit** (`qfit`), which spikes when the "
+                f"empirical PSF no longer fits — the objective streak signal. Built from our own "
+                f"data (peppar catalogues + cal images), independent of JWST1PASS. ")
+        ns = metrics.get("n_streaked") or 0
+        if ns:
+            exps = ", ".join(metrics.get("streaked_exposures") or [])
+            qb = metrics.get("qfit_baseline")
+            base += (f"⚠️ **{ns} exposure(s) flagged as streaked:** {exps} — qfit above "
+                     f"{_EPSF_QFIT_STREAK_FACTOR:.0f}× the run baseline"
+                     + (f" ({qb:.1f})" if qb is not None else "") + ". Those exposures degrade the "
+                     f"PSF-fit astrometry/photometry and are candidates to down-weight or drop. ")
+        else:
+            base += (f"All {ne} exposures have a consistent qfit (none flagged). ")
+        return base + "([how this is made](DOCROOT#stage11))"
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
@@ -4907,7 +5098,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
