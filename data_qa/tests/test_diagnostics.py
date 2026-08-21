@@ -1367,6 +1367,56 @@ def test_mast_l3_catalog_none_when_absent_and_no_download(tmp_path, monkeypatch)
     assert D._mast_l3_catalog(o, "F212N", allow_download=False) is None
 
 
+# ---- REGRESSION: the MAST source catalogue is delivered as .ecsv under mastDownload/ with a
+# pupil-filter product name (F162M ships as f150w2-f162m).  A resolver that only looked at
+# pipeline/*_cat.fits missed it and red-flagged a catalogued obs (cloud E/F o002) as "not
+# catalogued".  These pin every home + naming so it cannot regress. ----
+def _write_mast_ecsv(path, n=60):
+    from astropy.table import Table
+    ra = 266.40 + np.arange(n) * 1e-4
+    dec = -28.90 + np.arange(n) * 1e-4
+    Table({"sky_centroid.ra": ra, "sky_centroid.dec": dec,
+           "aper_total_abmag": 18.0 + np.arange(n) * 0.02}).write(str(path), overwrite=True)
+
+
+def test_mast_source_catalog_finds_mastdownload_ecsv_pupil_filter(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    # F162M is delivered as the pupil pair f150w2-f162m, as an .ecsv, one product-dir deep.
+    d = tmp_path / "cloudef" / "mastDownload" / "JWST" / "jw02092-o002_t001_nircam_f150w2-f162m"
+    d.mkdir(parents=True)
+    _write_mast_ecsv(d / "jw02092-o002_t001_nircam_f150w2-f162m_cat.ecsv")
+    o = Observation(program="2092", obs="002", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F162M"], visits=[], epoch="", notes="")
+    got = D._mast_source_catalog(o, "F162M")
+    assert got is not None and got.endswith("f150w2-f162m_cat.ecsv")
+    # and it flows through to usable positions (the stage-4 red-flag was jsc is None)
+    sc, mag, lbl = D._jwst_sources(o, "F162M", position_valid=True)
+    assert sc is not None and len(sc) >= 30 and "MAST" in lbl
+
+
+def test_mast_source_catalog_downloads_when_absent(tmp_path, monkeypatch):
+    # No local product: the resolver DOWNLOADS instead of returning None (-> stage red-flag).
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    (tmp_path / "cloudef").mkdir()
+    o = Observation(program="2092", obs="002", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F162M"], visits=[], epoch="", notes="")
+    called = {}
+    def _fake_dl(oo, ff):
+        called["hit"] = (oo.obsid, ff)
+        return "/scratch/dl/jw02092-o002_t001_nircam_f150w2-f162m_cat.ecsv"
+    monkeypatch.setattr(D, "_download_mast_l3_catalog", _fake_dl)
+    got = D._mast_source_catalog(o, "F162M")
+    assert called["hit"] == ("jw02092-o002", "F162M")           # download was attempted
+    assert got.endswith("f150w2-f162m_cat.ecsv")
+
+
+def test_download_mast_l3_catalog_disabled_by_env(tmp_path, monkeypatch):
+    # QA_MAST_DOWNLOAD=0 (set for the whole suite by conftest) fast-fails without any network.
+    o = Observation(program="2092", obs="002", target="Cloud E/F", release_field="cloudef",
+                    instrument="NIRCam", filters=["F162M"], visits=[], epoch="", notes="")
+    assert D._download_mast_l3_catalog(o, "F162M") is None
+
+
 def test_caption_stage8_distortion():
     cap = D.caption_for(8, dict(stage=8, sw="F212N", f2="F187N", n_stars=39025,
                                 resid_rms_mas=1.63, binned_amp90_mas=1.09, per_cell_sem_mas=0.10,

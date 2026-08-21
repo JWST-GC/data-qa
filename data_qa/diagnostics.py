@@ -390,16 +390,37 @@ def _vega_zeropoint(o: Observation, filt, sc, instr):
 
 
 def _mast_source_catalog(o: Observation, filt):
-    """MAST-delivered per-i2d source catalog for one filter (single-band), or None.  Named
-    ``<obsid>_t001_nircam_clear-<filt>_cat.fits`` next to the i2d -- NOT the per-detector
-    ``*_nrcaN_destreak_cat.fits`` intermediates."""
+    """MAST-delivered L3 source catalog for one filter (single-band), or None.  Two homes, in
+    priority order:
+      1. next to a locally-reduced i2d: ``<obsid>_t001_nircam_*<filt>*_cat.fits`` under the field's
+         ``<filt>/pipeline`` / ``images-merged`` dirs;
+      2. the STScI archive delivery under ``mastDownload/JWST/<product-dir>/..._cat.ecsv`` (or
+         ``.fits``, or ``MAST_FITS/``).  This is where the pupil-filter deliveries live -- F162M
+         ships as ``f150w2-f162m`` -- and it is the ONLY catalog for a field whose merged/DAO
+         products are absent (e.g. cloud E/F o002), so it must be searched or stage 4 red-flags an
+         obs that IS catalogued.  Any tile token (t001/t002); per-detector / segmentation files
+         excluded."""
+    fl = filt.lower()
+    _bad = ("nrca", "nrcb", "destreak", "segm")
     for d in (f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/*/pipeline",
               f"{BASE}/{o.field}/images-merged"):
-        hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_*{filt.lower()}*_cat.fits")
-                if not any(t in os.path.basename(p).lower() for t in ("nrca", "nrcb", "destreak"))]
+        hits = [p for p in glob.glob(f"{d}/{o.obsid}_t*_nircam_*{fl}*_cat.fits")
+                if not any(t in os.path.basename(p).lower() for t in _bad)]
         if hits:
             return sorted(hits)[-1]
-    return None
+    # MAST archive delivery.  TARGETED patterns (one product-dir deep -- NOT a recursive ``**`` walk
+    # of the enormous mastDownload tree, which made stage 4 hang).  Prefer .ecsv (the L3 default).
+    for ext in ("ecsv", "fits"):
+        for pat in (f"{BASE}/{o.field}/mastDownload/JWST/{o.obsid}_t*_nircam_*{fl}*/"
+                    f"{o.obsid}_t*_nircam_*{fl}*_cat.{ext}",
+                    f"{BASE}/{o.field}/MAST_FITS/{o.obsid}_t*_nircam_*{fl}*_cat.{ext}"):
+            hits = [p for p in glob.glob(pat)
+                    if not any(t in os.path.basename(p).lower() for t in _bad)]
+            if hits:
+                return sorted(hits)[-1]
+    # Nothing local: DOWNLOAD it rather than let the caller red-flag a catalogued obs (guarded;
+    # no-ops for every current field, whose catalogues are already on disk above).
+    return _download_mast_l3_catalog(o, filt)
 
 
 def _jwst_sources(o: Observation, filt, position_valid=False):
@@ -1481,10 +1502,13 @@ def _mast_catalog_positions(o: Observation, filt):
                                 for s in ("nrca", "nrcb", "destreak", "segm"))]
         if hits:
             break
-    if not hits:
+    # Nothing local: DOWNLOAD it (guarded) rather than return None -> a missing MAST catalogue is
+    # fetched, not treated as absent.  No-ops for every current field (catalogues already on disk).
+    best = sorted(hits)[-1] if hits else _download_mast_l3_catalog(o, filt)
+    if not best:
         return None
     try:
-        t = Table.read(sorted(hits)[-1])
+        t = Table.read(best)
     except (OSError, ValueError):
         return None
     if "sky_centroid" in t.colnames:
@@ -2860,26 +2884,21 @@ def _detect_on_mosaic(path, crop=5000, fwhm_pix=2.5, nsigma=5.0, maxn=500000):
     return sc[good], mag[good], cut.wcs, cut.data
 
 
-def _mast_l3_catalog(o, filt, allow_download=None):
-    """The MAST-delivered STScI level-3 source catalogue (``*_<filt>_cat.fits``) for this obs.
-    Prefer a local copy; if absent, download it from MAST *when it exists there* (best-effort,
-    guarded -- missing astroquery / no network / no such product all fall back to None, and the
-    caller then RECONSTRUCTS the list by detecting on the i2d).  Returns a path or None."""
-    for d in (f"{BASE}/{o.field}/mastDownload", f"{BASE}/{o.field}/mastDownload/**",
-              f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"):
-        hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_*{filt.lower()}*_cat.fits",
-                                     recursive=True)
-                if not any(s in os.path.basename(p).lower()
-                           for s in ("nrca", "nrcb", "destreak", "segm"))]
-        if hits:
-            return sorted(hits)[-1]
-    if allow_download is None:
-        # opt-in: default OFF so a QA refresh never reaches out over the network, and (below) any
-        # download lands in the scratch OUTDIR, never inside the read-only product tree.
-        allow_download = os.environ.get("QA_MAST_DOWNLOAD", "0") != "0"
-    if not allow_download:
+# The STScI L3 source catalogue is delivered as ``_cat.ecsv`` (the default) or ``_cat.fits``; the
+# per-detector, destreak and segmentation products share the ``_cat`` stem and must be excluded.
+_MAST_CAT_EXCLUDE = ("nrca", "nrcb", "destreak", "segm")
+
+
+def _download_mast_l3_catalog(o, filt):
+    """Download this obs+filter's MAST L3 source catalogue (``_cat.ecsv`` or ``_cat.fits``) into the
+    scratch OUTDIR and return the local path, or None.  Best-effort and guarded: missing astroquery,
+    no network, a hang, or no such product on MAST all fall back to None.  The download NEVER writes
+    into the read-only product tree.  Callers reach this only when no local copy was found."""
+    # A network HANG is not an exception (the prior "Pipeline MAST hang" was exactly this), so cap
+    # every socket with a default timeout and SCOPE the query to this obsid so get_product_list
+    # cannot pull the whole programme.  QA_MAST_DOWNLOAD=0 disables the network reach entirely.
+    if os.environ.get("QA_MAST_DOWNLOAD", "1") == "0":
         return None
-    # Build a specific exception tuple (no bare except) covering astroquery/network failures.
     excs = [ImportError, OSError, ValueError, KeyError, TimeoutError, ConnectionError]
     try:
         from astroquery.exceptions import RemoteServiceError
@@ -2891,9 +2910,6 @@ def _mast_l3_catalog(o, filt, allow_download=None):
         excs.append(requests.exceptions.RequestException)
     except ImportError:
         pass
-    # A network HANG is not an exception (the prior "Pipeline MAST hang" was exactly this), so cap
-    # every socket with a default timeout for the duration of the query, and SCOPE the query to
-    # this obsid (obs_id=jw<prog>-o<obs>*) so get_product_list can't pull the whole programme.
     import socket
     prev_to = socket.getdefaulttimeout()
     socket.setdefaulttimeout(float(os.environ.get("QA_MAST_TIMEOUT", "60")))
@@ -2905,23 +2921,43 @@ def _mast_l3_catalog(o, filt, allow_download=None):
         if obs_t is None or not len(obs_t):
             return None
         prod = Observations.get_product_list(obs_t)
-        want = np.array([("_cat.fits" in str(fn).lower() and o.obsid in str(fn)
-                          and filt.lower() in str(fn).lower()
-                          and not any(s in str(fn).lower()
-                                      for s in ("nrca", "nrcb", "destreak", "segm")))
+        want = np.array([(("_cat.ecsv" in str(fn).lower() or "_cat.fits" in str(fn).lower())
+                          and o.obsid in str(fn) and filt.lower() in str(fn).lower()
+                          and not any(s in str(fn).lower() for s in _MAST_CAT_EXCLUDE))
                          for fn in prod["productFilename"]])
         if not want.any():
             return None
         dl = Observations.download_products(
             prod[want],
             download_dir=os.path.join(OUTDIR, "mastDownload"))   # scratch, never the product tree
-        good = [p for p in (dl["Local Path"] if dl is not None and len(dl) else [])
-                if p and os.path.exists(p)]
-        return good[0] if good else None
+        good = sorted(p for p in (dl["Local Path"] if dl is not None and len(dl) else [])
+                      if p and os.path.exists(p))
+        # prefer .ecsv (the L3 default) if both landed
+        return next((p for p in good if p.lower().endswith(".ecsv")), good[0] if good else None)
     except tuple(excs):
         return None
     finally:
         socket.setdefaulttimeout(prev_to)
+
+
+def _mast_l3_catalog(o, filt, allow_download=None):
+    """The MAST-delivered STScI level-3 source catalogue (``_cat.ecsv``/``_cat.fits``) for this obs.
+    Prefer a local copy; if absent, download it from MAST when it exists there (guarded).  When
+    still None, the caller reconstructs the list by detecting on the i2d.  Returns a path or None."""
+    for ext in ("ecsv", "fits"):
+        for d in (f"{BASE}/{o.field}/mastDownload", f"{BASE}/{o.field}/mastDownload/**",
+                  f"{BASE}/{o.field}/MAST_FITS", f"{BASE}/{o.field}/{filt}/pipeline",
+                  f"{BASE}/{o.field}/images-merged"):
+            hits = [p for p in glob.glob(f"{d}/{o.obsid}_t*_nircam_*{filt.lower()}*_cat.{ext}",
+                                         recursive=True)
+                    if not any(s in os.path.basename(p).lower() for s in _MAST_CAT_EXCLUDE)]
+            if hits:
+                return sorted(hits)[-1]
+    # allow_download kept for the explicit callers/tests; default now attempts (guarded) so a
+    # genuinely-missing product is DOWNLOADED rather than red-flagged.
+    if allow_download is False:
+        return None
+    return _download_mast_l3_catalog(o, filt)
 
 
 def _load_mast_catalog(path):
