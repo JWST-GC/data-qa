@@ -4274,10 +4274,16 @@ def _exposure_qfit(o: Observation, filt):
     return out
 
 
-def _effective_psf(cal_path, half=_EPSF_HALF, nbright=60, thresh_sigma=30.0):
-    """The effective PSF of one exposure/detector: median of the peak-normalised cutouts of its
-    bright, isolated stars, detected directly on the cal image (independent of any fit).  A streaked
-    exposure yields a fat, washed-out stamp.  Returns (stamp, n_stars) or (None, 0)."""
+_DQ_SATURATED = 2                    # JWST DQ SATURATED flag (bit 1)
+
+
+def _effective_psf(cal_path, half=_EPSF_HALF, nbright=40, thresh_sigma=30.0):
+    """The effective PSF of one exposure/detector: the MEAN of the peak-normalised cutouts of its
+    bright, isolated, UNSATURATED stars, detected directly on the cal image (independent of any fit).
+    A streaked exposure yields a stretched/washed-out stamp.  Saturated stars are excluded (their
+    flat-topped cores hide the trail and are the brightest, so they would otherwise dominate); the
+    mean (not median) keeps the asymmetric trail a streak leaves.  Returns (stamp, n_stars) or
+    (None, n_found)."""
     from astropy.io import fits
     from astropy.stats import sigma_clipped_stats
     try:
@@ -4288,6 +4294,7 @@ def _effective_psf(cal_path, half=_EPSF_HALF, nbright=60, thresh_sigma=30.0):
     try:
         with fits.open(cal_path) as hd:
             img = np.asarray((hd["SCI"] if "SCI" in hd else hd[1]).data, float)
+            dq = np.asarray(hd["DQ"].data, int) if "DQ" in hd else np.zeros(img.shape, int)
     except (OSError, ValueError, KeyError):
         return None, 0
     fin = np.isfinite(img)
@@ -4301,19 +4308,21 @@ def _effective_psf(cal_path, half=_EPSF_HALF, nbright=60, thresh_sigma=30.0):
     xy = np.column_stack([x, y])
     d, _ = cKDTree(xy).query(xy, k=2)
     iso = d[:, 1] > 2.3 * half                          # isolated: no neighbour inside the stamp
-    idx = np.where(iso)[0]
-    idx = idx[np.argsort(-flux[idx])][:nbright]         # brightest isolated
     stamps = []
-    for i in idx:
+    for i in np.where(iso)[0][np.argsort(-flux[np.where(iso)[0]])]:   # brightest isolated first
         xi, yi = int(round(x[i])), int(round(y[i]))
         if xi - half < 0 or yi - half < 0 or xi + half + 1 > img.shape[1] or yi + half + 1 > img.shape[0]:
+            continue
+        if (dq[yi - 2:yi + 3, xi - 2:xi + 3] & _DQ_SATURATED).any():  # drop saturated cores
             continue
         c = (img - med)[yi - half:yi + half + 1, xi - half:xi + half + 1]
         if np.isfinite(c).all() and c.max() > 0:
             stamps.append(c / c.max())
+        if len(stamps) >= nbright:
+            break
     if len(stamps) < 10:
         return None, len(stamps)
-    return np.median(stamps, axis=0), len(stamps)
+    return np.mean(stamps, axis=0), len(stamps)
 
 
 def stage11_effective_psf(o: Observation, sw, lw):
@@ -4359,17 +4368,23 @@ def stage11_effective_psf(o: Observation, sw, lw):
     streak_thresh = _EPSF_QFIT_STREAK_FACTOR * qbase if qbase else None
     streaked = []
 
+    from astropy.visualization import AsinhStretch, ImageNormalize
+    # asinh stretch: compress the bright core so the faint WINGS (and a streak's trailing structure)
+    # are visible -- a linear/sqrt stretch buries them under the peak.
+    norm = ImageNormalize(vmin=0.0, vmax=1.0, stretch=AsinhStretch(0.06))
     n = len(exps)
     ncol = min(6, n); nrow = int(np.ceil(n / ncol))
-    fig, ax = plt.subplots(nrow, ncol, figsize=(2.35 * ncol, 2.7 * nrow), squeeze=False)
+    fig, ax = plt.subplots(nrow, ncol, figsize=(2.35 * ncol, 2.9 * nrow), squeeze=False)
     for a in ax.flat:
         a.set_xticks([]); a.set_yticks([]); a.set_axis_off()
+    nstars_by_exp = {}
     for k, exp in enumerate(exps):
         a = ax.flat[k]; a.set_axis_on(); a.set_xticks([]); a.set_yticks([])
         cal = _peppar_cal_for_cat(f"{pdir}/{det}/{exp}_{det.lower()}_cal_{o.field}_iter1_cat.fits")
         e, ns = (_effective_psf(cal) if cal else (None, 0))
+        nstars_by_exp[exp] = int(ns)
         if e is not None:
-            a.imshow(np.power(np.clip(e, 0, None), 0.4), origin="lower", cmap="inferno")
+            a.imshow(np.clip(e, 0, None), origin="lower", cmap="inferno", norm=norm)
         else:
             a.text(0.5, 0.5, "no ePSF", ha="center", va="center", fontsize=8,
                    style="italic", transform=a.transAxes)
@@ -4379,17 +4394,21 @@ def stage11_effective_psf(o: Observation, sw, lw):
             streaked.append(exp)
         lbl = exp.split("_")[-1]                       # the exposure number
         qtxt = f"qfit={q:.1f}" if q is not None else "qfit —"
-        a.set_title(f"exp {lbl}  {qtxt}" + ("  ⚠STREAK" if bad else ""),
+        a.set_title(f"exp {lbl}  {qtxt}\n{ns} stars" + ("  ⚠STREAK" if bad else ""),
                     fontsize=8.5, color=("#c33" if bad else "black"))
+    ntot = sum(nstars_by_exp.values())
     metrics.update(n_exposures=n, detector_shown=det,
                    qfit_baseline=qbase, qfit_by_exposure={e: qf[e][0] for e in exps if e in qf},
+                   epsf_nstars_by_exposure={e.split("_")[-1]: nstars_by_exp[e] for e in exps},
+                   epsf_nstars_total=ntot, epsf_nstars_median=int(np.median(list(nstars_by_exp.values()))),
                    streaked_exposures=[e.split("_")[-1] for e in streaked],
                    n_streaked=len(streaked))
     metrics["passed"] = (len(streaked) == 0)
-    ttl = f"{o.target} {o.obsid} — effective PSF per exposure ({filt}, {det})"
+    ttl = (f"{o.target} {o.obsid} — effective PSF per exposure ({filt}, {det}); each stamp is the "
+           f"mean of bright, isolated, unsaturated stars")
     if streaked:
         ttl += f"  —  {len(streaked)} streaked exposure(s) flagged"
-    fig.suptitle(ttl, fontsize=11, y=0.99)
+    fig.suptitle(ttl, fontsize=10, y=0.995)
     return _save(fig, f"{o.obsid}_stage11.png"), metrics
 
 

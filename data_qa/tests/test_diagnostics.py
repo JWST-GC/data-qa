@@ -2303,6 +2303,24 @@ def test_effective_psf_builds_stamp_and_guards(tmp_path):
     assert D._effective_psf(str(tmp_path / "blank.fits")) == (None, 0)
 
 
+def test_effective_psf_excludes_saturated_via_dq(tmp_path):
+    # Every star's core flagged SATURATED in the DQ plane -> all excluded -> no stamp (not a crash).
+    from astropy.io import fits
+    rng = np.random.default_rng(2)
+    img = rng.normal(0.0, 1.0, (400, 400)).astype("float32")
+    dq = np.zeros((400, 400), "int32")
+    yy, xx = np.mgrid[0:23, 0:23]
+    g = np.exp(-((xx - 11) ** 2 + (yy - 11) ** 2) / (2 * 1.5 ** 2))
+    centres = [(rng.integers(40, 360), rng.integers(40, 360)) for _ in range(40)]
+    for cx, cy in centres:
+        img[cy - 11:cy + 12, cx - 11:cx + 12] += 500.0 * g
+        dq[cy - 1:cy + 2, cx - 1:cx + 2] |= D._DQ_SATURATED          # flag the core saturated
+    fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(img, name="SCI"),
+                  fits.ImageHDU(dq, name="DQ")]).writeto(str(tmp_path / "sat.fits"), overwrite=True)
+    stamp, n = D._effective_psf(str(tmp_path / "sat.fits"))
+    assert stamp is None and n < 10                                  # saturated cores all dropped
+
+
 def test_stage11_red_flags_without_peppar(tmp_path, monkeypatch):
     monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
     png, m = D.stage11_effective_psf(_obs(field="brick", filt="F212N"), "F212N", None)

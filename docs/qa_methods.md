@@ -560,10 +560,14 @@ Source: [`data_qa/diagnostics.py` → `stage10_photometric_consistency`](../data
 
 **What it shows.** Whether any exposure has a **streaked or broadened PSF** — a momentary tracking
 failure or guide-star glitch (e.g. arches jw02045-o001 exposure 4, "tracking failed for a second").
-For each exposure of a representative detector, the **empirical (effective) PSF** is built by
-stacking the peak-normalised cutouts of its bright, isolated stars detected directly on the cal
-image. A good exposure gives a sharp core with the six-spike NIRCam diffraction pattern; a streaked
-exposure gives a fat, washed-out stamp that has lost that structure.
+For each exposure of a representative detector, the **empirical (effective) PSF** is the **mean** of
+the peak-normalised cutouts of its bright, isolated, **unsaturated** stars detected directly on the
+cal image. Saturated stars are excluded via the **DQ** plane (their flat-topped cores are the
+brightest and hide the trail, so they would otherwise dominate), and the mean — not the median —
+keeps the asymmetric structure a streak leaves. The stamps use an **asinh** stretch so the faint
+wings (and a streak's trail) show. A good exposure gives a sharp core with the six-spike NIRCam
+diffraction pattern; a streaked exposure gives an elongated/washed-out stamp that has lost it. Each
+panel is labelled with the **number of stars** that went into it.
 
 **The objective flag.** Each stamp is labelled with that exposure's peppar PSF-fit
 **quality-of-fit** (`qfit`, median over its bright stars): a streaked exposure fits the empirical PSF
@@ -574,8 +578,9 @@ Flagged exposures degrade the PSF-fit astrometry/photometry and are candidates t
 
 This is built from **our own data** (peppar per-frame catalogues + cal images), independent of
 JWST1PASS (stage 10), so it works on every field with peppar products. Metrics: `n_exposures`,
-`detector_shown`, `qfit_baseline`, `qfit_by_exposure`, `streaked_exposures`, `n_streaked`. Red-flags
-when no peppar catalogues exist for the obs/filter.
+`detector_shown`, `qfit_baseline`, `qfit_by_exposure`, `epsf_nstars_by_exposure`,
+`epsf_nstars_total`, `epsf_nstars_median`, `streaked_exposures`, `n_streaked`. Red-flags when no
+peppar catalogues exist for the obs/filter.
 
 Source: [`data_qa/diagnostics.py` → `stage11_effective_psf`](../data_qa/diagnostics.py)
 (`_exposure_qfit`, `_effective_psf`).
