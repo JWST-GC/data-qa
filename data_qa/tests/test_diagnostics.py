@@ -2055,3 +2055,64 @@ def test_stage10_flags_sw_meta_scale_on_lw_filter(tmp_path, monkeypatch):
     assert m["passed"] and m["filter"] == "F405N"
     assert m.get("meta_scale_assumed_sw") is True
     assert "unconfirmed" in D.caption_for(10, m) and "SW" in D.caption_for(10, m)
+
+
+def _write_psfperts(path, n_real=6, n_slots=10, h=21):
+    """A LOG.psfperts.fits: n_real real square stamps then constant filler slots, laid side by side."""
+    from astropy.io import fits
+    import numpy as _np
+    stamps = []
+    yy, xx = _np.mgrid[0:h, 0:h]
+    for i in range(n_slots):
+        if i < n_real:
+            # a small centred blob with a per-exposure wobble, amplitude ~0.05
+            s = 0.05 * _np.exp(-((xx - h / 2) ** 2 + (yy - h / 2 - 0.3 * i) ** 2) / 6.0)
+            stamps.append(s - s.mean())
+        else:
+            stamps.append(_np.full((h, h), 0.1, float))     # constant filler
+    fits.PrimaryHDU(_np.hstack(stamps).astype("float32")).writeto(str(path), overwrite=True)
+
+
+def test_read_psfperts_keeps_only_real_stamps(tmp_path):
+    p = tmp_path / "LOG.psfperts.fits"
+    _write_psfperts(str(p), n_real=6, n_slots=10, h=21)
+    real = D._read_psfperts(str(p))
+    assert real is not None and len(real) == 6          # 4 constant filler slots dropped
+    assert all(s.shape == (21, 21) for s in real)
+
+
+def test_jwst1pass_psfperts_locator(tmp_path, monkeypatch):
+    monkeypatch.setenv("QA_JWST1PASS_DIR", str(tmp_path))
+    o = _obs(field="brick", filt="F182M")
+    assert D._jwst1pass_psfperts(o, "F182M") == []
+    for det in ("NRCA1", "NRCB4"):
+        d = tmp_path / "01.JWST1PASS" / det; d.mkdir(parents=True)
+        _write_psfperts(str(d / "LOG.psfperts.fits"))
+    got = D._jwst1pass_psfperts(o, "F182M")
+    assert [det for det, _ in got] == ["NRCA1", "NRCB4"]      # sorted, detector from parent dir
+
+
+def test_stage10_composite_includes_psfperts(tmp_path, monkeypatch):
+    # Both products present: consistency panels AND the per-chip perturbation grid.
+    monkeypatch.setenv("QA_JWST1PASS_DIR", str(tmp_path))
+    (tmp_path / "03.MATCHUP").mkdir()
+    _write_matchup(str(tmp_path / "03.MATCHUP" / "MATCHUP.XYMEEE"), _good_rows(300))
+    for det in ("NRCA1", "NRCA2", "NRCB1"):
+        d = tmp_path / "01.JWST1PASS" / det; d.mkdir(parents=True)
+        _write_psfperts(str(d / "LOG.psfperts.fits"), n_real=6)
+    png, m = D.stage10_photometric_consistency(_obs(field="brick", filt="F182M"), "F182M", None)
+    assert m["passed"]
+    assert m["n_stars"] == 300 and m["n_chips"] == 3 and m["n_pert_exposures"] == 6
+    assert "pert_exposure_var_frac" in m
+    cap = D.caption_for(10, m)
+    assert "LOG.psfperts.fits" in cap and "3 chips × 6 exposures" in cap
+
+
+def test_stage10_psfperts_only_without_matchup(tmp_path, monkeypatch):
+    # Perturbation logs present but NO MATCHUP: stage still passes on the PSF half alone.
+    monkeypatch.setenv("QA_JWST1PASS_DIR", str(tmp_path))
+    d = tmp_path / "01.JWST1PASS" / "NRCA1"; d.mkdir(parents=True)
+    _write_psfperts(str(d / "LOG.psfperts.fits"), n_real=4)
+    png, m = D.stage10_photometric_consistency(_obs(field="brick", filt="F182M"), "F182M", None)
+    assert m["passed"] and m.get("n_chips") == 1 and "n_stars" not in m
+    assert "LOG.psfperts.fits" in D.caption_for(10, m)

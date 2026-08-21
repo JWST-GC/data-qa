@@ -2691,6 +2691,45 @@ def _jwst1pass_matchup(o: Observation, filt):
     return None
 
 
+def _read_psfperts(path):
+    """The per-exposure PSF-perturbation stamps from a JWST1PASS ``LOG.psfperts.fits``.  jwst1pass
+    (PERT=1) derives one delta-PSF per exposure from the fit residuals of bright isolated stars; the
+    file stores them as square stamps laid side by side across the x-axis, padded to a fixed slot
+    count with constant filler blocks.  Returns the list of real (non-constant) stamps, or None."""
+    from astropy.io import fits
+    d = fits.getdata(_used(path, "JWST1PASS perturbation PSF"))
+    if d is None or getattr(d, "ndim", 0) != 2:
+        return None
+    h = d.shape[0]
+    n = d.shape[1] // h
+    if n < 1 or h < 4:
+        return None
+    real = []
+    for i in range(n):
+        b = d[:, i * h:(i + 1) * h]
+        if float(np.nanmax(b)) - float(np.nanmin(b)) > 1e-6:      # skip constant filler slots
+            real.append(np.asarray(b, float))
+    return real or None
+
+
+def _jwst1pass_psfperts(o: Observation, filt):
+    """(detector, path) for every per-chip ``LOG.psfperts.fits`` of this obs's field+filter jwst1pass
+    run, or [] if none.  Same root convention and ``QA_JWST1PASS_DIR`` override as the MATCHUP
+    locator; the perturbation logs live one level down per chip (``01.JWST1PASS/<DET>/`` in Jay's
+    layout, or ``<DET>/`` directly).  Shallow globs only."""
+    if not filt:
+        return []
+    override = os.environ.get("QA_JWST1PASS_DIR")
+    bases = [override] if override else [
+        f"{_JWST1PASS_ROOTS.get(o.field, _JWST1PASS_DEFAULT_ROOT)}/{o.field}/jwst1pass/{filt}"]
+    for base in bases:
+        for pat in (f"{base}/01.JWST1PASS/*/LOG.psfperts.fits", f"{base}/*/LOG.psfperts.fits"):
+            hits = sorted(glob.glob(pat))
+            if hits:
+                return [(os.path.basename(os.path.dirname(p)), p) for p in hits]
+    return []
+
+
 def _saturation_turnover(m, sig, floor):
     """Brightest magnitude at which the binned RMS has climbed to 2x the faint-side floor -- the
     onset of the saturation/bright-star degradation Jay notes.  None if it never does."""
@@ -2701,49 +2740,18 @@ def _saturation_turnover(m, sig, floor):
     return float(over.min()) if over.size else None
 
 
-def stage10_photometric_consistency(o: Observation, sw, lw):
-    """JWST1PASS across-exposure consistency (Jay Anderson's ``MATCHUP.XYMEEE``): for every star the
-    RMS of its position (X, Y) and instrumental magnitude across the exposures it was found in, plus
-    the mean quality-of-fit, all versus instrumental magnitude.  The four panels reproduce Jay's
-    ``show_matchup.sm``.  A tight, flat bright-end floor that rises only at the faint (S/N) and
-    saturated (bright) ends is "in family"; a raised or structured floor flags a photometric or
-    distortion problem in that filter's frames."""
-    import matplotlib
-    matplotlib.use("Agg")
-    metrics = dict(stage=10, sw=sw, lw=lw)
-    # jwst1pass is run per filter; prefer the SW channel (Jay's F182M example), fall back to LW.
-    filt = next((f for f in (sw, lw) if f and _jwst1pass_matchup(o, f)), None)
-    if filt is None:
-        reason = "no JWST1PASS MATCHUP.XYMEEE product on disk for this obs/filter"
-        png = _red_flag_figure(o, "stage10", "JWST1PASS CONSISTENCY UNAVAILABLE",
-                               f"Cannot build the across-exposure consistency panels: {reason}.")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
-        return png, metrics
-    metrics["filter"] = filt
-    d = _read_matchup_xymeee(_jwst1pass_matchup(o, filt))
-    if d is None:
-        reason = "MATCHUP.XYMEEE has too few multiply-measured stars (Ng>=2) to assess consistency"
-        png = _red_flag_figure(o, "stage10", "JWST1PASS CONSISTENCY UNAVAILABLE", reason + ".")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
-        return png, metrics
-
+def _draw_consistency_panels(axes, d, metrics):
+    """Fill four axes [[X-RMS, Y-RMS], [mag-RMS, QFIT]] with Jay's show_matchup.sm curves vs
+    instrumental magnitude, and record the bright-end floors + saturation turnover in ``metrics``."""
     m = d["m"]
     exm = d["ex"] * _META_PIX_MAS         # position RMS: META pixels -> mas (SW grid, see constant)
     eym = d["ey"] * _META_PIX_MAS
-    metrics["n_stars"] = int(m.size)
-    metrics["n_exposures"] = int(np.nanmax(d["Nf"]))
-    metrics["meta_pix_mas"] = _META_PIX_MAS
-    # _META_PIX_MAS is the SW grid scale; an LW MATCHUP would sit on a coarser grid, so flag the
-    # position-RMS-in-mas as unconfirmed rather than converting it silently 2x too small.
-    if filt.upper() in _LW_PREF:
-        metrics["meta_scale_assumed_sw"] = True
-
-    fig, ax = _fig(2, 2, 5.4, 4.3)
+    (a_x, a_y), (a_m, a_q) = axes
     panels = [
-        (ax[0][0], exm, "X RMS (mas)", "x_rms_floor_mas", 3.0 * _META_PIX_MAS),
-        (ax[0][1], eym, "Y RMS (mas)", "y_rms_floor_mas", 3.0 * _META_PIX_MAS),
-        (ax[1][0], d["em"], "magnitude RMS (mag)", "mag_rms_floor", 0.25),
-        (ax[1][1], d["q"], "quality of fit", "qfit_floor", 0.25),
+        (a_x, exm, "X RMS (mas)", "x_rms_floor_mas", 3.0 * _META_PIX_MAS),
+        (a_y, eym, "Y RMS (mas)", "y_rms_floor_mas", 3.0 * _META_PIX_MAS),
+        (a_m, d["em"], "magnitude RMS (mag)", "mag_rms_floor", 0.25),
+        (a_q, d["q"], "quality of fit", "qfit_floor", 0.25),
     ]
     for a, y, ylab, mkey, ytop in panels:
         a.plot(m, y, ".", ms=1.4, color="#666666", alpha=0.35, rasterized=True)
@@ -2757,14 +2765,107 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
         a.set_xlabel("instrumental magnitude")
         a.set_ylabel(ylab)
         a.grid(alpha=0.25)
-    # onset of the bright-star (saturation) degradation Jay flags, from the mag-RMS curve
-    if metrics.get("mag_rms_floor") is not None:
+    if metrics.get("mag_rms_floor") is not None:            # saturation onset from the mag-RMS curve
         turn = _saturation_turnover(m, d["em"], metrics["mag_rms_floor"])
         if turn is not None:
             metrics["saturation_turnover_mag"] = turn
-            ax[1][0].axvline(turn, color="#3366cc", ls="--", lw=1.0)
-    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency ({filt}, "
-                 f"n={metrics['n_stars']}, {metrics['n_exposures']} exp)", fontsize=11, y=0.99)
+            a_m.axvline(turn, color="#3366cc", ls="--", lw=1.0)
+
+
+def _draw_psfperts_grid(fig, subspec, perts, metrics):
+    """Render the per-chip, per-exposure PSF-perturbation stamps (Jay's first figure) into
+    ``subspec``: one row per detector, one column per exposure.  Records the perturbation amplitude
+    and the exposure-to-exposure variation (small + repeatable = the PSF is stable, "in family")."""
+    ndet = len(perts)
+    ncol = max(len(s) for _det, s in perts)
+    gs = subspec.subgridspec(ndet, ncol + 1, wspace=0.06, hspace=0.12,
+                             width_ratios=[0.6] + [1.0] * ncol)
+    amps, varfracs = [], []
+    for r, (det, stamps) in enumerate(perts):
+        lab = fig.add_subplot(gs[r, 0]); lab.set_axis_off()
+        lab.text(1.0, 0.5, det, ha="right", va="center", fontsize=8, transform=lab.transAxes)
+        mean = np.mean(stamps, axis=0)
+        mean_amp = float(np.sqrt(np.mean(mean ** 2)))
+        vmax = 3.0 * np.std(np.concatenate([s.ravel() for s in stamps])) or 1.0
+        for c in range(ncol):
+            a = fig.add_subplot(gs[r, c + 1]); a.set_xticks([]); a.set_yticks([])
+            if c >= len(stamps):
+                a.set_axis_off(); continue
+            s = stamps[c]
+            a.imshow(s, origin="lower", cmap="gray", vmin=-vmax, vmax=vmax)
+            amps.append(float(np.sqrt(np.mean(s ** 2))))
+            if mean_amp > 0:                                 # scatter of this exposure from the mean
+                varfracs.append(float(np.sqrt(np.mean((s - mean) ** 2)) / mean_amp))
+            if r == 0:
+                a.set_title(f"{c + 1:03d}", fontsize=8)
+    metrics["n_chips"] = ndet
+    metrics["n_pert_exposures"] = ncol
+    if amps:
+        metrics["pert_rms_med"] = float(np.median(amps))
+    if varfracs:
+        metrics["pert_exposure_var_frac"] = float(np.median(varfracs))
+
+
+def stage10_photometric_consistency(o: Observation, sw, lw):
+    """JWST1PASS across-exposure consistency (Jay Anderson's products).  TOP: for every star the RMS
+    of its position (X, Y) and instrumental magnitude across the exposures it was found in, plus the
+    mean quality-of-fit, all versus instrumental magnitude -- the four panels of Jay's
+    ``show_matchup.sm`` from ``MATCHUP.XYMEEE``.  BOTTOM: the per-chip, per-exposure PSF-perturbation
+    stamps (``LOG.psfperts.fits``) -- the delta-PSF jwst1pass adds each exposure to absorb temporal
+    PSF variation.  A tight, flat consistency floor (rising only at the faint S/N and bright
+    saturation ends) plus small, exposure-to-exposure-repeatable perturbations is "in family"; a
+    raised floor or erratic perturbations flag a photometric, distortion or PSF-stability problem."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    metrics = dict(stage=10, sw=sw, lw=lw)
+    # jwst1pass is run per filter; prefer the SW channel (Jay's F182M example), fall back to LW, and
+    # accept a filter that has EITHER product (a consistency table or the perturbation logs).
+    filt = next((f for f in (sw, lw)
+                 if f and (_jwst1pass_matchup(o, f) or _jwst1pass_psfperts(o, f))), None)
+    if filt is None:
+        reason = "no JWST1PASS products (MATCHUP.XYMEEE or LOG.psfperts.fits) on disk for this obs"
+        png = _red_flag_figure(o, "stage10", "JWST1PASS UNAVAILABLE",
+                               f"Cannot build the JWST1PASS panels: {reason}.")
+        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        return png, metrics
+    metrics["filter"] = filt
+    mp = _jwst1pass_matchup(o, filt)
+    d = _read_matchup_xymeee(mp) if mp else None
+    perts = [(det, s) for det, p in _jwst1pass_psfperts(o, filt)
+             if (s := _read_psfperts(p)) is not None]
+
+    if d is not None:
+        metrics["n_stars"] = int(d["m"].size)
+        metrics["n_exposures"] = int(np.nanmax(d["Nf"]))
+        metrics["meta_pix_mas"] = _META_PIX_MAS
+        # _META_PIX_MAS is the SW grid scale; an LW MATCHUP would sit on a coarser grid, so flag the
+        # position-RMS-in-mas as unconfirmed rather than converting it silently 2x too small.
+        if filt.upper() in _LW_PREF:
+            metrics["meta_scale_assumed_sw"] = True
+
+    # Compose: consistency 2x2 on top (when a MATCHUP was read), perturbation grid below (when the
+    # logs are present).  Height follows what is actually drawn so a single-product run is compact.
+    have_cons, have_pert = d is not None, bool(perts)
+    hr = ([4.0] if have_cons else []) + ([max(1.5, 0.55 * len(perts))] if have_pert else [])
+    fig = plt.figure(figsize=(11.0, sum(hr) + 1.0))
+    outer = fig.add_gridspec(len(hr), 1, height_ratios=hr, hspace=0.28)
+    row = 0
+    if have_cons:
+        cg = outer[row].subgridspec(2, 2, hspace=0.32, wspace=0.24)
+        axes = [[fig.add_subplot(cg[i, j]) for j in range(2)] for i in range(2)]
+        _draw_consistency_panels(axes, d, metrics)
+        row += 1
+    if have_pert:
+        _draw_psfperts_grid(fig, outer[row], perts, metrics)
+
+    bits = []
+    if have_cons:
+        bits.append(f"consistency n={metrics['n_stars']}, {metrics['n_exposures']} exp")
+    if have_pert:
+        bits.append(f"PSF perturbations {metrics['n_chips']} chips × {metrics['n_pert_exposures']} exp")
+    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS ({filt}; " + "; ".join(bits) + ")",
+                 fontsize=11, y=0.995)
     metrics["passed"] = True
     return _save(fig, f"{o.obsid}_stage10.png"), metrics
 
@@ -4369,28 +4470,42 @@ def _caption_for_impl(n, metrics):
                  "each curve point. ([how this is made](DOCROOT#stage6))")
         return base
     if n == 10:
-        # Built in code so the floors are only quoted when a curve was actually drawn.  The
-        # no-product case is handled by the generic red-flag branch above (n != 7).
+        # Built in code so each half is only described when it was actually drawn (a run may have the
+        # MATCHUP table, the perturbation logs, or both).  The no-product case is handled by the
+        # generic red-flag branch above (n != 7).
         filt = metrics.get("filter", "?")
         xf = metrics.get("x_rms_floor_mas"); mf = metrics.get("mag_rms_floor")
-        base = (f"**Stage 10 — JWST1PASS across-exposure consistency ({filt}).** From Jay Anderson's "
-                f"`MATCHUP.XYMEEE`: for each of {metrics.get('n_stars', 0)} stars found in ≥2 of the "
-                f"{metrics.get('n_exposures', 0)} exposures, the RMS of its position (X, Y) and "
-                f"instrumental magnitude across those exposures, plus mean quality-of-fit, all vs "
-                f"instrumental magnitude — the four panels of Jay's `show_matchup.sm`. A tight, flat "
-                f"bright-end floor that rises only at the faint (S/N) and saturated (bright) ends is "
-                f"\"in family\"; a raised or structured floor flags a photometric or distortion "
-                f"problem in that filter's frames. Position RMS is in mas "
-                f"({metrics.get('meta_pix_mas', _META_PIX_MAS):.0f} mas/META-pixel). ")
-        if xf is not None and mf is not None:
-            base += (f"Bright-end floors: {xf:.2f} mas in X, {mf:.3f} mag. ")
-        if metrics.get("meta_scale_assumed_sw"):
-            base += ("⚠️ Position RMS assumes the 32 mas/pixel **SW** META grid; this is an LW "
-                     "filter, whose META grid is coarser — read the X/Y-RMS-in-mas as unconfirmed "
-                     "until the LW grid scale is applied. ")
-        if metrics.get("saturation_turnover_mag") is not None:
-            base += (f"The mag-RMS doubles above its floor brighter than "
-                     f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation onset). ")
+        base = (f"**Stage 10 — JWST1PASS across-exposure consistency ({filt}).** Jay Anderson's "
+                f"JWST1PASS products, independent of jicama and of the STScI L3 catalogues. ")
+        if metrics.get("n_stars"):
+            base += (f"**TOP** (`MATCHUP.XYMEEE`): for each of {metrics['n_stars']} stars found in ≥2 "
+                     f"of the {metrics.get('n_exposures', 0)} exposures, the RMS of its position "
+                     f"(X, Y) and instrumental magnitude across those exposures, plus mean "
+                     f"quality-of-fit, all vs instrumental magnitude — the four panels of Jay's "
+                     f"`show_matchup.sm`. A tight, flat bright-end floor that rises only at the faint "
+                     f"(S/N) and saturated (bright) ends is \"in family\"; a raised or structured "
+                     f"floor flags a photometric or distortion problem. Position RMS is in mas "
+                     f"({metrics.get('meta_pix_mas', _META_PIX_MAS):.0f} mas/META-pixel). ")
+            if xf is not None and mf is not None:
+                base += f"Bright-end floors: {xf:.2f} mas in X, {mf:.3f} mag. "
+            if metrics.get("meta_scale_assumed_sw"):
+                base += ("⚠️ Position RMS assumes the 32 mas/pixel **SW** META grid; this is an LW "
+                         "filter, whose META grid is coarser — read the X/Y-RMS-in-mas as unconfirmed "
+                         "until the LW grid scale is applied. ")
+            if metrics.get("saturation_turnover_mag") is not None:
+                base += (f"The mag-RMS doubles above its floor brighter than "
+                         f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation "
+                         f"onset). ")
+        if metrics.get("n_chips"):
+            base += (f"**BOTTOM** (`LOG.psfperts.fits`): the per-chip, per-exposure PSF-perturbation "
+                     f"stamps — the delta-PSF jwst1pass adds each exposure to absorb temporal PSF "
+                     f"variation — over {metrics['n_chips']} chips × {metrics['n_pert_exposures']} "
+                     f"exposures. Small stamps that repeat from exposure to exposure mean the PSF is "
+                     f"stable; erratic or growing structure flags a PSF-model problem. ")
+            vf = metrics.get("pert_exposure_var_frac")
+            if vf is not None:
+                base += (f"Exposure-to-exposure variation is {100 * vf:.0f}% of the perturbation "
+                         f"amplitude (small = repeatable). ")
         return base + "([how this is made](DOCROOT#stage10))"
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
