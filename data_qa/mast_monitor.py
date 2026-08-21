@@ -192,7 +192,18 @@ DEFAULT_STATE = "/orange/adamginsburg/jwst/ops/mast_state.json"
 
 # Columns kept from the MAST observation table (t_* are MJD floats).
 MONITOR_COLUMNS = ("obs_id", "t_max", "t_obs_release", "calib_level",
-                   "instrument_name", "filters", "target_name")
+                   "instrument_name", "filters", "target_name",
+                   # the pointing centre, carried so a per-tile reference
+                   # catalog can be built without a second MAST round-trip
+                   # (keflavich/jwst-gc-pipeline#415).  Every row of one
+                   # observation reports the same pair: measured 2026-08-20
+                   # across all 139 planned 10678 observations (12 rows each)
+                   # and all three delivered 2221 observations, max spread
+                   # 0.00" in both.
+                   "s_ra", "s_dec")
+
+#: Columns read as floats rather than strings.
+_FLOAT_COLUMNS = ("t_max", "t_obs_release", "s_ra", "s_dec")
 
 # calib-level-3 products: jw02221-o001_t001_nircam_...; level<=2: jw02221001001_...
 _OBS_DASH_RE = re.compile(r"^jw(\d{5})-o(\d{3})")
@@ -374,7 +385,7 @@ def query_program(program) -> List[dict]:
         row = {}
         for c in cols:
             v = r[c]
-            if c in ("t_max", "t_obs_release"):
+            if c in _FLOAT_COLUMNS:
                 row[c] = _scalar(v, float, default=None)
             elif c == "calib_level":
                 # planned/unreleased rows have a MASKED calib_level: -1 marks
@@ -401,6 +412,8 @@ def summarize(rows: List[dict], poll_mjd: float) -> Dict[str, dict]:
             "instrument_name": row.get("instrument_name"),
             "filters": row.get("filters"),
             "target_name": row.get("target_name"),
+            "s_ra": row.get("s_ra"),
+            "s_dec": row.get("s_dec"),
         }
     return out
 
@@ -713,6 +726,63 @@ def rearm(state_path, spec: str, include_download=False) -> int:
     for mapname, k, value in removed:
         print(f"--rearm: removed {mapname}[{k}] "
               f"(was: {trigger_record_when(value)})")
+    return 0
+
+
+def pointings(state_path, program, released_only=False) -> List[dict]:
+    """Per-observation pointing centres for one program, from the state file.
+
+    One row per observation, newest poll wins: ``{obsnum, tile, ra, dec,
+    calib_level, released, instrument}``.  Every MAST row of an observation
+    reports the same centre (verified 2026-08-20: 139 planned 10678
+    observations and 3 delivered 2221 ones, 0.00" spread within each), so the
+    first row carrying finite coordinates answers for the observation.
+
+    This exists so the per-tile reference catalogs of
+    keflavich/jwst-gc-pipeline#415 can be built from what the monitor already
+    polled, rather than each builder invocation re-querying MAST for a centre
+    the state file has held since the observation was planned.  Observations
+    with no coordinates on record are omitted rather than reported at (0, 0).
+    """
+    state = load_state(state_path)
+    obs = (state.get("programs", {}).get(str(int(program)), {})
+           .get("obs", {}))
+    out = {}
+    for obs_id, rec in sorted(obs.items()):
+        ra, dec = rec.get("s_ra"), rec.get("s_dec")
+        if ra is None or dec is None:
+            continue
+        if released_only and not rec.get("released"):
+            continue
+        obsnum = obsnum_from_obs_id(obs_id)
+        if not obsnum or obsnum in out:
+            continue
+        out[obsnum] = dict(obsnum=obsnum, tile=rec.get("target_name"),
+                           ra=float(ra), dec=float(dec),
+                           calib_level=rec.get("calib_level"),
+                           released=bool(rec.get("released")),
+                           instrument=rec.get("instrument_name"))
+    return [out[k] for k in sorted(out)]
+
+
+def print_pointings(state_path, program, released_only=False) -> int:
+    """--pointings: one TSV line per observation, for a shell/driver caller.
+
+    TSV rather than JSON because the consumer is a build loop in another
+    repository, which cannot import this package.  Exits 1 when the program
+    has no coordinates on record, so a driver reading an empty list does not
+    mistake it for "no tiles to build".
+    """
+    rows = pointings(state_path, program, released_only=released_only)
+    if not rows:
+        scope = "released " if released_only else ""
+        print(f"--pointings: no {scope}observations of program {program} "
+              f"carry coordinates in {state_path}", file=sys.stderr)
+        return 1
+    print("obsnum\ttile\tra_deg\tdec_deg\tcalib\treleased")
+    for r in rows:
+        print(f"{r['obsnum']}\t{r['tile'] or ''}\t{r['ra']:.6f}\t"
+              f"{r['dec']:.6f}\t{r['calib_level']}\t{int(r['released'])}")
     return 0
 
 
@@ -1240,6 +1310,14 @@ def main(argv=None):
     ap.add_argument("--rearm-download", action="store_true",
                     help="with --rearm: also delete the obs's 'downloaded' "
                          "key(s) so the products re-download")
+    ap.add_argument("--pointings", metavar="PROGRAM", default=None,
+                    help="print one TSV line per observation of PROGRAM with "
+                         "its tile name and pointing centre, from the state "
+                         "file, then exit; drives the per-tile reference "
+                         "catalog build (keflavich/jwst-gc-pipeline#415).  "
+                         "Exits 1 when no observation carries coordinates.")
+    ap.add_argument("--released-only", action="store_true",
+                    help="with --pointings, list only released observations")
     ap.add_argument("--max-submit", type=int, default=DEFAULT_MAX_SUBMIT,
                     help="max actionable (program,obs,instrument) groups an "
                          "acting run may touch; overflow acts on the N oldest "
@@ -1271,6 +1349,9 @@ def main(argv=None):
 
     if args.rearm_download and not args.rearm:
         ap.error("--rearm-download requires --rearm PROGRAM-oNNN")
+    if args.pointings:
+        return print_pointings(args.state, args.pointings,
+                               released_only=args.released_only)
     if args.rearm:
         # state-surgery verb: touch only the one-shot maps, no MAST poll
         return rearm(args.state, args.rearm,

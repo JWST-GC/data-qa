@@ -50,8 +50,19 @@ that already exists.
   program list (from the pipeline's program→field map: 2221, 1182, 2211,
   4147, 5365, 3958, 2092, 1939, 1905, 3523, 6778, 7213; configurable).
 - State file (`--state`, default `/orange/adamginsburg/jwst/ops/mast_state.json`)
-  records known `obs_id` + `t_max`/release date + calib level; a run reports
-  NEW or NEWLY-RELEASED observations and exits 0/emits JSON events.
+  records known `obs_id` + `t_max`/release date + calib level + the pointing
+  centre (`s_ra`/`s_dec`); a run reports NEW or NEWLY-RELEASED observations and
+  exits 0/emits JSON events.
+- `--pointings <program>` prints the recorded centres, one TSV line per
+  observation (`obsnum, tile, ra_deg, dec_deg, calib, released`), and exits.
+  It reads the state file and queries nothing, so it costs nothing to call in
+  a loop.  This is what drives the per-tile reference catalogs of
+  keflavich/jwst-gc-pipeline#415: a treasury tile needs a catalog built at its
+  own centre, and re-asking MAST for a coordinate the monitor polled when the
+  observation was planned is a round-trip with nothing to gain.  Add
+  `--released-only` to skip observations whose data is not on the archive yet.
+  It exits 1 when no observation carries coordinates, so a build loop reading
+  an empty list cannot mistake it for "no tiles to build".
 - Actions per new event (each individually gated):
   `--download` (delegates to `retrieve_data.py` / the reduction's own
   downloader), `--trigger` (calls `pipeline_trigger.py`), `--report`
