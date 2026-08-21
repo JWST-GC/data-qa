@@ -56,6 +56,43 @@ def test_caption_stage4_flags_discontinuity():
     assert "internal discontinuity" in cap and "8%" in cap
 
 
+def test_cell_map_broke_down_decision():
+    # arcsec-scale cell scatter + a solid clean isolated bulk -> cell map unreliable (cloudef o005)
+    assert D._cell_map_broke_down(1783.0, 12.0, 402) is True
+    # a real, tight cell map (cloudef o002: 16 mas scatter) is trusted, not overridden
+    assert D._cell_map_broke_down(16.0, 116.0, 3464) is False
+    # a real ~58 mas sub-region discontinuity (gc2211 o050) is NOT swallowed as "unreliable"
+    assert D._cell_map_broke_down(58.0, 30.0, 500) is False
+    # absurd scatter but too few clean isolated stars to trust the fallback -> stay with the cells
+    assert D._cell_map_broke_down(1783.0, 12.0, 10) is False
+    assert D._cell_map_broke_down(1783.0, None, 0) is False
+
+
+def test_caption_stage4_cell_map_unreliable_and_unmeasurable():
+    # arcsec cell scatter AND no confident whole-field peak (issue #38 o005): suppress the phantom
+    # "internal discontinuity", call the offset UNMEASURABLE, and flag the isolated median as a
+    # possible NN-collapse -- do NOT sell it as a clean tie.
+    cap = D.caption_for(4, dict(stage=4, sw="F162M", offset_med_mas=12, n_cells=16,
+                                offset_scatter_mas=1783, n_cells_confirmed=16, bad_src_frac=1.0,
+                                n_cells_dropped=0, cell_map_unreliable=True,
+                                offset_unmeasurable=True, isolated_bulk_n=402))
+    assert "per-cell map is unreliable" in cap
+    assert "internal discontinuity" not in cap
+    assert "not reliably measurable" in cap and "collapse" in cap and "does not auto-pass" in cap
+    assert "n=402" in cap
+    assert cap.count("1783 mas") == 1        # scatter stated once, in the warning
+
+
+def test_caption_stage4_cell_map_unreliable_confident_wholefield():
+    # cells garbage but the swept whole-field xcorr IS confident -> quote it, not "unmeasurable"
+    cap = D.caption_for(4, dict(stage=4, sw="F162M", offset_med_mas=150, n_cells=16,
+                                offset_scatter_mas=900, n_cells_dropped=0,
+                                cell_map_unreliable=True, offset_unmeasurable=False))
+    assert "swept whole-field cross-correlation" in cap
+    assert "internal discontinuity" not in cap and "not reliably measurable" not in cap
+    assert "150 mas" in cap
+
+
 def test_caption_stage1_dropped_filters_noted():
     cap = D.caption_for(1, dict(stage=1, sw="F212N", lw="F405N", dropped_filters=["F444W", "F322W2"]))
     assert "F444W" in cap and "F322W2" in cap and "not reduced" in cap
