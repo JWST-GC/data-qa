@@ -1,5 +1,5 @@
 #!/bin/bash
-# Refresh diagnostics (stages 1-5) + the pipeline-status table on every open QA issue.
+# Refresh diagnostics (stages 1-11) + the pipeline-status table on every open QA issue.
 #
 # Idempotent: every comment is marker-keyed and updated in place, and every image asset is
 # replaced by name -- re-running never duplicates comments or accumulates assets, so it is
@@ -18,13 +18,13 @@
 #   QA_REPO             default JWST-GC/data-qa
 #   QA_BASE             default /orange/adamginsburg/jwst   (on-disk products)
 #   QA_OUTDIR           scratch dir for the rendered PNGs   (default: mktemp)
-#   REFRESH_STAGES      default "1 2 3 4 5 6"
+#   REFRESH_STAGES      default "1 2 3 4 5 6 7 8 9 10 11"
 #   QA_EXCLUDE_FIELDS   default "w51 wd1 wd2 ngc6334"       (field keys to skip)
 #   QA_EXCLUDE_RE       default "westerlund|ngc ?6334|globular|w51"  (display-name skip regex)
 set -uo pipefail
 
 REPO="${QA_REPO:-JWST-GC/data-qa}"
-STAGES="${REFRESH_STAGES:-1 2 3 4 5 6 7 8 9}"
+STAGES="${REFRESH_STAGES:-1 2 3 4 5 6 7 8 9 10 11}"
 
 # Token: exported env, else a 600-perm PAT file, else gh's stored creds.
 if [ -z "${GITHUB_TOKEN:-}" ]; then
@@ -99,7 +99,7 @@ for spec in "${SPECS[@]}"; do
   echo "===== $disp — jw$(printf %05d "$prog")-o$obs ($inst) ====="
   if [ "${inst,,}" = "nircam" ]; then
     out=$(python3 -m data_qa.diagnostics --program "$prog" --obs "$obs" --target "$disp" --stage $STAGES --post 2>&1); drc=$?
-    echo "$out" | grep -iE "SW=|stage [0-9]:|created|updated|FAILED|no obs" || true
+    echo "$out" | grep -iE "SW=|stage [0-9]+:|created|updated|FAILED|no obs" || true
     note_failure "$out" "$drc" && rc_any=1
   elif [ "${inst,,}" = "miri" ]; then
     # MIRI: basics overview (MAST i2d + Spitzer side-by-side + saturation mask)
