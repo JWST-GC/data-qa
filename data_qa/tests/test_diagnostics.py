@@ -507,6 +507,54 @@ def test_catalog_staleness_only_uses_the_virac2locked_table(tmp_path, monkeypatc
     assert cdate is None                              # NOT stale vs the VIRAC2locked table
 
 
+def test_a_consensus_source_field_is_not_invisible_to_the_staleness_check(tmp_path,
+                                                                          monkeypatch):
+    """arches and w51 have no VIRAC2locked table -- `alignment_config` dispatches them to the
+    checkpoint-written consensus table.  Globbing only for VIRAC2locked returned "not stale" for
+    them whatever the dates, which is how arches came to be QA'd on a release catalogue seven
+    weeks older than its own alignment (stage 4: 14.8 mas; stage 7: astrom_improved False)."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    cats = tmp_path / "arches" / "catalogs"
+    offs = tmp_path / "arches" / "offsets"
+    cats.mkdir(parents=True); offs.mkdir(parents=True)
+    name = "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7.fits"
+    _touch(cats, name)
+    _touch(offs, "Offsets_JWST_Brick2045_consensus.csv")
+    t0 = 1_000_000_000.0
+    os.utime(str(cats / name), (t0, t0))                                     # catalogue first
+    os.utime(str(offs / "Offsets_JWST_Brick2045_consensus.csv"),
+             (t0 + 47 * 86400, t0 + 47 * 86400))                             # alignment 47 days later
+    o = Observation(program="2045", obs="001", target="Arches", release_field="arches",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    cdate, adate, cname = D._catalog_vs_alignment_age(o, f"release:{name}")
+    assert cdate is not None, (
+        "a consensus-source field reported not-stale with its catalogue 47 days older "
+        "than its only alignment table")
+    assert cname == name
+
+
+def test_a_stale_consensus_table_does_not_outrank_the_locked_one(tmp_path, monkeypatch):
+    """The PR #101 finding, which the fallback must not undo: where a locked table exists it is
+    the operative one, and a NEWER consensus table beside it must not set the bar."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    cats = tmp_path / "cloudef" / "catalogs"
+    offs = tmp_path / "cloudef" / "offsets"
+    cats.mkdir(parents=True); offs.mkdir(parents=True)
+    name = "basic_merged_indivexp_photometry_tables_merged_resbgsub_m8.fits"
+    _touch(cats, name)
+    _touch(offs, "Offsets_JWST_Brick2092_VIRAC2locked.csv")
+    _touch(offs, "Offsets_JWST_Brick2092_consensus.csv")
+    t0 = 1_000_000_000.0
+    os.utime(str(offs / "Offsets_JWST_Brick2092_VIRAC2locked.csv"), (t0, t0))
+    os.utime(str(cats / name), (t0 + 5 * 86400, t0 + 5 * 86400))             # newer than operative
+    os.utime(str(offs / "Offsets_JWST_Brick2092_consensus.csv"),
+             (t0 + 30 * 86400, t0 + 30 * 86400))                             # newer, but NOT operative
+    o = Observation(program="2092", obs="002", target="CloudEF", release_field="cloudef",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    cdate, _adate, _cname = D._catalog_vs_alignment_age(o, f"release:{name}")
+    assert cdate is None, "the consensus table set the bar while a locked table existed"
+
+
 def test_isolated_bulk_none_when_too_sparse():
     import astropy.units as u
     from astropy.coordinates import SkyCoord
