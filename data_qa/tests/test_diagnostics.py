@@ -837,28 +837,70 @@ def test_available_filters_only_present(tmp_path, monkeypatch):
     assert D._available_filters(o) == ["F212N"]                          # F444W (no data) dropped
 
 
-def test_peppar_precision_prefers_combo_else_perframe(tmp_path, monkeypatch):
+def test_peppar_precision_returns_formal_and_combo_framestd(tmp_path, monkeypatch):
     from astropy.table import Table
     monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
     pdir = tmp_path / "brick" / "peppar" / "F212N"
     det = pdir / "NRCA1"; det.mkdir(parents=True)
-    Table({"m": np.linspace(-5.0, 5.0, 120), "x_err": np.full(120, 0.1), "y_err": np.full(120, 0.1)}
+    # ONE per-frame cat -> 'formal' only (frame-to-frame needs >=3 frames, so no computed frame_std)
+    Table({"m": np.linspace(-5.0, 5.0, 120), "x_fit": np.arange(120.0), "y_fit": np.arange(120.0),
+           "x_err": np.full(120, 0.1), "y_err": np.full(120, 0.1)}
           ).write(str(det / "jw02221001001_00001_nrca1_cal_brick_iter1_cat.fits"), overwrite=True)
     o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
                     instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
-    m, prec, kind = D._peppar_precision(o, "F212N")
-    assert "formal" in kind                                    # per-frame path (no combo yet)
-    assert abs(float(np.median(prec)) - 3.1) < 0.5   # hypot(.1,.1)/sqrt2 = .1 px * 31 mas = 3.1
-    # a combined starlist (empirical across-frame scatter) takes precedence when present.
-    # x_wcs_std is ARCSEC (tangent-plane offset), so 0.004" must convert to ~4 mas -- this pins the
-    # factor at 1e3; the old deg->mas 3.6e6 would read this same table as 14416 mas (3600x high).
+    pp = D._peppar_precision(o, "F212N")
+    assert set(pp) == {"formal"}                               # per-frame only, no frame_std yet
+    assert abs(float(np.median(pp["formal"][1])) - 3.1) < 0.5  # hypot(.1,.1)/√2 * 31 mas = 3.1
+    # a combined starlist supplies frame_std directly.  x_wcs_std is ARCSEC (tangent-plane), so
+    # 0.004" -> ~4 mas pins the factor at 1e3 (the old deg->mas 3.6e6 would read it as 14416 mas).
     Table({"m": np.linspace(-5.0, 5.0, 120), "x_wcs_std": np.full(120, 0.004),
            "y_wcs_std": np.full(120, 0.004)}).write(
         str(pdir / "combo_starlist_F212N_NRCA1.fits"), overwrite=True)
-    m2, prec2, kind2 = D._peppar_precision(o, "F212N")
-    assert "empirical" in kind2
-    # hypot(0.004,0.004)/sqrt2 arcsec = 0.004" -> 4.0 mas
-    assert abs(float(np.median(prec2)) - 4.0) < 0.2
+    pp2 = D._peppar_precision(o, "F212N")
+    assert "frame_std" in pp2 and "formal" in pp2
+    assert abs(float(np.median(pp2["frame_std"][1])) - 4.0) < 0.2
+
+
+def test_peppar_frame_std_computed_from_per_frame_catalogues(tmp_path, monkeypatch):
+    # No combo starlist: frame-to-frame std is COMPUTED by SKY-matching per-frame detections across
+    # the (dithered, mosaicked) exposures via each frame's cal WCS.  Build 5 exposures of the SAME
+    # 200 stars at fixed sky positions with a known 3 mas per-axis positional jitter.
+    from astropy.table import Table
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    det = tmp_path / "brick" / "peppar" / "F212N" / "NRCA1"; det.mkdir(parents=True)
+    pipe = tmp_path / "brick" / "F212N" / "pipeline"; pipe.mkdir(parents=True)
+
+    def _wcs(cr):
+        w = WCS(naxis=2); w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        w.wcs.crval = list(cr); w.wcs.crpix = [1024.5, 1024.5]
+        w.wcs.cd = (0.031 / 3600.0) * np.array([[-1.0, 0.0], [0.0, 1.0]])   # 31 mas/px
+        return w
+    rng = np.random.default_rng(0)
+    n = 200
+    ra0 = 266.5 + rng.uniform(0, 0.01, n); dec0 = -28.9 + rng.uniform(0, 0.01, n)  # 36" spread
+    mags = np.linspace(-9.0, -4.0, n)
+    jit_deg = 3.0 / 3.6e6                                       # 3 mas per axis
+    for k in range(5):
+        cr = (266.5, -28.9)                                    # same pointing (dither irrelevant here)
+        w = _wcs(cr)
+        ra = ra0 + rng.normal(0, jit_deg, n) / np.cos(np.radians(dec0))
+        dec = dec0 + rng.normal(0, jit_deg, n)
+        x, y = w.world_to_pixel(SkyCoord(ra * u.deg, dec * u.deg))
+        Table({"m": mags, "x_fit": np.asarray(x, float), "y_fit": np.asarray(y, float),
+               "x_err": np.full(n, 0.02), "y_err": np.full(n, 0.02)}).write(
+            str(det / f"jw02221001001_02101_0000{k+1}_nrca1_cal_brick_iter1_cat.fits"), overwrite=True)
+        hdu = fits.ImageHDU(np.zeros((4, 4), "float32"), header=w.to_header(), name="SCI")
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(
+            str(pipe / f"jw02221001001_02101_0000{k+1}_nrca1_cal.fits"), overwrite=True)
+    res = D._peppar_frame_std(str(tmp_path / "brick" / "peppar" / "F212N"), pixscale=31.0)
+    assert res is not None
+    m, prec = res
+    # per-axis sky jitter ~3 mas -> hypot(3,3)/√2 = 3 mas
+    assert abs(float(np.median(prec)) - 3.0) < 1.2
 
 
 def test_peppar_precision_none_without_products(tmp_path, monkeypatch):

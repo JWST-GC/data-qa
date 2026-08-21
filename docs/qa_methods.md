@@ -428,10 +428,27 @@ lower panel of source counts:
 
 The three separate the *fit uncertainty* (σ_fit) from the *achieved repeatability* (rms(jwst)) from
 *agreement with an external frame* (rms(offset)); their faint-end rise tracks S/N, shaded band =
-16–84th percentile. The **lower panel** histograms the number of sources in each 0.5-mag Vega bin —
-the sample size behind each curve point, and where it runs out at the faint end.
+16–84th percentile. The **lower-left panel** histograms the number of sources in each 0.5-mag Vega
+bin — the sample size behind each curve point, and where it runs out at the faint end.
 
-Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnostics.py).
+**Right column — the independent `peppar` (Hosek WebbPSF) catalogues**, a cross-check that shares
+none of jicama's detection/fit choices (peppar magnitudes are instrumental, no zero-point). Two
+curves per channel:
+
+- **per-frame formal σ_fit** (dashed) — the peppar PSF-fit position error (`x_err`/`y_err`), the
+  noise-limited *predicted* precision, the analogue of jicama's formal σ_fit.
+- **frame-to-frame σ** (solid) — the standard deviation of each star's **sky position across the
+  exposures it appears in**, the analogue of jicama's rms(jwst): the *achieved* repeatability,
+  ~20–100× the formal error. It is read straight from a combined starlist's `x_wcs_std`/`y_wcs_std`
+  when one exists; otherwise it is **computed** by matching the per-frame catalogues in sky
+  coordinates (via each frame's cal WCS, since the exposures are dithered and mosaicked so a star
+  lands on different pixels — and different chips — each frame), grouping detections within 40 mas
+  and taking the scatter of groups seen in ≥3 exposures. Its own source-count histogram sits below
+  it. Metrics: `peppar_framestd_floor_mas_<filt>` (the achieved floor, also the headline
+  `peppar_floor_mas`), `peppar_formal_floor_mas_<filt>`.
+
+Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnostics.py)
+(`_peppar_precision`, `_peppar_frame_std`).
 
 <a id="stage8"></a>
 ## Stage 8 — inter-filter distortion residual

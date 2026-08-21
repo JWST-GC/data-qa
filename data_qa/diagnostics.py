@@ -3792,12 +3792,122 @@ _PEPPAR_ROOTS = {"brick": "/blue/adamginsburg/adamginsburg/jwst",
 _PEPPAR_DEFAULT_ROOT = "/orange/adamginsburg/jwst"
 
 
+def _peppar_cal_for_cat(catpath):
+    """The per-frame cal.fits that a peppar ``*_iter1_cat.fits`` was fit on, or None.  Cat lives at
+    ``<field>/peppar/<FILT>/<DET>/<exp>_<det>_cal_<field>_iter1_cat.fits``; the cal sits at
+    ``<field>/<FILT>/pipeline/<exp>_<det>_cal.fits``."""
+    base = os.path.basename(catpath)
+    m = re.match(r"(.+_cal)_.*_iter1_cat\.fits$", base)          # strip the _<field>_iter1_cat tail
+    if not m:
+        return None
+    calname = m.group(1) + ".fits"
+    filt_dir = os.path.dirname(os.path.dirname(os.path.dirname(catpath)))   # .../peppar
+    field_dir = os.path.dirname(filt_dir)
+    filt = os.path.basename(os.path.dirname(os.path.dirname(catpath)))      # <FILT>
+    for cand in (f"{field_dir}/{filt}/pipeline/{calname}",
+                 f"{field_dir}/images-merged/{calname}"):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0, min_frames=3):
+    """Frame-to-frame position scatter from the per-frame peppar catalogues, for fields with no
+    combined starlist (every current field): the standard deviation of each star's SKY position
+    across the exposures it appears in.  The exposures are dithered AND mosaicked, so a star sits at
+    different detector pixels -- and appears on different chips -- in different frames; matching must
+    be in SKY coordinates, using each frame's cal WCS.  Detections within ``tol_mas`` are grouped and
+    a group seen in >= ``min_frames`` distinct exposures yields one scatter point.  Returns
+    (mag, framestd_mas) or None.  Bounded (brightest ``nbright``/frame, ``max_frames`` exposures)."""
+    from astropy.table import Table
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return None
+    cats = sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits"))
+    # cap the number of exposures (by exposure token), not raw files: keep all detectors of the
+    # chosen exposures so a star's chip-to-chip appearances are all available.
+    exps = []
+    for c in cats:
+        mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
+        if mo and mo.group(1) not in exps:
+            exps.append(mo.group(1))
+    keep_exps = set(exps[:max_frames])
+    ra, dec, mag, fid = [], [], [], []
+    for c in cats:
+        mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
+        if not mo or mo.group(1) not in keep_exps:
+            continue
+        cal = _peppar_cal_for_cat(c)
+        if cal is None:
+            continue
+        try:
+            t = Table.read(c)
+            with fits.open(cal) as hd:
+                w = WCS(hd["SCI"].header if "SCI" in hd else hd[1].header)
+        except (OSError, ValueError, KeyError):
+            continue
+        if not {"x_fit", "y_fit", "m"} <= set(t.colnames):
+            continue
+        m = np.asarray(t["m"], float); x = np.asarray(t["x_fit"], float); y = np.asarray(t["y_fit"], float)
+        ok = np.isfinite(m) & np.isfinite(x) & np.isfinite(y)
+        idx = np.where(ok)[0]
+        idx = idx[np.argsort(m[idx])][:nbright]                 # brightest per frame
+        if idx.size < 20:
+            continue
+        r, d = w.all_pix2world(x[idx], y[idx], 0)               # peppar x/y are 0-based pixels
+        ra.append(np.asarray(r, float)); dec.append(np.asarray(d, float))
+        mag.append(m[idx]); fid.append(np.full(idx.size, keep_exps and exps.index(mo.group(1))))
+    if len(ra) < min_frames:
+        return None
+    ra = np.concatenate(ra); dec = np.concatenate(dec)
+    mag = np.concatenate(mag); fid = np.concatenate(fid).astype(int)
+    good = np.isfinite(ra) & np.isfinite(dec)
+    ra, dec, mag, fid = ra[good], dec[good], mag[good], fid[good]
+    if ra.size < 50:
+        return None
+    # group detections by sky position (single-link within tol_mas on the unit sphere)
+    xyz = SkyCoord(ra * u.deg, dec * u.deg).cartesian.xyz.value.T
+    chord = 2.0 * np.sin(np.radians(tol_mas / 3.6e6) / 2.0)     # tol in mas -> deg is /3.6e6
+    tree = cKDTree(xyz)
+    grp = np.full(ra.size, -1, int)
+    gid = 0
+    cosd = np.cos(np.radians(np.median(dec)))
+    mags_out, std_out = [], []
+    for i in range(ra.size):
+        if grp[i] >= 0:
+            continue
+        members = [j for j in tree.query_ball_point(xyz[i], chord) if grp[j] < 0]
+        for j in members:
+            grp[j] = gid
+        gid += 1
+        mj = np.asarray(members)
+        if np.unique(fid[mj]).size < min_frames:               # seen in >= min_frames exposures
+            continue
+        dra = (ra[mj] - ra[mj].mean()) * cosd * 3.6e6           # deg -> mas
+        dde = (dec[mj] - dec[mj].mean()) * 3.6e6
+        prec = float(np.hypot(np.std(dra), np.std(dde)) / np.sqrt(2.0))   # per-axis
+        if prec > 0:
+            mags_out.append(float(np.median(mag[mj]))); std_out.append(prec)
+    if len(std_out) < 50:
+        return None
+    return np.array(mags_out), np.array(std_out)
+
+
 def _peppar_precision(o: Observation, filt, max_frames=48):
-    """(instrumental mag, per-axis astrometric precision [mas], kind) from the peppar catalogues --
-    an independent PSF-photometry measurement, NOT jicama.  Prefers the combined starlist's
-    ACROSS-FRAME position scatter (``x_wcs_std``/``y_wcs_std`` -- the achieved repeatability); else
-    the per-frame ``*_iter1_cat.fits`` FORMAL PSF-fit position error (``x_err``/``y_err``).  Peppar
-    mags are instrumental (no Vega zero-point).  None if no peppar products for this obs's field/filt."""
+    """Independent peppar astrometric-precision series vs instrumental magnitude, as a dict with the
+    two quantities peppar carries (either key may be absent, whichever products exist):
+      ``frame_std`` : (mag, prec_mas) -- the combined starlist's ACROSS-FRAME position scatter
+                      (``x_wcs_std``/``y_wcs_std``, arcsec->mas): the **frame-to-frame standard
+                      deviation**, i.e. the achieved repeatability.
+      ``formal``    : (mag, prec_mas) -- the per-frame FORMAL PSF-fit position error
+                      (``x_err``/``y_err``, px->mas): the predicted, noise-limited precision.
+    Peppar mags are instrumental (no Vega zero-point).  None if no peppar products for this
+    obs's field/filter."""
     from astropy.table import Table
     if not filt:
         return None
@@ -3822,17 +3932,26 @@ def _peppar_precision(o: Observation, filt, max_frames=48):
         g = np.isfinite(m) & np.isfinite(pr) & (pr > 0)
         return (m[g], pr[g]) if int(g.sum()) >= 50 else None
 
+    out = {}
     combos = glob.glob(f"{pdir}/combo_starlist_{filt}_*.fits")
     if combos:
         # x_wcs/y_wcs are tangent-plane offsets in ARCSEC, not degrees: x_wcs spans 70.5" over a
         # 2227 px detector = 0.0317"/px = the SW pixel scale, so x_wcs_std is arcsec and the factor
         # to mas is 1e3 (a median x_wcs_std of 0.004" -> 4.0 mas, matching xe's 0.074 px -> 2.3 mas).
-        emp = _pool(combos, "m", "x_wcs_std", "y_wcs_std", 1.0e3)   # arcsec -> mas
-        if emp is not None:
-            return emp[0], emp[1], "empirical (across-frame rms)"
+        fs = _pool(combos, "m", "x_wcs_std", "y_wcs_std", 1.0e3)    # arcsec -> mas
+        if fs is not None:
+            out["frame_std"] = fs
+    if "frame_std" not in out:
+        # no combined starlist (e.g. cloud E/F): COMPUTE the frame-to-frame scatter from the
+        # per-frame catalogues by cross-matching each star across the dithered exposures.
+        cf = _peppar_frame_std(pdir, pixscale)
+        if cf is not None:
+            out["frame_std"] = cf
     cats = sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits"))[:max_frames]
-    frm = _pool(cats, "m", "x_err", "y_err", pixscale)             # px -> mas
-    return (frm[0], frm[1], "formal σ_fit (per-frame)") if frm is not None else None
+    fm = _pool(cats, "m", "x_err", "y_err", pixscale)              # px -> mas
+    if fm is not None:
+        out["formal"] = fm
+    return out or None
 
 
 def stage6_astrom_error(o: Observation, sw, lw):
@@ -3860,7 +3979,8 @@ def stage6_astrom_error(o: Observation, sw, lw):
                           hspace=0.08, wspace=0.28)
     a = fig.add_subplot(gs[0, 0])
     ah = fig.add_subplot(gs[1, 0], sharex=a)
-    a2 = fig.add_subplot(gs[:, 1])
+    a2 = fig.add_subplot(gs[0, 1])                    # peppar curves (top-right)
+    a2h = fig.add_subplot(gs[1, 1], sharex=a2)        # peppar source-count histogram (bottom-right)
     hist_series = []                 # (mag_used, colour, filt) for the count histogram below
     any_data = False
     all_vega = True
@@ -3889,7 +4009,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
         any_data = True
         lbl = f"{filt}  (n={int(ok.sum())}" + ("" if zp is not None else ", instr") + ")"
         a.plot(ctr, med, "-", color=color, lw=1.7,
-               label=lbl + r"  formal $\sigma_{\rm fit}$ (not repeatability)")
+               label=lbl + r"  formal $\sigma_{\rm fit}$")
         a.fill_between(ctr, lo, hi, color=color, alpha=0.20)
         # This solid curve is the fitter's FORMAL 1-sigma position error, per detection -- it has no
         # systematic in it by construction, so it is NOT the achieved astrometric precision (that is
@@ -3972,36 +4092,75 @@ def stage6_astrom_error(o: Observation, sw, lw):
         ah.grid(alpha=0.25, which="both")
     ah.set_xlabel(xlbl)
 
-    # RIGHT panel: the SAME astrometric-precision-vs-magnitude, but from the INDEPENDENT peppar
-    # (Hosek WebbPSF) catalogues instead of jicama -- a cross-check that does not share jicama's
-    # detection/fit choices.  Peppar mags are instrumental (no Vega ZP), so its x-axis is instrumental.
-    pep_any = False; pep_kind = None
+    # RIGHT column: the same precision-vs-magnitude from the INDEPENDENT peppar (Hosek WebbPSF)
+    # catalogues -- a cross-check that does not share jicama's detection/fit choices.  Two curves per
+    # channel: the per-frame FORMAL PSF-fit error (dashed, predicted precision) and the combined
+    # starlist's FRAME-TO-FRAME standard deviation (solid, achieved repeatability -- the analogue of
+    # the jicama rms(jwst) curve).  Peppar mags are instrumental (no Vega ZP).  A parallel
+    # source-count histogram (bottom-right) mirrors the jicama one.
+    pep_any = False
+    pep_kinds = set()
+    pep_hist = []                    # (mag, colour, filt) behind the primary (frame_std) curve
     for filt, color in [(sw, "#3366cc"), (lw, "#cc3311")]:
         if not filt:
             continue
         pp = _peppar_precision(o, filt)
-        if pp is None:
+        if not pp:
             continue
-        pmag, pprec, pep_kind = pp
-        ok = pprec < 500.0
-        med, lo, hi, ctr = _binned_stat(pmag[ok], pprec[ok])
-        if med is None:
-            continue
-        pep_any = True
-        a2.plot(ctr, med, "-", color=color, lw=1.7, label=f"{filt}  (n={int(ok.sum())})")
-        a2.fill_between(ctr, lo, hi, color=color, alpha=0.20)
-        metrics[f"peppar_floor_mas_{filt.lower()}"] = float(np.nanmin(med))
+        fl = filt.lower()
+        fs = pp.get("frame_std")
+        hist_mag = None                          # the sample to histogram for this channel
+        if fs is not None:
+            fmag, fprec = fs
+            ok = fprec < 500.0
+            med, lo, hi, ctr = _binned_stat(fmag[ok], fprec[ok])
+            if med is not None:
+                pep_any = True; pep_kinds.add("frame-to-frame σ")
+                a2.plot(ctr, med, "-", color=color, lw=1.9,
+                        label=f"{filt} frame-to-frame σ (n={int(ok.sum())})")
+                a2.fill_between(ctr, lo, hi, color=color, alpha=0.20)
+                metrics[f"peppar_framestd_floor_mas_{fl}"] = float(np.nanmin(med))
+                metrics[f"peppar_floor_mas_{fl}"] = float(np.nanmin(med))   # headline = achieved
+                hist_mag = fmag[ok]
+        fm = pp.get("formal")
+        if fm is not None:
+            gmag, gprec = fm
+            ok = gprec < 500.0
+            med, lo, hi, ctr = _binned_stat(gmag[ok], gprec[ok])
+            if med is not None:
+                pep_any = True; pep_kinds.add("per-frame formal σ_fit")
+                a2.plot(ctr, med, "--", color=color, lw=1.4, alpha=0.9,
+                        label=f"{filt} per-frame formal σ_fit")
+                metrics[f"peppar_formal_floor_mas_{fl}"] = float(np.nanmin(med))
+                metrics.setdefault(f"peppar_floor_mas_{fl}", float(np.nanmin(med)))
+                hist_mag = gmag[ok]              # full per-frame detection sample (mirrors jicama)
+        if hist_mag is not None:
+            pep_hist.append((hist_mag, color, filt))
     if pep_any:
         a2.set_yscale("log"); a2.set_ylim(0.03, 300.0)
-        a2.set_xlabel("instrumental magnitude (peppar; no ZP)")
         a2.set_ylabel("astrometric precision (mas)")
-        a2.legend(fontsize=9, loc="upper left"); a2.grid(alpha=0.25, which="both")
-        a2.set_title(f"peppar {pep_kind}", fontsize=10)
-        metrics["peppar_kind"] = pep_kind
+        a2.legend(fontsize=8.5, loc="upper left"); a2.grid(alpha=0.25, which="both")
+        a2.set_title("peppar (independent) — " + " + ".join(sorted(pep_kinds)), fontsize=9.5)
+        metrics["peppar_kind"] = ", ".join(sorted(pep_kinds))
+        # BOTTOM-RIGHT: peppar source counts per instrumental-mag bin, mirroring the jicama panel.
+        pallmag = (np.concatenate([m[np.isfinite(m)] for m, _c, _f in pep_hist])
+                   if pep_hist else np.array([]))
+        if pallmag.size:
+            pbins = np.arange(np.floor(pallmag.min()), np.ceil(pallmag.max()) + 0.5, 0.5)
+            pmids = 0.5 * (pbins[:-1] + pbins[1:])
+            for m, color, filt in pep_hist:
+                cnt, _ = np.histogram(m[np.isfinite(m)], bins=pbins)
+                a2h.step(pmids, cnt, where="mid", color=color, lw=1.6)
+                if cnt.max() > 0:
+                    metrics[f"peppar_lf_peak_mag_{filt.lower()}"] = float(pmids[int(np.argmax(cnt))])
+            a2h.set_yscale("log"); a2h.set_ylabel("sources / 0.5 mag")
+            a2h.grid(alpha=0.25, which="both")
+        a2h.set_xlabel("instrumental magnitude (peppar; no ZP)")
     else:
         a2.text(0.5, 0.5, "no peppar catalogues\nfor this obs/filter", ha="center", va="center",
                 fontsize=10, style="italic", transform=a2.transAxes)
         a2.set_xticks([]); a2.set_yticks([])
+        a2h.set_xticks([]); a2h.set_yticks([])
     metrics["passed"] = True
     return _save(fig, f"{o.obsid}_stage6.png"), metrics
 
@@ -4496,11 +4655,14 @@ def _caption_for_impl(n, metrics):
                      "formal σ_fit floor (`floor_is_empirical` false). ")
         base += ("All curves rise at the faint end with S/N; shaded band = 16–84th percentile. The "
                  "**lower-left panel** histograms the source counts per Vega-mag bin — the sample "
-                 "behind each curve point. The **RIGHT panel** repeats the precision-vs-magnitude "
-                 "from the INDEPENDENT peppar (Hosek WebbPSF) catalogues — the combined starlist's "
-                 "across-exposure scatter when present, else the per-frame formal PSF-fit error — a "
-                 "jicama-independent cross-check (peppar mags are instrumental, no zero-point). "
-                 "([how this is made](DOCROOT#stage6))")
+                 "behind each curve point. The **RIGHT column** repeats the precision-vs-magnitude "
+                 "from the INDEPENDENT peppar (Hosek WebbPSF) catalogues (mags instrumental, no "
+                 "zero-point): **per-frame formal σ_fit** (dashed, the noise-limited fit error) and "
+                 "the **frame-to-frame σ** (solid, the standard deviation of each star's position "
+                 "across the exposures — the achieved repeatability, ~20× the formal error), from "
+                 "the combined starlist's across-exposure scatter where present, else computed by "
+                 "cross-matching the per-frame catalogues. Its own source-count histogram sits below "
+                 "it. ([how this is made](DOCROOT#stage6))")
         return base
     if n == 10:
         # Built in code so the floors are only quoted when a curve was actually drawn.  The
