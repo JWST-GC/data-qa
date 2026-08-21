@@ -1699,21 +1699,30 @@ def stage4_offsets(o: Observation, sw):
     # matched one to one, are 0.4-1.6 mas apart).  So once the cells have established that the
     # field offset is small, re-measure the reported value from the SAME STARS.  The per-cell map
     # goes on doing the job it exists for, which is finding a spatial discontinuity.
-    # Clean isolated-star bulk: independent of the histogram peak (no nearest-neighbour collapse, no
-    # spurious-peak failure).  Computed HERE (not after the verdict) because it is the fallback when
-    # the per-cell map has broken down.
+    # Clean isolated-star bulk (independent of the per-cell peaks) and the pipeline's swept,
+    # contrast-gated, edge-alias-rejecting WHOLE-FIELD offset -- both needed to decide what to do
+    # when the per-cell map breaks down.
     ib = _isolated_bulk(jsc, ref_sc)
     iso_off = float(np.hypot(ib[0], ib[1])) if ib is not None else None
     iso_n = int(ib[2]) if ib is not None else 0
-    # Cell-method breakdown: the surviving cells still scatter by ~arcsec, so the per-cell offsets are
-    # noise, not a tie.  When a solid clean isolated bulk exists, report IT and drop the phantom
-    # spatial-discontinuity verdict the garbage cells would otherwise raise (cloudef o005).
+    wf = _crossmatch_offset(jsc, ref_sc, restrict_footprint=True)     # swept measure_offset
+    wf_ok = bool(wf is not None and wf.get("ok"))
+    # Cell-method breakdown: the surviving cells scatter by ~arcsec, so the per-cell peaks are noise,
+    # not a tie or a real discontinuity (cloudef o005: 1783 mas).  In that state DO NOT trust the
+    # per-cell map -- and DO NOT trust the isolated-star median either, which collapses toward 0 when
+    # the true offset approaches its 0.15" match window (Solved-Problem rule).  Use the swept
+    # whole-field offset when it is CONFIDENT; otherwise the offset is genuinely unmeasurable here
+    # (sparse VIRAC, no contrast) and must be reported as indicative, not as a clean tie.
     cell_map_unreliable = _cell_map_broke_down(spread, iso_off, iso_n)
+    offset_unmeasurable = bool(cell_map_unreliable and not wf_ok)
 
     ss = aa.same_star_tie(jsc, ref_sc)
-    if cell_map_unreliable:
-        off_med = iso_off
-        bulk_source = "isolated (cell map unreliable)"
+    if cell_map_unreliable and wf_ok:
+        off_med = float(wf["off"])
+        bulk_source = "whole-field xcorr (cell map unreliable)"
+    elif cell_map_unreliable:
+        off_med = iso_off                        # indicative only; flagged unmeasurable below
+        bulk_source = "isolated (indicative; offset unmeasurable)"
     else:
         off_med = ss["off"] if ss else cell_off_med
         bulk_source = "same-star" if ss else "histogram"
@@ -1723,8 +1732,11 @@ def stage4_offsets(o: Observation, sw):
     # < 50 mas < THRESH["absolute"] and can never fail -- gating on it would pass a real 90 mas
     # offset (cell_off_med ~= 87, same-star ~= 13).  Gate on the LARGER of the two so a genuine
     # mis-registration the histogram sees survives the refinement.  When the cell map is unreliable,
-    # gate on the isolated bulk instead (the cell histogram is noise).
-    gate_off = iso_off if cell_map_unreliable else max(cell_off_med, off_med)
+    # gate on the confident whole-field offset; when even that is absent the offset is unmeasurable.
+    if cell_map_unreliable:
+        gate_off = off_med if wf_ok else None
+    else:
+        gate_off = max(cell_off_med, off_med)
     # PASS needs a small offset, enough COVERAGE, spatially CONSISTENT cells (no adjacency-confirmed
     # sub-region off by >30 mas holding >2% of sources; catches a minority a robust spread cannot),
     # and a small inter-module offset.  The adjacency test needs a real grid, so the WHOLE-FIELD
@@ -1737,13 +1749,16 @@ def stage4_offsets(o: Observation, sw):
     # A garbage cell map cannot pronounce a spatial discontinuity: its adjacency-confirmed "deviating"
     # cells are noise agreeing with noise, so do not fail the field on them.
     spatial_ok = True if (whole_field or cell_map_unreliable) else cc["consistent"]
-    passed = bool(gate_off < aa.THRESH["absolute"] and spatial_ok and coverage_ok and
-                  (io is None or io < aa.THRESH["intermodule"]))
+    # An unmeasurable offset cannot PASS: we could not confirm the frame is tied, so leave it for a
+    # human rather than green-tick it on a collapse-biased number.
+    passed = bool(gate_off is not None and gate_off < aa.THRESH["absolute"] and spatial_ok
+                  and coverage_ok and (io is None or io < aa.THRESH["intermodule"]))
     metrics.update(offset_med_mas=off_med, offset_scatter_mas=spread,
                    bulk_off=off_med,                        # reported offset (same-star when available)
                    gate_off_mas=gate_off,                   # value the magnitude gate tests (cell histogram)
                    spatial_assessed=spatial_assessed,       # False -> whole-field fallback, no per-cell map
                    grid_used=grid_used, cell_map_unreliable=cell_map_unreliable,
+                   offset_unmeasurable=offset_unmeasurable,
                    bulk_source=bulk_source, cell_off_med=cell_off_med,
                    same_star_off=(ss["off"] if ss else None),
                    same_star_npairs=(ss["npairs"] if ss else None),
@@ -4497,17 +4512,26 @@ def _caption_for_impl(n, metrics):
                 f"The field offset is {om_str} mas over {nc} measured cells ({nd} without a "
                 f"peak){unc}. ")
         # Cell-method breakdown (issue #38, cloudef o005): the cells scatter by ~arcsec, so the
-        # per-cell histogram peaks are noise, not a tie or a real discontinuity.  Say the map failed
-        # and that the quoted offset is the clean isolated-star bulk instead.
+        # per-cell histogram peaks are noise, not a tie or a real discontinuity.  Say the map failed;
+        # then either quote the confident swept whole-field offset, or -- if even that has no peak --
+        # say the offset is UNMEASURABLE (do NOT pass off the collapse-biased isolated median as a tie).
         if metrics.get("cell_map_unreliable"):
-            ibn = metrics.get("isolated_bulk_n")
             base += (f"⚠️ **The per-cell map is unreliable here.** The cells scatter by "
                      f"{(sp or 0):.0f} mas (≈{(sp or 0) / 1000:.1f}″) — far more than any real tie or "
                      f"sub-region discontinuity — so the per-cell histogram peaks are spurious (VIRAC "
-                     f"is too sparse over this field to peak reliably per cell). The offset quoted "
-                     f"above is instead the **clean isolated-star bulk** ({om_str} mas, "
-                     f"n={ibn}), matched one-to-one: the field IS well tied — the per-cell map, not "
-                     f"the frame, is what failed, so no spatial-discontinuity verdict is drawn. ")
+                     f"is too sparse over this field to peak reliably per cell), and **no "
+                     f"spatial-discontinuity verdict is drawn**. ")
+            if metrics.get("offset_unmeasurable"):
+                ibn = metrics.get("isolated_bulk_n")
+                base += (f"The whole-field swept cross-correlation also finds no confident peak, so "
+                         f"the JWST−VIRAC offset is **not reliably measurable** over this field. The "
+                         f"only clean-match estimate is the isolated-star bulk ({om_str} mas, "
+                         f"n={ibn}), but with VIRAC this sparse a near-zero value can be a "
+                         f"nearest-neighbour collapse rather than a true tie — read it as indicative "
+                         f"only, and this observation does not auto-pass. ")
+            else:
+                base += (f"The offset quoted above ({om_str} mas) is instead the confident **swept "
+                         f"whole-field cross-correlation**, which is density-immune. ")
         # Reliability + provenance guards (issue #37/#38): say plainly when the number is measured
         # on a pre-re-tie catalogue, or when the histogram peak disagrees with clean isolated matches.
         if metrics.get("catalog_stale"):
@@ -4543,11 +4567,11 @@ def _caption_for_impl(n, metrics):
         base += ("The RIGHT panel, when present, is the NRCA-minus-NRCB offset, measured "
                  "[without any external catalogue](DOCROOT#glossary-reffree). ")
         if metrics.get("cell_map_unreliable"):
-            # cells exist but are noise; the pass rests on the isolated-star bulk, and the per-cell
-            # spatial-consistency check is void (not skipped for lack of cells).
-            base += ("A pass here needs a small isolated-star offset; the per-cell "
-                     "spatial-consistency check is void because the cell map broke down, so a subtle "
-                     "sub-region discontinuity could go unseen. ([how this is made](DOCROOT#stage4))")
+            # cells exist but are noise; the per-cell spatial-consistency check is void (not skipped
+            # for lack of cells), and an unmeasurable offset is left for a human rather than passed.
+            base += ("The per-cell spatial-consistency check is void because the cell map broke "
+                     "down, so a subtle sub-region discontinuity could go unseen. "
+                     "([how this is made](DOCROOT#stage4))")
         elif metrics.get("spatial_assessed", True):
             base += ("A pass needs a small field offset AND cells that agree with each other. "
                      "([how this is made](DOCROOT#stage4))")
