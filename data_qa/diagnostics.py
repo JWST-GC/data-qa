@@ -1603,7 +1603,8 @@ def _isolated_bulk(jsc, ref_sc, iso_arcsec=0.5, match_arcsec=0.15, ambig_arcsec=
     < ``match_arcsec``, second-nearest > ``ambig_arcsec``).  These do not suffer the nearest-neighbour
     collapse (they are isolated) nor the spurious-peak failure (they are matched one-to-one), so their
     median offset is the true bulk where enough of them exist.  Returns (median_dRA, median_dDec, n) in
-    mas, or None if too few clean matches (VIRAC too sparse to check)."""
+    mas, or None if too few clean matches (the frame offset exceeds the match window, so few true
+    pairs survive)."""
     import astropy.units as u
     if jsc is None or ref_sc is None or len(jsc) < 100 or len(ref_sc) < 50:
         return None
@@ -1741,7 +1742,7 @@ def stage4_offsets(o: Observation, sw):
     # per-cell map -- and DO NOT trust the isolated-star median either, which collapses toward 0 when
     # the true offset approaches its 0.15" match window (Solved-Problem rule).  Use the swept
     # whole-field offset when it is CONFIDENT; otherwise the offset is genuinely unmeasurable here
-    # (sparse VIRAC, no contrast) and must be reported as indicative, not as a clean tie.
+    # (offset beyond the search window, no contrast) and must be reported as indicative, not a tie.
     cell_map_unreliable = _cell_map_broke_down(spread, iso_off, iso_n)
     offset_unmeasurable = bool(cell_map_unreliable and not wf_ok)
 
@@ -1800,7 +1801,7 @@ def stage4_offsets(o: Observation, sw):
 
     # Guard A -- cross-check the histogram-peak bulk against the CLEAN isolated matches (computed
     # above), which suffer neither the nearest-neighbour collapse nor the spurious-peak failure.  A
-    # large disagreement means the reported peak is not the true bulk (sparse reference / spurious
+    # large disagreement means the reported peak is not the true bulk (offset beyond the window / spurious
     # lobe), so the number is low-confidence even when its peak_ratio looks strong.  When the cell map
     # is already declared unreliable the isolated bulk IS the reported value, so no disagreement.
     if ib is not None:
@@ -3071,9 +3072,10 @@ def _load_mast_catalog(path):
 def _offset_cloud(jsc, ref_sc):
     """The per-star (JWST − VIRAC) offset VECTORS for genuinely-matched stars.
 
-    VIRAC is sparse, so the distance from a random JWST source to its nearest VIRAC neighbour is
-    about the reference's own source spacing (~250 mas at GC density) for ANY frame, and it swamps
-    the offset being looked for.  So: coarse-align by the ``aa.xcorr`` histogram peak, which finds
+    VIRAC is far sparser than JWST (its medNN is ~1.2" at GC density, vs ~0.5" for JWST), so the
+    distance from a random JWST source to its nearest VIRAC neighbour is about the reference's own
+    ~1.2" spacing for ANY frame, and it swamps the offset being looked for.  So: coarse-align by the
+    ``aa.xcorr`` histogram peak, which finds
     the bulk shift out to 1.5", keep the pairs that then fall within 0.1" (the real matches), and
     return their (ΔRA, ΔDec) in mas.  The centre of that cloud is the field offset from VIRAC.
     Returns (dra_arr, dde_arr, bulk_off_mas) or None."""
@@ -3328,7 +3330,7 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     axh.set_title("source counts in the common window — MAST vs pipeline", fontsize=9)
 
     # bottom-right (MAIN): each catalogue's offset from VIRAC, as a 2-D (ΔRA, ΔDec) cloud with
-    # marginals.  VIRAC's own ~250 mas source spacing swamps a nearest-neighbour distance, so this
+    # marginals.  VIRAC's own ~1.2" source spacing swamps a nearest-neighbour distance, so this
     # coarse-aligns by the xcorr histogram peak first; the cloud CENTRE is then the field offset
     # (MAST far from 0, jicama near 0).
     axo = fig.add_subplot(gs[1, 1])
@@ -4834,9 +4836,13 @@ def _caption_for_impl(n, metrics):
         unc = ("" if metrics.get("cell_map_unreliable") or sp is None
                else f", and the cells scatter by {sp:.0f} mas about it")
         om_str = f"{om:.1f}" if abs(om) < 10 else f"{om:.0f}"
-        dev_or_unmeas = ("outlined cells "
-                f"[deviate together](DOCROOT#glossary-adjacency) from the field value, grey cells "
-                f"were not measurable") if any (True, ) else ""
+        _bits = []
+        if ncf:
+            _bits.append("outlined cells [deviate together](DOCROOT#glossary-adjacency) "
+                         "from the field value")
+        if nd:
+            _bits.append("grey cells were not measurable")
+        dev_or_unmeas = ("; " + "; ".join(_bits)) if _bits else ""
         base = (f"**Stage 4 — positional offsets (JWST catalogue − VIRAC).** \n\n"
                 # NOTE TO CLAUDE: this was commented out as irrelevant text.  I asked for concise and relevant, I want concise and relevant.
                 # This is a "
@@ -4847,7 +4853,7 @@ def _caption_for_impl(n, metrics):
                 f" The [offset between the JWST-mean and the VIRAC position](DOCROOT#glossary-bulk) is measured separately in each spatial cell."
                 f" The measurement is the 'mode' (i.e., the peak of the histogram) of [all JWST−VIRAC pair "
                 f"separations](DOCROOT#glossary-xcorr) in that cell.\n\n"
-                f"LEFT maps that offset across the mosaic; {dev_or_unmeas}.\n\n"
+                f"LEFT maps that offset across the mosaic{dev_or_unmeas}.\n\n"
                 f"MIDDLE plots the **per-cell** offsets as (ΔRA, ΔDec) points sized by source "
                 f"count, with the field value in the title, a circle at the 75 mas gate, and "
                 f"ΔRA/ΔDec marginal histograms.\n\n"
@@ -4860,17 +4866,18 @@ def _caption_for_impl(n, metrics):
         if metrics.get("cell_map_unreliable"):
             base += (f"⚠️ **The per-cell map is unreliable here.** The cells scatter by "
                      f"{(sp or 0):.0f} mas (≈{(sp or 0) / 1000:.1f}″) — far more than any real tie or "
-                     f"sub-region discontinuity — so the per-cell histogram peaks are spurious (VIRAC "
-                     f"is too sparse over this field to peak reliably per cell), and **no "
+                     f"sub-region discontinuity — so the per-cell peaks are chance coincidences: the "
+                     f"frame is offset beyond the 2.5″ per-cell window, and **no "
                      f"spatial-discontinuity verdict is drawn**. ")
             if metrics.get("offset_unmeasurable"):
                 ibn = metrics.get("isolated_bulk_n")
-                base += (f"The whole-field swept cross-correlation also finds no confident peak, so "
-                         f"the JWST−VIRAC offset is **not reliably measurable** over this field. The "
-                         f"only clean-match estimate is the isolated-star bulk ({om_str} mas, "
-                         f"n={ibn}), but with VIRAC this sparse a near-zero value can be a "
-                         f"nearest-neighbour collapse rather than a true tie — read it as indicative "
-                         f"only, and this observation does not auto-pass. ")
+                base += (f"The whole-field swept cross-correlation also finds no peak within its "
+                         f"search window, so the JWST−VIRAC offset is **not measured** here — most "
+                         f"likely an un-registered frame offset larger than the window. The "
+                         f"isolated-star value ({om_str} mas, n={ibn}) is a **nearest-neighbour "
+                         f"collapse** — the true offset exceeds the 0.15″ match window, so only chance "
+                         f"matches survive and their median falls to ~0 — read it as indicative only, "
+                         f"and this observation does not auto-pass. ")
             else:
                 base += (f"The offset quoted above ({om_str} mas) is instead the confident **swept "
                          f"whole-field cross-correlation**, which is density-immune. ")
@@ -4887,8 +4894,8 @@ def _caption_for_impl(n, metrics):
             dg = metrics.get("bulk_vs_isolated_disagree_mas")
             base += (f"⚠️ **Low confidence.** The histogram-peak offset disagrees with clean, "
                      f"unambiguous isolated-star matches ({ib:.0f} mas, n={ibn}) by {dg:.0f} mas — "
-                     f"VIRAC is sparse over this field and the peak may sit on a spurious lobe rather "
-                     f"than the true bulk, so read the quoted value as indicative only. ")
+                     f"the frame offset is likely larger than the search window, so the peak is "
+                     f"chance-dominated — read the quoted value as indicative only. ")
         # Which of the two measurements the quoted number came from.  They differ: see the comment
         # in stage4_offsets on the dense-reference pull on the histogram peak.
         if metrics.get("bulk_source") == "same-star":
