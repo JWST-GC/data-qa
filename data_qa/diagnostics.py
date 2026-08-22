@@ -4036,8 +4036,8 @@ def _peppar_precision(o: Observation, filt, max_frames=48):
 def stage6_astrom_error(o: Observation, sw, lw):
     """Astrometric precision vs Vega magnitude, one set of curves per channel (SW / LW):
       - solid  formal sigma_fit -- the PSF fitter's formal 1-sigma position error per detection.
-               A formal error bar carries no systematic, so its ~0.06 mas bright-end floor is NOT
-               the achieved precision; it is the noise-limited fit uncertainty.
+               A formal error bar carries no systematic, so its ~0.06 mas bright-end floor is
+               the noise-limited fit uncertainty.  Achieved precision is the rms(jwst) floor below.
       - dotted rms(jwst) internal -- the EMPIRICAL scatter of a star's position across exposures
                (merged std_ra/std_dec).  This is the achieved repeatability (a sub-mas floor, well
                above the formal sigma); the headline `floor_mas` is this number when available,
@@ -4094,7 +4094,8 @@ def stage6_astrom_error(o: Observation, sw, lw):
         # systematic in it by construction, so it is NOT the achieved astrometric precision (that is
         # the empirical rms(jwst) dotted curve below, ~20x larger).  Record it under an explicit key
         # and make the headline `floor_mas` the EMPIRICAL floor (set in the rms(jwst) block), so a
-        # reader of the metric gets the achieved precision, not the fit error (issue #1 review).
+        # reader of the metric gets the achieved precision (issue #1 review).  The fit error is
+        # kept separately as `formal_sigma_floor_mas_<filt>`.
         metrics[f"formal_sigma_floor_mas_{filt.lower()}"] = float(np.nanmin(med))
         metrics[f"floor_mas_{filt.lower()}"] = float(np.nanmin(med))   # provisional; empirical overrides
         metrics[f"floor_is_empirical_{filt.lower()}"] = False
@@ -4666,7 +4667,7 @@ def _caption_stage8(metrics):
                      f"ratio is the significance quoted here; a per-cell standard error reads "
                      f"about 2× more optimistic and is not used")
         if frac is not None:
-            base += (f"; {100 * frac:.1f}% of kept rows have |Δ| > 20 mas, from nearest-neighbour "
+            base += (f". {100 * frac:.1f}% of kept rows have |Δ| > 20 mas, from nearest-neighbour "
                      f"ambiguity inside the match radius, which inflates a standard error")
         base += ". "
     if metrics.get("red_flag"):
@@ -4944,7 +4945,7 @@ def _caption_for_impl(n, metrics):
         if mo is not None and jo is not None:
             base += f" — {jo:.0f} mas (jicama) vs {mo:.0f} mas (MAST)"
             if jo < mo:
-                base += ", the astrometric tightening the pipeline delivers over MAST. "
+                base += ", so the pipeline sits closer to VIRAC. "
             else:
                 base += " (MAST is as close to VIRAC as the pipeline here). "
         elif jo is not None:
@@ -4969,7 +4970,8 @@ def _caption_for_impl(n, metrics):
         base = ("**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel. "
                 "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error; a "
                 "formal error bar has no systematic in it, so its bright-end floor is the "
-                "noise-limited fit uncertainty, **not** the achieved precision. **rms(offset)** "
+                "noise-limited fit uncertainty. Achieved precision comes from the across-exposure "
+                "repeatability described below. **rms(offset)** "
                 "(dashed) is the RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) offset "
                 "(external scatter, incl. the VIRAC floor). ")
         if emp:
@@ -4983,13 +4985,13 @@ def _caption_for_impl(n, metrics):
         base += ("All curves rise at the faint end with S/N; shaded band = 16–84th percentile. The "
                  "**lower-left panel** histograms the source counts per Vega-mag bin — the sample "
                  "behind each curve point. The **RIGHT column** repeats the precision-vs-magnitude "
-                 "from the INDEPENDENT peppar (Hosek WebbPSF) catalogues (mags instrumental, no "
-                 "zero-point): **per-frame formal σ_fit** (dashed, the noise-limited fit error) and "
-                 "the **frame-to-frame σ** (solid, the standard deviation of each star's position "
-                 "across the exposures — the achieved repeatability, ~20× the formal error), from "
-                 "the combined starlist's across-exposure scatter where present, else computed by "
-                 "cross-matching the per-frame catalogues. Its own source-count histogram sits below "
-                 "it. ([how this is made](DOCROOT#stage6))")
+                 "from the INDEPENDENT peppar (Hosek WebbPSF) catalogues, whose magnitudes are "
+                 "instrumental with no zero-point. It draws **per-frame formal σ_fit** (dashed, the "
+                 "noise-limited fit error) and the **frame-to-frame σ** (solid, the standard "
+                 "deviation of each star's position across the exposures — the achieved "
+                 "repeatability, ~20× the formal error). That scatter comes from the combined "
+                 "starlist where present, else from cross-matching the per-frame catalogues. Its "
+                 "own source-count histogram sits below it. ([how this is made](DOCROOT#stage6))")
         return base
     if n == 10:
         # Built in code so the floors are only quoted when a curve was actually drawn.  The
