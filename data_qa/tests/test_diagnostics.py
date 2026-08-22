@@ -795,6 +795,29 @@ def test_make_issues_frame_ok_untficked_when_spatial_unassessed(monkeypatch):
     assert "[x]" in line2
 
 
+def test_make_issues_product_existence_checkboxes(monkeypatch):
+    # jicama / JWST1PASS / peppar presence boxes are auto-set from the diagnostics: a stage
+    # red-flags when its product is absent, so "not red-flagged" ticks the box.
+    from data_qa import make_issues as MI
+    monkeypatch.setattr(MI, "_guidestar_json", lambda: {})
+    o = Observation(program="2045", obs="001", target="Arches", release_field="arches",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {
+        "stage3": {"passed": True},                       # jicama present (Vega calib ran)
+        "stage6": {"peppar_kind": "frame-to-frame σ"},    # peppar present
+        "stage10": {"stage": 10, "red_flag": True},       # JWST1PASS absent
+        "stage11": {"stage": 11, "red_flag": False}})
+    lines = {l.split("**Products**: ")[1].split(" present")[0]: l
+             for l in MI.render_body(o).splitlines() if "**Products**:" in l}
+    assert "[x]" in lines["jicama (merged/release catalogue)"]
+    assert "[ ]" in lines["JWST1PASS products"]           # stage 10 red-flagged -> absent
+    assert "[x]" in lines["peppar products"]
+    # nothing present -> all three unticked
+    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {"stage10": {"red_flag": True}})
+    lines2 = [l for l in MI.render_body(o).splitlines() if "**Products**:" in l]
+    assert len(lines2) == 3 and all("[ ]" in l for l in lines2)
+
+
 def test_mosaic_path_lone_module_incomplete_when_sibling_filter_two_module(tmp_path, monkeypatch):
     # issue #13 re-review: the two-module guard must be OBSERVATION-scoped.  cloudef jw02092-o002
     # F360M has only NRCA, but sibling filters have merged mosaics -> the obs is two-module, so the

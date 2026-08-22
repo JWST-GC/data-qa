@@ -76,6 +76,7 @@ def _guidestar_block(o: Observation) -> str:
 def render_body(o: Observation) -> str:
     M = _qa_metrics(o)
     s1, s2, s3, s4, s5 = (M.get(f"stage{n}", {}) for n in (1, 2, 3, 4, 5))
+    s6, s7, s10, s11 = (M.get(f"stage{n}", {}) for n in (6, 7, 10, 11))
     from . import astrometry_audit as aa
     THRESH_ABS, THRESH_IM = aa.THRESH["absolute"], aa.THRESH["intermodule"]
     delivered = bool(s1.get("passed"))
@@ -94,6 +95,17 @@ def render_body(o: Observation) -> str:
     interm_ok = im is not None and im < THRESH_IM
     phot_ok = bool(s3.get("passed"))
     catalog_ok = bool(s2.get("passed"))
+    # Product-existence flags for the board (auto-set from the diagnostics; each stage red-flags when
+    # its product is absent, so "not red-flagged" == "product present").
+    #  - jicama = the merged/release catalogue: stage 7 says so directly, else stage 4 read positions
+    #    from a "release:" catalogue, else stage 3's Vega calibration (which needs the merged cat) ran.
+    jicama_present = (bool(s7.get("jicama_is_release"))
+                     or str(s4.get("source", "")).startswith("release")
+                     or bool(s3.get("passed")))
+    #  - JWST1PASS (stage 10): a MATCHUP.XYMEEE / LOG.psfperts product exists.
+    jwst1pass_present = bool(s10) and not s10.get("red_flag")
+    #  - peppar: stage 6 drew a peppar curve (peppar_kind set) or stage 11 built the ePSF grid.
+    peppar_present = bool(s6.get("peppar_kind")) or (bool(s11) and not s11.get("red_flag"))
 
     filt_rows = "\n".join(f"  - [ ] `{f}` — mosaic reviewed; astrometry + photometry OK"
                           for f in o.filters) or "  - (filters TBD)"
@@ -140,6 +152,9 @@ def render_body(o: Observation) -> str:
 - [ ] Background / stripes / artifacts acceptable
 - [ ] **Destreak**: assessed whether 1/f striping requires destreak (SW/LW per module); noted decision (cataloging defaults to the plain `align` crf products)
 - [{_ck(catalog_ok)}] Catalog produced and vetted
+- [{_ck(jicama_present)}] **Products**: jicama (merged/release catalogue) present
+- [{_ck(jwst1pass_present)}] **Products**: JWST1PASS products present
+- [{_ck(peppar_present)}] **Products**: peppar products present
 - [{_ck(catalog_ok)}] **Depth**: detection luminosity functions reach the expected depth (not missing stars we should be detecting)
 - [ ] **Purity**: minimal junk detections in PSF wings and in extended-emission regions
 - [ ] **Residuals**: PSF-subtracted residual histogram is narrow and centered on zero (no systematic over/under-subtraction)
