@@ -4741,7 +4741,7 @@ def _caption_for_impl(n, metrics):
         om_str = f"{om:.1f}" if abs(om) < 10 else f"{om:.0f}"
         dev_or_unmeas = ("outlined cells "
                 f"[deviate together](DOCROOT#glossary-adjacency) from the field value, grey cells "
-                f"were not measurable")
+                f"were not measurable") if any (True, ) else ""
         base = (f"**Stage 4 — positional offsets (JWST catalogue − VIRAC).** \n\n"
                 # NOTE TO CLAUDE: this was commented out as irrelevant text.  I asked for concise and relevant, I want concise and relevant.
                 # This is a "
