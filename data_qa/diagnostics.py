@@ -4307,6 +4307,9 @@ def stage6_astrom_error(o: Observation, sw, lw):
 # exposure's own stars is visibly fatter/washed-out.  Stage 11 shows BOTH, from OUR data (peppar
 # per-frame catalogues + the cal images) -- no JWST1PASS run required.
 _EPSF_HALF = 11                      # ePSF stamp half-size (px) -> 23x23
+_EPSF_NBRIGHT = 40                   # max stars stacked per exposure (brightest isolated first)
+_EPSF_THRESH_SIGMA = 30.0            # DAOStarFinder detection threshold for the stack
+_EPSF_ISO_PX = 25                    # isolation radius (px): drop a star with any neighbour within
 _EPSF_QFIT_STREAK_FACTOR = 2.0       # exposure qfit > this x the median-of-exposures = streak flag
 _EPSF_LOG_VMIN = 0.003               # log-stretch floor (fraction of the peak) for the ePSF stamps
 
@@ -4374,7 +4377,7 @@ def _daophot_key_for_token(token):
 _DQ_SATURATED = 2                    # JWST DQ SATURATED flag (bit 1)
 
 
-def _effective_psf(cal_path, half=_EPSF_HALF, nbright=40, thresh_sigma=30.0):
+def _effective_psf(cal_path, half=_EPSF_HALF, nbright=_EPSF_NBRIGHT, thresh_sigma=_EPSF_THRESH_SIGMA):
     """The effective PSF of one exposure/detector: the MEAN of the peak-normalised cutouts of its
     bright, isolated, UNSATURATED stars, detected directly on the cal image (independent of any fit).
     A streaked exposure yields a stretched/washed-out stamp.  Saturated stars are excluded (their
@@ -4404,7 +4407,7 @@ def _effective_psf(cal_path, half=_EPSF_HALF, nbright=40, thresh_sigma=30.0):
     x = np.asarray(tb["xcentroid"]); y = np.asarray(tb["ycentroid"]); flux = np.asarray(tb["flux"])
     xy = np.column_stack([x, y])
     d, _ = cKDTree(xy).query(xy, k=2)
-    iso = d[:, 1] > 2.3 * half                          # isolated: no neighbour inside the stamp
+    iso = d[:, 1] > _EPSF_ISO_PX                         # isolated: no neighbour inside the stamp
     stamps = []
     for i in np.where(iso)[0][np.argsort(-flux[np.where(iso)[0]])]:   # brightest isolated first
         xi, yi = int(round(x[i])), int(round(y[i]))
@@ -4616,14 +4619,12 @@ _HEADLINE = {
 # in code (variant- or availability-dependent), so no template exists for them -- avoids a dead
 # duplicate that drifts.
 CAPTIONS = {
-    1: "**Stage 1 — first mosaics.** Grayscale {sw} (SW) and {lw} (LW) `i2d`. Confirms the "
-       "observation was delivered and the mosaics are present and not obviously corrupt. "
+    1: "**Stage 1 — first mosaics.** Grayscale {sw} (SW) and {lw} (LW) `i2d`. "
        "([how this is made](DOCROOT#stage1))",
-    3: "**Stage 3 — photometric calibration (zeropoint).** 2-D histogram (colour = star counts) of "
+    3: "**Stage 3 — photometric calibration (zeropoint).** 2-D histogram of "
        "JWST {sw} catalogue magnitude vs [VIRAC Ks](DOCROOT#glossary-virac) for {n_matched} "
-       "[cross-matched](DOCROOT#glossary-crossmatch) stars. The **cyan 1:1 line** (in the legend) "
-       "is anchored on the densest stellar ridge; a well-calibrated catalogue lies along it. The "
-       "measured slope is {slope:.2f} and the scatter about the locus is {scatter:.2f} mag. "
+       "[cross-matched](DOCROOT#glossary-crossmatch) stars. The 1:1 line is anchored on the densest "
+       "stellar ridge. Slope {slope:.2f}, scatter about the locus {scatter:.2f} mag. "
        "([how this is made](DOCROOT#stage3))",
 }
 
@@ -4733,8 +4734,7 @@ def _caption_stage8(metrics):
             f"paired across bands upstream, by mutual nearest neighbour within ~100 mas in "
             f"`merge_catalogs` (visible as truncation near 100 mas) — ~100× the ~1 mas signal, so "
             f"the radius does little to shape this map. LEFT/MIDDLE: binned-median ΔRA/ΔDec maps; "
-            f"RIGHT: per-cell quiver. A flat map = the two solutions agree; a coherent "
-            f"gradient/swirl = a differential distortion residual. ")
+            f"RIGHT: per-cell quiver. ")
     if nS is not None and rms is not None:
         base += f"Here: {nS} stars, {rms:.2f} mas per-star"
         if amp is not None and null is not None and signif is not None:
@@ -4814,8 +4814,7 @@ def _caption_for_impl(n, metrics):
                     f"[luminosity function](DOCROOT#glossary-lf) (star counts vs magnitude) as the "
                     f"right-side marginal. ")
         if lf is not None:
-            body += (f"Turnover ≈ {lf:.1f} mag is a rough depth indicator "
-                     f"(fainter turnover = deeper catalogue). ")
+            body += (f"[Luminosity-function](DOCROOT#glossary-lf) turnover ≈ {lf:.1f} mag. ")
         if metrics.get("n_stars_hi_sn") is not None:
             body += (f"A second CMD below is limited to [S/N > 10](DOCROOT#glossary-snr) in both "
                      f"bands ({metrics['n_stars_hi_sn']} stars, turnover ≈ "
@@ -4962,12 +4961,10 @@ def _caption_for_impl(n, metrics):
         # the S/N panel is present (3 cols), else TOP-RIGHT (2 cols).  The footprint is its own
         # full-width row below.
         ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
-        base = ("**Stage 5 — inter-detector / inter-module agreement.** How far a star seen in one "
-                "detector sits from the same star seen in another. The TOP-LEFT "
+        base = ("**Stage 5 — inter-detector / inter-module agreement.** The TOP-LEFT "
                 "[per-detector quiver](DOCROOT#glossary-quiver) shows each detector's median "
-                "residual **against VIRAC** (field offset removed), each arrow annotated with its "
-                "matched-star count. VIRAC is the shared reference, so every detector gets a "
-                "vector, including NRCB2, which shares no sky with NRCA at all; the NRCA−NRCB "
+                "residual **against VIRAC** (field offset removed); every detector gets a vector, "
+                "including NRCB2, which shares no sky with NRCA. The NRCA−NRCB "
                 f"difference is {(diff if diff is not None else float('nan')):.1f} mas. The "
                 f"{ov_pos} panel compares [JWST against itself](DOCROOT#glossary-reffree) in the "
                 f"NRCA∩NRCB overlap — {off:.1f} mas offset, {rms:.1f} mas scatter (ΔRA and ΔDec "
@@ -4975,22 +4972,18 @@ def _caption_for_impl(n, metrics):
         if metrics.get("n_overlap_hi"):
             base += (f" The panel to its right repeats that comparison for "
                      f"[S/N > 10](DOCROOT#glossary-snr) stars ({metrics['n_overlap_hi']} stars, "
-                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas scatter), where "
-                     f"the scatter measures how well the modules agree, with the centroid noise of "
-                     f"faint stars taken out of it.")
+                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas scatter), removing "
+                     f"faint-star centroid noise from the scatter.")
         if metrics.get("n_overlap_footprint"):
             base += (" The full-width row below the panels maps the overlap stars on the sky, "
-                     "coloured by per-star |A−B|. It shows the shared stars tracing the thin "
-                     "NRCA∩NRCB dither-overlap strip, and flags any part of that strip where the "
-                     "two modules agree less well.")
+                     "coloured by per-star |A−B|.")
         if metrics.get("cutout_footprint_mismatch"):
             base += (" ⚠️ The BOTTOM cutout strip is empty because **no drizzled mosaic covers the "
                      "module-overlap zone — the catalogue and the mosaic are on disjoint footprints** "
                      "(a reduction mismatch, not a QA gap). ([how this is made](DOCROOT#stage5))")
         else:
-            base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`. Where "
-                     "the two modules agree, each star is one round PSF; where they disagree, it "
-                     "doubles or elongates. ([how this is made](DOCROOT#stage5))")
+            base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`. "
+                     "([how this is made](DOCROOT#stage5))")
         return base
     if n == 9:
         ni = metrics.get("n_isolated"); ac = metrics.get("aper_corr_med")
@@ -5001,7 +4994,7 @@ def _caption_for_impl(n, metrics):
                 "stars (nearest catalogue neighbour beyond the sky annulus) so a neighbour's light "
                 "doesn't contaminate the aperture or its background. LEFT: aperture vs PSF "
                 "instrumental mag with the 1:1 + aperture-correction line. RIGHT: (aperture − PSF) "
-                "vs PSF mag, showing the full range. ")
+                "vs PSF mag. ")
         if ni is not None and ac is not None and sct is not None:
             base += (f"Here: {ni} isolated stars"
                      + (" (capped)" if metrics.get("n_capped") else "")
@@ -5010,9 +5003,7 @@ def _caption_for_impl(n, metrics):
             if tf is not None:
                 base += f", {100 * tf:.1f}% beyond ±0.3 mag"
             base += ". "
-        base += ("A tight locus at a constant offset with a small tail means the two photometries "
-                 "agree; large scatter or a heavy tail flags PSF-model or crowding problems. "
-                 "([how this is made](DOCROOT#stage9))")
+        base += "([how this is made](DOCROOT#stage9))"
         return base
     if n == 7:
         if metrics.get("red_flag"):
@@ -5022,10 +5013,9 @@ def _caption_for_impl(n, metrics):
         # counts in the COMMON WINDOW (fair), not the full-field totals
         nj = metrics.get("n_jicama_window"); nm = metrics.get("n_mast_window")
         mo = metrics.get("mast_offset_med_mas"); jo = metrics.get("jicama_offset_med_mas")
-        base = ("**Stage 7 — MAST vs pipeline.** A comparison of the pipeline against the raw "
-                "[MAST-delivered](DOCROOT#glossary-mtier) products. The TOP row shows the "
-                "MAST level-3 `i2d` mosaic (before) next to our pipeline mosaic (after) over the "
-                "same sky region. The BOTTOM-LEFT panel compares source counts — the "
+        base = ("**Stage 7 — MAST vs pipeline.** The TOP row shows the "
+                "[MAST-delivered](DOCROOT#glossary-mtier) level-3 `i2d` mosaic next to our pipeline "
+                "mosaic over the same sky region. The BOTTOM-LEFT panel compares source counts — the "
                 "[jicama](DOCROOT#glossary-jicama) catalogue vs the MAST catalogue "
                 "(the MAST-delivered `_cat.fits` when archived, else approximated by running "
                 "DAOStarFinder at 5σ on the MAST i2d — an approximation of the STScI L3 catalogue "
@@ -5069,10 +5059,8 @@ def _caption_for_impl(n, metrics):
         sw, lw = metrics.get("sw"), metrics.get("lw")
         emp = any(metrics.get(f"floor_is_empirical_{f.lower()}") for f in (sw, lw) if f)
         base = ("**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel. "
-                "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error; a "
-                "formal error bar has no systematic in it, so its bright-end floor is the "
-                "noise-limited fit uncertainty. Achieved precision comes from the across-exposure "
-                "repeatability described below. **rms(offset)** "
+                "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error, "
+                "so its bright-end floor is the noise-limited fit uncertainty. **rms(offset)** "
                 "(dashed) is the RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) offset "
                 "(external scatter, incl. the VIRAC floor). ")
         if emp:
@@ -5083,7 +5071,7 @@ def _caption_for_impl(n, metrics):
             base += ("The empirical **rms(jwst)** repeatability curve needs per-exposure catalogs, "
                      "absent for this obs, so it is not drawn and `floor_mas` falls back to the "
                      "formal σ_fit floor (`floor_is_empirical` false). ")
-        base += ("All curves rise at the faint end with S/N; shaded band = 16–84th percentile. The "
+        base += ("Shaded band = 16–84th percentile. The "
                  "**lower-left panel** histograms the source counts per Vega-mag bin — the sample "
                  "behind each curve point. The **RIGHT column** repeats the precision-vs-magnitude "
                  "from the INDEPENDENT peppar (Hosek WebbPSF) catalogues, whose magnitudes are "
@@ -5103,11 +5091,8 @@ def _caption_for_impl(n, metrics):
                 f"`MATCHUP.XYMEEE`: for each of {metrics.get('n_stars', 0)} stars found in ≥2 of the "
                 f"{metrics.get('n_exposures', 0)} exposures, the RMS of its position (X, Y) and "
                 f"instrumental magnitude across those exposures, plus mean quality-of-fit, all vs "
-                f"instrumental magnitude — the four panels of Jay's `show_matchup.sm`. A tight, flat "
-                f"bright-end floor that rises only at the faint (S/N) and saturated (bright) ends is "
-                f"\"in family\"; a raised or structured floor flags a photometric or distortion "
-                f"problem in that filter's frames. Position RMS is in mas "
-                f"({metrics.get('meta_pix_mas', _META_PIX_MAS):.0f} mas/META-pixel). ")
+                f"instrumental magnitude — the four panels of Jay's `show_matchup.sm`. Position RMS "
+                f"is in mas ({metrics.get('meta_pix_mas', _META_PIX_MAS):.0f} mas/META-pixel). ")
         if xf is not None and mf is not None:
             base += (f"Bright-end floors: {xf:.2f} mas in X, {mf:.3f} mag. ")
         if metrics.get("meta_scale_assumed_sw"):
@@ -5124,26 +5109,16 @@ def _caption_for_impl(n, metrics):
         filt = metrics.get("filter", "?"); det = metrics.get("detector_shown", "?")
         ne = metrics.get("n_exposures", 0)
         base = (f"**Stage 11 — effective PSF per exposure ({filt}, {det}).** Each panel is the "
-                f"empirical PSF of one exposure — the mean of its bright, isolated, **unsaturated** "
-                f"stars stacked from the cal image (log stretch, so the wings show). A momentary "
-                f"tracking failure or guide-star glitch **broadens** that exposure's stars, so its "
-                f"stamp is fatter and more washed-out — a larger halo and a lower, less-peaked core — "
-                f"than the sharp, six-spike NIRCam PSF of the good exposures. (The broadening is "
-                f"roughly symmetric, not a clean elongation, so the flag is not an axis-ratio.) Each "
-                f"stamp is labelled with its star count, its ePSF rms radius (`r`, the breadth), and "
-                f"the exposure's peppar PSF-fit **quality-of-fit** (`qfit`), which spikes when the "
-                f"empirical PSF no longer fits — the objective flag. Built from our own data (peppar "
-                f"catalogues + cal images), independent of JWST1PASS. ")
+                f"peak-normalised mean of up to {_EPSF_NBRIGHT} stars from one exposure's `_cal` "
+                f"image, detected above {_EPSF_THRESH_SIGMA:.0f}σ, isolated (no neighbour within "
+                f"{_EPSF_ISO_PX} px), and unsaturated (SATURATED-flagged cores dropped). ")
         ns = metrics.get("n_streaked") or 0
         if ns:
             exps = ", ".join(metrics.get("streaked_exposures") or [])
             qb = metrics.get("qfit_baseline")
-            base += (f"⚠️ **{ns} exposure(s) flagged:** {exps} — qfit above "
-                     f"{_EPSF_QFIT_STREAK_FACTOR:.0f}× the run baseline"
-                     + (f" ({qb:.1f})" if qb is not None else "") + ". Those exposures degrade the "
-                     f"PSF-fit astrometry/photometry and are candidates to down-weight or drop. ")
-        else:
-            base += (f"All {ne} exposures have a consistent qfit (none flagged). ")
+            base += (f"⚠️ **{ns} exposure(s) flagged:** {exps} — peppar `qfit` above "
+                     f"{_EPSF_QFIT_STREAK_FACTOR:.0f}× the run median"
+                     + (f" ({qb:.1f})" if qb is not None else "") + ". ")
         return base + "([how this is made](DOCROOT#stage11))"
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
