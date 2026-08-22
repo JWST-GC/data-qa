@@ -4476,10 +4476,12 @@ def stage11_effective_psf(o: Observation, sw, lw):
         metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
         return png, metrics
 
-    # streak flag: an exposure whose qfit exceeds _EPSF_QFIT_STREAK_FACTOR x the median across exposures
+    # The streak flag lives in ONE place: _streaked_exposures (shared with the stage-6 clean
+    # recompute), so the two stages can never disagree on which exposures are bad.  qbase is kept
+    # only for the display/metric baseline.
     qvals = np.array([qf[e][0] for e in exps if e in qf], float)
     qbase = float(np.median(qvals)) if qvals.size else None
-    streak_thresh = _EPSF_QFIT_STREAK_FACTOR * qbase if qbase else None
+    flagged = _streaked_exposures(o, filt)
     streaked = []
 
     from astropy.visualization import LogStretch, ImageNormalize
@@ -4506,7 +4508,7 @@ def stage11_effective_psf(o: Observation, sw, lw):
             a.text(0.5, 0.5, "no ePSF", ha="center", va="center", fontsize=8,
                    style="italic", transform=a.transAxes)
         q = qf.get(exp, (None, 0))[0]
-        bad = bool(streak_thresh and q is not None and q > streak_thresh)
+        bad = exp in flagged
         if bad:
             streaked.append(exp)
         lbl = exp.split("_")[-1]                       # the exposure number

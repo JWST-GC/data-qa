@@ -2467,3 +2467,47 @@ def test_stage6_wrapper_no_clean_when_no_streak(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "_streaked_exposures", lambda o, f: set())
     png, m = D.stage6_astrom_error(_obs(field="brick", filt="F212N"), "F212N", None)
     assert "clean_png" not in m
+
+
+# ---- STAGE 6 clean recompute: keep "clean" actually clean (mutation guards from the #118 review) ----
+def test_peppar_precision_excluding_skips_combo_starlist(tmp_path, monkeypatch):
+    # The combined starlist bakes in ALL exposures, so it must NOT be used when excluding.  With a
+    # combo present but every per-frame cat belonging to the excluded exposure, exclude=None yields a
+    # frame_std (from the combo) while exclude={that token} yields none (combo skipped, nothing left).
+    from astropy.table import Table
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    pdir = tmp_path / "brick" / "peppar" / "F212N"; det = pdir / "NRCA1"; det.mkdir(parents=True)
+    Table({"m": np.linspace(-8, -3, 120), "x_wcs_std": np.full(120, 0.004),
+           "y_wcs_std": np.full(120, 0.004)}).write(str(pdir / "combo_starlist_F212N_NRCA1.fits"),
+                                                    overwrite=True)
+    _write_peppar_frame(det / "jw02221001001_02101_00004_nrca1_cal_brick_iter1_cat.fits", qfit=5.5)
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    assert "frame_std" in D._peppar_precision(o, "F212N")           # combo used when not excluding
+    assert D._peppar_precision(o, "F212N", exclude={"jw02221001001_02101_00004"}) is None  # combo skipped
+
+
+def test_stage6_figure_excluding_draws_no_rms_jwst(tmp_path, monkeypatch):
+    # rms(jwst) comes from the merged all-exposure std, so the clean figure must NOT draw it (it
+    # would be contaminated by the excluded exposure).  Assert _internal_pos_rms is not consulted.
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    monkeypatch.setenv("QA_OUTDIR", str(tmp_path))
+    n = 300
+    sc = SkyCoord(266.4 + np.arange(n) * 1e-4, np.full(n, -28.9), unit="deg")
+    pooled = (sc, np.full(n, 1.0), np.full(n, 1.0), np.linspace(-10, -3, n), np.full(n, 1.0))
+    monkeypatch.setattr(D, "_pooled_daophot", lambda o, f, exclude=None: pooled)
+    monkeypatch.setattr(D, "_vega_zeropoint", lambda *a, **k: None)
+    monkeypatch.setattr(D, "_viraccache_path", lambda o: None)
+    monkeypatch.setattr(D, "_refcat_path", lambda o: None)
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: "x.fits")
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: None)
+    monkeypatch.setattr(D, "_peppar_precision", lambda o, f, exclude=None: None)
+    calls = []
+    monkeypatch.setattr(D, "_internal_pos_rms", lambda o, f: calls.append(f) or None)
+    o = _obs(field="brick", filt="F212N")
+    _png, m = D._stage6_figure(o, "F212N", None, exclude={"jw_00004"})
+    assert calls == [] and not any(k.startswith("rms_jwst_floor") for k in m)   # clean: no rms(jwst)
+    calls.clear()
+    D._stage6_figure(o, "F212N", None)                             # normal: rms(jwst) consulted
+    assert calls == ["F212N"]
