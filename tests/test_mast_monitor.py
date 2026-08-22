@@ -1793,7 +1793,14 @@ def _assert_monitor_covers(mapping):
                 continue
             for obsnum in str(obsid).split("-"):
                 assert obsnum in mm.PROGRAMS[prog], (prog, obsid, obsnum)
-                assert mm.PROGRAMS[prog][obsnum] == field, (prog, obsnum, field)
+                qa_field = mm.PROGRAMS[prog][obsnum]
+                # The pipeline may register an observation under a PER-OBS reduction key
+                # (``gc2211_o023``) while data-qa keeps one QA field for the region (``gc2211``,
+                # whose release mosaics live under gc2211/; gc2211_o023/ is only reduction
+                # intermediates).  Accept the base QA field for a ``<field>_o<obs>`` reduction key.
+                # A semantic rename such as o005 -> cloudef_controlfield is NOT this pattern and
+                # still requires the explicit mapping.
+                assert field in (qa_field, f"{qa_field}_o{obsnum}"), (prog, obsnum, field)
 
 
 def test_pipeline_checkout_present_when_required():
