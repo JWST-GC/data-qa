@@ -1409,7 +1409,7 @@ def test_caption_stage7_full():
     assert "MAST vs pipeline" in cap and "offset from VIRAC" in cap
     assert "14 mas (jicama)" in cap and "134 mas (MAST)" in cap
     # jicama (14) < MAST (134): the improvement clause is present
-    assert "astrometric tightening the pipeline delivers" in cap
+    assert "so the pipeline sits closer to VIRAC" in cap
     # the cloud width is set by the match radius -> the caveat is present
     assert "0.1″ cross-match radius" in cap
 
@@ -1431,7 +1431,7 @@ def test_caption_stage7_neutral_when_jicama_not_tighter():
     # (blocker A) jicama (20) NOT tighter than MAST (18): caption reports both, no 'tightening' claim
     cap = D.caption_for(7, dict(stage=7, jicama_offset_med_mas=19.56, mast_offset_med_mas=17.62))
     assert "20 mas (jicama)" in cap and "18 mas (MAST)" in cap
-    assert "astrometric tightening the pipeline delivers" not in cap
+    assert "so the pipeline sits closer to VIRAC" not in cap
     assert "MAST is as close to VIRAC as the pipeline here" in cap
 
 
@@ -1439,7 +1439,7 @@ def test_caption_stage7_drops_clause_when_mast_unavailable():
     # (blocker B) only the MAST offset is unmeasurable: the caption drops the improvement clause
     # and states that the comparison is unavailable, claiming no tightening.
     cap = D.caption_for(7, dict(stage=7, jicama_offset_med_mas=14.5))
-    assert "astrometric tightening the pipeline delivers" not in cap
+    assert "so the pipeline sits closer to VIRAC" not in cap
     assert "MAST comparison is unavailable" in cap
 
 
@@ -1450,7 +1450,7 @@ def test_stage7_verdict_jicama_unmeasurable_fails_and_redflags():
     # and the caption then enters the red-flag branch (no 'tightening' claim)
     cap = D.caption_for(7, dict(stage=7, red_flag=True, red_flag_reason=reason))
     assert cap.startswith("🚩") and "RED FLAG" in cap
-    assert "astrometric tightening the pipeline delivers" not in cap
+    assert "so the pipeline sits closer to VIRAC" not in cap
 
 
 def test_stage7_verdict_mast_only_unmeasurable_passes_without_redflag():
