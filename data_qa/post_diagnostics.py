@@ -35,6 +35,8 @@ STAGE_FUNC = {
     5: "stage5_intermodule", 6: "stage6_astrom_error", 7: "stage7_mast_vs_pipeline",
     8: "stage8_distortion",
     9: "stage9_psf_vs_aper",
+    10: "stage10_photometric_consistency", 11: "stage11_effective_psf",
+    "6clean": "stage6_astrom_error",          # stage 6 recomputed excluding bad-PSF exposures
     "miri": "miri_overview",
 }
 
@@ -42,7 +44,8 @@ STAGE_FUNC = {
 def _provenance_footer(repo, stage):
     """One-line 'how this was made' footer: the narrative method doc + the exact source function."""
     base = f"https://github.com/{repo}/blob/main"
-    doc = f"{base}/docs/qa_methods.md#stage{stage}"
+    anchor = "stage6" if stage == "6clean" else f"stage{stage}"   # 6clean shares stage 6's doc
+    doc = f"{base}/docs/qa_methods.md#{anchor}"
     func = STAGE_FUNC.get(stage)
     src = (f"[`data_qa/diagnostics.py` → `{func}()`]({base}/data_qa/diagnostics.py)"
            if func else f"[`data_qa/diagnostics.py`]({base}/data_qa/diagnostics.py)")

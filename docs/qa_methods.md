@@ -447,8 +447,17 @@ curves per channel:
   it. Metrics: `peppar_framestd_floor_mas_<filt>` (the achieved floor, also the headline
   `peppar_floor_mas`), `peppar_formal_floor_mas_<filt>`.
 
+**Second figure when exposures are flagged.** When [stage 11](#stage11) flags one or more
+**bad-PSF (streaked/broadened) exposures** for the obs, stage 6 posts an **additional** figure (its
+own comment, marker `stage6clean`) recomputed with those exposures **left out of the per-exposure
+pools** — so a momentary tracking failure no longer inflates the precision. The `formal σ_fit`,
+`rms(offset)` and the peppar `frame-to-frame σ` / `formal` curves are all rebuilt without the bad
+exposures; the `rms(jwst)` curve is omitted there (it comes from the merged catalogue's all-exposure
+`std`, which cannot be re-derived per-exposure), so the peppar frame-to-frame σ carries the
+achieved-repeatability comparison. Metrics: `excluded_exposures` and `clean_*_floor_mas`.
+
 Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnostics.py)
-(`_peppar_precision`, `_peppar_frame_std`).
+(`_stage6_figure`, `_streaked_exposures`, `_peppar_precision`, `_peppar_frame_std`).
 
 <a id="stage8"></a>
 ## Stage 8 — inter-filter distortion residual
