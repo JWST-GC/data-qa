@@ -78,7 +78,9 @@ def test_caption_stage4_cell_map_unreliable_and_unmeasurable():
                                 offset_unmeasurable=True, isolated_bulk_n=402))
     assert "per-cell map is unreliable" in cap
     assert "internal discontinuity" not in cap
-    assert "not reliably measurable" in cap and "collapse" in cap and "does not auto-pass" in cap
+    assert "not measured" in cap and "collapse" in cap and "does not auto-pass" in cap
+    # the cause is a frame offset beyond the window; do not (falsely) blame a sparse reference
+    assert "too sparse" not in cap and "sparse over this field" not in cap
     assert "n=402" in cap
     assert cap.count("1783 mas") == 1        # scatter stated once, in the warning
 
@@ -89,7 +91,7 @@ def test_caption_stage4_cell_map_unreliable_confident_wholefield():
                                 offset_scatter_mas=900, n_cells_dropped=0,
                                 cell_map_unreliable=True, offset_unmeasurable=False))
     assert "swept whole-field cross-correlation" in cap
-    assert "internal discontinuity" not in cap and "not reliably measurable" not in cap
+    assert "internal discontinuity" not in cap and "not measured" not in cap
     assert "150 mas" in cap
 
 
