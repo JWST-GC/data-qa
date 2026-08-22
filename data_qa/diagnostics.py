@@ -1094,15 +1094,20 @@ def stage3_calibration(o: Observation, sw):
 
 
 # --------------------------------------------------------------------------- STAGE 4
-def _pooled_daophot(o: Observation, filt, max_files=64):
+def _pooled_daophot(o: Observation, filt, max_files=64, exclude=None):
     """Pool the per-exposure DAOPHOT cats for one filter into (position, per-star astrometric
     sigma, instrumental mag, flux).  Unlike the merged science catalog, the per-exposure cats
     carry the formal PSF-fit position uncertainty: ``dra``/``ddec`` are the RA/Dec 1-sigma
     errors in arcsec (== x_err/y_err * pixel scale, so no pixel-scale assumption is needed).
+    ``exclude`` is a set of peppar exposure tokens (``jw…_<vgroup>_<exp>``) whose cats are dropped
+    -- used by the stage-6 clean recompute to leave out bad-PSF exposures.
     Returns (SkyCoord, sig_ra_mas, sig_de_mas, instr_mag, flux) or None."""
     import astropy.units as u
     from astropy.table import vstack, Table
     cats = _daophot_glob(o, filt)          # obs-scoped
+    if exclude:                            # drop the flagged exposures (vgroup<VG>_exp<EE> in name)
+        keys = {_daophot_key_for_token(t) for t in exclude}
+        cats = [c for c in cats if not any(k in os.path.basename(c) for k in keys)]
     if not cats:
         return None
     if len(cats) > max_files:
@@ -3890,7 +3895,8 @@ def _peppar_cal_for_cat(catpath):
     return None
 
 
-def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0, min_frames=3):
+def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0, min_frames=3,
+                      exclude=None):
     """Frame-to-frame position scatter from the per-frame peppar catalogues, for fields with no
     combined starlist (every current field): the standard deviation of each star's SKY position
     across the exposures it appears in.  The exposures are dithered AND mosaicked, so a star sits at
@@ -3907,7 +3913,7 @@ def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0,
         from scipy.spatial import cKDTree
     except ImportError:
         return None
-    cats = sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits"))
+    cats = _exclude_frames(sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits")), exclude)
     # cap the number of exposures (by exposure token), not raw files: keep all detectors of the
     # chosen exposures so a star's chip-to-chip appearances are all available.
     exps = []
@@ -3977,7 +3983,17 @@ def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0,
     return np.array(mags_out), np.array(std_out)
 
 
-def _peppar_precision(o: Observation, filt, max_frames=48):
+def _exclude_frames(cats, exclude):
+    """Drop per-frame catalogues whose exposure token (``jw…_<vgroup>_<exp>``) is in ``exclude``."""
+    if not exclude:
+        return cats
+    def _tok(c):
+        mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
+        return mo.group(1) if mo else None
+    return [c for c in cats if _tok(c) not in exclude]
+
+
+def _peppar_precision(o: Observation, filt, max_frames=48, exclude=None):
     """Independent peppar astrometric-precision series vs instrumental magnitude, as a dict with the
     two quantities peppar carries (either key may be absent, whichever products exist):
       ``frame_std`` : (mag, prec_mas) -- the combined starlist's ACROSS-FRAME position scatter
@@ -4012,7 +4028,9 @@ def _peppar_precision(o: Observation, filt, max_frames=48):
         return (m[g], pr[g]) if int(g.sum()) >= 50 else None
 
     out = {}
-    combos = glob.glob(f"{pdir}/combo_starlist_{filt}_*.fits")
+    # A combined starlist bakes in ALL exposures, so it cannot honour ``exclude``; when excluding,
+    # skip it and take the per-frame computed scatter (which can drop the bad frames) instead.
+    combos = [] if exclude else glob.glob(f"{pdir}/combo_starlist_{filt}_*.fits")
     if combos:
         # x_wcs/y_wcs are tangent-plane offsets in ARCSEC, not degrees: x_wcs spans 70.5" over a
         # 2227 px detector = 0.0317"/px = the SW pixel scale, so x_wcs_std is arcsec and the factor
@@ -4023,17 +4041,17 @@ def _peppar_precision(o: Observation, filt, max_frames=48):
     if "frame_std" not in out:
         # no combined starlist (e.g. cloud E/F): COMPUTE the frame-to-frame scatter from the
         # per-frame catalogues by cross-matching each star across the dithered exposures.
-        cf = _peppar_frame_std(pdir, pixscale)
+        cf = _peppar_frame_std(pdir, pixscale, exclude=exclude)
         if cf is not None:
             out["frame_std"] = cf
-    cats = sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits"))[:max_frames]
+    cats = _exclude_frames(sorted(glob.glob(f"{pdir}/*/*_iter1_cat.fits")), exclude)[:max_frames]
     fm = _pool(cats, "m", "x_err", "y_err", pixscale)              # px -> mas
     if fm is not None:
         out["formal"] = fm
     return out or None
 
 
-def stage6_astrom_error(o: Observation, sw, lw):
+def _stage6_figure(o: Observation, sw, lw, exclude=None, png_suffix=""):
     """Astrometric precision vs Vega magnitude, one set of curves per channel (SW / LW):
       - solid  formal sigma_fit -- the PSF fitter's formal 1-sigma position error per detection.
                A formal error bar carries no systematic, so its ~0.06 mas bright-end floor is
@@ -4049,6 +4067,8 @@ def stage6_astrom_error(o: Observation, sw, lw):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     metrics = dict(stage=6, sw=sw, lw=lw)
+    if exclude:
+        metrics["excluded_exposures"] = sorted(e.split("_")[-1] for e in exclude)
     # LEFT column: two stacked panels sharing the magnitude axis -- the jicama precision curve on top
     # (a) and a parallel source-count histogram (sources per Vega-mag bin) below (ah), so the number
     # of stars behind each curve point -- and where the sample runs out at the faint end -- is visible.
@@ -4066,7 +4086,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
     for filt, color in [(sw, "#3366cc"), (lw, "#cc3311")]:
         if not filt:
             continue
-        pooled = _pooled_daophot(o, filt)
+        pooled = _pooled_daophot(o, filt, exclude=exclude)
         if pooled is None:
             continue
         _sc, sig_ra, sig_de, mag, _flux = pooled
@@ -4127,8 +4147,11 @@ def stage6_astrom_error(o: Observation, sw, lw):
                     metrics[f"rms_offset_floor_mas_{filt.lower()}"] = float(np.nanmin(rms))
         # rms(jwst): the INTERNAL per-star position scatter across exposures (merged-catalog
         # std_ra/std_dec, deg -> mas), median vs mag -- the empirical JWST repeatability, distinct
-        # from the formal sigma_pos and from the external rms(offset-VIRAC).
-        jr = _internal_pos_rms(o, filt)
+        # from the formal sigma_pos and from the external rms(offset-VIRAC).  SKIPPED in the
+        # exposure-excluded recompute: the merged std bakes in ALL exposures and cannot be re-derived
+        # here without re-matching, so the peppar frame-to-frame σ carries the achieved-repeatability
+        # story in the clean figure instead.
+        jr = None if exclude else _internal_pos_rms(o, filt)
         if jr is not None:
             jmag_v, jrms = jr
             med_j, _, _, ctr_j = _binned_stat(jmag_v, jrms)
@@ -4143,7 +4166,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
     if not any_data:
         plt.close(fig)          # close the empty curve fig before the red-flag builds its own
         reason = "no per-exposure DAOPHOT catalogs on disk for this obs/filter"
-        png = _red_flag_figure(o, "stage6", "ASTROMETRIC-ERROR CURVE UNAVAILABLE",
+        png = _red_flag_figure(o, "stage6" + png_suffix, "ASTROMETRIC-ERROR CURVE UNAVAILABLE",
                                f"Cannot build the precision-vs-magnitude curve: {reason}.")
         metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
         return png, metrics
@@ -4184,7 +4207,7 @@ def stage6_astrom_error(o: Observation, sw, lw):
     for filt, color in [(sw, "#3366cc"), (lw, "#cc3311")]:
         if not filt:
             continue
-        pp = _peppar_precision(o, filt)
+        pp = _peppar_precision(o, filt, exclude=exclude)
         if not pp:
             continue
         fl = filt.lower()
@@ -4241,8 +4264,38 @@ def stage6_astrom_error(o: Observation, sw, lw):
                 fontsize=10, style="italic", transform=a2.transAxes)
         a2.set_xticks([]); a2.set_yticks([])
         a2h.set_xticks([]); a2h.set_yticks([])
+    if exclude:
+        fig.suptitle(f"Stage 6 recomputed — EXCLUDING {len(exclude)} bad-PSF exposure(s) "
+                     f"({', '.join(metrics['excluded_exposures'])}); rms(jwst) omitted",
+                     fontsize=11, y=1.0)
     metrics["passed"] = True
-    return _save(fig, f"{o.obsid}_stage6.png"), metrics
+    return _save(fig, f"{o.obsid}_stage6{png_suffix}.png"), metrics
+
+
+def stage6_astrom_error(o: Observation, sw, lw):
+    """Stage 6 = the astrometric-precision figure.  When stage 11 has flagged bad-PSF (streaked)
+    exposures for this obs, ALSO build a SECOND, separate figure recomputed with those exposures
+    excluded, so the reader sees how much the flagged exposures cost the precision.  The clean figure
+    is returned in ``metrics['clean_png']`` and posted under its own marker by ``main``."""
+    png, metrics = _stage6_figure(o, sw, lw)
+    if metrics.get("red_flag"):
+        return png, metrics
+    bad = set()
+    for f in (sw, lw):
+        if f:
+            bad |= _streaked_exposures(o, f)
+    if bad:
+        cpng, cm = _stage6_figure(o, sw, lw, exclude=bad, png_suffix="clean")
+        if not cm.get("red_flag"):
+            metrics["clean_png"] = cpng
+            metrics["excluded_exposures"] = cm.get("excluded_exposures")
+            # carry the clean floors for the caption / metrics JSON
+            for k, v in cm.items():
+                if k.endswith("_floor_mas") or k.startswith(("floor_mas_", "peppar_framestd_floor",
+                                                             "peppar_formal_floor", "rms_offset_floor",
+                                                             "formal_sigma_floor")):
+                    metrics[f"clean_{k}"] = v
+    return png, metrics
 
 
 # --------------------------------------------------------------------------- STAGE 11
@@ -4295,6 +4348,25 @@ def _exposure_qfit(o: Observation, filt):
         if qq.size >= 30:
             out[exp] = (float(np.median(qq)), int(qq.size))
     return out
+
+
+def _streaked_exposures(o: Observation, filt):
+    """The set of exposure tokens (``jw…_<vgroup>_<exp>``) stage 11 flags as bad-PSF for this
+    obs/filter: qfit above ``_EPSF_QFIT_STREAK_FACTOR`` x the median qfit across the run's exposures.
+    Empty set when there is no peppar data or nothing is flagged."""
+    qf = _exposure_qfit(o, filt)
+    if not qf:
+        return set()
+    base = float(np.median([v[0] for v in qf.values()]))
+    thr = _EPSF_QFIT_STREAK_FACTOR * base
+    return {tok for tok, (q, _n) in qf.items() if q > thr}
+
+
+def _daophot_key_for_token(token):
+    """Map a peppar exposure token ``jw<prog><obs><visit>_<vgroup>_<exp>`` to the substring the
+    per-exposure DAOPHOT catalogues carry for that same exposure, ``vgroup<vgroup>_exp<exp>``."""
+    parts = token.split("_")
+    return f"vgroup{parts[-2]}_exp{parts[-1]}" if len(parts) >= 3 else token
 
 
 _DQ_SATURATED = 2                    # JWST DQ SATURATED flag (bit 1)
@@ -4405,10 +4477,12 @@ def stage11_effective_psf(o: Observation, sw, lw):
         metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
         return png, metrics
 
-    # streak flag: an exposure whose qfit exceeds _EPSF_QFIT_STREAK_FACTOR x the median across exposures
+    # The streak flag lives in ONE place: _streaked_exposures (shared with the stage-6 clean
+    # recompute), so the two stages can never disagree on which exposures are bad.  qbase is kept
+    # only for the display/metric baseline.
     qvals = np.array([qf[e][0] for e in exps if e in qf], float)
     qbase = float(np.median(qvals)) if qvals.size else None
-    streak_thresh = _EPSF_QFIT_STREAK_FACTOR * qbase if qbase else None
+    flagged = _streaked_exposures(o, filt)
     streaked = []
 
     from astropy.visualization import LogStretch, ImageNormalize
@@ -4435,7 +4509,7 @@ def stage11_effective_psf(o: Observation, sw, lw):
             a.text(0.5, 0.5, "no ePSF", ha="center", va="center", fontsize=8,
                    style="italic", transform=a.transAxes)
         q = qf.get(exp, (None, 0))[0]
-        bad = bool(streak_thresh and q is not None and q > streak_thresh)
+        bad = exp in flagged
         if bad:
             streaked.append(exp)
         lbl = exp.split("_")[-1]                       # the exposure number
@@ -4676,6 +4750,26 @@ def _caption_stage8(metrics):
 
 
 def _caption_for_impl(n, metrics):
+    if n == "6clean":
+        exps = ", ".join(metrics.get("excluded_exposures") or [])
+        sw = metrics.get("sw"); lw = metrics.get("lw")
+        base = (f"**Stage 6 (recomputed) — astrometric precision EXCLUDING bad-PSF exposures.** "
+                f"The same curves as the stage-6 figure above, but with the exposure(s) "
+                f"[stage 11](DOCROOT#stage11) flagged as streaked/broadened (**{exps}**) left out of "
+                f"the per-exposure pools, so a momentary tracking failure no longer inflates the "
+                f"precision. The **peppar frame-to-frame σ** carries the achieved-repeatability "
+                f"story here (the jicama rms(jwst) curve is omitted — it comes from the merged "
+                f"catalogue's all-exposure std, which cannot be re-derived per-exposure). ")
+        for f in (sw, lw):
+            if not f:
+                continue
+            fl = f.lower()
+            full = metrics.get(f"peppar_framestd_floor_mas_{fl}")
+            clean = metrics.get(f"clean_peppar_framestd_floor_mas_{fl}")
+            if full is not None and clean is not None:
+                base += (f"{f} peppar frame-to-frame σ floor: {full:.2f} → **{clean:.2f} mas** "
+                         f"with the bad exposure(s) excluded. ")
+        return base + "([how this is made](DOCROOT#stage6))"
     if n == 8:
         return _caption_stage8(metrics)
     # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
@@ -5236,6 +5330,13 @@ def main(argv=None):
             try:
                 from .post_diagnostics import post_stage, PostError
                 post_stage(o, n, png, caption_for(n, metrics), args.repo)
+                # Stage 6 emits a SECOND figure recomputed excluding stage-11-flagged bad-PSF
+                # exposures; post it under its own marker so it sits beside, not over, the main one.
+                if n == 6 and metrics.get("clean_png"):
+                    post_stage(o, "6clean", metrics["clean_png"],
+                               caption_for("6clean", metrics), args.repo)
+                    print(f"  stage 6clean: {metrics['clean_png']}  "
+                          f"excluding {metrics.get('excluded_exposures')}")
             except (PostError, OSError) as e:
                 print(f"  stage {n}: post FAILED (figure built OK): {e}", file=sys.stderr)
     print(f"metrics -> {mpath}")

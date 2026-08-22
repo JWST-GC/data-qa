@@ -2435,3 +2435,102 @@ def test_exposure_qfit_scoped_to_obs(tmp_path, monkeypatch):
     qf = D._exposure_qfit(o, "F212N")
     assert len(qf) == 2                                             # only o001's two exposures
     assert all(e.startswith("jw02221001") for e in qf)
+
+
+# ------------------------------------------------ STAGE 6 clean recompute (exclude bad-PSF exposures)
+def test_daophot_key_for_token():
+    assert D._daophot_key_for_token("jw02045001001_02101_00004") == "vgroup02101_exp00004"
+
+
+def test_exclude_frames_drops_flagged_exposures():
+    cats = ["/x/jw02045001001_02101_00004_nrca1_cal_arches_iter1_cat.fits",
+            "/x/jw02045001001_02101_00005_nrca1_cal_arches_iter1_cat.fits"]
+    kept = D._exclude_frames(cats, {"jw02045001001_02101_00004"})
+    assert kept == [cats[1]]
+    assert D._exclude_frames(cats, None) == cats                 # None -> unchanged
+
+
+def test_streaked_exposures_returns_flagged_token(tmp_path, monkeypatch):
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    det = tmp_path / "brick" / "peppar" / "F212N" / "NRCA1"; det.mkdir(parents=True)
+    for k, q in enumerate([5.5, 5.5, 16.0, 5.5], start=1):       # exp3 streaked
+        _write_peppar_frame(det / f"jw02221001001_02101_0000{k}_nrca1_cal_brick_iter1_cat.fits",
+                            qfit=q, seed=k)
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    assert D._streaked_exposures(o, "F212N") == {"jw02221001001_02101_00003"}
+
+
+def test_stage6_wrapper_builds_clean_figure_when_streaked(monkeypatch, tmp_path):
+    # The wrapper must build a SECOND figure excluding the flagged exposures and expose clean_png.
+    def _fake_fig(o, sw, lw, exclude=None, png_suffix=""):
+        if exclude:
+            return (str(tmp_path / "clean.png"),
+                    {"stage": 6, "sw": sw, "lw": lw, "passed": True,
+                     "excluded_exposures": sorted(e.split("_")[-1] for e in exclude),
+                     "peppar_framestd_floor_mas_f212n": 2.0})
+        return str(tmp_path / "main.png"), {"stage": 6, "sw": sw, "lw": lw, "passed": True,
+                                            "peppar_framestd_floor_mas_f212n": 2.6}
+    monkeypatch.setattr(D, "_stage6_figure", _fake_fig)
+    monkeypatch.setattr(D, "_streaked_exposures",
+                        lambda o, f: {"jw_00004"} if f == "F212N" else set())
+    png, m = D.stage6_astrom_error(_obs(field="arches", filt="F212N"), "F212N", "F323N")
+    assert png.endswith("main.png")
+    assert m["clean_png"].endswith("clean.png")
+    assert m["excluded_exposures"] == ["00004"]
+    assert m["clean_peppar_framestd_floor_mas_f212n"] == 2.0
+    cap = D.caption_for("6clean", m)
+    assert "EXCLUDING bad-PSF" in cap and "00004" in cap and "2.60 → **2.00 mas**" in cap
+
+
+def test_stage6_wrapper_no_clean_when_no_streak(monkeypatch, tmp_path):
+    monkeypatch.setattr(D, "_stage6_figure",
+                        lambda o, sw, lw, exclude=None, png_suffix="": (str(tmp_path / "m.png"),
+                                                                        {"stage": 6, "passed": True}))
+    monkeypatch.setattr(D, "_streaked_exposures", lambda o, f: set())
+    png, m = D.stage6_astrom_error(_obs(field="brick", filt="F212N"), "F212N", None)
+    assert "clean_png" not in m
+
+
+# ---- STAGE 6 clean recompute: keep "clean" actually clean (mutation guards from the #118 review) ----
+def test_peppar_precision_excluding_skips_combo_starlist(tmp_path, monkeypatch):
+    # The combined starlist bakes in ALL exposures, so it must NOT be used when excluding.  With a
+    # combo present but every per-frame cat belonging to the excluded exposure, exclude=None yields a
+    # frame_std (from the combo) while exclude={that token} yields none (combo skipped, nothing left).
+    from astropy.table import Table
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    pdir = tmp_path / "brick" / "peppar" / "F212N"; det = pdir / "NRCA1"; det.mkdir(parents=True)
+    Table({"m": np.linspace(-8, -3, 120), "x_wcs_std": np.full(120, 0.004),
+           "y_wcs_std": np.full(120, 0.004)}).write(str(pdir / "combo_starlist_F212N_NRCA1.fits"),
+                                                    overwrite=True)
+    _write_peppar_frame(det / "jw02221001001_02101_00004_nrca1_cal_brick_iter1_cat.fits", qfit=5.5)
+    o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    assert "frame_std" in D._peppar_precision(o, "F212N")           # combo used when not excluding
+    assert D._peppar_precision(o, "F212N", exclude={"jw02221001001_02101_00004"}) is None  # combo skipped
+
+
+def test_stage6_figure_excluding_draws_no_rms_jwst(tmp_path, monkeypatch):
+    # rms(jwst) comes from the merged all-exposure std, so the clean figure must NOT draw it (it
+    # would be contaminated by the excluded exposure).  Assert _internal_pos_rms is not consulted.
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    monkeypatch.setenv("QA_OUTDIR", str(tmp_path))
+    n = 300
+    sc = SkyCoord(266.4 + np.arange(n) * 1e-4, np.full(n, -28.9), unit="deg")
+    pooled = (sc, np.full(n, 1.0), np.full(n, 1.0), np.linspace(-10, -3, n), np.full(n, 1.0))
+    monkeypatch.setattr(D, "_pooled_daophot", lambda o, f, exclude=None: pooled)
+    monkeypatch.setattr(D, "_vega_zeropoint", lambda *a, **k: None)
+    monkeypatch.setattr(D, "_viraccache_path", lambda o: None)
+    monkeypatch.setattr(D, "_refcat_path", lambda o: None)
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: "x.fits")
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: None)
+    monkeypatch.setattr(D, "_peppar_precision", lambda o, f, exclude=None: None)
+    calls = []
+    monkeypatch.setattr(D, "_internal_pos_rms", lambda o, f: calls.append(f) or None)
+    o = _obs(field="brick", filt="F212N")
+    _png, m = D._stage6_figure(o, "F212N", None, exclude={"jw_00004"})
+    assert calls == [] and not any(k.startswith("rms_jwst_floor") for k in m)   # clean: no rms(jwst)
+    calls.clear()
+    D._stage6_figure(o, "F212N", None)                             # normal: rms(jwst) consulted
+    assert calls == ["F212N"]
