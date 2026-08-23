@@ -2499,8 +2499,7 @@ def stage5_intermodule(o: Observation, sw):
             fig.text(0.5, 0.02,
                      f"{shown} star{'s' if shown != 1 else ''} from the NRCA∩NRCB overlap of the "
                      f"{filt} merged mosaic (each detected in BOTH modules; 25 px ≈ "
-                     f"{25 * pscale:.1f}\").  Where the two modules agree the star is one round "
-                     f"PSF; where they disagree it doubles or elongates.",
+                     f"{25 * pscale:.1f}\").",
                      ha="center", fontsize=8)
         title_extra = ""
         suptitle_y = 0.98
@@ -2512,7 +2511,7 @@ def stage5_intermodule(o: Observation, sw):
         fig.subplots_adjust(top=0.80)
         suptitle_y = 0.995
         title_extra = (f"  ·  single module ({single_module})" if single_module
-                       else "  ·  A/B overlap not measurable")
+                       else "  ·  (no overlap)")
 
     # a single-module obs (sickle = NRCB only) has no A/B comparison to fail -> N/A passes.
     if single_module:
@@ -2523,7 +2522,7 @@ def stage5_intermodule(o: Observation, sw):
         title_extra += f"  ·  ⚠ {nan_frac * 100:.0f}% NaN centroids"
     metrics["passed"] = bool((single_module or (ov and ov["off"] < aa.THRESH["intermodule"]))
                              and not high_nan)
-    fig.suptitle(f"{o.target} {o.obsid} — inter-detector / inter-module agreement ({filt}){title_extra}",
+    fig.suptitle(f"{o.target} {o.obsid} — module overlap measurement ({filt}){title_extra}",
                  fontsize=11, y=suptitle_y)
     return _save(fig, f"{o.obsid}_stage5.png"), metrics
 
@@ -4842,6 +4841,10 @@ def _caption_for_impl(n, metrics):
         if nd:
             _bits.append("grey cells were not measurable")
         dev_or_unmeas = ("; " + "; ".join(_bits)) if _bits else ""
+        # The (ΔRA, ΔDec) scatter is the 2nd panel: MIDDLE only when the NRCA−NRCB panel is drawn
+        # as a 3rd column (intermodule_off set); otherwise it is the RIGHT of a 2-column figure.
+        has_im = metrics.get("intermodule_off") is not None
+        scatter_pos = "MIDDLE" if has_im else "RIGHT"
         base = (f"**Stage 4 — positional offsets (JWST catalogue − VIRAC).** \n\n"
                 # NOTE TO CLAUDE: this was commented out as irrelevant text.  I asked for concise and relevant, I want concise and relevant.
                 # This is a "
@@ -4853,7 +4856,7 @@ def _caption_for_impl(n, metrics):
                 f" The measurement is the 'mode' (i.e., the peak of the histogram) of [all JWST−VIRAC pair "
                 f"separations](DOCROOT#glossary-xcorr) in that cell.\n\n"
                 f"LEFT maps that offset across the mosaic{dev_or_unmeas}.\n\n"
-                f"MIDDLE plots the **per-cell** offsets as (ΔRA, ΔDec) points sized by source "
+                f"{scatter_pos} plots the **per-cell** offsets as (ΔRA, ΔDec) points sized by source "
                 f"count, with the field value in the title, a circle at the 75 mas gate, and "
                 f"ΔRA/ΔDec marginal histograms.\n\n"
                 f"The field offset is {om_str} mas over {nc} measured cells ({nd} without a "
@@ -4912,8 +4915,9 @@ def _caption_for_impl(n, metrics):
             base += (f"{ncf} adjacent cell(s) holding {100 * (badf or 0):.0f}% of the sources sit "
                      f"at a different offset from the rest of the field — an internal "
                      f"discontinuity, so this observation does NOT pass. ")
-        base += ("The RIGHT panel, when present, is the NRCA-minus-NRCB offset, measured "
-                 "[without any external catalogue](DOCROOT#glossary-reffree). ")
+        if has_im:
+            base += ("The RIGHT panel is the NRCA-minus-NRCB offset, measured "
+                     "[without any external catalogue](DOCROOT#glossary-reffree). ")
         if metrics.get("cell_map_unreliable"):
             # cells exist but are noise; the per-cell spatial-consistency check is void (not skipped
             # for lack of cells), and an unmeasurable offset is left for a human rather than passed.
@@ -4949,11 +4953,8 @@ def _caption_for_impl(n, metrics):
                         f"NRCA–NRCB comparison to make and the "
                         f"[JWST-against-itself](DOCROOT#glossary-reffree) overlap panel is "
                         f"omitted.{diff_clause} ([how this is made](DOCROOT#stage5))")
-            return ("**Stage 5 — inter-detector / inter-module agreement.** The NRCA–NRCB overlap "
-                    "could not be measured (no shared stars in the NRCA∩NRCB dither overlap after "
-                    "alignment), so that panel and the cutout gallery are omitted."
-                    f"{diff_clause} How well the two modules agree is unverified for this "
-                    "observation. ([how this is made](DOCROOT#stage5))")
+            return ("**Stage 5 — inter-detector / inter-module agreement.**"
+                    f"{diff_clause} ([how this is made](DOCROOT#stage5))")
         # overlap measured -> full caption; the S/N>10 panel is only present when ov_hi succeeded
         off = metrics.get("intermodule_off"); rms = metrics.get("intermodule_rms")
         no = metrics.get("n_overlap")
@@ -4961,29 +4962,28 @@ def _caption_for_impl(n, metrics):
         # the S/N panel is present (3 cols), else TOP-RIGHT (2 cols).  The footprint is its own
         # full-width row below.
         ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
-        base = ("**Stage 5 — inter-detector / inter-module agreement.** The TOP-LEFT "
-                "[per-detector quiver](DOCROOT#glossary-quiver) shows each detector's median "
+        base = ("**Stage 5 — inter-detector / inter-module agreement.**\n\n"
+                "TOP-LEFT [per-detector quiver](DOCROOT#glossary-quiver): each detector's median "
                 "residual **against VIRAC** (field offset removed); every detector gets a vector, "
-                "including NRCB2, which shares no sky with NRCA. The NRCA−NRCB "
-                f"difference is {(diff if diff is not None else float('nan')):.1f} mas. The "
-                f"{ov_pos} panel compares [JWST against itself](DOCROOT#glossary-reffree) in the "
+                "including NRCB2, which shares no sky with NRCA. NRCA−NRCB difference "
+                f"{(diff if diff is not None else float('nan')):.1f} mas.\n\n"
+                f"{ov_pos} panel: [JWST against itself](DOCROOT#glossary-reffree) in the "
                 f"NRCA∩NRCB overlap — {off:.1f} mas offset, {rms:.1f} mas scatter (ΔRA and ΔDec "
-                f"combined) over {no} shared stars — with ΔRA/ΔDec marginal histograms.")
+                f"combined) over {no} shared stars, with ΔRA/ΔDec marginal histograms.")
         if metrics.get("n_overlap_hi"):
-            base += (f" The panel to its right repeats that comparison for "
+            base += (f"\n\nThe panel to its right repeats it for "
                      f"[S/N > 10](DOCROOT#glossary-snr) stars ({metrics['n_overlap_hi']} stars, "
-                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas scatter), removing "
-                     f"faint-star centroid noise from the scatter.")
+                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas scatter).")
         if metrics.get("n_overlap_footprint"):
-            base += (" The full-width row below the panels maps the overlap stars on the sky, "
+            base += ("\n\nThe full-width row below maps the overlap stars on the sky, "
                      "coloured by per-star |A−B|.")
         if metrics.get("cutout_footprint_mismatch"):
-            base += (" ⚠️ The BOTTOM cutout strip is empty because **no drizzled mosaic covers the "
+            base += ("\n\n⚠️ The BOTTOM cutout strip is empty because **no drizzled mosaic covers the "
                      "module-overlap zone — the catalogue and the mosaic are on disjoint footprints** "
-                     "(a reduction mismatch, not a QA gap). ([how this is made](DOCROOT#stage5))")
+                     "(a reduction mismatch, not a QA gap).\n\n([how this is made](DOCROOT#stage5))")
         else:
-            base += (" The BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`. "
-                     "([how this is made](DOCROOT#stage5))")
+            base += ("\n\nThe BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`."
+                     "\n\n([how this is made](DOCROOT#stage5))")
         return base
     if n == 9:
         ni = metrics.get("n_isolated"); ac = metrics.get("aper_corr_med")
@@ -5058,11 +5058,10 @@ def _caption_for_impl(n, metrics):
         # the metric -- the exact formal-sold-as-achieved conflation this stage was fixed to avoid.
         sw, lw = metrics.get("sw"), metrics.get("lw")
         emp = any(metrics.get(f"floor_is_empirical_{f.lower()}") for f in (sw, lw) if f)
-        base = ("**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel. "
-                "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error, "
-                "so its bright-end floor is the noise-limited fit uncertainty. **rms(offset)** "
-                "(dashed) is the RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) offset "
-                "(external scatter, incl. the VIRAC floor). ")
+        base = ("**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel.\n\n"
+                "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error. "
+                "**rms(offset)** (dashed) is the RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) "
+                "offset (external scatter, incl. the VIRAC floor). ")
         if emp:
             base += ("**rms(jwst)** (dotted) is the empirical scatter of a star across exposures — "
                      "the **achieved internal repeatability** (sub-mas, well above the formal σ_fit), "
@@ -5071,16 +5070,14 @@ def _caption_for_impl(n, metrics):
             base += ("The empirical **rms(jwst)** repeatability curve needs per-exposure catalogs, "
                      "absent for this obs, so it is not drawn and `floor_mas` falls back to the "
                      "formal σ_fit floor (`floor_is_empirical` false). ")
-        base += ("Shaded band = 16–84th percentile. The "
-                 "**lower-left panel** histograms the source counts per Vega-mag bin — the sample "
-                 "behind each curve point. The **RIGHT column** repeats the precision-vs-magnitude "
-                 "from the INDEPENDENT peppar (Hosek WebbPSF) catalogues, whose magnitudes are "
-                 "instrumental with no zero-point. It draws **per-frame formal σ_fit** (dashed, the "
-                 "noise-limited fit error) and the **frame-to-frame σ** (solid, the standard "
-                 "deviation of each star's position across the exposures — the achieved "
-                 "repeatability, ~20× the formal error). That scatter comes from the combined "
-                 "starlist where present, else from cross-matching the per-frame catalogues. Its "
-                 "own source-count histogram sits below it. ([how this is made](DOCROOT#stage6))")
+        base += ("\n\nShaded band = 16–84th percentile. The **lower-left panel** histograms the "
+                 "source counts per Vega-mag bin.\n\n"
+                 "The **RIGHT column** repeats the precision-vs-magnitude from the peppar "
+                 "(Hosek WebbPSF) catalogues, whose magnitudes are instrumental with no zero-point. "
+                 "It draws **per-frame formal σ_fit** (dashed, the noise-limited fit error) and the "
+                 "**frame-to-frame σ** (solid, the standard deviation of each star's position across "
+                 "the exposures). That scatter comes from the combined starlist where present, else "
+                 "from cross-matching the per-frame catalogues.\n\n([how this is made](DOCROOT#stage6))")
         return base
     if n == 10:
         # Built in code so the floors are only quoted when a curve was actually drawn.  The
