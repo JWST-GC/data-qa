@@ -228,21 +228,42 @@ FILTER_TOKEN = re.compile(r"^F\d{3,4}[WNM]2?$")
 GRISM_TOKEN = re.compile(r"^GRISM")
 
 
+def _filter_channel(tok: str) -> str:
+    """NIRCam channel of a filter token by its central wavelength: SW below 2.4 um, else LW.
+    F212N -> 'SW', F323N -> 'LW', F150W2 -> 'SW'.  MIRI tokens (>= F560) fall in 'LW'; MIRI has no
+    narrowband+blocker imaging pairs, so the channel label is only ever a no-op for them."""
+    m = re.match(r"^F(\d+)", tok)
+    return "SW" if (m and int(m.group(1)) < 240) else "LW"
+
+
 def parse_filters(filters_str) -> List[str]:
     """MAST `filters` string -> validated IMAGING filter tokens.
 
     Splits on ';' (also tolerating ','), validates each token against
     FILTER_TOKEN, drops CLEAR/pupil/GRISM/junk, dedupes, keeps first-seen
-    (stable) order.  A dispersed (grism/WFSS) configuration yields no imaging
-    product, so a config whose pupil carries a grism contributes nothing
-    (e.g. ``F322W2;GRISMR`` -> ``[]``) -- otherwise a spectroscopy-only filter is
-    reported as un-reduced imaging (issue #35: F322W2 on quintuplet o003)."""
+    (stable) order.  Two configurations produce no standalone imaging filter and
+    are removed (issue #35, quintuplet o003):
+
+    * A dispersed (grism/WFSS) config yields spectra, not an imaging mosaic, so a
+      config whose pupil carries a grism contributes nothing (``F322W2;GRISMR`` -> ``[]``).
+    * A NIRCam narrowband sits in the pupil wheel with a wide/medium *blocking*
+      filter of the SAME channel in the filter wheel; only the narrowband yields a
+      science mosaic, so a same-channel wide/medium co-listed with a narrowband is
+      dropped as the blocker (``F322W2;F323N`` -> ``['F323N']``).  A simultaneous
+      SW+LW pair is two different channels, so both are kept (``F212N;F480M`` ->
+      ``['F212N', 'F480M']``); a genuinely-observed wide filter keeps its own
+      ``CLEAR;<wide>`` config."""
     toks = [t.strip().upper() for t in (filters_str or "").replace(",", ";").split(";")]
     if any(GRISM_TOKEN.match(t) for t in toks):
         return []                                # WFSS/dispersed config -> no imaging filter
+    valid = [t for t in toks if FILTER_TOKEN.match(t)]
+    narrow_channels = {_filter_channel(t) for t in valid if t.endswith("N")}
     out: List[str] = []
-    for tok in toks:
-        if FILTER_TOKEN.match(tok) and tok not in out:
+    for tok in valid:
+        # a same-channel non-narrowband alongside a narrowband is that narrowband's blocking filter
+        if not tok.endswith("N") and _filter_channel(tok) in narrow_channels:
+            continue
+        if tok not in out:
             out.append(tok)
     return out
 
