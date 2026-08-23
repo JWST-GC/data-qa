@@ -156,9 +156,9 @@ def test_caption_stage5_surfaces_cutout_footprint_mismatch():
     base = dict(stage=5, intermodule_diff=3.0, intermodule_off=4.1, intermodule_rms=6.2, n_overlap=137)
     # no drizzled mosaic covers the overlap zone -> the caption says so, not the normal cutout blurb
     cap = D.caption_for(5, dict(base, cutout_footprint_mismatch=True))
-    assert "disjoint footprints" in cap and "one round PSF" not in cap
+    assert "disjoint footprints" in cap and "overlap-star cutouts" not in cap
     # normal case keeps the cutout description
-    assert "one round PSF" in D.caption_for(5, dict(base, cutout_footprint_mismatch=False))
+    assert "overlap-star cutouts" in D.caption_for(5, dict(base, cutout_footprint_mismatch=False))
 
 
 def test_caption_stage5_overlap_without_hi_sn_panel():
@@ -168,7 +168,7 @@ def test_caption_stage5_overlap_without_hi_sn_panel():
                                 intermodule_rms=6.2, n_overlap=137, n_overlap_footprint=137))
     assert "S/N > 10" not in cap and "to its right" not in cap
     assert "TOP-RIGHT" in cap and "137 shared stars" in cap
-    assert "full-width row" in cap and "dither-overlap strip" in cap   # footprint described
+    assert "full-width row" in cap and "|A−B|" in cap   # footprint described
 
 
 # --------------------------------------------------------------------------- doc links / clarity
