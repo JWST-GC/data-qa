@@ -1355,11 +1355,13 @@ def test_query_failure_skips_program_not_poll(monkeypatch, tmp_path, capsys):
 # ------------------------------------------------------------- filter parsing (MED-5)
 @pytest.mark.parametrize("raw,expected", [
     ("CLEAR;F212N", ["F212N"]),
-    ("F444W;F470N", ["F444W", "F470N"]),
-    ("F212N;F480M", ["F212N", "F480M"]),
+    ("F444W;F470N", ["F470N"]),            # F444W is F470N's LW blocking filter -> dropped (#35)
+    ("F322W2;F323N", ["F323N"]),           # F322W2 is F323N's LW blocking filter -> dropped (#35)
+    ("F210M;F212N", ["F212N"]),            # F210M is F212N's SW blocking filter -> dropped
+    ("F212N;F480M", ["F212N", "F480M"]),   # SW narrowband + LW medium: different channels, both kept
     ("F150W2;CLEAR", ["F150W2"]),
     ("F770W", ["F770W"]),                  # MIRI 3-digit
-    ("F1000W;F770W", ["F1000W", "F770W"]),  # MIRI 4-digit
+    ("F1000W;F770W", ["F1000W", "F770W"]),  # MIRI 4-digit (no narrowband -> no blocker removal)
     ("GRISMR;F322W2", []),                 # WFSS/dispersed: no imaging filter (issue #35)
     ("GRISMC;F444W", []),                  # ditto, other grism
     ("CLEAR;F322W2", ["F322W2"]),          # direct-imaging config of the same filter is kept
