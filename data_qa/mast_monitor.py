@@ -220,17 +220,28 @@ def obsnum_from_obs_id(obs_id: str) -> str:
 # `filters` column mixes in pupil/CLEAR/GRISM tokens (CLEAR;F212N, F444W;F470N)
 # that must never reach the reduction's FILTERS array.
 FILTER_TOKEN = re.compile(r"^F\d{3,4}[WNM]2?$")
+# A dispersing element in the pupil (NIRCam WFSS GRISMR/GRISMC, or a bare GRISM
+# token) means this configuration is SPECTROSCOPY, not imaging: it produces no
+# imaging mosaic, so its filter must not enter the imaging filter list.  A filter
+# is one filter+pupil pair; F322W2;GRISMR (WFSS) is a different product from
+# CLEAR;F322W2 (direct imaging), and only the latter yields an i2d to QA.
+GRISM_TOKEN = re.compile(r"^GRISM")
 
 
 def parse_filters(filters_str) -> List[str]:
-    """MAST `filters` string -> validated filter tokens.
+    """MAST `filters` string -> validated IMAGING filter tokens.
 
     Splits on ';' (also tolerating ','), validates each token against
     FILTER_TOKEN, drops CLEAR/pupil/GRISM/junk, dedupes, keeps first-seen
-    (stable) order."""
+    (stable) order.  A dispersed (grism/WFSS) configuration yields no imaging
+    product, so a config whose pupil carries a grism contributes nothing
+    (e.g. ``F322W2;GRISMR`` -> ``[]``) -- otherwise a spectroscopy-only filter is
+    reported as un-reduced imaging (issue #35: F322W2 on quintuplet o003)."""
+    toks = [t.strip().upper() for t in (filters_str or "").replace(",", ";").split(";")]
+    if any(GRISM_TOKEN.match(t) for t in toks):
+        return []                                # WFSS/dispersed config -> no imaging filter
     out: List[str] = []
-    for tok in (filters_str or "").replace(",", ";").split(";"):
-        tok = tok.strip().upper()
+    for tok in toks:
         if FILTER_TOKEN.match(tok) and tok not in out:
             out.append(tok)
     return out

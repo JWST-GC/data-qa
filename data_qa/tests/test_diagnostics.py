@@ -48,6 +48,18 @@ def test_caption_stage4_no_spread_no_nan():
     assert "7.1 mas" in cap and "6 measured cells" in cap
 
 
+def test_caption_stage4_scatter_panel_position():
+    # 2-column figure (no NRCA-NRCB panel): the (ΔRA,ΔDec) scatter is the RIGHT panel, not MIDDLE,
+    # and there is no intermodule sentence.
+    cap = D.caption_for(4, dict(stage=4, sw="F212N", offset_med_mas=7.1, n_cells=6))
+    assert "RIGHT plots the" in cap and "MIDDLE plots" not in cap
+    assert "NRCA-minus-NRCB" not in cap
+    # 3-column figure (intermodule_off set -> NRCA-NRCB drawn as the RIGHT column): scatter is MIDDLE
+    cap = D.caption_for(4, dict(stage=4, sw="F212N", offset_med_mas=7.1, n_cells=6,
+                                intermodule_off=4.0))
+    assert "MIDDLE plots the" in cap and "NRCA-minus-NRCB" in cap
+
+
 def test_caption_stage4_flags_discontinuity():
     # an adjacency-confirmed deviating region is called out in the caption
     cap = D.caption_for(4, dict(stage=4, offset_med_mas=31, n_cells=12, offset_scatter_mas=8.0,
@@ -124,12 +136,12 @@ def test_caption_stage6_names_formal_vs_empirical():
 
 
 def test_caption_stage5_no_overlap_two_modules():
-    # both modules present but no shared stars -> overlap keys absent; must NOT truncate to a
-    # bare fragment and must say the tie is unverified.
+    # both modules present but no shared stars -> overlap keys absent; keeps the measured A-B diff
+    # and does not editorialize about the omitted panel (an omitted panel is simply not expected).
     cap = D.caption_for(5, dict(stage=5, intermodule_diff=3.0, passed=False))
     assert "nan" not in cap.lower()
-    assert "could not be measured" in cap and "unverified" in cap
-    assert "3.0 mas" in cap
+    assert "could not be measured" not in cap and "unverified" not in cap
+    assert "A–B diff" in cap and "3.0 mas" in cap
 
 
 def test_caption_stage5_single_module():

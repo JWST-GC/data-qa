@@ -1360,7 +1360,9 @@ def test_query_failure_skips_program_not_poll(monkeypatch, tmp_path, capsys):
     ("F150W2;CLEAR", ["F150W2"]),
     ("F770W", ["F770W"]),                  # MIRI 3-digit
     ("F1000W;F770W", ["F1000W", "F770W"]),  # MIRI 4-digit
-    ("GRISMR;F322W2", ["F322W2"]),
+    ("GRISMR;F322W2", []),                 # WFSS/dispersed: no imaging filter (issue #35)
+    ("GRISMC;F444W", []),                  # ditto, other grism
+    ("CLEAR;F322W2", ["F322W2"]),          # direct-imaging config of the same filter is kept
     ("F212N;F212N;F480M", ["F212N", "F480M"]),   # dedupe, stable order
     ("MASKRND;WLP8;junk;", []),
     ("", []),
