@@ -2295,6 +2295,20 @@ def test_jwst1pass_matchup_locator(tmp_path, monkeypatch):
     assert D._jwst1pass_matchup(o, "F182M") == str(d / "MATCHUP.XYMEEE")
 
 
+def test_jwst1pass_matchup_per_obs_match_layout(tmp_path, monkeypatch):
+    # the real product layout is {FILT}/o{obs}/match/MATCHUP.XYMEEE (issue: stage 10 red-flagged
+    # every field because the resolver only globbed one level under {FILT})
+    monkeypatch.setitem(D._JWST1PASS_ROOTS, "brick", str(tmp_path))
+    monkeypatch.delenv("QA_JWST1PASS_DIR", raising=False)
+    o = _obs(field="brick", obs="001", filt="F182M")
+    assert D._jwst1pass_matchup(o, "F182M") is None
+    d = tmp_path / "brick" / "jwst1pass" / "F182M" / "o001" / "match"; d.mkdir(parents=True)
+    (d / "MATCHUP.XYMEEE").write_text("# empty\n")
+    assert D._jwst1pass_matchup(o, "F182M") == str(d / "MATCHUP.XYMEEE")
+    # obs-scoped: a different obs of the same filter must NOT pick up o001's product
+    assert D._jwst1pass_matchup(_obs(field="brick", obs="004", filt="F182M"), "F182M") is None
+
+
 def test_jwst1pass_matchup_env_override(tmp_path, monkeypatch):
     (tmp_path / "MATCHUP.XYMEEE").write_text("# here\n")
     monkeypatch.setenv("QA_JWST1PASS_DIR", str(tmp_path))
