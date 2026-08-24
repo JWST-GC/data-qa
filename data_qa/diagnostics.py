@@ -2781,19 +2781,34 @@ def _read_matchup_xymeee(path):
 
 def _jwst1pass_matchup(o: Observation, filt):
     """Path to the ``MATCHUP.XYMEEE`` for this obs's field+filter, or None if jwst1pass has not been
-    run for it.  Convention ``{root}/{field}/jwst1pass/{FILT}/MATCHUP.XYMEEE`` (shallow globs only --
-    no recursive ``**`` over the products tree).  ``QA_JWST1PASS_DIR`` overrides the lookup wholesale
-    (used to point the stage at a one-off product directory)."""
+    run for it.  The products are laid out per observation as
+    ``{root}/{field}/jwst1pass/{FILT}/o{obs}/match/MATCHUP.XYMEEE``; the flat ``{FILT}/MATCHUP.XYMEEE``
+    and ``{FILT}/03.MATCHUP/`` conventions are also accepted (shallow globs only -- no recursive
+    ``**`` over the products tree).  The lookup is OBS-SCOPED: a filter dir can hold several
+    observations (brick F182M/o001 vs F200W/o004), so an unscoped glob would pick another obs's
+    product.  ``QA_JWST1PASS_DIR`` overrides the lookup wholesale (a one-off product directory)."""
     if not filt:
         return None
     override = os.environ.get("QA_JWST1PASS_DIR")
-    roots = [override] if override else [
-        f"{_JWST1PASS_ROOTS.get(o.field, _JWST1PASS_DEFAULT_ROOT)}/{o.field}/jwst1pass/{filt}"]
-    for base in roots:
-        for cand in (f"{base}/MATCHUP.XYMEEE", f"{base}/03.MATCHUP/MATCHUP.XYMEEE"):
+    obs = f"o{o.obs}"
+    if override:
+        for cand in (f"{override}/MATCHUP.XYMEEE", f"{override}/03.MATCHUP/MATCHUP.XYMEEE"):
             if os.path.isfile(cand):
                 return cand
-        hits = sorted(glob.glob(f"{base}/*/MATCHUP.XYMEEE"))
+        hits = sorted(glob.glob(f"{override}/*/MATCHUP.XYMEEE"))
+        return hits[0] if hits else None
+    base = f"{_JWST1PASS_ROOTS.get(o.field, _JWST1PASS_DEFAULT_ROOT)}/{o.field}/jwst1pass/{filt}"
+    # obs-scoped per-observation layout first, then the legacy flat conventions
+    for cand in (f"{base}/{obs}/match/MATCHUP.XYMEEE",
+                 f"{base}/{obs}/03.MATCHUP/MATCHUP.XYMEEE",
+                 f"{base}/{obs}/MATCHUP.XYMEEE",
+                 f"{base}/MATCHUP.XYMEEE",
+                 f"{base}/03.MATCHUP/MATCHUP.XYMEEE"):
+        if os.path.isfile(cand):
+            return cand
+    # obs-scoped shallow globs (one and two levels below the obs dir)
+    for pat in (f"{base}/{obs}/*/MATCHUP.XYMEEE", f"{base}/{obs}/*/*/MATCHUP.XYMEEE"):
+        hits = sorted(glob.glob(pat))
         if hits:
             return hits[0]
     return None
