@@ -187,6 +187,44 @@ def _available_filters(o: Observation):
 
 
 # --------------------------------------------------------------------------- product lookup
+def _field_roots(o: Observation):
+    """Every on-disk root that can hold THIS observation's products, most specific first.
+
+    A QA field is normally one directory, ``<BASE>/<field>/``.  When a field's observations are
+    split into per-observation REDUCTION trees the split is partial on disk, and an observation's
+    products then live in BOTH: gc2211 (keflavich/jwst-gc-pipeline#469, five pointings 8-13' apart
+    at five epochs) has its frames and per-observation catalogues under ``gc2211_o023`` ...
+    ``gc2211_o050`` while the mosaics, the peppar catalogues and the offsets tables stayed under
+    ``gc2211``.  Resolving only the base field finds the mosaics and misses the frames; resolving
+    only the split tree does the reverse (JWST-GC/data-qa#119).
+
+    So search both, split tree first.  A field with no split tree gets exactly the old behaviour --
+    one root, the same glob -- so this is inert everywhere else."""
+    roots = []
+    split = f"{BASE}/{o.field}_o{o.obs}"
+    if os.path.isdir(split):
+        roots.append(split)
+    roots.append(f"{BASE}/{o.field}")
+    return roots
+
+
+def _field_dirs(o: Observation, *rels):
+    """``rels`` expanded against every field root, PATTERN-major: each relative directory is tried
+    under the split tree and then the base field before moving to the next one, so a caller's
+    existing directory PRIORITY (e.g. ``<filt>/pipeline`` before ``images-merged``) is preserved."""
+    return [f"{root}/{rel}" for rel in rels for root in _field_roots(o)]
+
+
+def _fglob(o: Observation, relpat, **kw):
+    """``glob`` one relative pattern under every field root, split tree first, deduped."""
+    out, seen = [], set()
+    for root in _field_roots(o):
+        for hit in sorted(glob.glob(f"{root}/{relpat}", **kw)):
+            if hit not in seen:
+                seen.add(hit); out.append(hit)
+    return out
+
+
 def _mosaic_path(o: Observation, filt):
     """Released science mosaic for this obs+filter, or None.  Prefers the all-detector 'merged'
     drizzle.  A genuinely single-module observation (e.g. sickle jw03958-o007, NRCB-only) names its
@@ -200,11 +238,9 @@ def _mosaic_path(o: Observation, filt):
     case return None so the deliverable reads incomplete (#13 review)."""
     if not filt:                     # obs with no filter for this channel (e.g. a single-band obs)
         return None
-    dir_pats = [
-        f"{BASE}/{o.field}/{filt}/pipeline",
-        f"{BASE}/{o.field}/*/pipeline",
-        f"{BASE}/{o.field}/images-merged",   # not-yet-released fields (e.g. gc2211) land mosaics here
-    ]
+    # not-yet-released fields (e.g. gc2211) land mosaics in images-merged; a split field
+    # (<field>_o<obs>) keeps its frames in its own tree and its mosaics in the base one.
+    dir_pats = _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")
 
     def find(tag):
         stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits"
@@ -291,9 +327,16 @@ def _catalog_candidates(o: Observation):
       * always drop ``_YYYYMMDD`` dated snapshots when a non-dated catalog remains (a later
         dedup pass makes the live catalog SMALLER, so size-based tie-breaks would otherwise
         prefer a stale pre-dedup snapshot -- a provenance violation).
+    A catalogue sitting in this observation's SPLIT tree (``<field>_o<obs>/catalogs/``) is this
+    observation's by location, whether or not its filename carries the token, so it counts as
+    tokened here.  That matters: gc2211's per-observation merged catalogues moved into the split
+    trees and the pooled five-pointing catalogue stayed behind, so without this every one of the
+    five observations reads the pooled catalogue and they all report the same stage 2/3/4 numbers
+    (JWST-GC/data-qa#94, #119).
+
     Skips residual/model/region sidecars."""
     cand = []
-    for p in sorted(glob.glob(f"{BASE}/{o.field}/catalogs/*.fits")):
+    for p in _fglob(o, "catalogs/*.fits"):
         low = os.path.basename(p).lower()
         if any(s in low for s in ("_residual", "_model", "_reproject", "region")):
             continue
@@ -302,9 +345,10 @@ def _catalog_candidates(o: Observation):
         except OSError:
             mtime = 0.0
         tier, kind = _catalog_priority(low)
-        cand.append((p, kind, tier, mtime, low))
+        insplit = os.path.dirname(os.path.dirname(p)).endswith(f"_o{o.obs}")
+        cand.append((p, kind, tier, mtime, low, insplit))
     this = [c for c in cand
-            if (m := _OBS_TOK_RE.search(c[4])) and m.group(1) == o.obs]
+            if c[5] or ((m := _OBS_TOK_RE.search(c[4])) and m.group(1) == o.obs)]
     if this:
         cand = this
     else:
@@ -312,7 +356,7 @@ def _catalog_candidates(o: Observation):
     nondated = [c for c in cand if not _DATED_RE.search(c[4])]
     if nondated:
         cand = nondated
-    return [(p, kind, tier, mtime) for (p, kind, tier, mtime, _low) in cand]
+    return [(p, kind, tier, mtime) for (p, kind, tier, mtime, _low, _sp) in cand]
 
 
 def _catalog_for(o: Observation, sw, lw):
@@ -411,8 +455,7 @@ def _mast_source_catalog(o: Observation, filt):
          excluded."""
     fl = filt.lower()
     _bad = ("nrca", "nrcb", "destreak", "segm")
-    for d in (f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/*/pipeline",
-              f"{BASE}/{o.field}/images-merged"):
+    for d in _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged"):
         hits = [p for p in glob.glob(f"{d}/{o.obsid}_t*_nircam_*{fl}*_cat.fits")
                 if not any(t in os.path.basename(p).lower() for t in _bad)]
         if hits:
@@ -495,7 +538,7 @@ def _dao_position_catalog(o: Observation, filt):
     but no merged photometry table and no MAST ``_cat.fits``) still has real positions, so the
     offset the reader cares about stays measurable and the obs need not be red-flagged.  Prefers the
     vetted science catalog at the highest pipeline stage; excludes carta/seed helper files."""
-    pats = [p for p in glob.glob(f"{BASE}/{o.field}/catalogs/{filt.lower()}_*dao_basic*_o{o.obs}_vetted.fits")
+    pats = [p for p in _fglob(o, f"catalogs/{filt.lower()}_*dao_basic*_o{o.obs}_vetted.fits")
             if "carta" not in p and "seed" not in p]
     if not pats:
         return None
@@ -609,15 +652,19 @@ def _refcat_path(o: Observation):
     the rule is epoch-blind and should be revisited if per-epoch refcats proliferate.  Related:
     the untokened gc2211 refcat carries no pmRA/pmDE, so aa.load_reference does no PM propagation
     and _obs_epoch has no effect on the reference here (the ~128 mas offset is flat in dt anyway)."""
-    hits = sorted(glob.glob(f"{BASE}/{o.field}/catalogs/gaia_virac2_refcat_epoch*.fits"))
-    if not hits:
-        return None
-    tok = [h for h in hits if (m := _OBS_TOK_RE.search(os.path.basename(h))) and m.group(1) == o.obs]
-    if tok:
-        return sorted(tok)[-1]
-    unt = [h for h in hits if not _OBS_TOK_RE.search(os.path.basename(h))]
-    if unt:
-        return sorted(unt)[-1]
+    # Roots in order (split tree first): a refcat inside <field>_o<obs>/catalogs/ belongs to THIS
+    # observation by location even when its filename carries no token, so it wins outright.
+    for root in _field_roots(o):
+        hits = sorted(glob.glob(f"{root}/catalogs/gaia_virac2_refcat_epoch*.fits"))
+        if not hits:
+            continue
+        tok = [h for h in hits
+               if (m := _OBS_TOK_RE.search(os.path.basename(h))) and m.group(1) == o.obs]
+        if tok:
+            return sorted(tok)[-1]
+        unt = [h for h in hits if not _OBS_TOK_RE.search(os.path.basename(h))]
+        if unt:
+            return sorted(unt)[-1]
     return None                                  # only other-obs tokened refcats exist -> refuse
 
 
@@ -654,11 +701,8 @@ def _viraccache_path(o: Observation):
     The gaia_virac2 refcat carries only a blended 'refmag', unusable for a Ks zeropoint.  VIRAC Ks
     is a dense, obs-independent reference, so a per-obs split field (gc2211_o023) may fall back to
     its base field's cache (gc2211) -- unlike the position refcat, whose footprint IS obs-specific."""
-    for fld in dict.fromkeys([o.field, _base_field(o.field)]):
-        p = f"{BASE}/{fld}/astrometry_diag/refcache/virac2.fits"
-        if os.path.exists(p):
-            return p
-    return None
+    hits = _fglob(o, "astrometry_diag/refcache/virac2.fits")
+    return hits[0] if hits else None
 
 
 _DAO_OBS_RE = re.compile(r"_o(\d{3})_")     # per-exposure token is underscore-bounded: _o023_visit
@@ -673,13 +717,13 @@ def _daophot_glob(o: Observation, filt, det="*"):
       * if a per-obs generation exists but not for this obs -> return [] (don't fall back to a
         different obs or a stale untokened generation);
       * else use the untokened files (single-obs-per-field layout)."""
-    base = f"{BASE}/{o.field}/{filt}/{filt.lower()}_{det}"
-    tok = sorted(glob.glob(f"{base}_o{o.obs}_visit*_*_m3_daophot_basic.fits"))
+    base = f"{filt}/{filt.lower()}_{det}"
+    tok = _fglob(o, f"{base}_o{o.obs}_visit*_*_m3_daophot_basic.fits")
     if tok:
         return tok
-    if glob.glob(f"{base}_o[0-9][0-9][0-9]_visit*_*_m3_daophot_basic.fits"):
+    if _fglob(o, f"{base}_o[0-9][0-9][0-9]_visit*_*_m3_daophot_basic.fits"):
         return []
-    return [c for c in sorted(glob.glob(f"{base}_visit*_*_m3_daophot_basic.fits"))
+    return [c for c in _fglob(o, f"{base}_visit*_*_m3_daophot_basic.fits")
             if not _DAO_OBS_RE.search(os.path.basename(c))]
 
 
@@ -694,8 +738,8 @@ def _virac_with_errors(o: Observation, epoch):
     Prefer ``virac2_full.fits`` (carries per-star e_pmRA/e_pmDE) over ``virac2.fits`` -- several
     fields' virac2.fits lacks the PM-error columns, and using the real per-star PM errors beats
     a constant floor (which collapses the significance to a fixed unit conversion)."""
-    full = f"{BASE}/{o.field}/astrometry_diag/refcache/virac2_full.fits"
-    p = full if os.path.exists(full) else _viraccache_path(o)
+    full = _fglob(o, "astrometry_diag/refcache/virac2_full.fits")
+    p = full[0] if full else _viraccache_path(o)
     if not p:
         return None
     import astropy.units as u
@@ -1735,7 +1779,8 @@ def _catalog_vs_alignment_age(o: Observation, src):
     if not src or "release:" not in src:
         return None, None, None
     name = src.split("release:", 1)[1].split(" [", 1)[0].strip()
-    cpath = os.path.join(BASE, o.field, "catalogs", name)
+    cp = _fglob(o, f"catalogs/{glob.escape(name)}")
+    cpath = cp[0] if cp else os.path.join(BASE, o.field, "catalogs", name)
     # Compare against the OPERATIVE alignment table only -- not the newest of every CSV in the dir,
     # since an older per-filter/VVV table would otherwise set the bar (PR #101 review).
     #
@@ -1752,9 +1797,9 @@ def _catalog_vs_alignment_age(o: Observation, src):
     # Preference, not union: where a locked table exists it is the operative one and a stale
     # consensus table beside it must not set the bar, which is the PR #101 finding.  The consensus
     # table is consulted only when no locked table exists.
-    offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*VIRAC2locked.csv"))
+    offs = _fglob(o, "offsets/Offsets_*VIRAC2locked.csv")
     if not offs:
-        offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*_consensus.csv"))
+        offs = _fglob(o, "offsets/Offsets_*_consensus.csv")
     if not (os.path.exists(cpath) and offs):
         return None, None, None
     cm = os.path.getmtime(cpath)
@@ -2166,7 +2211,7 @@ def _cutout_mosaic(o, filt):
     mosaic 'nrcb', not 'merged')."""
     if not filt:
         return None
-    dirs = [f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"]
+    dirs = _field_dirs(o, f"{filt}/pipeline", "images-merged")
     def pick(tag):
         for d in dirs:
             hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
@@ -2191,7 +2236,7 @@ def _mosaic_covering(o, filt, ra, dec):
         return None, 0
     cands = []
     for tag in ("merged", "nrcb", "nrca"):
-        for d in (f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"):
+        for d in _field_dirs(o, f"{filt}/pipeline", "images-merged"):
             cands += [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
                       if not any(s in p.lower() for s in ("residual", "model", "resbgsub", "bg_i2d"))]
     seen = set(); cands = [c for c in cands if not (c in seen or seen.add(c))]
@@ -3221,9 +3266,8 @@ def _mast_l3_catalog(o, filt, allow_download=None):
     Prefer a local copy; if absent, download it from MAST when it exists there (guarded).  When
     still None, the caller reconstructs the list by detecting on the i2d.  Returns a path or None."""
     for ext in ("ecsv", "fits"):
-        for d in (f"{BASE}/{o.field}/mastDownload", f"{BASE}/{o.field}/mastDownload/**",
-                  f"{BASE}/{o.field}/MAST_FITS", f"{BASE}/{o.field}/{filt}/pipeline",
-                  f"{BASE}/{o.field}/images-merged"):
+        for d in _field_dirs(o, "mastDownload", "mastDownload/**", "MAST_FITS",
+                             f"{filt}/pipeline", "images-merged"):
             hits = [p for p in glob.glob(f"{d}/{o.obsid}_t*_nircam_*{filt.lower()}*_cat.{ext}",
                                          recursive=True)
                     if not any(s in os.path.basename(p).lower() for s in _MAST_CAT_EXCLUDE)]
@@ -4069,10 +4113,19 @@ _PEPPAR_ROOTS = {"brick": "/blue/adamginsburg/adamginsburg/jwst",
 _PEPPAR_DEFAULT_ROOT = "/orange/adamginsburg/jwst"
 
 
+_PEPPAR_EXP_RE = re.compile(r"^jw\d{5}(\d{3})\d{3}_")     # jw<prog5><obs3><visit3>_...
+
+
 def _peppar_cal_for_cat(catpath):
     """The per-frame cal.fits that a peppar ``*_iter1_cat.fits`` was fit on, or None.  Cat lives at
     ``<field>/peppar/<FILT>/<DET>/<exp>_<det>_cal_<field>_iter1_cat.fits``; the cal sits at
-    ``<field>/<FILT>/pipeline/<exp>_<det>_cal.fits``."""
+    ``<field>/<FILT>/pipeline/<exp>_<det>_cal.fits``.
+
+    On a SPLIT field the peppar catalogues stay under ``<field>/peppar`` while the frames move to
+    ``<field>_o<obs>/<FILT>/pipeline`` (gc2211), so the sibling split tree is searched too -- the
+    observation number is read off the exposure name, which carries it (``jw<prog><obs><visit>``).
+    Without this every gc2211 peppar catalogue resolves to no cal image and stage 11 and the
+    peppar half of stage 6 go blank (JWST-GC/data-qa#119)."""
     base = os.path.basename(catpath)
     m = re.match(r"(.+_cal)_.*_iter1_cat\.fits$", base)          # strip the _<field>_iter1_cat tail
     if not m:
@@ -4081,10 +4134,17 @@ def _peppar_cal_for_cat(catpath):
     filt_dir = os.path.dirname(os.path.dirname(os.path.dirname(catpath)))   # .../peppar
     field_dir = os.path.dirname(filt_dir)
     filt = os.path.basename(os.path.dirname(os.path.dirname(catpath)))      # <FILT>
-    for cand in (f"{field_dir}/{filt}/pipeline/{calname}",
-                 f"{field_dir}/images-merged/{calname}"):
-        if os.path.isfile(cand):
-            return cand
+    roots = [field_dir]
+    mo = _PEPPAR_EXP_RE.match(base)
+    if mo:
+        split = f"{field_dir}_o{mo.group(1)}"
+        if os.path.isdir(split):
+            roots.insert(0, split)
+    for root in roots:
+        for cand in (f"{root}/{filt}/pipeline/{calname}",
+                     f"{root}/images-merged/{calname}"):
+            if os.path.isfile(cand):
+                return cand
     return None
 
 

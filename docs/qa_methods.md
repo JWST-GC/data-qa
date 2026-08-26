@@ -42,6 +42,15 @@ The record survives a stage that fails partway — what it read before it died i
 useful thing about the failure — and it appears on red-flagged stages, where "the plot is empty"
 is much easier to act on with the list of what was and was not there.
 
+**Where a stage looks.** A QA field is normally one directory, `/orange/adamginsburg/jwst/<field>/`.
+Where a field's observations have been split into per-observation reduction trees, an observation's
+products live in **both** `<field>/` and `<field>_o<obs>/` — gc2211's five pointings keep their
+frames and per-observation catalogues in the split trees while the mosaics, peppar catalogues and
+offsets tables stayed in the base field. Every product lookup searches both, split tree first
+(`_field_roots`), and a catalogue found inside `<field>_o<obs>/catalogs/` counts as that
+observation's whether or not its filename carries the `_oNNN` token. A field with no split tree is
+resolved exactly as before.
+
 **On large sets.** The per-exposure daophot catalogues run to hundreds of files (brick F212N: 192;
 gc2211 F200W: 592). At ~100 characters a path, one such role approaches GitHub's 65 kB comment
 limit on its own, so a directory holding more than 12 files is rendered as its full path, its
