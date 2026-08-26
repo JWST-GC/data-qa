@@ -1286,6 +1286,15 @@ _CELL_BAD_FRAC = 0.02
 # Require at least this fraction of the field's sources to sit in cells with a measurable peak,
 # else the field is too sparsely sampled to pass.
 _CELL_MIN_COVERAGE = 0.5
+# How many measured cells the per-cell map needs before its spatial verdict is CONCLUSIVE, i.e.
+# before a PASS may be read as "the spatial-consistency check ran and found nothing".  This is a
+# statement about the map's resolving power, and it is deliberately NOT part of the consistency
+# verdict itself (issue #66): making `consistent` False for want of cells inverted the gate, since
+# a 2x2 grid with 3 of 4 cells measured hard-failed while a field too sparse for any 2x2 cell fell
+# back to 1x1, bypassed the per-cell test entirely and passed.  Better sampling then scored worse.
+# The adjacency test still runs and can still FAIL an under-sampled grid on real evidence; what an
+# under-sampled grid may not do is manufacture a failure out of its own thinness.
+_CELL_MIN_CONCLUSIVE = 4
 # Low peak floor: a cell qualifies once it has SOME peak above chance.  aa.MIN_PEAK_RATIO (4.0)
 # anti-correlates with source count -- the background it divides by, median(H[H>0]), grows with the
 # chance-pair count -- so a 4.0 cut keeps the SPARSE cells and drops the dense ones, which makes the
@@ -1418,7 +1427,7 @@ def _cell_consistency(cells, dropped):
 
     Returns a dict of the numbers plus per-cell ``deviating``/``confirmed`` flags for plotting."""
     if not cells:
-        return dict(n_cells=0, consistent=False)
+        return dict(n_cells=0, consistent=False, spatial_conclusive=False)
     def _wmed(v, w):
         o = np.argsort(v); vs, ws = v[o], w[o]; cw = np.cumsum(ws)
         return float(vs[np.searchsorted(cw, 0.5 * cw[-1])])
@@ -1484,11 +1493,17 @@ def _cell_consistency(cells, dropped):
     # cells are added.  Stage 8 measures its significance against
     # a shuffled-position null for the same reason.
     spread = float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))) if len(cells) >= 2 else None
-    consistent = bool(len(cells) >= 4 and bad_frac < _CELL_BAD_FRAC and coverage >= _CELL_MIN_COVERAGE)
+    # The consistency verdict is the ADJACENCY evidence plus coverage, at whatever cell count the
+    # grid yielded.  Whether that verdict is conclusive is reported separately as
+    # ``spatial_conclusive`` (issue #66); the caller ticks the checklist off that flag and gates the
+    # PASS off this one, so a thin grid stays un-ticked without being failed.
+    consistent = bool(bad_frac < _CELL_BAD_FRAC and coverage >= _CELL_MIN_COVERAGE)
+    spatial_conclusive = bool(len(cells) >= _CELL_MIN_CONCLUSIVE)
     return dict(off_med=off_med, off_dra=mdra, off_dde=mdde, spread=spread,
                 n_cells=len(cells), n_dropped=len(dropped), n_deviating=int(deviating.sum()),
                 n_confirmed=int(confirmed.sum()), n_spurious=n_spurious, bad_src_frac=bad_frac,
-                coverage=coverage, consistent=consistent, deviating=deviating, confirmed=confirmed,
+                coverage=coverage, consistent=consistent,
+                spatial_conclusive=spatial_conclusive, deviating=deviating, confirmed=confirmed,
                 cells=cells, dropped=dropped)     # spurious-filtered; caller plots THESE
 
 
@@ -1803,8 +1818,16 @@ def stage4_offsets(o: Observation, sw):
     # fallback (grid_used == 1) is the one case that skips it.  A low cell count still faces it: a
     # large field with 3/16 measurable cells is 21% coverage and must fail (issue #13 review).
     # Coverage is enforced in EVERY branch.
+    #
+    # MONOTONIC IN SAMPLING (issue #66): a grid that measured too few cells to be conclusive is
+    # reported as NOT ASSESSED, exactly like the whole-field fallback, instead of being failed for
+    # thinness.  Adding a cell to a field can now only leave the verdict alone or reveal a real
+    # discontinuity through the adjacency test -- it can no longer turn a PASS into a FAIL with no
+    # evidence behind it.  The checklist tick still requires ``spatial_assessed``, so nothing
+    # under-sampled is auto-ticked; coverage still fails the sparse large field.
     whole_field = (grid_used == 1)
-    spatial_assessed = not whole_field and not cell_map_unreliable
+    spatial_assessed = bool(not whole_field and not cell_map_unreliable
+                            and cc.get("spatial_conclusive", False))
     coverage_ok = cc["coverage"] >= _CELL_MIN_COVERAGE
     # A garbage cell map cannot pronounce a spatial discontinuity: its adjacency-confirmed "deviating"
     # cells are noise agreeing with noise, so do not fail the field on them.
@@ -1816,7 +1839,7 @@ def stage4_offsets(o: Observation, sw):
     metrics.update(offset_med_mas=off_med, offset_scatter_mas=spread,
                    bulk_off=off_med,                        # reported offset (same-star when available)
                    gate_off_mas=gate_off,                   # value the magnitude gate tests (cell histogram)
-                   spatial_assessed=spatial_assessed,       # False -> whole-field fallback, no per-cell map
+                   spatial_assessed=spatial_assessed,       # False -> whole-field fallback or a grid too thin to conclude
                    grid_used=grid_used, cell_map_unreliable=cell_map_unreliable,
                    offset_unmeasurable=offset_unmeasurable,
                    bulk_source=bulk_source, cell_off_med=cell_off_med,
@@ -1827,7 +1850,8 @@ def stage4_offsets(o: Observation, sw):
                    n_cells_spurious=cc.get("n_spurious", 0),
                    n_cells_deviating=cc["n_deviating"], n_cells_confirmed=cc["n_confirmed"],
                    bad_src_frac=cc["bad_src_frac"], cell_coverage=cc["coverage"],
-                   cells_consistent=cc["consistent"], passed=passed)
+                   cells_consistent=cc["consistent"],
+                   cells_spatial_conclusive=cc.get("spatial_conclusive", False), passed=passed)
 
     # Guard A -- cross-check the histogram-peak bulk against the CLEAN isolated matches (computed
     # above), which suffer neither the nearest-neighbour collapse nor the spurious-peak failure.  A
@@ -5084,13 +5108,23 @@ def _caption_for_impl(n, metrics):
         elif metrics.get("spatial_assessed", True):
             base += ("A pass needs a small field offset AND cells that agree with each other. "
                      "([how this is made](DOCROOT#stage4))")
-        else:
+        elif (metrics.get("n_cells") or 0) <= 1:
             # whole-field fallback: only one cell measured, so the per-cell spatial check did not
             # run.  Say so, since a caption claiming it ran would be false.
             base += ("NOTE: too few stars in common to sub-divide the field, so the offset was "
                      "measured WHOLE-FIELD (one cell). A small value passes the magnitude gate; "
                      "the per-cell spatial-consistency check did not run, and a sub-region "
                      "discontinuity would go unseen here. ([how this is made](DOCROOT#stage4))")
+        else:
+            # a grid ran, but too few of its cells held enough reference stars for the adjacency
+            # test to conclude.  It still fires on real evidence (adjacent cells at a different
+            # offset fail the field); what it cannot do here is certify the field as clean.
+            base += (f"NOTE: only {metrics.get('n_cells')} cells held enough reference stars to "
+                     f"measure, too few for the per-cell spatial-consistency check to be "
+                     f"conclusive. The magnitude and coverage gates still apply, and adjacent "
+                     f"cells at a different offset would still fail the field; a subtle "
+                     f"sub-region discontinuity could go unseen. "
+                     f"([how this is made](DOCROOT#stage4))")
         if str(metrics.get("source", "")).startswith("release-dao"):
             base += (" (Positions here come from a per-filter DAO catalogue. This observation has "
                      "yet to be photometrically catalogued, which is what stage 3 red-flags.)")
