@@ -2822,3 +2822,72 @@ def test_clipped_locus_fit_refuses_a_clip_that_strips_its_own_support(monkeypatc
     slope, zp, scat, n_locus, n_unclipped, clip_exit = D._clipped_locus_fit(x, y)
     assert clip_exit == "floor-unclipped"
     assert n_locus == n_unclipped == 34                  # nothing was thrown away
+
+
+# --------------------------------------------------------------------------- _ab_overlap
+def _ab_module_catalogs(true_dra_mas, true_ddec_mas, n=800, seed=95):
+    """Two module catalogues of the SAME stars, A displaced from B by a known offset.
+
+    ``true_dra/ddec`` is the shift that moves A onto B, the quantity ``_ab_overlap`` reports.
+    """
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.default_rng(seed)
+    ra0, dec0 = 266.5, -28.6
+    cosd = float(np.cos(np.radians(dec0)))
+    b_ra = ra0 + rng.uniform(-0.01, 0.01, n)
+    b_dec = dec0 + rng.uniform(-0.01, 0.01, n)
+    a_ra = b_ra - true_dra_mas / 1000.0 / 3600.0 / cosd
+    a_dec = b_dec - true_ddec_mas / 1000.0 / 3600.0
+    return (SkyCoord(a_ra * u.deg, a_dec * u.deg), SkyCoord(b_ra * u.deg, b_dec * u.deg))
+
+
+def test_ab_overlap_refines_a_biased_histogram_peak_onto_the_same_stars(monkeypatch):
+    """The reported A−B offset must be the peak CORRECTED by the same stars, not the raw peak.
+
+    A histogram peak measured against a catalogue tracing the same clustered field is pulled by a
+    correlated wrong-pair background (issue #95).  Inject that pull directly: hand `_ab_overlap` a
+    peak that is 6.0/-4.0 mas off truth and check the returned offset comes back to truth, with the
+    raw peak still on record.
+    """
+    from data_qa import astrometry_audit as aa
+    true_dra, true_ddec = 12.0, -7.0
+    bias_dra, bias_ddec = 6.0, -4.0
+    a_sc, b_sc = _ab_module_catalogs(true_dra, true_ddec)
+
+    def _biased_xcorr(a, b, **kw):
+        dra, ddec = true_dra + bias_dra, true_ddec + bias_ddec
+        return dict(dra=dra, ddec=ddec, off=float(np.hypot(dra, ddec)),
+                    npairs=5000, peak_ratio=25.0)
+
+    monkeypatch.setattr(aa, "xcorr", _biased_xcorr)
+    ov = D._ab_overlap(a_sc, b_sc)
+    assert ov is not None
+    assert ov["bulk_source"] == "same-star"
+    # the raw peak is 7.2 mas off truth; the refined offset is back on it
+    assert abs(ov["peak_off"] - np.hypot(true_dra + bias_dra, true_ddec + bias_ddec)) < 1e-6
+    assert abs(ov["dra"] - true_dra) < 0.5 and abs(ov["dde"] - true_ddec) < 0.5
+    assert abs(ov["off"] - np.hypot(true_dra, true_ddec)) < 0.5
+    # sign check: ADDING the residual median instead of subtracting doubles the error
+    wrong = np.hypot(true_dra + 2 * bias_dra, true_ddec + 2 * bias_ddec)
+    assert abs(ov["off"] - wrong) > 5.0
+
+
+def test_ab_overlap_keeps_the_raw_peak_when_too_few_pairs_to_refine(monkeypatch):
+    """Below the pair floor the refinement is refused and the histogram peak stands, labelled."""
+    from data_qa import astrometry_audit as aa
+    true_dra, true_ddec = 12.0, -7.0
+    bias_dra, bias_ddec = 6.0, -4.0
+    a_sc, b_sc = _ab_module_catalogs(true_dra, true_ddec)
+
+    def _biased_xcorr(a, b, **kw):
+        dra, ddec = true_dra + bias_dra, true_ddec + bias_ddec
+        return dict(dra=dra, ddec=ddec, off=float(np.hypot(dra, ddec)),
+                    npairs=5000, peak_ratio=25.0)
+
+    monkeypatch.setattr(aa, "xcorr", _biased_xcorr)
+    monkeypatch.setattr(D, "AB_SAME_STAR_MINPAIRS", 10_000)
+    ov = D._ab_overlap(a_sc, b_sc)
+    assert ov is not None
+    assert ov["bulk_source"] == "histogram"
+    assert ov["off"] == ov["peak_off"]
