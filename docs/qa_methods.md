@@ -3,11 +3,14 @@
 This document is the reference for the automated QA diagnostics posted on each observation's
 tracking issue. Every diagnostic comment links back here (to the matching stage section) and to
 the exact source function that built it.
+
 - Source: [`data_qa/diagnostics.py`](../data_qa/diagnostics.py) builds every figure and metric;
   [`data_qa/post_diagnostics.py`](../data_qa/post_diagnostics.py) posts them.
 - The diagnostics are **NIRCam-only**. MIRI issues carry only the pipeline-status table.
-- Each stage writes a metrics JSON (`data_qa/metrics/<obsid>.json`) and posts/updates the extisting comment.
--  **The `passed` and `failed` flags should only serve as suggestions for the reviewer**. Each stage below defines "passing" criteria.
+- Each stage writes a metrics JSON (`data_qa/metrics/<obsid>.json`) and posts/updates one
+  **marker-keyed** comment per stage, so re-running **updates in place** — it never duplicates.
+- **None of these stages is an automated gate.** The `passed` flag is a suggestion for the human
+  reviewer, not an enforced pass/fail. Each stage below defines its "passing" criteria.
 - Every stage reports the **full path of every file it read** — see
   [which files a stage used](#inputs).
 
@@ -21,10 +24,16 @@ Jump to: [Glossary](#glossary) ·
 ## Which files a stage used
 
 Each posted comment ends with a collapsed **Files read for this stage** block giving the full
-path of every file that stage opened, grouped by what it was used for and then by directory. The same list is the `inputs` key of that stage in
-`data_qa/metrics/<obsid>.json`.
+path of every file that stage opened, grouped by what it was used for and then by directory. The
+same list is the `inputs` key of that stage in `data_qa/metrics/<obsid>.json`. This is what makes a
+stale read visible: a stage that quietly read an old generation, another observation's catalogue,
+or one module's detectors used to look exactly like a stage that read the right thing.
 
-Due to GitHub's 65 kB comment limit, if more than 12 files were used then only the first three and last filenames are displayed. In such cases, <o.obsid>.json file contains all paths that were used. 
+Because of GitHub's 65 kB comment limit, a single **directory** holding more than 12 files is
+shown as its path, its count, the first three filenames and the last — a stage that read 40 files
+spread over four directories still lists all of them. The block **says** when it summarised and
+points at `data_qa/metrics/<obsid>.json`, which always holds the complete list. The file **count**
+is never abbreviated.
 
 <a id="glossary"></a>
 ## Glossary
@@ -33,24 +42,29 @@ Due to GitHub's 65 kB comment limit, if more than 12 files were used then only t
 ### Catalog tiers: MAST default, `m1` … `m8`
 
 The jicama pipeline refines a field's catalog through numbered merge/refinement stages. Higher =
-more processed; the QA always chooses the **highest tier present on disk** for the observation with the MAST-delivered catalog being the lowest priority and `m8` being the highest. 
+more processed; the QA always chooses the **highest tier present on disk** for the observation, with
+the MAST-delivered catalog being the lowest priority and `m8` the highest.
+
 - **MAST-delivered source catalog** — the STScI level-3 pipeline's own source list shipped with
   the mosaic (`*_cat.fits`). Single-band, aperture photometry, no cross-band merge. This is the
   "raw" baseline the pipeline improves on (see [stage 7](#stage7)).
 - **`mN`** — the `N`th [jicama](#glossary-jicama)-pipeline pass. Successive passes add
   PSF-fit photometry, per-exposure combination, cross-band forced photometry, and quality
   vetting; `m7` seeds each filter's forced photometry at the cross-band source positions.
-- **`m8` / `m8_dedup`** — the final iteration. `m8_dedup` removes duplicate rows that may be present in `m8`due to the cross-band merge. The most-recent-on-disk of the two is used. The cataloging process is described in https://github.com/keflavich/jwst-gc-pipeline/blob/main/PHOTOMETRY_PIPELINE.md (most of the text there is AI generated for now).
-
+- **`m8` / `m8_dedup`** — the final iteration. `m8_dedup` removes duplicate rows that the
+  cross-band merge can leave in `m8`. The two share the same top tier, so the
+  most-recent-on-disk of them is used. The cataloging process is described in
+  [`PHOTOMETRY_PIPELINE.md`](https://github.com/keflavich/jwst-gc-pipeline/blob/main/PHOTOMETRY_PIPELINE.md)
+  (most of the text there is AI generated for now).
 - A catalog labelled **`crossmatch`** in a caption means no single merged catalog held both
-  requested filters, so the CMD was built by cross-matching the two single-band catalogs. 
+  requested filters, so the CMD was built by cross-matching the two single-band catalogs.
 
 <a id="glossary-jicama"></a>
 ### jicama
 
 `jicama` is the name of our PSF-photometry catalog pipeline, distinct from the MAST/STScI
-source catalog, and from the `peppar` and `STARFINDER` catalogs).
-The `mN` catalogs are a product of `jicama` pipeline.
+source catalog and from the `peppar` and `STARFINDER` catalogs.
+The `mN` catalogs are the products of the `jicama` pipeline.
 
 <a id="glossary-virac"></a>
 ### VIRAC / VIRAC2 / Ks
@@ -236,25 +250,22 @@ on the same panel. Above the cut the residual scatter is dominated by how well t
 <a id="stage1"></a>
 ## Stage 1 — first mosaics
 
+Stage 1 shows SW and LW `i2d` mosaic thumbnails, loaded from the `merged_i2d.fits` images in
+ZScale/asinh grayscale, to provide the first look at the data.
 
-Stage 1 shows grayscale `i2d` mosaic thumbnails, loaded from the `merged_i2d.fits`
-images in ZScale/asinh grayscale to provide the first look of the data.
-
-
-<details> 
+<details>
 <summary>What to do?</summary>
 <br>
-Check the images for double-stars or other visual artifacts. 
+Check the images for double-stars or other visual artifacts.
 </details>
 <br>
 
-
-<details> 
+<details>
 <summary>Other details</summary>
 
-* For redundancy, if a filter was observed, but no data exists on disk then this will be explicitly stated here.
+* For redundancy, if a filter was observed but no data exists on disk, that is stated explicitly here rather than dropped silently.
 
-* The images gets loaded from the pipeline folder or, if not available, from MAST. See "files read" for details.
+* Each image is loaded from the pipeline folder or, when that is unavailable, from MAST. See "files read" for details.
 </details>
 <br>
 
@@ -270,13 +281,13 @@ versions are produced: **all stars**, and one **limited to [S/N > 10](#glossary-
 
 `stage2_cmd` reads the jicama [`mN`](#glossary-mtier) catalog (or, if no single catalog holds both
 bands, cross-matches the two single-band catalogs — labelled `crossmatch`); the MAST L3 product is
-used only when no jicama catalog exists. `lf_turnover` =
-magnitude of the LF peak bin. 
+used only when no jicama catalog exists. `n_stars` = finite (SW, LW) pairs; `lf_turnover` =
+magnitude of the LF peak bin.
 
-<details> 
+<details>
 <summary>What to do?</summary>
 <br>
-Look for a coherent stellar locus. Check whether the number of stars is reasonable based on other similar fields.
+Look for a coherent stellar locus. Check whether <code>n_stars</code> is reasonable based on other similar fields (the suggested <code>passed</code> flag is set when it exceeds 500).
 </details>
 <br>
 
