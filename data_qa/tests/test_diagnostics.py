@@ -2341,6 +2341,24 @@ def test_jwst1pass_matchup_locator(tmp_path, monkeypatch):
     assert D._jwst1pass_matchup(o, "F182M") == str(d / "MATCHUP.XYMEEE")
 
 
+def test_jwst1pass_psfperts_locator_and_figure(tmp_path, monkeypatch):
+    from astropy.io import fits
+    monkeypatch.setitem(D._JWST1PASS_ROOTS, "brick", str(tmp_path))
+    o = _obs(field="brick", obs="001", filt="F182M")
+    assert D._jwst1pass_psfperts(o, "F182M") == []               # nothing on disk yet
+    base = tmp_path / "brick" / "jwst1pass" / "F182M" / "o001"
+    for det in ("NRCA1", "NRCB4", "NRCA2"):
+        d = base / det; d.mkdir(parents=True)
+        img = np.full((171, 570), -0.1, "float32"); img[40:120, 40:300] = 0.01   # fill + interior
+        fits.PrimaryHDU(img).writeto(str(d / "LOG.psfperts.fits"))
+    pp = D._jwst1pass_psfperts(o, "F182M")
+    assert [det for det, _ in pp] == ["NRCA1", "NRCA2", "NRCB4"]  # sorted by detector
+    # obs-scoped: a different obs sees nothing
+    assert D._jwst1pass_psfperts(_obs(field="brick", obs="004", filt="F182M"), "F182M") == []
+    png = D._psfperts_figure(o, "F182M", pp)
+    assert os.path.exists(png)
+
+
 def test_jwst1pass_matchup_per_obs_match_layout(tmp_path, monkeypatch):
     # the real product layout is {FILT}/o{obs}/match/MATCHUP.XYMEEE (issue: stage 10 red-flagged
     # every field because the resolver only globbed one level under {FILT})
