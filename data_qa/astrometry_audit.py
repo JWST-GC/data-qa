@@ -68,7 +68,18 @@ def detect(path, thr=50.0, fwhm=2.5):
 def xcorr(a: SkyCoord, b: SkyCoord, maxsep=XMAXSEP, binarc=XBIN):
     """Bulk on-sky offset (mas) to move ``a`` onto ``b`` via the peak of the 2-D
     histogram of all pair separations within ``maxsep``.  Crowding-proof.  Returns dict
-    with dra/ddec/off (mas), npairs, peak_ratio, or None."""
+    with dra/ddec/off (mas), npairs, npeak, peak_ratio, or None.
+
+    Two DIFFERENT pair counts come back, and a caller gating on the wrong one gates on nothing:
+
+    * ``npairs`` -- ALL pairs within ``maxsep``, the histogram's total content.  It scales with
+      the product of the two densities and the search area, so at GC crowding it is enormous and
+      mostly chance pairs: sickle jw03958-o007 2x2 cells hold 39k-46k of them against ~670 VIRAC
+      reference stars, brick jw02221-o001 4x4 cells 13k-48k (measured 2026-08-25).
+    * ``npeak`` -- pairs in the PEAK BIN, i.e. how many common stars actually support the offset
+      being reported.  Same cells: 37-55 (sickle 2x2), 44-114 (brick 4x4), 156 (sickle whole
+      field).  This is the quantity a "is this peak supported?" floor belongs on.
+    """
     ia, ib, sep, _ = search_around_sky(a, b, maxsep)
     if len(ia) < 30:
         return None
@@ -92,7 +103,8 @@ def xcorr(a: SkyCoord, b: SkyCoord, maxsep=XMAXSEP, binarc=XBIN):
             break
         dra0, ddec0 = float(np.median(dra[near])), float(np.median(ddec[near]))
     return dict(dra=dra0 * 1000, ddec=ddec0 * 1000, off=float(np.hypot(dra0, ddec0) * 1000),
-                npairs=int(len(ia)), peak_ratio=float(H.max() / bg) if bg else float("inf"))
+                npairs=int(len(ia)), npeak=int(H.max()),
+                peak_ratio=float(H.max() / bg) if bg else float("inf"))
 
 
 # The offset-histogram peak is density-immune to nearest-neighbour collapse but NOT to a

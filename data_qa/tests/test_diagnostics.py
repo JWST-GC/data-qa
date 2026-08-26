@@ -681,6 +681,72 @@ def test_cell_offsets_adaptive_grid_fired_1x1():
     assert len(cells) == 1
 
 
+def _one_cell_field(n=400):
+    """A single dense patch: one 1x1 cell, so _cell_grid's floors are the only thing deciding."""
+    return _uniform_shift(n, 0.0, seed=3)
+
+
+def _fake_xcorr(npairs, npeak, peak_ratio=8.0):
+    return lambda a, b, **kw: dict(dra=5.0, ddec=0.0, off=5.0, npairs=npairs, npeak=npeak,
+                                   peak_ratio=peak_ratio)
+
+
+def test_cell_grid_pair_floor_is_independent_of_the_star_floor(monkeypatch):
+    # issue #65: min_pairs is a PAIR count, chosen for pairs.  With the star floor held fixed and
+    # generous, moving the pair floor alone must decide the cell -- which is only possible because
+    # the pair floor is no longer `min_pairs = min_src`.
+    jsc, ref = _one_cell_field()
+    monkeypatch.setattr(D.aa, "xcorr", _fake_xcorr(npairs=120, npeak=60))
+    kept, _ = D._cell_grid(jsc, ref, 1, 50, min_pairs=100, min_peak_pairs=10)
+    dropped_cells, dropped = D._cell_grid(jsc, ref, 1, 50, min_pairs=5000, min_peak_pairs=10)
+    assert len(kept) == 1 and dropped_cells == []
+    assert dropped[0]["reason"] == "too few pairs in the search radius"
+    # ...and the star floor still decides on its own quantity, with the pair floor generous
+    _c, star_dropped = D._cell_grid(jsc, ref, 1, 100000, min_pairs=1, min_peak_pairs=1)
+    assert star_dropped == [] or star_dropped[0]["reason"] == "too few reference stars"
+
+
+def test_cell_grid_drops_a_cell_with_plenty_of_stars_but_a_peak_no_stars_support(monkeypatch):
+    # the case the star floor cannot see: 40 000 chance pairs inside the search radius (so the
+    # total-pair floor is satisfied many times over) while the reported offset rests on 5 stars.
+    jsc, ref = _one_cell_field()
+    monkeypatch.setattr(D.aa, "xcorr", _fake_xcorr(npairs=40000, npeak=5))
+    cells, dropped = D._cell_grid(jsc, ref, 1, 50)
+    assert cells == [] and dropped[0]["reason"] == "too few pairs supporting the peak"
+    monkeypatch.setattr(D.aa, "xcorr", _fake_xcorr(npairs=40000, npeak=50))
+    cells, _ = D._cell_grid(jsc, ref, 1, 50)
+    assert len(cells) == 1 and cells[0]["npeak"] == 50
+
+
+def test_cell_offsets_passes_explicit_pair_floors_at_every_rung(monkeypatch):
+    # the floors must arrive at _cell_grid as the deliberate constants, at every adaptive rung, and
+    # must NOT track the rung's star floor (300 / 150 / 100).
+    seen = []
+
+    def _spy(jsc, ref_sc, ncell, min_src, pr_floor=None, min_pairs=None, min_peak_pairs=None):
+        seen.append(dict(ncell=ncell, min_src=min_src, min_pairs=min_pairs,
+                         min_peak_pairs=min_peak_pairs))
+        return [], []
+
+    monkeypatch.setattr(D, "_cell_grid", _spy)
+    jsc, ref = _one_cell_field()
+    D._cell_offsets(jsc, ref)
+    assert [s["min_src"] for s in seen] == [300, 150, 100]        # star floors still step down
+    assert {s["min_pairs"] for s in seen} == {D._CELL_MIN_PAIRS}
+    assert {s["min_peak_pairs"] for s in seen} == {D._CELL_MIN_PEAK_PAIRS}
+    assert all(s["min_pairs"] != s["min_src"] or s["min_peak_pairs"] != s["min_src"] for s in seen)
+
+
+def test_xcorr_reports_the_pairs_that_support_the_peak():
+    # npeak is the PEAK BIN's occupancy, so a synthetic field of N stars shifted rigidly reports
+    # ~N supporting pairs while npairs counts every pair in the 2.5" radius.
+    jsc, ref = _uniform_shift(300, 100.0, seed=5, span=0.004)
+    xc = D.aa.xcorr(jsc, ref)
+    assert xc["npeak"] <= xc["npairs"]
+    assert xc["npeak"] >= 200                 # the 300 true pairs, minus bin-edge splitting
+    assert xc["npairs"] > 2 * xc["npeak"]     # the rest of the radius is chance pairs
+
+
 def test_offset_failure_reason_reports_counts_not_cause(monkeypatch, tmp_path):
     # the reason string must report measured counts (JWST / reference / pairs) and NOT assert a
     # single cause; and a confident peak must never print "peak_ratio >=4 < 4".
@@ -689,8 +755,11 @@ def test_offset_failure_reason_reports_counts_not_cause(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))
     ra = 266.40 + np.linspace(0, 0.02, 300); dec = -28.90 + np.linspace(0, 0.02, 300)
     jsc = SkyCoord(ra * u.deg, dec * u.deg); ref = SkyCoord(ra * u.deg, dec * u.deg)
-    hi = D._offset_failure_reason(_obs(), "F210M", jsc, ref, {"peak_ratio": 16.0, "npairs": 250})
-    assert "300 JWST sources" in hi and "matched pairs" in hi
+    hi = D._offset_failure_reason(_obs(), "F210M", jsc, ref,
+                                  {"peak_ratio": 16.0, "npairs": 250, "npeak": 40})
+    # the pair count must be named for what it is -- pairs inside the search radius, of which only
+    # some support the peak (issue #65); "matched pairs at the best peak" described neither.
+    assert "300 JWST sources" in hi and "250 pairs within" in hi and "40 land in the peak bin" in hi
     assert "16.0" in hi and "< 4" not in hi and "≥" in hi
     lo = D._offset_failure_reason(_obs(), "F210M", jsc, ref, {"peak_ratio": 1.2, "npairs": 5})
     assert "300 JWST sources" in lo and "not determined" in lo

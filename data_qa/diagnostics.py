@@ -1259,7 +1259,10 @@ def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk):
     # naming one of several possible causes -- the failure could be too few reference stars, too few
     # JWST sources, or a genuine no-peak, and this function did not distinguish them.
     counts = (f"{len(jsc)} JWST sources vs {len(ref_sc)} VIRAC reference stars in the footprint"
-              + (f", {npairs} matched pairs at the best peak" if npairs is not None else ""))
+              + (f", {npairs} pairs within the {aa.XMAXSEP.to('arcsec').value:.1f}\" search radius"
+                 if npairs is not None else "")
+              + (f" of which {(bulk or {}).get('npeak')} land in the peak bin"
+                 if (bulk or {}).get("npeak") is not None else ""))
     # Report the JWST magnitude range if we have it; do NOT claim a VIRAC comparison that was not run.
     jmag = _jwst_sources(o, filt)[1]
     mag_note = ""
@@ -1323,25 +1326,41 @@ _CELL_SPURIOUS_WT = 0.02
 _CELL_SPREAD_ABSURD = 300.0
 # Trust the isolated-star bulk as the override only when it rests on a solid clean sample.
 _ISO_OVERRIDE_MIN_N = 50
+# --- the PAIR floors, chosen on pair counts and independent of the star floors above (issue #65) ---
+# Total pairs within the xcorr search radius.  A sanity floor only: it scales with the product of
+# the two densities and the search area, so at GC crowding it is never the binding gate (measured
+# 2026-08-25: sickle 2x2 cells 39k-46k pairs, brick 4x4 cells 13k-48k).  Held at the most permissive
+# of the values the rungs used to inherit from ``min_src`` (300/150/100), so no rung tightens.
+_CELL_MIN_PAIRS = 100
+# Pairs in the PEAK BIN: how many common stars actually support the offset the cell reports.  THIS
+# is the floor that means something -- a cell can hold 40 000 chance pairs and a peak built on five
+# stars.  Real cells measure 37-55 (sickle 2x2), 44-114 (brick 4x4), 156 (sickle whole field), so 10
+# sits ~4x below the thinnest measured real cell while rejecting a peak no star population supports.
+_CELL_MIN_PEAK_PAIRS = 10
 
 
-def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=None):
+def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=_CELL_MIN_PAIRS,
+               min_peak_pairs=_CELL_MIN_PEAK_PAIRS):
     """One ``ncell`` x ``ncell`` pass of the per-cell xcorr offset (see ``_cell_offsets``).
 
-    Three DISTINCT thresholds, each on its own quantity.  Collapsing them into one constant is what
-    produced the _ab_overlap 9.6x inflation, by counting stars where pairs were meant:
+    FOUR DISTINCT thresholds, each on its own quantity, each chosen for that quantity.  Collapsing
+    them into one constant is what produced the _ab_overlap 9.6x inflation, by counting stars where
+    pairs were meant:
       * ``min_src`` -- minimum STAR occupancy required of BOTH the JWST cell and the (2"-margin)
         reference crop before xcorr is attempted.  At GC density the VIRAC *reference* crop is the
         binding one, since VIRAC is far sparser than JWST: a cell can hold 1000+ JWST sources and
         still fall short of ``min_src`` reference stars, in which case xcorr is never called.  That
         is why sickle's 4x4 cells drop with peak_ratio=None -- the REFERENCE stars ran out.
       * ``pr_floor`` -- minimum xcorr peak_ratio (peak height / chance background) to trust a peak.
-      * ``min_pairs`` -- minimum number of matched PAIRS in the accepted peak (a pair count, not a
-        star count); defaults to ``min_src``.
+      * ``min_pairs`` -- minimum TOTAL pairs inside the xcorr search radius (``aa.xcorr``'s
+        ``npairs``).  A star count and a pair count are different quantities: this one used to
+        default to ``min_src``, which made one number gate three things and left the pair threshold
+        an accident of the star threshold.  It is now an explicit constant the caller passes.
+      * ``min_peak_pairs`` -- minimum pairs in the PEAK BIN (``aa.xcorr``'s ``npeak``), i.e. the
+        common stars supporting the reported offset.  This is the pair floor with teeth; the total
+        count above is dominated by chance pairs at GC density.
 
     Returns (cells, dropped)."""
-    if min_pairs is None:
-        min_pairs = min_src
     ra = jsc.ra.deg; dec = jsc.dec.deg
     rra = ref_sc.ra.deg; rde = ref_sc.dec.deg
     # RA-wrap guard: a footprint straddling RA=0 would give bogus linear bins (no GC field does).
@@ -1362,16 +1381,26 @@ def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=N
                   (rde >= de_[j] - mrg) & (rde <= de_[j + 1] + mrg))
             n_ref = int(rm.sum())
             xc = aa.xcorr(jsc[m], ref_sc[rm]) if n_ref >= min_src else None
-            if xc and xc.get("peak_ratio", 0) >= pr_floor and xc.get("npairs", 0) >= min_pairs:
+            npeak = int(xc.get("npeak", 0)) if xc else 0
+            if (xc and xc.get("peak_ratio", 0) >= pr_floor
+                    and xc.get("npairs", 0) >= min_pairs and npeak >= min_peak_pairs):
                 cells.append(dict(i=i, j=j, ra=cra, dec=cdec, dra=float(xc["dra"]),
                                   dde=float(xc["ddec"]), off=float(xc["off"]),
                                   peak_ratio=float(xc["peak_ratio"]), n=n, n_ref=n_ref,
-                                  npairs=int(xc["npairs"])))
+                                  npairs=int(xc["npairs"]), npeak=npeak))
             else:
-                # record WHY it dropped: no reference stars to correlate against, vs a real no-peak.
-                dropped.append(dict(i=i, j=j, ra=cra, dec=cdec, n=n, n_ref=n_ref,
-                                    reason=("too few reference stars" if n_ref < min_src
-                                            else "no clear peak")))
+                # record WHY it dropped: no reference stars to correlate against, a peak no star
+                # population supports, or a real no-peak.  Naming the pair floors separately keeps
+                # "the reference ran out" distinguishable from "the peak rests on five stars".
+                if n_ref < min_src:
+                    reason = "too few reference stars"
+                elif xc and xc.get("npairs", 0) < min_pairs:
+                    reason = "too few pairs in the search radius"
+                elif xc and npeak < min_peak_pairs:
+                    reason = "too few pairs supporting the peak"
+                else:
+                    reason = "no clear peak"
+                dropped.append(dict(i=i, j=j, ra=cra, dec=cdec, n=n, n_ref=n_ref, reason=reason))
     return cells, dropped
 
 
@@ -1390,6 +1419,11 @@ def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
     confident-peak gate (``aa.MIN_PEAK_RATIO``).  A handful of common stars measures a field
     offset; the fine grid adds the spatial information on top of it.
 
+    Only the STAR floor and the peak-ratio floor step down across the rungs: a coarser cell spans
+    more sky, so what it takes to call a cell occupied changes with the rung.  The PAIR floors do
+    not -- how many common stars it takes to believe a histogram peak is a property of the peak,
+    not of the grid -- so both are passed as the same explicit constants at every rung (issue #65).
+
     Returns (cells, dropped, grid_used).  ``grid_used`` is the ncell of the grid that produced the
     measurement (1 = whole-field fallback, carrying no per-cell spatial information), so the caller
     can set the coverage/consistency gates from it directly."""
@@ -1399,7 +1433,9 @@ def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
     attempts.append((1, 100, aa.MIN_PEAK_RATIO))     # whole-field offset, confident peak required
     last_dropped = []
     for nc, mpc, prf in attempts:
-        cells, dropped = _cell_grid(jsc, ref_sc, nc, mpc, prf)
+        cells, dropped = _cell_grid(jsc, ref_sc, nc, mpc, prf,
+                                    min_pairs=_CELL_MIN_PAIRS,
+                                    min_peak_pairs=_CELL_MIN_PEAK_PAIRS)
         last_dropped = dropped
         if cells:
             return cells, dropped, nc
