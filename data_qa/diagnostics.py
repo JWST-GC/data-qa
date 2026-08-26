@@ -205,6 +205,15 @@ def _field_roots(o: Observation):
     if os.path.isdir(split):
         roots.append(split)
     roots.append(f"{BASE}/{o.field}")
+    # The registry may name EITHER end of the split: `gc2211` (the base, where the
+    # mosaics and offsets stayed) or `gc2211_o023` (the split tree, where the frames
+    # went).  Resolving only forwards finds the frames from a base-named field and
+    # misses the mosaics from a split-named one, which is the same half-answer this
+    # helper exists to stop -- so the base field is a root too whenever the field is
+    # itself a split name.
+    base = f"{BASE}/{_base_field(o.field)}"
+    if base not in roots:
+        roots.append(base)
     return roots
 
 
