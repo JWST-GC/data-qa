@@ -641,7 +641,7 @@ def record_downloaded(state_path, key: str, when: str, state: Optional[dict] = N
 # (issue #71).  Matched by PREFIX against the run notice, and the memo below
 # keys on this coarse class: the LOW DISK text embeds the fluctuating free-TB
 # figure, so keying on the full message would re-notify on every 0.1 TB wiggle.
-DOWNGRADE_NOTICE_PREFIXES = ("LOW DISK", "CAPPED")
+DOWNGRADE_NOTICE_PREFIXES = ("LOW DISK", "CAPPED", "DOWNLOAD DEFERRED")
 
 # Top-level state-file key remembering which downgrade reason was last
 # announced with a NEW (notifying) comment.
@@ -1010,9 +1010,24 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
     The download tree is a STAGING copy for QA inspection -- the reduction
     downloads its own inputs (see DEFAULT_DOWNLOAD_DIR).  Release-gated
     (event_ready) and deduplicated via the state file's ``downloaded`` map
-    (burned only on a successful release-gated download)."""
+    (burned only on a successful release-gated download).
+
+    Returns ``{group key: SKIP reason}`` for the groups this run REACHED and
+    left owed -- low-disk, unknown-size, oversize (issue #84).  Those skips
+    burn no ``downloaded`` key, so the download is still owed, and main()
+    re-arms them (``_revert_deferred``) so the group re-fires next poll.
+    Without that, the end-of-run commit retires the group's events, nothing
+    records the debt, and no later run re-offers the download.
+
+    The skips NOT reported: no field mapping, planned/unreleased and
+    already-downloaded.  Each is a standing property of the group rather than
+    something this run did to it -- an unmapped program stays unmapped until
+    someone edits PROGRAMS, a planned tile re-fires on its own when the data
+    lands (a NEWLY_RELEASED / CALIB_LEVEL_UP event), and an
+    already-downloaded group is done."""
     from . import retrieve_data   # lazy: astroquery
     downloaded = (state or {}).get("downloaded", {})
+    owed: Dict[tuple, str] = {}
     for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
         if not evs[0]["field"]:
             # mirror act_trigger: an unmapped program has nowhere to reduce, so
@@ -1041,6 +1056,7 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
             if not ok:
                 print(f"--download: SKIPPED(low-disk) program {program} obs "
                       f"{obsnum}: {msg}", file=sys.stderr)
+                owed[(program, obsnum, instr)] = "low-disk"
                 continue
             headroom_tb = free_tb - min_free_tb
             try:
@@ -1058,6 +1074,7 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
                           f"obs {obsnum}: could not determine the projected "
                           "download size; rerun with --force-download-unknown-size "
                           "to download anyway", file=sys.stderr)
+                    owed[(program, obsnum, instr)] = "unknown-size"
                     continue
                 print(f"--download: WARNING program {program} obs {obsnum}: "
                       "unknown projected size; proceeding under "
@@ -1067,6 +1084,7 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
                       f"{obsnum}: projected {size / 1e12:.2f} TB exceeds the "
                       f"{headroom_tb:.2f} TB headroom ({free_tb:.1f} TB free - "
                       f"{min_free_tb:.1f} TB --min-free-tb floor)", file=sys.stderr)
+                owed[(program, obsnum, instr)] = "oversize"
                 continue
         print(f"--download: program {program} obs {obsnum} ({instrument}; "
               f"{len(evs)} event(s); dry_run={not execute})")
@@ -1078,6 +1096,7 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
             # burned only on a successful, release-gated download (mirrors the
             # 'triggered' map semantics)
             record_downloaded(state_path, dkey, mjd_to_iso(now_mjd()), state=state)
+    return owed
 
 
 def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=None):
@@ -1582,11 +1601,34 @@ def main(argv=None):
 
     if all_events:
         if args.download:
-            act_download(actionable, execute=args.execute,
-                         download_dir=args.download_dir,
-                         min_free_tb=args.min_free_tb,
-                         force_unknown_size=args.force_download_unknown_size,
-                         state=state, state_path=args.state)
+            owed = act_download(actionable, execute=args.execute,
+                                download_dir=args.download_dir,
+                                min_free_tb=args.min_free_tb,
+                                force_unknown_size=args.force_download_unknown_size,
+                                state=state, state_path=args.state) or {}
+            if owed:
+                # A group act_download REACHED and did not download (low-disk /
+                # unknown-size / oversize) burned no 'downloaded' key, so the
+                # download is still owed -- but its post-poll records are in
+                # `state`, and the end-of-run commit would retire the event that
+                # carries it.  Re-arm exactly as a capped-deferred group is
+                # re-armed: restore the pre-poll baseline so the group re-fires
+                # (and counts against --max-submit again) next poll (issue #84).
+                by_group = _group_by_obs(actionable)
+                _revert_deferred(state, old_obs_by_prog,
+                                 [ev for key in owed
+                                  for ev in by_group.get(key, [])])
+                reasons = ", ".join(f"{_group_label(k)} ({r})"
+                                    for k, r in sorted(owed.items(),
+                                                       key=lambda kv: str(kv[0])))
+                deferred_download = (
+                    f"DOWNLOAD DEFERRED — {len(owed)} group(s) reached but not "
+                    f"downloaded: {reasons}.  They keep their pre-poll "
+                    "baselines and re-fire next run; no 'downloaded' key was "
+                    "burned, so nothing was lost.")
+                notice = (f"{notice}  {deferred_download}" if notice
+                          else deferred_download)
+                print(f"--download: {deferred_download}", file=sys.stderr)
         if args.trigger:
             act_trigger(actionable, execute=args.execute, pipe_root=args.pipe_root,
                         state=state, state_path=args.state)
