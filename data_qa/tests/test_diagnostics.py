@@ -762,19 +762,60 @@ def test_mosaic_path_single_module_nrcb(tmp_path, monkeypatch):
     assert D._mosaic_module(D._mosaic_path(o, "F210M")) == ""
 
 
-def test_stage4_2x2_three_of_four_fails_without_spatial_check(monkeypatch):
-    # A 2x2 grid with 3 of 4 cells measured (grid_used=2, coverage 0.75 -- ABOVE the 0.5 floor) must
-    # FAIL, because <4 cells is not 'consistent'.  Coverage cannot catch this (0.75 >= 0.5), so the
-    # grid-keyed spatial gate is the only thing holding it -- reverting to an `n_cells >= 4` heuristic
-    # would flip it green (#13 re-review).
-    ij3 = [(0, 0), (0, 1), (1, 0)]                 # 3 of the 4 cells in a 2x2 grid
-    cells = [dict(i=i, j=j, ra=266.41 + 0.001 * i, dec=-28.89 + 0.001 * j, dra=5.0, dde=0.0,
-                  off=5.0, peak_ratio=8.0, n=400, n_ref=400, npairs=400) for i, j in ij3]
-    dropped = [dict(i=1, j=1, ra=266.41, dec=-28.89, n=400, n_ref=100, reason="too few reference stars")]
+def _three_of_four(dra_by_cell=None, n_by_cell=None):
+    """3 of the 4 cells of a 2x2 grid, plus the 1 dropped cell (coverage 0.75)."""
+    ij3 = [(0, 0), (0, 1), (1, 0)]
+    dra_by_cell = dra_by_cell or {}
+    n_by_cell = n_by_cell or {}
+    cells = [dict(i=i, j=j, ra=266.41 + 0.001 * i, dec=-28.89 + 0.001 * j,
+                  dra=dra_by_cell.get((i, j), 5.0), dde=0.0,
+                  off=abs(dra_by_cell.get((i, j), 5.0)), peak_ratio=8.0,
+                  n=n_by_cell.get((i, j), 400), n_ref=400, npairs=400) for i, j in ij3]
+    dropped = [dict(i=1, j=1, ra=266.41, dec=-28.89, n=400, n_ref=100,
+                    reason="too few reference stars")]
+    return cells, dropped
+
+
+def test_stage4_2x2_three_of_four_agreeing_passes_but_is_not_auto_ticked(monkeypatch):
+    # issue #66: a 2x2 grid with 3 of 4 cells measured (coverage 0.75, ABOVE the 0.5 floor) whose
+    # cells AGREE must not be failed for the thinness of its own grid.  It passes the magnitude and
+    # coverage gates, and `spatial_assessed` stays False so make_issues leaves 'frame_ok' unticked
+    # -- the same treatment the 1x1 whole-field fallback gets.  Restoring `len(cells) >= 4` inside
+    # `consistent` fails this.
+    cells, dropped = _three_of_four()
     _stage4_seams(monkeypatch, cells, dropped, grid_used=2)
     _png, m = D.stage4_offsets(_obs(), "F210M")
     assert m["grid_used"] == 2 and 0.5 <= m["cell_coverage"] < 1.0
-    assert m["spatial_assessed"] is True and m["passed"] is False
+    assert m["passed"] is True and m["spatial_assessed"] is False
+    assert m["cells_spatial_conclusive"] is False
+
+
+def test_stage4_three_of_four_with_adjacent_deviating_cells_still_fails(monkeypatch):
+    # ...and the adjacency test keeps its teeth on the same thin grid: two ORTHOGONALLY ADJACENT
+    # cells sitting 120 mas from the field value confirm each other, so the field FAILS on evidence
+    # rather than on cell count.  (0,0)-(0,1) are adjacent in j, and the third cell carries most of
+    # the sources, so the source-weighted consensus is the quiet one and the pair is the minority
+    # (13.8% of the sources -- above the 2% _CELL_BAD_FRAC).
+    cells, dropped = _three_of_four({(0, 0): 120.0, (0, 1): 120.0}, {(1, 0): 5000})
+    _stage4_seams(monkeypatch, cells, dropped, grid_used=2)
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    assert m["n_cells_confirmed"] >= 2 and m["cells_consistent"] is False
+    assert m["passed"] is False
+
+
+def test_stage4_verdict_is_monotonic_in_sampling(monkeypatch):
+    # issue #66, the inversion itself: the SAME clean field measured with a 1x1 whole-field cell and
+    # with a 2x2 grid that resolved 3 of 4 cells must not disagree.  Before the fix the better-sampled
+    # measurement scored WORSE (2x2 3-of-4 -> passed False; 1x1 -> passed True).
+    one = [dict(i=0, j=0, ra=266.41, dec=-28.89, dra=5.0, dde=0.0, off=5.0, peak_ratio=20.0,
+                n=1200, n_ref=1200, npairs=1200)]
+    _stage4_seams(monkeypatch, one, [], grid_used=1)
+    _png, m1 = D.stage4_offsets(_obs(), "F210M")
+    cells, dropped = _three_of_four()
+    _stage4_seams(monkeypatch, cells, dropped, grid_used=2)
+    _png, m2 = D.stage4_offsets(_obs(), "F210M")
+    assert m1["passed"] is True and m2["passed"] is True
+    assert m1["spatial_assessed"] is False and m2["spatial_assessed"] is False
 
 
 def test_stage4_caption_states_when_spatial_check_skipped():
