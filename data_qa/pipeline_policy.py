@@ -37,8 +37,11 @@ import subprocess
 import sys
 from typing import Dict, Optional, Tuple
 
-#: Same pipe-root convention as pipeline_trigger (the live reduction checkout).
-DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
+from . import paths
+
+#: Same pipe-root convention everywhere (data_qa.paths owns the path and the
+#: $PIPE_ROOT override; re-exported here so the historical name keeps working).
+DEFAULT_PIPE_ROOT = paths.DEFAULT_PIPE_ROOT
 
 #: The pipeline env's python -- the same default the pipeline's own submit
 #: scripts use (``PYTHON=${PYTHON:-...}`` in submit_reduction.sbatch).
@@ -104,7 +107,7 @@ def _warn_fallback(field, obs, reason):
           f"resubmits (data-qa#69).", file=sys.stderr)
 
 
-def probe_policy(field, obs, filters, pipe_root=DEFAULT_PIPE_ROOT,
+def probe_policy(field, obs, filters, pipe_root=None,
                  python=None, timeout=PROBE_TIMEOUT_S) -> Optional[dict]:
     """The pipeline's destreak policy for (field, obs, filters), or None.
 
@@ -117,6 +120,7 @@ def probe_policy(field, obs, filters, pipe_root=DEFAULT_PIPE_ROOT,
     caller degrades to today's hardcoded default.
     """
     python = python or pipeline_python()
+    pipe_root = pipe_root or paths.pipe_root()
     key = (str(field), str(obs), tuple(filters), pipe_root, python)
     if key in _CACHE:
         return _CACHE[key]
