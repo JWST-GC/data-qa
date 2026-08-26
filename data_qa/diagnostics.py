@@ -997,6 +997,55 @@ def stage2_cmd(o: Observation, sw, lw):
 
 
 # --------------------------------------------------------------------------- STAGE 3
+LOCUS_CLIP_KEEP_ITERATING = 30   # survivors below this: adopt the clip, stop iterating
+LOCUS_CLIP_MIN_FIT = 10          # survivors below this: refuse the clip, the fit loses its support
+
+
+def _clipped_locus_fit(x, y, k=3.0, maxiter=5):
+    """Sigma-clipped linear fit ``y = slope*x + zp`` to the stellar locus, and what the clip did.
+
+    The deep release catalogue matched to VIRAC carries a red/mismatch cloud above the locus
+    (Ks-bright, narrowband-faint stars), so the reported slope/scatter must describe the CLIPPED
+    locus -- the calibration -- rather than the astrophysical spread plus the cloud.
+
+    The clip is iterated to convergence, with the sample floor placed on CONTINUING rather than on
+    ADOPTING (JWST-GC/data-qa#97).  The floor used to break out of the loop before ``xf, yf`` were
+    reassigned, so a field sparse enough to hit it reported the slope, scatter and ``n_locus`` of
+    the UNCLIPPED match set -- and ``n_locus == n_matched``, which reads exactly like a locus so
+    clean that the first pass rejected nothing.  The upstream gate admits a field at 30 matches, so
+    any field between 30 and ~40 matches took that exit as soon as the clip rejected more than a
+    few stars (simulated 34 matches + a 4-star cloud: slope 1.064, 31 of 34 stars kept, against
+    slope 1.015 on the 27 the clip actually leaves).
+
+    So: adopt the clip, then stop iterating once the survivors fall under
+    ``LOCUS_CLIP_KEEP_ITERATING``; refuse a clip that would leave fewer than
+    ``LOCUS_CLIP_MIN_FIT`` stars (the fit would have no support) and report the unclipped set,
+    flagged as such.  Returns ``(slope, zp, scatter, n_locus, n_unclipped, clip_exit)`` where
+    ``clip_exit`` is one of ``converged`` (nothing left to reject -- the fit is the converged one),
+    ``floor`` (clipped fit adopted, iteration stopped on the sample floor), ``floor-unclipped``
+    (the clip was refused; slope/scatter/n_locus describe the UNCLIPPED set) or ``maxiter``."""
+    xf, yf = np.asarray(x, float), np.asarray(y, float)
+    n_unclipped = int(len(xf))
+    slope, zp = np.polyfit(xf, yf, 1)
+    clip_exit = "maxiter"
+    for _ in range(maxiter):
+        resid = yf - (slope * xf + zp)
+        loc = np.abs(resid) < k * aa.mad_std(resid)
+        if loc.all():
+            clip_exit = "converged"
+            break
+        if int(loc.sum()) < LOCUS_CLIP_MIN_FIT:
+            clip_exit = "floor-unclipped"       # reported numbers describe the UNCLIPPED set
+            break
+        xf, yf = xf[loc], yf[loc]
+        slope, zp = np.polyfit(xf, yf, 1)
+        if int(len(xf)) < LOCUS_CLIP_KEEP_ITERATING:
+            clip_exit = "floor"                 # clipped fit adopted; too few left to clip again
+            break
+    scat = float(aa.mad_std(yf - (slope * xf + zp)))
+    return float(slope), float(zp), scat, int(len(xf)), n_unclipped, clip_exit
+
+
 def stage3_calibration(o: Observation, sw):
     """JWST (SW ~ F212N) catalogue mag vs VIRAC Ks for matched stars.  The cyan 1:1 line is the
     ideal unit-slope relation (not a fit); the measured free slope and the scatter about the
@@ -1043,31 +1092,8 @@ def stage3_calibration(o: Observation, sw):
     x = ref_mag[keep]; y = jmag[idx[keep]]
     g = np.isfinite(x) & np.isfinite(y)
     x, y = x[g], y[g]
-    # robust linear fit y = slope*x + zp, sigma-clipped to the locus.  The deep release catalog
-    # matched to VIRAC has a red/mismatch cloud above the locus (Ks-bright, F212N-faint stars);
-    # one clip pass measures the CALIBRATION scatter (is the zeropoint sane) rather than the
-    # astrophysical colour spread.
-    # Iterate the 3-sigma locus clip to CONVERGENCE: stopping after one step at k=3 leaves the
-    # reported slope/scatter dependent on where the iteration happened to halt.
-    #
-    # NOTE the loop has TWO exits, and the second one changes what gets reported.  ``loc.all()``
-    # is convergence.  ``loc.sum() < 30`` is a floor on the surviving sample, and it breaks BEFORE
-    # ``xf, yf`` are reassigned, so a field sparse enough to hit it reports the slope, scatter and
-    # n_locus of the UNCLIPPED set.  The upstream gate admits a field at 30 matches, so a ~34-star
-    # locus carrying a red mismatch cloud takes that exit on the first pass and reports
-    # n_locus == n_matched -- which is indistinguishable from a locus so clean the clip rejected
-    # nothing.  See JWST-GC/data-qa#97.
-    xf, yf = x, y
-    slope, zp = np.polyfit(xf, yf, 1)
-    for _ in range(5):
-        resid = yf - (slope * xf + zp)
-        loc = np.abs(resid) < 3 * aa.mad_std(resid)
-        if loc.all() or loc.sum() < 30:
-            break
-        xf, yf = xf[loc], yf[loc]
-        slope, zp = np.polyfit(xf, yf, 1)
-    scat = float(aa.mad_std(yf - (slope * xf + zp)))
-    n_locus = int(len(xf))
+    # robust sigma-clipped linear fit to the stellar locus (see _clipped_locus_fit)
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = _clipped_locus_fit(x, y)
     hb = a.hexbin(x, y, gridsize=80, bins="log", cmap="magma", mincnt=1)
     fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
     # Draw ONLY the ideal UNIT-SLOPE (1:1) reference line -- the relation a well-calibrated
@@ -1083,11 +1109,15 @@ def stage3_calibration(o: Observation, sw):
     a.plot(xs, xs + zp1, "c-", lw=1.4, label="1:1 line")
     a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
     a.legend(fontsize=8, loc="upper left")
-    a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus})  "
+    # Say which exit the clip took: n_locus == n_matched reads the same whether the clip converged
+    # with nothing to reject or was refused for want of survivors, and those are different numbers.
+    locus_note = " unclipped" if clip_exit == "floor-unclipped" else ""
+    a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus}{locus_note})  "
                 f"slope={slope:.2f}  scatter={scat:.2f}  locus zp={zp1:.2f}", fontsize=9)
     # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen
     # only the SCATTER for the real narrow-vs-broad (F212N vs Ks) colour/extinction spread.
-    metrics.update(n_matched=int(g.sum()), n_locus=n_locus, slope=float(slope),
+    metrics.update(n_matched=int(g.sum()), n_locus=n_locus, n_locus_unclipped=n_unclipped,
+                   clip_exit=clip_exit, slope=float(slope),
                    zeropoint=float(zp), scatter=scat,
                    passed=(0.8 < slope < 1.2 and scat < 0.8))
     return _save(fig, f"{o.obsid}_stage3.png"), metrics

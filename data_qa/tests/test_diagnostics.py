@@ -2630,3 +2630,67 @@ def test_stage6_figure_excluding_draws_no_rms_jwst(tmp_path, monkeypatch):
     calls.clear()
     D._stage6_figure(o, "F212N", None)                             # normal: rms(jwst) consulted
     assert calls == ["F212N"]
+
+
+# --------------------------------------------------------------------------- _clipped_locus_fit
+def _sparse_locus_with_cloud():
+    """34 matches on a unit-slope locus, 4 of them displaced into a red mismatch cloud.
+
+    The upstream stage-3 gate admits a field at 30 matches, so a locus this sparse is where the
+    sample floor decides what gets reported (issue #97).
+    """
+    rng = np.random.default_rng(97)
+    x = np.linspace(12.0, 18.0, 34)
+    y = x + rng.normal(0.0, 0.10, x.size)         # clean locus, slope 1
+    y[-4:] += 2.0                                 # the red/mismatch cloud
+    return x, y
+
+
+def _old_clip_loop(x, y):
+    """The pre-#97 loop: the sample floor breaks BEFORE the clip is adopted."""
+    import astropy.stats as ast
+    xf, yf = x, y
+    slope, zp = np.polyfit(xf, yf, 1)
+    for _ in range(5):
+        resid = yf - (slope * xf + zp)
+        loc = np.abs(resid) < 3 * ast.mad_std(resid)
+        if loc.all() or loc.sum() < 30:
+            break
+        xf, yf = xf[loc], yf[loc]
+        slope, zp = np.polyfit(xf, yf, 1)
+    return float(slope), float(ast.mad_std(yf - (slope * xf + zp))), int(len(xf))
+
+
+def test_clipped_locus_fit_adopts_the_clip_at_the_sample_floor():
+    """A sparse locus carrying a mismatch cloud must report the CLIPPED fit.
+
+    The old loop broke on ``loc.sum() < 30`` before reassigning xf/yf, so it reported the slope,
+    scatter and n_locus of the set the clip had NOT been applied to.
+    """
+    x, y = _sparse_locus_with_cloud()
+    old_slope, _old_scat, old_n = _old_clip_loop(x, y)
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = D._clipped_locus_fit(x, y)
+    assert n_unclipped == 34
+    assert clip_exit == "floor"                   # stopped on the floor WITH the clip in hand
+    assert n_locus < old_n                        # 27 clipped stars, against 31 reported before
+    assert abs(slope - 1.0) < abs(old_slope - 1.0)    # 1.015 against 1.064
+    assert scat < 0.10
+
+
+def test_clipped_locus_fit_reports_convergence_separately_from_the_floor():
+    """A clean locus converges; the two exits must be distinguishable in the metrics."""
+    rng = np.random.default_rng(3)
+    x = np.linspace(12.0, 18.0, 400)
+    y = x + rng.normal(0.0, 0.05, x.size)
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = D._clipped_locus_fit(x, y)
+    assert clip_exit in ("converged", "maxiter")
+    assert abs(slope - 1.0) < 0.02
+
+
+def test_clipped_locus_fit_refuses_a_clip_that_strips_its_own_support(monkeypatch):
+    """A clip that would leave too few stars to fit is refused, and SAID to be refused."""
+    monkeypatch.setattr(D, "LOCUS_CLIP_MIN_FIT", 33)     # the first pass leaves 31
+    x, y = _sparse_locus_with_cloud()
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = D._clipped_locus_fit(x, y)
+    assert clip_exit == "floor-unclipped"
+    assert n_locus == n_unclipped == 34                  # nothing was thrown away

@@ -306,12 +306,14 @@ lies along it.
 
 `stage3_calibration` anchors on VIRAC (nearest JWST source within 0.1″), then makes a robust
 linear fit with **up to 5 sigma-clip iterations** (3σ) to measure the slope and the scatter about
-the locus. The loop stops on either of two conditions: the clip is stable (nothing more to
-reject), **or** the next clip would leave fewer than 30 stars. The second exit returns before the
-clipped set is adopted, so on a sparse field the reported `slope`, `scatter` and `n_locus` are
-those of the **unclipped** match set — `n_locus == n_matched` is the signature, and it reads the
-same as a locus so clean the first pass rejected nothing. The fitted slope is reported in the title and
-left undrawn: a free-slope line wanders with the red mismatch cloud and reads as a bad fit. `slope`, `scatter` (mag about the locus), `zeropoint`, `n_matched`, `n_locus`. Consider
+the locus. Each pass adopts the clip and refits; the 30-star sample floor stops the **next**
+iteration rather than the current adoption, so a sparse field still reports a clipped fit. A clip
+that would leave fewer than 10 stars is refused outright — the fit would have no support — and the
+unclipped set is reported and labelled `unclipped` in the title. `clip_exit` records which exit was
+taken (`converged`, `floor`, `floor-unclipped`, `maxiter`) and `n_locus_unclipped` the pre-clip
+count, so `n_locus == n_matched` no longer reads the same for a clean locus and a refused clip.
+The fitted slope is reported in the title and
+left undrawn: a free-slope line wanders with the red mismatch cloud and reads as a bad fit. `slope`, `scatter` (mag about the locus), `zeropoint`, `n_matched`, `n_locus`, `n_locus_unclipped`, `clip_exit`. Consider
 it passing if the slope is 0.8–1.2 and the scatter < 0.8 mag.
 
 Source: [`data_qa/diagnostics.py` → `stage3_calibration`](../data_qa/diagnostics.py).
