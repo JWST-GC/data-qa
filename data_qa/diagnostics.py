@@ -2833,30 +2833,39 @@ def _jwst1pass_psfperts(o: Observation, filt):
     return out
 
 
-def _draw_psfperts_row(a, path, det, filt, vlim=_PSFPERTS_VLIM):
-    """Draw one detector's perturbation-PSF residual image (``LOG.psfperts.fits``) into axis ``a`` as
-    a full-width panel, on the diverging +/-0.1 scale jwst1pass clips to.  Returns (mappable, rms) --
-    rms over the UNCLIPPED interior (|v| < 0.0999), since the montage's frame lines and unused cells
-    sit at +/-0.1 and would otherwise dominate.  (None, None) if the file cannot be read."""
-    import matplotlib.pyplot as plt
+def _psfperts_interior(path, filt, det):
+    """Read a ``LOG.psfperts.fits`` montage, crop to its content bounding box, and return
+    ``(cropped_image, content_mask)`` -- content = the actual per-exposure residual pixels
+    (|v| < 0.0999), excluding the +/-0.1 frame lines and unused cells jwst1pass pads the montage
+    with.  ``(None, None)`` if the file cannot be read."""
     from astropy.io import fits
     try:
         img = np.asarray(fits.getdata(_used(path, f"{filt} {det} psfperts")), float)
     except (OSError, ValueError, KeyError):
-        a.axis("off"); return None, None
+        return None, None
     content = np.abs(img) < _PSFPERTS_CLIP
-    # crop to the content bounding box (drops pure-margin rows/cols) ...
     rows = np.where(content.any(1))[0]; cols = np.where(content.any(0))[0]
     if rows.size and cols.size:
         sl = (slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1))
         img = img[sl]; content = content[sl]
+    return img, content
+
+
+def _draw_psfperts_row(a, path, det, filt, vlim):
+    """Draw one detector's per-exposure ePSF-minus-reference residuals (``LOG.psfperts.fits``) into
+    axis ``a`` as a full-width panel.  The colour scale is ``+/-vlim`` set to the RESIDUAL amplitude
+    (a few x1e-3), NOT the +/-0.1 the montage pads with -- otherwise the residuals wash out to
+    white.  The frame lines + unused cells are masked to grey.  Returns (mappable, interior rms)."""
+    import matplotlib.pyplot as plt
+    img, content = _psfperts_interior(path, filt, det)
+    if img is None:
+        a.axis("off"); return None, None
     rms = float(np.sqrt(np.nanmean(img[content] ** 2))) if content.any() else float("nan")
-    # ... and blank the +/-0.1 fill + frame lines to white, so the panel shows only the actual
-    # perturbation stamps rather than a large dark fill block (the fill is Jay's unused montage cells).
-    disp = np.where(content, img, np.nan)
-    cmap = plt.get_cmap("RdBu_r").copy(); cmap.set_bad("white")
+    disp = np.where(content, img, np.nan)                    # frame/fill -> masked (grey), not 0
+    cmap = plt.get_cmap("RdBu_r").copy(); cmap.set_bad("0.80")
     im = a.imshow(disp, origin="lower", cmap=cmap, vmin=-vlim, vmax=vlim, aspect="auto")
-    a.set_title(f"perturbation-PSF residual — {det}   interior rms = {rms:.3f}", fontsize=8.5)
+    a.set_title(f"per-exposure ePSF − reference residual — {det}   interior rms = {rms:.4f}",
+                fontsize=8.5)
     a.set_xticks([]); a.set_yticks([])
     return im, rms
 
@@ -2948,15 +2957,25 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
     # bright-star residuals + added to the library STDPSF; a strong/structured one flags a PSF-model
     # mismatch for that chip).
     if pp:
+        # shared colour scale = the 99th percentile of |residual| across all detectors (a few x1e-3),
+        # so the per-exposure structure has real contrast and every chip is on the same scale; the
+        # +/-0.1 the montage pads with would wash everything to white.
+        p99 = []
+        for _, path in pp:
+            img, content = _psfperts_interior(path, filt, "")
+            if img is not None and content.any():
+                p99.append(float(np.percentile(np.abs(img[content]), 99)))
+        vlim = float(np.clip(max(p99) if p99 else 0.006, 0.002, 0.03))
         rms_by_det = {}
         for k, (det, path) in enumerate(pp):
             a = fig.add_subplot(gs[2 + k, :])
-            im, rms = _draw_psfperts_row(a, path, det, filt)
+            im, rms = _draw_psfperts_row(a, path, det, filt, vlim)
             if im is not None:
-                fig.colorbar(im, ax=a, fraction=0.012, pad=0.01, label="frac. flux")
+                fig.colorbar(im, ax=a, fraction=0.012, pad=0.01, label="ePSF − ref (frac. flux)")
                 rms_by_det[det] = rms
         metrics["psfperts_dets"] = [det for det, _ in pp]
         metrics["psfperts_rms"] = rms_by_det
+        metrics["psfperts_vlim"] = vlim
     fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency ({filt}, "
                  f"n={metrics['n_stars']}, {metrics['n_exposures']} exp)", fontsize=11, y=0.995)
     metrics["passed"] = True
@@ -5230,10 +5249,14 @@ def _caption_for_impl(n, metrics):
                      f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation onset). ")
         dets = metrics.get("psfperts_dets") or []
         if dets:
+            vl = metrics.get("psfperts_vlim")
+            scale = f" on a ±{vl:.3f} diverging scale" if vl else ""
             base += (f"\n\nBelow, one full-width row per detector ({', '.join(dets)}) shows that "
-                     f"chip's **perturbation-PSF residual** (`LOG.psfperts.fits`): the correction "
-                     f"jwst1pass fit from the bright-star fit residuals and added to the library "
-                     f"STDPSF, on a ±0.1 fractional-flux scale, titled with its interior rms. ")
+                     f"chip's **per-exposure ePSF − reference residual** (`LOG.psfperts.fits`): the "
+                     f"correction jwst1pass fit from the bright-star fit residuals, per exposure, "
+                     f"added to the library STDPSF. Colour is fractional flux{scale} (set to the "
+                     f"residual amplitude for contrast; frame/unused cells greyed), each row titled "
+                     f"with its interior rms. ")
         return base + "([how this is made](DOCROOT#stage10))"
     if n == 11:
         # Built in code so the streak-flag sentence is only stated when an exposure is actually

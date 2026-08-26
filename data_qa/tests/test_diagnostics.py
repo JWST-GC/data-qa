@@ -2359,7 +2359,7 @@ def test_jwst1pass_psfperts_locator_and_figure(tmp_path, monkeypatch):
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     _, a = plt.subplots()
-    im, rms = D._draw_psfperts_row(a, pp[0][1], pp[0][0], "F182M")
+    im, rms = D._draw_psfperts_row(a, pp[0][1], pp[0][0], "F182M", vlim=0.02)
     assert im is not None and abs(rms - 0.01) < 1e-3
 
 
