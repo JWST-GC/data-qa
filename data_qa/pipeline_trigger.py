@@ -418,17 +418,59 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_RO
     ]
 
 
-_PARSABLE_JOBID_RE = re.compile(r"(?m)^\s*(\d+)(?:;[\w.-]+)?\s*$")
+#: `sbatch --parsable` prints exactly ONE line, "<jobid>[;cluster]".
+_PARSABLE_JOBID_RE = re.compile(r"^\s*(\d+)(?:;[\w.-]+)?\s*$")
 _SUBMITTED_JOBID_RE = re.compile(r"Submitted batch job (\d+)")
 
+#: step names whose submitter is invoked with ``--parsable`` (see
+#: reduction_step); their job id is read POSITIONALLY from their own stdout.
+PARSABLE_STEPS = ("reduction",)
 
-def parse_jobids(text) -> List[str]:
-    """Every SLURM job id in captured submitter stdout: bare ``--parsable``
-    lines (``<jobid>[;cluster]``, the reduction sbatch) plus ``Submitted batch
-    job <id>`` lines (the cataloging chain's sbatch calls), deduped in
-    first-seen order."""
-    ids = [m.group(1) for m in _PARSABLE_JOBID_RE.finditer(text or "")]
-    ids += _SUBMITTED_JOBID_RE.findall(text or "")
+
+def parsable_jobid(text) -> Optional[str]:
+    """The job id of a ``sbatch --parsable`` capture: the FIRST non-empty line,
+    and only when that whole line is ``<jobid>[;cluster]``.  ``None`` when the
+    capture has another shape -- which is a submitter that did not submit, not
+    a job id to be guessed at."""
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        m = _PARSABLE_JOBID_RE.match(line)
+        return m.group(1) if m else None
+    return None
+
+
+def parse_jobids(results) -> List[str]:
+    """SLURM job ids from captured submitter stdout, deduped in first-seen order.
+
+    ``results`` is run_plan's ``{step name: stdout}`` mapping, and each step is
+    read for what that step actually prints:
+
+      * a ``--parsable`` step (``PARSABLE_STEPS``, the reduction sbatch) gives
+        its job id POSITIONALLY, from the first line of its OWN stdout;
+      * any step gives the ids on its ``Submitted batch job <id>`` lines (the
+        cataloging chain's sbatch calls).
+
+    A bare-numeric line ANYWHERE else is not a job id (issue #87).  Regexing
+    bare-numeric lines over the whole capture used to record a year or a count
+    printed by the cataloging chain -- ``parse_jobids("...\\n2026\\n7\\n")`` ->
+    ``['2026', '7']`` -- into the ``triggered`` record's ``jobids``, where the
+    planned sacct outcome probe (issue #68c) would query it and read "no such
+    job" as an outcome for a submission that ran fine.
+
+    A bare string is still accepted and read as one unnamed, non-parsable step
+    (``Submitted batch job`` lines only).
+    """
+    if results is None:
+        return []
+    steps = {"": results} if isinstance(results, str) else dict(results)
+    ids: List[str] = []
+    for name, text in steps.items():
+        if name in PARSABLE_STEPS:
+            jobid = parsable_jobid(text)
+            if jobid:
+                ids.append(jobid)
+        ids += _SUBMITTED_JOBID_RE.findall(text or "")
     return list(dict.fromkeys(ids))
 
 
@@ -460,9 +502,16 @@ def run_plan(plan: List[dict]) -> Dict[str, str]:
             raise RuntimeError(f"{step['name']} failed (rc={proc.returncode}); "
                                "aborting the remaining steps")
         results[step["name"]] = proc.stdout.strip()
-        if step["name"] == "reduction":
-            # `sbatch --parsable` prints just "<jobid>[;cluster]"
-            reduction_jobid = proc.stdout.strip().split(";")[0]
+        if step["name"] in PARSABLE_STEPS:
+            # `sbatch --parsable` prints just "<jobid>[;cluster]"; anything else
+            # is not a job id, and threading it into DEP would build
+            # `--dependency=afterok:<garbage>` (issue #87)
+            reduction_jobid = parsable_jobid(proc.stdout)
+            if not reduction_jobid:
+                raise RuntimeError(
+                    f"{step['name']} exited 0 but its --parsable stdout is not "
+                    f"a job id ({proc.stdout.strip()!r}); refusing to thread it "
+                    "into the cataloging DEP")
             print(f"[reduction] job id {reduction_jobid} -> DEP for cataloging")
     return results
 
@@ -491,7 +540,7 @@ def submit(program, obs, field=None, filters=None, pipe_root=None, execute=False
         if missing:
             print(f"# WARNING: missing under {pipe_root}: {missing} "
                   "(--execute would refuse)", file=sys.stderr)
-    jobids = parse_jobids("\n".join(results.values()))
+    jobids = parse_jobids(results)
     return dict(plan=plan, results=results, jobids=jobids)
 
 
