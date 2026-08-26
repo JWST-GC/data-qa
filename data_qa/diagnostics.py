@@ -2268,9 +2268,20 @@ def _ab_overlap(a_sc, b_sc):
 
     ``off`` is the bulk A->B shift.  It is measured in two steps: the ``aa.xcorr`` histogram PEAK
     detects it (a search_around_sky median would fabricate pairs at this density), and the SAME
-    STARS the peak then pairs one-to-one refine it -- ``off`` is the peak PLUS the median residual
-    of those pairs.  ``peak_off`` reports what the histogram alone said, so the difference between
-    the two is visible per field.
+    STARS the peak then pairs one-to-one refine it.  Written out with the residual's sense
+    explicit, so the verb does not depend on a convention the reader supplies:
+
+        a_aligned = a + peak
+        off       = peak - median(a_aligned - b_matched)
+
+    ``aa.xcorr(a, b)`` returns ``median(b - a)``, the shift that MOVES A ONTO B, so A is aligned by
+    ADDING the peak and a peak too large by ``d`` leaves ``+d`` in ``a_aligned - b_matched``.  The
+    refinement therefore SUBTRACTS that median; adding it would double the peak's error instead of
+    removing it.  (Measured: inject a peak biased +6.0/-4.0 mas off a truth of 12.0/-7.0 and the
+    median residual comes back exactly +6.0/-4.0, ``peak - median`` lands on truth and
+    ``peak + median`` at twice the error.  Both the value and the residual's sign are pinned by
+    ``test_ab_overlap_refines_a_biased_histogram_peak_onto_the_same_stars``.)  ``peak_off`` reports
+    what the histogram alone said, so the size of the correction is visible per field.
 
     The refinement is the same correction stage 4 applies (``aa.same_star_tie``), for the same
     reason (JWST-GC/data-qa#95): two catalogues tracing one clustered field make a correlated,

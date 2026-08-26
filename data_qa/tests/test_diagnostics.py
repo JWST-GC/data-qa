@@ -2871,6 +2871,12 @@ def test_ab_overlap_refines_a_biased_histogram_peak_onto_the_same_stars(monkeypa
     # sign check: ADDING the residual median instead of subtracting doubles the error
     wrong = np.hypot(true_dra + 2 * bias_dra, true_ddec + 2 * bias_ddec)
     assert abs(ov["off"] - wrong) > 5.0
+    # ...and pin the residual's SENSE, which is what makes the verb "subtract" rather than "add":
+    # a_aligned = a + peak, so a peak too large by d leaves +d (not -d) in a_aligned - b_matched.
+    # The docstring and docs/qa_methods.md state the formula in these terms; an alignment direction
+    # flipped without updating them would keep `off` right by luck here and fail this.
+    assert abs(ov["same_star_dra"] - bias_dra) < 0.5
+    assert abs(ov["same_star_ddec"] - bias_ddec) < 0.5
 
 
 def test_ab_overlap_keeps_the_raw_peak_when_too_few_pairs_to_refine(monkeypatch):
