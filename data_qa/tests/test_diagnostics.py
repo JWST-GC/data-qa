@@ -19,6 +19,24 @@ def _obs(field="gc2211", obs="023", filt="F200W"):
                        instrument="NIRCam", filters=[filt], visits=[], epoch="", notes="")
 
 
+def test_base_field_and_viraccache_fallback(tmp_path, monkeypatch):
+    # a per-obs split field falls back to its base field's VIRAC Ks refcache (issue #119)
+    assert D._base_field("gc2211_o023") == "gc2211"
+    assert D._base_field("gc2211") == "gc2211"          # no suffix -> unchanged
+    assert D._base_field("cloudef_controlfield") == "cloudef_controlfield"  # not an _o<obs> split
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    o = _obs(field="gc2211_o023")
+    assert D._viraccache_path(o) is None                # nothing on disk
+    # cache only under the BASE field -> the per-obs split field still finds it
+    base = tmp_path / "gc2211" / "astrometry_diag" / "refcache"; base.mkdir(parents=True)
+    (base / "virac2.fits").write_text("x")
+    assert D._viraccache_path(o) == str(base / "virac2.fits")
+    # a per-obs cache, when present, is preferred over the base one
+    own = tmp_path / "gc2211_o023" / "astrometry_diag" / "refcache"; own.mkdir(parents=True)
+    (own / "virac2.fits").write_text("x")
+    assert D._viraccache_path(o) == str(own / "virac2.fits")
+
+
 # --------------------------------------------------------------------------- _binned_stat
 def test_binned_stat_basic():
     x = np.repeat(np.arange(10.0), 20)          # 10 bins, 20 pts each

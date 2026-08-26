@@ -638,11 +638,27 @@ def _obs_epoch(o: Observation, mosaic_path):
     return None
 
 
+_FIELD_OBS_SUFFIX = re.compile(r"_o\d+$")
+
+
+def _base_field(field):
+    """The region field for a per-observation split key: ``gc2211_o023`` -> ``gc2211``.  When the
+    pipeline splits a region into per-obs reduction fields (pipeline #469), shared obs-independent
+    reference products stay under the base field; returns ``field`` unchanged when there is no
+    ``_o<obs>`` suffix."""
+    return _FIELD_OBS_SUFFIX.sub("", field)
+
+
 def _viraccache_path(o: Observation):
     """Raw VIRAC2 cache (has a real Ksmag column) for the photometric-calibration check.
-    The gaia_virac2 refcat carries only a blended 'refmag', unusable for a Ks zeropoint."""
-    p = f"{BASE}/{o.field}/astrometry_diag/refcache/virac2.fits"
-    return p if os.path.exists(p) else None
+    The gaia_virac2 refcat carries only a blended 'refmag', unusable for a Ks zeropoint.  VIRAC Ks
+    is a dense, obs-independent reference, so a per-obs split field (gc2211_o023) may fall back to
+    its base field's cache (gc2211) -- unlike the position refcat, whose footprint IS obs-specific."""
+    for fld in dict.fromkeys([o.field, _base_field(o.field)]):
+        p = f"{BASE}/{fld}/astrometry_diag/refcache/virac2.fits"
+        if os.path.exists(p):
+            return p
+    return None
 
 
 _DAO_OBS_RE = re.compile(r"_o(\d{3})_")     # per-exposure token is underscore-bounded: _o023_visit

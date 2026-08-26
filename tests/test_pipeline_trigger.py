@@ -479,7 +479,7 @@ def test_deblend_satstars_set_for_gc_fields():
     """The pipeline README marks DEBLEND_SATSTARS=1 required for crowded GC
     fields; every treasury tile is inner-CMZ."""
     for field, program, obsnum in (("gc-treasury", 10678, "001"),
-                                   ("gc2211", 2211, "023"),
+                                   ("gc2211_o023", 2211, "023"),   # per-obs split field (#119)
                                    ("arches", 2045, "001")):
         step = pt.cataloging_step(program, obsnum, field, ["F212N"],
                                   pipe_root="/pipe")

@@ -54,8 +54,11 @@ def test_gc_fields_membership():
     """DEBLEND_SATSTARS keys off GC_FIELDS: every inner-GC/CMZ field is in, and
     the 1182 brick+w51 split must never sweep w51 (or any other non-GC field)
     into the set."""
-    assert {"gc-treasury", "brick", "cloudc", "gc2211", "sgrc", "sgrb2",
+    # gc2211 is split into one field per observation (pipeline #469, issue #119)
+    assert {"gc-treasury", "brick", "cloudc", "sgrc", "sgrb2",
             "arches", "quintuplet", "sickle", "cloudef", "sgra"} <= mm.GC_FIELDS
+    assert {"gc2211_o023", "gc2211_o028", "gc2211_o046",
+            "gc2211_o049", "gc2211_o050"} <= mm.GC_FIELDS
     assert not {"w51", "wd1", "wd2", "ngc6334"} & mm.GC_FIELDS
     # every GC field is a field the monitor can actually map to
     mappable = {f for obsmap in mm.PROGRAMS.values() for f in obsmap.values()}
@@ -1902,13 +1905,12 @@ def _assert_monitor_covers(mapping):
             for obsnum in str(obsid).split("-"):
                 assert obsnum in mm.PROGRAMS[prog], (prog, obsid, obsnum)
                 qa_field = mm.PROGRAMS[prog][obsnum]
-                # The pipeline may register an observation under a PER-OBS reduction key
-                # (``gc2211_o023``) while data-qa keeps one QA field for the region (``gc2211``,
-                # whose release mosaics live under gc2211/; gc2211_o023/ is only reduction
-                # intermediates).  Accept the base QA field for a ``<field>_o<obs>`` reduction key.
-                # A semantic rename such as o005 -> cloudef_controlfield is NOT this pattern and
-                # still requires the explicit mapping.
-                assert field in (qa_field, f"{qa_field}_o{obsnum}"), (prog, obsnum, field)
+                # EXACT match: PROGRAMS must name the same field the pipeline registers.  Where the
+                # pipeline split a region into per-obs reduction fields (gc2211 -> gc2211_o023 ...,
+                # pipeline #469), PROGRAMS now carries those per-obs keys too (issue #119), so no
+                # base-field relaxation is needed -- and re-tightening restores the drift guard the
+                # relaxation had been masking.
+                assert field == qa_field, (prog, obsnum, field)
 
 
 def test_pipeline_checkout_present_when_required():
