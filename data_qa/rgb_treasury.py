@@ -66,7 +66,11 @@ import sys
 
 import numpy as np
 
-DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
+from . import paths
+
+#: data_qa.paths owns the path and the $PIPE_ROOT override; the name is
+#: re-exported so this module's CLI help and callers keep working.
+DEFAULT_PIPE_ROOT = paths.DEFAULT_PIPE_ROOT
 LONG_BANDS = ("F480M", "F405N")
 WCS_PASS_ARCSEC = 0.1
 PERCENTILES = (1.0, 99.5)   # same limits the cmz.hips global stretch uses
@@ -92,7 +96,7 @@ def _import_hips(pipe_root=None):
         return hips
     except ImportError:
         pass
-    root = pipe_root or DEFAULT_PIPE_ROOT
+    root = pipe_root or paths.pipe_root()
     if root and os.path.isdir(root) and root not in sys.path:
         sys.path.insert(0, root)
         try:
@@ -564,7 +568,7 @@ def build_parser():
                         "reference catalog can be found)")
     p.add_argument("--percentiles", nargs=2, type=float, default=list(PERCENTILES),
                    metavar=("LO", "HI"), help="global stretch percentiles")
-    p.add_argument("--pipe-root", default=DEFAULT_PIPE_ROOT,
+    p.add_argument("--pipe-root", default=None,
                    help="jwst-gc-pipeline checkout for the cmz.hips import "
                         "fallback")
     p.add_argument("--dry-run", action="store_true",

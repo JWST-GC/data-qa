@@ -7,6 +7,7 @@ import os
 import pytest
 
 from data_qa import mast_monitor as mm
+from data_qa import paths
 from data_qa.observations import FIELDS
 
 POLL = 60000.0   # fake "now" MJD
@@ -1689,9 +1690,10 @@ def test_act_download_dual_instrument_separate_keys(monkeypatch, tmp_path):
 #
 # PIPE_ROOT names the checkout; the tests workflow points it at the
 # keflavich/jwst-gc-pipeline checkout it makes, so the guard runs in CI instead
-# of skipping (the green-by-skip half of #74).
-DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
-_PIPE_ROOT = os.environ.get("PIPE_ROOT", DEFAULT_PIPE_ROOT)
+# of skipping (the green-by-skip half of #74).  data_qa.paths reads that
+# variable for the whole package now (issue #85), so this guard and the code
+# under test resolve the same checkout.
+_PIPE_ROOT = paths.pipe_root()
 _PIPE_FIELDS_PY = os.path.join(_PIPE_ROOT, "jwst_gc_pipeline", "fields.py")
 # CI sets this after checking the pipeline out: a checkout step that silently
 # produced nothing then fails the suite.  A skip would hide it.

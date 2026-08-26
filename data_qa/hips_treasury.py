@@ -55,7 +55,11 @@ import json
 import os
 import sys
 
-DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
+from . import paths
+
+#: data_qa.paths owns the path and the $PIPE_ROOT override; the name is
+#: re-exported so this module's CLI help and callers keep working.
+DEFAULT_PIPE_ROOT = paths.DEFAULT_PIPE_ROOT
 VERBS = ("plan", "build", "color", "sbatch")
 BLUE_BAND = "F212N"
 LONG_DIR = "LONG"
@@ -71,7 +75,7 @@ def _import_hips(pipe_root=None):
         return hips
     except ImportError:
         pass
-    root = pipe_root or DEFAULT_PIPE_ROOT
+    root = pipe_root or paths.pipe_root()
     if root and os.path.isdir(root) and root not in sys.path:
         sys.path.insert(0, root)
     from jwst_gc_pipeline.cmz import hips   # raises ImportError with context
@@ -204,7 +208,7 @@ def build_parser():
     p.add_argument("--spec", required=True, help="JSON spec (see docstring)")
     p.add_argument("--field", help="field name (build/sbatch)")
     p.add_argument("--threads", type=int, default=8)
-    p.add_argument("--pipe-root", default=DEFAULT_PIPE_ROOT,
+    p.add_argument("--pipe-root", default=None,
                    help="jwst-gc-pipeline checkout for the cmz.hips import "
                         "fallback")
     return p

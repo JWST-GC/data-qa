@@ -42,12 +42,13 @@ import subprocess
 import sys
 from typing import Dict, List, Optional
 
-from . import pipeline_policy
+from . import paths, pipeline_policy
 from .mast_monitor import GC_FIELDS, OBS_TOKEN_PATTERN, field_for
 
-#: single home for the pipe-root default (pipeline_policy owns it; re-exported
-#: here so the trigger's callers and CLI keep the historical name)
-DEFAULT_PIPE_ROOT = pipeline_policy.DEFAULT_PIPE_ROOT
+#: single home for the pipe-root default (data_qa.paths owns the path and the
+#: $PIPE_ROOT override; re-exported here so the trigger's callers and CLI keep
+#: the historical name).  Resolve with paths.pipe_root(), which reads the env.
+DEFAULT_PIPE_ROOT = paths.DEFAULT_PIPE_ROOT
 REDUCTION_SBATCH = "scripts/reduction/submit_reduction.sbatch"
 CATALOGING_CHAIN = "scripts/reduction/submit_cataloging_chain.sh"
 DEP_PLACEHOLDER = "<REDUCTION_JOBID>"
@@ -119,7 +120,7 @@ class NotRegisteredInPipelineError(RuntimeError):
     minutes later, burning the monitor's one-shot trigger key (issue #68)."""
 
 
-def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
+def registry_preflight(program, obs, pipe_root=None, python=None,
                        timeout_s=PREFLIGHT_TIMEOUT_S, instrument="nircam"):
     """Verify (program, obs) is registered in the pipeline's fields.yaml BEFORE
     any sbatch; raises NotRegisteredInPipelineError when it is not.
@@ -162,6 +163,7 @@ def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
                          "instrument name (lowercase letters, e.g. 'nircam')")
     python = (python or os.environ.get("PIPELINE_PYTHON")
               or DEFAULT_PIPELINE_PYTHON)
+    pipe_root = pipe_root or paths.pipe_root()
     code = _PREFLIGHT_CODE.format(program=int(program), obs=obs_token,
                                   instrument=instrument, mark=_VERDICT_MARK,
                                   modmark=_MODULE_MARK,
@@ -218,13 +220,14 @@ def registry_preflight(program, obs, pipe_root=DEFAULT_PIPE_ROOT, python=None,
         + (f": {detail}" if detail else "") + ")")
 
 
-def missing_scripts(pipe_root) -> List[str]:
+def missing_scripts(pipe_root=None) -> List[str]:
     """The pipeline submitter scripts NOT found under pipe_root (empty = all good)."""
+    pipe_root = pipe_root or paths.pipe_root()
     return [rel for rel in (REDUCTION_SBATCH, CATALOGING_CHAIN)
             if not os.path.exists(os.path.join(pipe_root, rel))]
 
 
-def reduction_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
+def reduction_step(program, obs, field, filters, pipe_root=None,
                    modules="nrca,nrcb,merged", skip_step12=False,
                    destreak=None) -> dict:
     """The reduction array submission: one array task per filter.
@@ -240,6 +243,7 @@ def reduction_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
     the driver already destreaks wherever the policy allows (the policy can only
     turn destreaking OFF, so destreak=True cannot override a policy-off field).
     """
+    pipe_root = pipe_root or paths.pipe_root()
     job = f"{field}{int(program)}-o{obs}-reduce"
     export = (f"ALL,PROPOSAL={int(program)},FIELD={obs},"
               f"SKIP={1 if skip_step12 else 0},FILTERS={' '.join(filters)}")
@@ -268,7 +272,7 @@ def reduction_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
     return dict(name="reduction", argv=argv, env=env)
 
 
-def cataloging_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
+def cataloging_step(program, obs, field, filters, pipe_root=None,
                     modules="merged", each_suffix=None, destreak=None,
                     policy=None, dep: Optional[str] = DEP_PLACEHOLDER) -> dict:
     """The cataloging chain (env-var driven; DEP gates it on the reduction array).
@@ -286,6 +290,7 @@ def cataloging_step(program, obs, field, filters, pipe_root=DEFAULT_PIPE_ROOT,
          ``*_cal.fits`` -> ``*_align.fits`` before Image3, so the per-exposure
          crf products are ``*_align_o<field>_crf.fits``).
     """
+    pipe_root = pipe_root or paths.pipe_root()
     if each_suffix:
         suffix = each_suffix
     elif destreak is not None:
@@ -364,7 +369,7 @@ def _warn_destreak_contradiction(field, obs, destreak, policy) -> List[str]:
     return disagree
 
 
-def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_ROOT,
+def build_plan(program, obs, field=None, filters=None, pipe_root=None,
                modules="nrca,nrcb,merged", catalog_modules="merged",
                each_suffix=None, destreak=None, skip_step12=False,
                probe=True) -> List[dict]:
@@ -377,6 +382,7 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=DEFAULT_PIPE_RO
     warning (``_warn_destreak_contradiction``).  ``probe=False`` skips the
     subprocess and keeps the historical hardcoded default.
     """
+    pipe_root = pipe_root or paths.pipe_root()
     field = field or field_for(program, obs)
     if not field:
         raise ValueError(f"no field mapping for program {program} obs {obs}; "
@@ -474,7 +480,7 @@ def submit(program, obs, field=None, filters=None, pipe_root=None, execute=False
     results/jobids are empty on dry-run; jobids are parsed from the captured
     sbatch output so the caller (act_trigger) can record them alongside the
     one-shot trigger key."""
-    pipe_root = pipe_root or DEFAULT_PIPE_ROOT
+    pipe_root = pipe_root or paths.pipe_root()
     plan = build_plan(program, obs, field=field, filters=filters,
                       pipe_root=pipe_root, **kwargs)
     missing = missing_scripts(pipe_root)
@@ -504,8 +510,9 @@ def main(argv=None):
                     help="target/field name (default: from the PROGRAMS map)")
     ap.add_argument("--filters", nargs="+", required=True,
                     help="filter list; becomes the array dimension")
-    ap.add_argument("--pipe-root", default=DEFAULT_PIPE_ROOT,
-                    help=f"jwst-gc-pipeline checkout (default {DEFAULT_PIPE_ROOT})")
+    ap.add_argument("--pipe-root", default=None,
+                    help="jwst-gc-pipeline checkout (default: $PIPE_ROOT, "
+                         f"else {DEFAULT_PIPE_ROOT})")
     ap.add_argument("--modules", default="nrca,nrcb,merged",
                     help="reduction MODULES (default nrca,nrcb,merged)")
     ap.add_argument("--catalog-modules", default="merged",
