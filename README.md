@@ -2,6 +2,8 @@
 
 Data-quality assessment and issue tracking for the JWST Galactic Center surveys.
 
+See [the project page](https://github.com/orgs/JWST-GC/projects/2/views/1)
+
 **This repository is for reporting and discussing data-quality issues on individual
 datasets — one GitHub issue per observation.**
 
