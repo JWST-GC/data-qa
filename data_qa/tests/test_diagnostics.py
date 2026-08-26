@@ -2355,8 +2355,12 @@ def test_jwst1pass_psfperts_locator_and_figure(tmp_path, monkeypatch):
     assert [det for det, _ in pp] == ["NRCA1", "NRCA2", "NRCB4"]  # sorted by detector
     # obs-scoped: a different obs sees nothing
     assert D._jwst1pass_psfperts(_obs(field="brick", obs="004", filt="F182M"), "F182M") == []
-    png = D._psfperts_figure(o, "F182M", pp)
-    assert os.path.exists(png)
+    # one full-width row draws, and interior rms EXCLUDES the +/-0.1 fill (0.01 interior -> ~0.01)
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _, a = plt.subplots()
+    im, rms = D._draw_psfperts_row(a, pp[0][1], pp[0][0], "F182M")
+    assert im is not None and abs(rms - 0.01) < 1e-3
 
 
 def test_jwst1pass_matchup_per_obs_match_layout(tmp_path, monkeypatch):

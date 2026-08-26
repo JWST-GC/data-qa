@@ -2833,39 +2833,32 @@ def _jwst1pass_psfperts(o: Observation, filt):
     return out
 
 
-def _psfperts_figure(o, filt, det_paths, vlim=_PSFPERTS_VLIM):
-    """Montage of the per-detector perturbation-PSF residual images, one panel per chip, on the
-    shared diverging +/-0.1 scale jwst1pass clips to; each panel titled with the detector and the
-    interior rms amplitude (the frame lines and unused montage cells sit at +/-0.1 and are excluded
-    from that rms so it reflects the actual perturbation, not the montage border)."""
-    import matplotlib
-    matplotlib.use("Agg")
+def _draw_psfperts_row(a, path, det, filt, vlim=_PSFPERTS_VLIM):
+    """Draw one detector's perturbation-PSF residual image (``LOG.psfperts.fits``) into axis ``a`` as
+    a full-width panel, on the diverging +/-0.1 scale jwst1pass clips to.  Returns (mappable, rms) --
+    rms over the UNCLIPPED interior (|v| < 0.0999), since the montage's frame lines and unused cells
+    sit at +/-0.1 and would otherwise dominate.  (None, None) if the file cannot be read."""
     import matplotlib.pyplot as plt
     from astropy.io import fits
-    n = len(det_paths)
-    ncol = min(4, n); nrow = int(np.ceil(n / ncol))
-    fig, ax = plt.subplots(nrow, ncol, figsize=(2.7 * ncol, 1.15 * nrow + 0.8), squeeze=False)
-    im = None
-    for k, (det, p) in enumerate(det_paths):
-        a = ax[k // ncol][k % ncol]
-        try:
-            img = np.asarray(fits.getdata(_used(p, f"{filt} {det} psfperts")), float)
-        except (OSError, ValueError, KeyError):
-            a.axis("off"); continue
-        interior = img[np.abs(img) < _PSFPERTS_CLIP]
-        rms = float(np.sqrt(np.nanmean(interior ** 2))) if interior.size else float("nan")
-        im = a.imshow(img, origin="lower", cmap="RdBu_r", vmin=-vlim, vmax=vlim, aspect="auto")
-        a.set_title(f"{det}  rms={rms:.3f}", fontsize=7.5)
-        a.set_xticks([]); a.set_yticks([])
-    for k in range(n, nrow * ncol):
-        ax[k // ncol][k % ncol].axis("off")
-    if im is not None:
-        fig.colorbar(im, ax=ax.ravel().tolist(), fraction=0.03, pad=0.02,
-                     label="fractional flux residual")
-    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS perturbation-PSF residual ({filt})",
-                 fontsize=10, y=0.99)
-    fig.subplots_adjust(top=0.84, hspace=0.5, wspace=0.08)
-    return _save(fig, f"{o.obsid}_stage10psf.png")
+    try:
+        img = np.asarray(fits.getdata(_used(path, f"{filt} {det} psfperts")), float)
+    except (OSError, ValueError, KeyError):
+        a.axis("off"); return None, None
+    content = np.abs(img) < _PSFPERTS_CLIP
+    # crop to the content bounding box (drops pure-margin rows/cols) ...
+    rows = np.where(content.any(1))[0]; cols = np.where(content.any(0))[0]
+    if rows.size and cols.size:
+        sl = (slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1))
+        img = img[sl]; content = content[sl]
+    rms = float(np.sqrt(np.nanmean(img[content] ** 2))) if content.any() else float("nan")
+    # ... and blank the +/-0.1 fill + frame lines to white, so the panel shows only the actual
+    # perturbation stamps rather than a large dark fill block (the fill is Jay's unused montage cells).
+    disp = np.where(content, img, np.nan)
+    cmap = plt.get_cmap("RdBu_r").copy(); cmap.set_bad("white")
+    im = a.imshow(disp, origin="lower", cmap=cmap, vmin=-vlim, vmax=vlim, aspect="auto")
+    a.set_title(f"perturbation-PSF residual — {det}   interior rms = {rms:.3f}", fontsize=8.5)
+    a.set_xticks([]); a.set_yticks([])
+    return im, rms
 
 
 def _saturation_turnover(m, sig, floor):
@@ -2915,12 +2908,23 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
     if filt.upper() in _LW_PREF:
         metrics["meta_scale_assumed_sw"] = True
 
-    fig, ax = _fig(2, 2, 5.4, 4.3)
+    import matplotlib.pyplot as plt
+    # One integrated figure: the 2x2 across-exposure consistency panels on top, then -- when
+    # jwst1pass ran with PERT -- one FULL-WIDTH per-detector perturbation-PSF residual row per chip
+    # below (LOG.psfperts.fits).  Both belong to the same stage-10 check, so they share one comment.
+    pp = _jwst1pass_psfperts(o, filt)
+    ndet = len(pp)
+    W = 11.0
+    hr = [4.0, 4.0] + [3.0] * ndet                       # 2 consistency rows + 1 per psfperts chip
+    fig = plt.figure(figsize=(W, sum(hr) + 1.0))
+    gs = fig.add_gridspec(2 + ndet, 2, height_ratios=hr, hspace=0.6, wspace=0.24)
+    axc = [[fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])],
+           [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])]]
     panels = [
-        (ax[0][0], exm, "X RMS (mas)", "x_rms_floor_mas", 3.0 * _META_PIX_MAS),
-        (ax[0][1], eym, "Y RMS (mas)", "y_rms_floor_mas", 3.0 * _META_PIX_MAS),
-        (ax[1][0], d["em"], "magnitude RMS (mag)", "mag_rms_floor", 0.25),
-        (ax[1][1], d["q"], "quality of fit", "qfit_floor", 0.25),
+        (axc[0][0], exm, "X RMS (mas)", "x_rms_floor_mas", 3.0 * _META_PIX_MAS),
+        (axc[0][1], eym, "Y RMS (mas)", "y_rms_floor_mas", 3.0 * _META_PIX_MAS),
+        (axc[1][0], d["em"], "magnitude RMS (mag)", "mag_rms_floor", 0.25),
+        (axc[1][1], d["q"], "quality of fit", "qfit_floor", 0.25),
     ]
     for a, y, ylab, mkey, ytop in panels:
         a.plot(m, y, ".", ms=1.4, color="#666666", alpha=0.35, rasterized=True)
@@ -2939,18 +2943,23 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
         turn = _saturation_turnover(m, d["em"], metrics["mag_rms_floor"])
         if turn is not None:
             metrics["saturation_turnover_mag"] = turn
-            ax[1][0].axvline(turn, color="#3366cc", ls="--", lw=1.0)
-    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency ({filt}, "
-                 f"n={metrics['n_stars']}, {metrics['n_exposures']} exp)", fontsize=11, y=0.99)
-    metrics["passed"] = True
-    # Second figure: the per-detector perturbation-PSF residual (LOG.psfperts.fits), posted under
-    # its own marker by main.  jwst1pass PERT=1 fits one perturbation from the bright-star residuals
-    # and adds it to the library STDPSF; a strong or structured one flags a PSF-model mismatch.
-    pp = _jwst1pass_psfperts(o, filt)
+            axc[1][0].axvline(turn, color="#3366cc", ls="--", lw=1.0)
+    # full-width perturbation-PSF residual rows (jwst1pass PERT=1: the perturbation fit from the
+    # bright-star residuals + added to the library STDPSF; a strong/structured one flags a PSF-model
+    # mismatch for that chip).
     if pp:
-        metrics["psfperts_png"] = _psfperts_figure(o, filt, pp[:16])
+        rms_by_det = {}
+        for k, (det, path) in enumerate(pp):
+            a = fig.add_subplot(gs[2 + k, :])
+            im, rms = _draw_psfperts_row(a, path, det, filt)
+            if im is not None:
+                fig.colorbar(im, ax=a, fraction=0.012, pad=0.01, label="frac. flux")
+                rms_by_det[det] = rms
         metrics["psfperts_dets"] = [det for det, _ in pp]
-        metrics["psfperts_filter"] = filt
+        metrics["psfperts_rms"] = rms_by_det
+    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency ({filt}, "
+                 f"n={metrics['n_stars']}, {metrics['n_exposures']} exp)", fontsize=11, y=0.995)
+    metrics["passed"] = True
     return _save(fig, f"{o.obsid}_stage10.png"), metrics
 
 
@@ -4889,14 +4898,6 @@ def _caption_for_impl(n, metrics):
                 base += (f"{f} peppar frame-to-frame σ floor: {full:.2f} → **{clean:.2f} mas** "
                          f"with the bad exposure(s) excluded. ")
         return base + "([how this is made](DOCROOT#stage6))"
-    if n == "10psf":
-        filt = metrics.get("psfperts_filter", "?")
-        dets = metrics.get("psfperts_dets") or []
-        return (f"**Stage 10 (JWST1PASS) — perturbation-PSF residual ({filt}).** Each panel is one "
-                f"detector's `LOG.psfperts.fits`: the perturbation jwst1pass fit from the bright-star "
-                f"fit residuals and added to the library STDPSF (fractional flux, diverging ± scale), "
-                f"titled with its rms amplitude. {len(dets)} detector(s): {', '.join(dets)}. "
-                f"([how this is made](DOCROOT#stage10))")
     if n == 8:
         return _caption_stage8(metrics)
     # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
@@ -5227,6 +5228,12 @@ def _caption_for_impl(n, metrics):
         if metrics.get("saturation_turnover_mag") is not None:
             base += (f"The mag-RMS doubles above its floor brighter than "
                      f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation onset). ")
+        dets = metrics.get("psfperts_dets") or []
+        if dets:
+            base += (f"\n\nBelow, one full-width row per detector ({', '.join(dets)}) shows that "
+                     f"chip's **perturbation-PSF residual** (`LOG.psfperts.fits`): the correction "
+                     f"jwst1pass fit from the bright-star fit residuals and added to the library "
+                     f"STDPSF, on a ±0.1 fractional-flux scale, titled with its interior rms. ")
         return base + "([how this is made](DOCROOT#stage10))"
     if n == 11:
         # Built in code so the streak-flag sentence is only stated when an exposure is actually
@@ -5444,13 +5451,6 @@ def main(argv=None):
                                caption_for("6clean", metrics), args.repo)
                     print(f"  stage 6clean: {metrics['clean_png']}  "
                           f"excluding {metrics.get('excluded_exposures')}")
-                # Stage 10 emits a SECOND figure: the per-detector JWST1PASS perturbation-PSF
-                # residual (LOG.psfperts.fits).  Post it under its own marker beside the main panels.
-                if n == 10 and metrics.get("psfperts_png"):
-                    post_stage(o, "10psf", metrics["psfperts_png"],
-                               caption_for("10psf", metrics), args.repo)
-                    print(f"  stage 10psf: {metrics['psfperts_png']}  "
-                          f"dets {metrics.get('psfperts_dets')}")
             except (PostError, OSError) as e:
                 print(f"  stage {n}: post FAILED (figure built OK): {e}", file=sys.stderr)
     print(f"metrics -> {mpath}")
