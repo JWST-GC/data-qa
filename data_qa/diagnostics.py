@@ -3911,15 +3911,27 @@ def _peppar_cal_for_cat(catpath):
     return None
 
 
+_PEPPAR_REG_ITERS = 3        # per-catalogue registration iterations (converges in ~2)
+_PEPPAR_MIN_FIT = 12         # min repeated stars a catalogue needs for a 6-param affine fit
+
+
 def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0, min_frames=3,
                       exclude=None):
     """Frame-to-frame position scatter from the per-frame peppar catalogues, for fields with no
-    combined starlist (every current field): the standard deviation of each star's SKY position
-    across the exposures it appears in.  The exposures are dithered AND mosaicked, so a star sits at
-    different detector pixels -- and appears on different chips -- in different frames; matching must
-    be in SKY coordinates, using each frame's cal WCS.  Detections within ``tol_mas`` are grouped and
-    a group seen in >= ``min_frames`` distinct exposures yields one scatter point.  Returns
-    (mag, framestd_mas) or None.  Bounded (brightest ``nbright``/frame, ``max_frames`` exposures)."""
+    combined starlist (every current field): the standard deviation of each star's position across
+    the exposures it appears in, AFTER registering every frame to a common astrometric frame.
+
+    The exposures are dithered AND mosaicked, so a star sits at different detector pixels -- and
+    appears on different chips -- in different frames; matching is done in SKY coordinates via each
+    frame's cal WCS.  Those cal WCS carry each exposure's independent guide-star pointing solution,
+    which scatters by a few mas between exposures; taking the raw sky-position std would therefore
+    report the per-frame POINTING jitter (~2.5 mas), not the intrinsic across-exposure repeatability
+    (issue #129).  So each per-frame(-detector) catalogue is first mapped onto the common frame by a
+    per-catalogue linear (6-param affine) transform fitted to the repeated stars -- the same bulk
+    offset/rotation/scale removal Jay Anderson's ``xym2mat`` does -- leaving only the intrinsic
+    residual (~0.3-0.4 mas).  Detections within ``tol_mas`` are grouped; a group seen in >=
+    ``min_frames`` distinct exposures yields one scatter point.  Returns (mag, framestd_mas) or None.
+    Bounded (brightest ``nbright``/frame, ``max_frames`` exposures)."""
     from astropy.table import Table
     from astropy.io import fits
     from astropy.wcs import WCS
@@ -3938,7 +3950,10 @@ def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0,
         if mo and mo.group(1) not in exps:
             exps.append(mo.group(1))
     keep_exps = set(exps[:max_frames])
-    ra, dec, mag, fid = [], [], [], []
+    # cid = index of the source catalogue (one detector-exposure, one cal WCS) -> the registration
+    # unit; fid = exposure index -> the unit the scatter is measured ACROSS.
+    ra, dec, mag, fid, cid = [], [], [], [], []
+    ci = 0
     for c in cats:
         mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
         if not mo or mo.group(1) not in keep_exps:
@@ -3962,23 +3977,26 @@ def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0,
             continue
         r, d = w.all_pix2world(x[idx], y[idx], 0)               # peppar x/y are 0-based pixels
         ra.append(np.asarray(r, float)); dec.append(np.asarray(d, float))
-        mag.append(m[idx]); fid.append(np.full(idx.size, keep_exps and exps.index(mo.group(1))))
-    if len(ra) < min_frames:
+        mag.append(m[idx]); fid.append(np.full(idx.size, exps.index(mo.group(1))))
+        cid.append(np.full(idx.size, ci)); ci += 1
+    if ci < min_frames:
         return None
     ra = np.concatenate(ra); dec = np.concatenate(dec)
-    mag = np.concatenate(mag); fid = np.concatenate(fid).astype(int)
+    mag = np.concatenate(mag); fid = np.concatenate(fid).astype(int); cid = np.concatenate(cid).astype(int)
     good = np.isfinite(ra) & np.isfinite(dec)
-    ra, dec, mag, fid = ra[good], dec[good], mag[good], fid[good]
+    ra, dec, mag, fid, cid = ra[good], dec[good], mag[good], fid[good], cid[good]
     if ra.size < 50:
         return None
+    # local tangent plane about the field centre, in mas (registration + scatter are linear here)
+    ra0 = float(np.median(ra)); dec0 = float(np.median(dec))
+    cosd = np.cos(np.radians(dec0))
+    xi = (ra - ra0) * cosd * 3.6e6; eta = (dec - dec0) * 3.6e6
     # group detections by sky position (single-link within tol_mas on the unit sphere)
     xyz = SkyCoord(ra * u.deg, dec * u.deg).cartesian.xyz.value.T
     chord = 2.0 * np.sin(np.radians(tol_mas / 3.6e6) / 2.0)     # tol in mas -> deg is /3.6e6
     tree = cKDTree(xyz)
     grp = np.full(ra.size, -1, int)
     gid = 0
-    cosd = np.cos(np.radians(np.median(dec)))
-    mags_out, std_out = [], []
     for i in range(ra.size):
         if grp[i] >= 0:
             continue
@@ -3986,12 +4004,35 @@ def _peppar_frame_std(pdir, pixscale, max_frames=12, nbright=2000, tol_mas=40.0,
         for j in members:
             grp[j] = gid
         gid += 1
-        mj = np.asarray(members)
-        if np.unique(fid[mj]).size < min_frames:               # seen in >= min_frames exposures
+    # Register each catalogue onto the running group means (xym2mat-style).  Iterate: recompute each
+    # group's mean, then per catalogue fit (xi, eta) -> (group-mean xi, eta), constrained by its stars
+    # that repeat (a group of >= 2 detections).  Affine when it has enough repeated stars, else a bulk
+    # offset, so a sparse detector is still de-pointed without an unstable 6-param fit.
+    ncat = int(cid.max()) + 1
+    for _ in range(_PEPPAR_REG_ITERS):
+        sx = np.zeros(gid); sy = np.zeros(gid); n = np.zeros(gid)
+        np.add.at(sx, grp, xi); np.add.at(sy, grp, eta); np.add.at(n, grp, 1.0)
+        gmx = sx / np.maximum(n, 1); gmy = sy / np.maximum(n, 1)
+        multi = n >= 2                                          # groups that constrain a transform
+        for k in range(ncat):
+            mk = np.where(cid == k)[0]
+            f = mk[multi[grp[mk]]]
+            if f.size >= _PEPPAR_MIN_FIT:                       # affine (offset + rotation + scale)
+                A = np.column_stack([xi[f], eta[f], np.ones(f.size)])
+                cx, _, _, _ = np.linalg.lstsq(A, gmx[grp[f]], rcond=None)
+                cy, _, _, _ = np.linalg.lstsq(A, gmy[grp[f]], rcond=None)
+                Ak = np.column_stack([xi[mk], eta[mk], np.ones(mk.size)])
+                xi[mk] = Ak @ cx; eta[mk] = Ak @ cy
+            elif f.size >= 3:                                   # too sparse for affine -> offset only
+                xi[mk] -= (xi[f] - gmx[grp[f]]).mean()
+                eta[mk] -= (eta[f] - gmy[grp[f]]).mean()
+    # per-group residual scatter across DISTINCT exposures (the achieved repeatability)
+    mags_out, std_out = [], []
+    for g in range(gid):
+        mj = np.where(grp == g)[0]
+        if np.unique(fid[mj]).size < min_frames:
             continue
-        dra = (ra[mj] - ra[mj].mean()) * cosd * 3.6e6           # deg -> mas
-        dde = (dec[mj] - dec[mj].mean()) * 3.6e6
-        prec = float(np.hypot(np.std(dra), np.std(dde)) / np.sqrt(2.0))   # per-axis
+        prec = float(np.hypot(np.std(xi[mj]), np.std(eta[mj])) / np.sqrt(2.0))   # per-axis
         if prec > 0:
             mags_out.append(float(np.median(mag[mj]))); std_out.append(prec)
     if len(std_out) < 50:
@@ -5091,8 +5132,10 @@ def _caption_for_impl(n, metrics):
                  "(Hosek WebbPSF) catalogues, whose magnitudes are instrumental with no zero-point. "
                  "It draws **per-frame formal σ_fit** (dashed, the noise-limited fit error) and the "
                  "**frame-to-frame σ** (solid, the standard deviation of each star's position across "
-                 "the exposures). That scatter comes from the combined starlist where present, else "
-                 "from cross-matching the per-frame catalogues.\n\n([how this is made](DOCROOT#stage6))")
+                 "the exposures, after registering every frame to a common frame with a per-frame "
+                 "linear fit that removes pointing/rotation/scale — so this is the intrinsic "
+                 "repeatability, not per-frame pointing jitter). That scatter is measured by "
+                 "cross-matching the per-frame catalogues.\n\n([how this is made](DOCROOT#stage6))")
         return base
     if n == 10:
         # Built in code so the floors are only quoted when a curve was actually drawn.  The

@@ -1025,6 +1025,52 @@ def test_peppar_frame_std_computed_from_per_frame_catalogues(tmp_path, monkeypat
     assert abs(float(np.median(prec)) - 3.0) < 1.2
 
 
+def test_peppar_frame_std_removes_per_frame_pointing(tmp_path, monkeypatch):
+    # Each frame's cal WCS carries an independent pointing solution: inject a large per-frame BULK
+    # offset (~8 mas/axis) on top of a small intrinsic per-star jitter (0.4 mas).  The registration
+    # step must remove the bulk offset so the reported scatter is the intrinsic ~0.4 mas, not the
+    # ~8 mas pointing jitter (issue #129).
+    from astropy.table import Table
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
+    det = tmp_path / "brick" / "peppar" / "F212N" / "NRCA1"; det.mkdir(parents=True)
+    pipe = tmp_path / "brick" / "F212N" / "pipeline"; pipe.mkdir(parents=True)
+
+    def _wcs(cr):
+        w = WCS(naxis=2); w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        w.wcs.crval = list(cr); w.wcs.crpix = [1024.5, 1024.5]
+        w.wcs.cd = (0.031 / 3600.0) * np.array([[-1.0, 0.0], [0.0, 1.0]])
+        return w
+    rng = np.random.default_rng(3)
+    n = 200
+    ra0 = 266.5 + rng.uniform(0, 0.01, n); dec0 = -28.9 + rng.uniform(0, 0.01, n)
+    mags = np.linspace(-9.0, -4.0, n)
+    intrinsic = 0.4 / 3.6e6                                     # 0.4 mas/axis real repeatability
+    for k in range(6):
+        # a per-frame pointing error, encoded in the frame's WCS CRVAL (~8 mas/axis)
+        off_ra = rng.normal(0, 8.0 / 3.6e6); off_de = rng.normal(0, 8.0 / 3.6e6)
+        w = _wcs((266.5 + off_ra / np.cos(np.radians(-28.9)), -28.9 + off_de))
+        ra = ra0 + rng.normal(0, intrinsic, n) / np.cos(np.radians(dec0))
+        dec = dec0 + rng.normal(0, intrinsic, n)
+        # place stars at their TRUE sky positions through this frame's offset WCS -> x/y carry the
+        # pointing error, exactly as a real cal frame does
+        x, y = w.world_to_pixel(SkyCoord(ra * u.deg, dec * u.deg))
+        Table({"m": mags, "x_fit": np.asarray(x, float), "y_fit": np.asarray(y, float),
+               "x_err": np.full(n, 0.02), "y_err": np.full(n, 0.02)}).write(
+            str(det / f"jw02221001001_02101_0000{k+1}_nrca1_cal_brick_iter1_cat.fits"), overwrite=True)
+        hdu = fits.ImageHDU(np.zeros((4, 4), "float32"), header=w.to_header(), name="SCI")
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(
+            str(pipe / f"jw02221001001_02101_0000{k+1}_nrca1_cal.fits"), overwrite=True)
+    res = D._peppar_frame_std(str(tmp_path / "brick" / "peppar" / "F212N"), pixscale=31.0)
+    assert res is not None
+    _, prec = res
+    # registered residual is the intrinsic ~0.4 mas, well below the injected ~8 mas pointing jitter
+    assert float(np.median(prec)) < 1.5
+
+
 def test_peppar_precision_none_without_products(tmp_path, monkeypatch):
     monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
     o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
