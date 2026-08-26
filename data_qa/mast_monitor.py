@@ -161,8 +161,12 @@ PROGRAMS: Dict[int, Dict[str, str]] = {
     TREASURY_PROGRAM: {},   # GC Treasury: every obs -> gc-treasury (see field_for)
     2221: {"001": "brick", "002": "cloudc"},
     1182: {"004": "brick", "002": "w51"},           # w51 = broadband
-    2211: {"023": "gc2211", "028": "gc2211", "046": "gc2211",
-           "049": "gc2211", "050": "gc2211"},
+    # pipeline #469 split gc2211 into one reduction FIELD per observation (five pointings 8-13'
+    # apart, five epochs) -- the products moved to gc2211_o023 ... gc2211_o050 and gc2211/ is now
+    # empty, so QA must resolve each obs to its own per-obs field (issue #119).  The display name
+    # stays "GC 2211" (observations.FIELDS), so the issue titles are unchanged.
+    2211: {"023": "gc2211_o023", "028": "gc2211_o028", "046": "gc2211_o046",
+           "049": "gc2211_o049", "050": "gc2211_o050"},
     4147: {"012": "sgrc"},
     5365: {"001": "sgrb2"},                          # NIRCam + MIRI obs
     6151: {"001": "w51"},

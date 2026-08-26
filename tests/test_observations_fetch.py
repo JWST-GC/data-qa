@@ -37,8 +37,9 @@ def test_registry_from_mast_over_curated_programs(monkeypatch):
     assert {o.obs for o in obs} == {"023", "028", "046", "049", "050"}
     byobs = {o.obs: o for o in obs}
     assert byobs["028"].filters == ["F150W", "F277W"]           # F277W present (MAST, not on-disk)
+    # split into one field per obs (pipeline #469, #119), but the display target stays "GC 2211"
     assert all(o.instrument == "NIRCam" and o.target == "GC 2211"
-               and o.field == "gc2211" for o in obs)
+               and o.field == f"gc2211_o{o.obs}" for o in obs)
     assert observations.LAST_FETCH_ERRORS == []
 
 
