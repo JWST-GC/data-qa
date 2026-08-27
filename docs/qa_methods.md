@@ -366,7 +366,15 @@ omitted (two-panel top row).
   the bulk A→B shift (the xcorr histogram peak) the nearest B source within 80 mas is taken for each
   A source and duplicate B are dropped (closest A kept), so the reported count is distinct overlap
   stars. A fixed-radius ball match in a crowded field returns a many-to-many pair count instead,
-  which is the ~34k figure this replaced.
+  which is the ~34k figure this replaced. The reported **offset is the peak refined on those same
+  stars**: `off = peak − median(A_aligned − B)` with `A_aligned = A + peak`, so the median is
+  **subtracted** (the xcorr peak is the shift that moves A onto B, so a peak too large by *d* leaves
+  *+d* in the residual). The refinement is needed because a histogram peak measured against a
+  catalogue tracing the same clustered field is pulled by several mas by the correlated wrong-pair
+  background, the bias [stage 4](#stage4) already corrects for. `intermodule_peak_off` records what
+  the peak alone said, and the residual cloud in the panel is drawn about the peak, so its
+  displacement from the centre is the peak's **error** — what the refinement subtracts. Below 30
+  one-to-one pairs the refinement is refused and the raw peak stands (`intermodule_bulk_source`).
 - **TOP-RIGHT** — the same comparison restricted to [S/N > 10](#glossary-snr) stars (when the field
   has flux errors), where the scatter measures how well the modules agree with the centroid noise
   of faint stars taken out of it.
