@@ -2313,13 +2313,43 @@ def _module_positions(o, filt):
     return a_sc, b_sc, dict(a=a_info, b=b_info)
 
 
+AB_SAME_STAR_MINPAIRS = 30      # below this, keep the raw peak (matches aa.same_star_tie's floor)
+
+
 def _ab_overlap(a_sc, b_sc):
     """How far a star seen in NRCA sits from the same star seen in NRCB, from two module position
     lists and no external catalogue.
 
-    ``off`` is the bulk A->B shift, taken as the ``aa.xcorr`` histogram PEAK.  A
-    search_around_sky median would fabricate pairs at this density.  ``rms`` is the scatter left in
-    the SAME stars after A is aligned onto B by that peak: ``hypot`` of the two axes' ``mad_std``.
+    ``off`` is the bulk A->B shift.  It is measured in two steps: the ``aa.xcorr`` histogram PEAK
+    detects it (a search_around_sky median would fabricate pairs at this density), and the SAME
+    STARS the peak then pairs one-to-one refine it.  Written out with the residual's sense
+    explicit, so the verb does not depend on a convention the reader supplies:
+
+        a_aligned = a + peak
+        off       = peak - median(a_aligned - b_matched)
+
+    ``aa.xcorr(a, b)`` returns ``median(b - a)``, the shift that MOVES A ONTO B, so A is aligned by
+    ADDING the peak and a peak too large by ``d`` leaves ``+d`` in ``a_aligned - b_matched``.  The
+    refinement therefore SUBTRACTS that median; adding it would double the peak's error instead of
+    removing it.  (Measured: inject a peak biased +6.0/-4.0 mas off a truth of 12.0/-7.0 and the
+    median residual comes back exactly +6.0/-4.0, ``peak - median`` lands on truth and
+    ``peak + median`` at twice the error.  Both the value and the residual's sign are pinned by
+    ``test_ab_overlap_refines_a_biased_histogram_peak_onto_the_same_stars``.)  ``peak_off`` reports
+    what the histogram alone said, so the size of the correction is visible per field.
+
+    The refinement is the same correction stage 4 applies (``aa.same_star_tie``), for the same
+    reason (JWST-GC/data-qa#95): two catalogues tracing one clustered field make a correlated,
+    non-uniform wrong-pair background that pulls the histogram peak by several mas.  Stage 5's case
+    is denser on BOTH sides than stage 4's -- ~400,000 chance pairs within 0.3" against ~32,000 for
+    JWST-VIRAC -- and the gate is 15 mas, so a several-mas bias spends a third of it.  The pairs and
+    their residuals are computed here anyway, so the refinement costs nothing.  It is guarded the
+    way ``same_star_tie`` guards it: the peak must be unambiguous (already required above) and
+    enough one-to-one pairs must survive, so the nearest pair is the RIGHT star rather than a dense
+    nearest-neighbour median.
+
+    ``rms`` is the scatter left in the SAME stars after A is aligned onto B by that peak: ``hypot``
+    of the two axes' ``mad_std``.  A shift does not change it, so it describes the peak-aligned and
+    the refined solution alike.
 
     Two factors separate that from a stage-6 curve, and both have to be applied to compare them:
     ``hypot`` COMBINES the axes where stage 6 divides by sqrt(2) to stay per-axis, and each
@@ -2366,7 +2396,21 @@ def _ab_overlap(a_sc, b_sc):
         return None
     dra = (a_al[ia].ra - b_sc[ib].ra).to(u.mas).value * cosd
     dde = (a_al[ia].dec - b_sc[ib].dec).to(u.mas).value
-    return dict(dra=float(xc["dra"]), dde=float(xc["ddec"]), off=float(xc["off"]),
+    # SAME-STAR refinement of the peak.  These residuals ARE the peak's error, measured on stars
+    # already matched one to one, so the A->B offset is the peak MINUS their median: ``dra`` is
+    # a_al - b, and a_al is A already moved BY the peak, so a peak too large by d leaves +d here and
+    # has to be reduced by d.  (Adding it -- the sketch in #95 -- doubles the error instead of
+    # removing it; verified against an injected peak bias.)  Refuse below AB_SAME_STAR_MINPAIRS
+    # pairs (aa.same_star_tie's floor) and keep the raw peak.
+    same_star = len(ia) >= AB_SAME_STAR_MINPAIRS
+    mdra = float(np.median(dra)) if same_star else 0.0
+    mdde = float(np.median(dde)) if same_star else 0.0
+    off_dra, off_dde = float(xc["dra"]) - mdra, float(xc["ddec"]) - mdde
+    return dict(dra=off_dra, dde=off_dde, off=float(np.hypot(off_dra, off_dde)),
+                peak_dra=float(xc["dra"]), peak_ddec=float(xc["ddec"]),
+                peak_off=float(xc["off"]),
+                same_star_dra=mdra, same_star_ddec=mdde, same_star_n=int(len(ia)),
+                bulk_source="same-star" if same_star else "histogram",
                 rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
                 n=int(len(ia)), peak_ratio=float(xc["peak_ratio"]),
                 dra_arr=dra, dde_arr=dde,
@@ -2386,9 +2430,14 @@ def _draw_ab_panel(ax, ovd, title):
     lim = max(50.0, 4.0 * ovd["rms"])
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
     axt, _axr = _add_marginals(ax, dra_a, dde_a, color="#5566aa", bins=40)
+    # The residuals are drawn about the histogram PEAK, so their displacement from (0,0) IS the
+    # peak's error -- what the same-star refinement in ``off`` takes back out.  Name both numbers,
+    # otherwise a visibly off-centre cloud reads as a plotting bug rather than as the correction.
+    peak = ovd.get("peak_off")
+    peak_note = f"   (histogram peak alone = {peak:.1f})" if peak is not None else ""
     axt.set_title(f"{title}  ({ovd['n']} stars)\n"
-                  f"offset = {ovd['off']:.1f} mas   scatter = {ovd['rms']:.1f} mas (ΔRA,ΔDec "
-                  f"combined)", fontsize=8)
+                  f"offset = {ovd['off']:.1f} mas{peak_note}   scatter = {ovd['rms']:.1f} mas "
+                  f"(ΔRA,ΔDec combined)", fontsize=8)
 
 
 def _draw_ab_footprint(ax, ovd, label):
@@ -2490,7 +2539,10 @@ def stage5_intermodule(o: Observation, sw):
         single_module = "NRCA" if a_sc is not None else "NRCB"
     ov = _ab_overlap(a_sc, b_sc)
     if ov:
-        metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"])
+        metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"],
+                       # what the histogram peak alone said, so the size of its bias is on record
+                       intermodule_peak_off=ov["peak_off"],
+                       intermodule_bulk_source=ov["bulk_source"])
     # The same comparison restricted to flux S/N > 10 (the best-measured stars), where the
     # residual scatter measures how well the two modules agree rather than how well a faint star's
     # centroid is known.  This adds a panel; the all-stars panel above stays.
@@ -2500,7 +2552,9 @@ def stage5_intermodule(o: Observation, sw):
         ov_hi = _ab_overlap(a_hi, b_hi)
         if ov_hi:
             metrics.update(intermodule_off_hi=ov_hi["off"], intermodule_rms_hi=ov_hi["rms"],
-                           n_overlap_hi=ov_hi["n"], sn_cut=10.0)
+                           n_overlap_hi=ov_hi["n"], sn_cut=10.0,
+                           intermodule_peak_off_hi=ov_hi["peak_off"],
+                           intermodule_bulk_source_hi=ov_hi["bulk_source"])
 
     # (1) per-detector residuals vs VIRAC, bulk-subtracted
     det = _per_detector_offsets(o, filt, ref_sc) if ref_sc is not None else {}
@@ -5282,6 +5336,12 @@ def _caption_for_impl(n, metrics):
                 f"{ov_pos} panel: [JWST against itself](DOCROOT#glossary-reffree) in the "
                 f"NRCA∩NRCB overlap — {off:.1f} mas offset, {rms:.1f} mas scatter (ΔRA and ΔDec "
                 f"combined) over {no} shared stars, with ΔRA/ΔDec marginal histograms.")
+        pk = metrics.get("intermodule_peak_off")
+        if pk is not None and off is not None:
+            base += (f" The offset is the [xcorr histogram peak](DOCROOT#glossary-xcorr) refined on "
+                     f"the SAME stars the peak pairs; the peak alone reads {pk:.1f} mas. The "
+                     f"residual cloud is drawn about the peak, so its displacement from the centre "
+                     f"is the peak's error, which the refinement takes out.")
         if metrics.get("n_overlap_hi"):
             base += (f"\n\nThe panel to its right repeats it for "
                      f"[S/N > 10](DOCROOT#glossary-snr) stars ({metrics['n_overlap_hi']} stars, "

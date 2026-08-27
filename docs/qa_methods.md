@@ -2,15 +2,15 @@
 
 This document is the reference for the automated QA diagnostics posted on each observation's
 tracking issue. Every diagnostic comment links back here (to the matching stage section) and to
-the exact source function that built it, so no shorthand on a plot is left undefined.
+the exact source function that built it.
 
 - Source: [`data_qa/diagnostics.py`](../data_qa/diagnostics.py) builds every figure and metric;
   [`data_qa/post_diagnostics.py`](../data_qa/post_diagnostics.py) posts them.
 - The diagnostics are **NIRCam-only**. MIRI issues carry only the pipeline-status table.
 - Each stage writes a metrics JSON (`data_qa/metrics/<obsid>.json`) and posts/updates one
-  marker-keyed comment per stage, so re-running **updates in place** — it never duplicates.
+  **marker-keyed** comment per stage, so re-running **updates in place** — it never duplicates.
 - **None of these stages is an automated gate.** The `passed` flag is a suggestion for the human
-  reviewer, not an enforced pass/fail; each stage below says what "consider it passing" means.
+  reviewer, not an enforced pass/fail. Each stage below defines its "passing" criteria.
 - Every stage reports the **full path of every file it read** — see
   [which files a stage used](#inputs).
 
@@ -23,24 +23,11 @@ Jump to: [Glossary](#glossary) ·
 <a id="inputs"></a>
 ## Which files a stage used
 
-Each posted comment ends with a collapsed **Files read for this stage** block giving the **full
-path** of every file that stage opened, grouped by what it was used for and then by directory, so
-a path always reads as `<directory>/<filename>`. The same list is the `inputs` key of that stage in
-`data_qa/metrics/<obsid>.json`.
-
-This answers the question the numbers cannot: *which* catalogue, *which* reference, *which*
-generation of the per-exposure products. A stage that quietly read a stale generation, a different
-observation's catalogue, or one module's detectors used to look exactly like a stage that read the
-right thing.
-
-A file is recorded at the point it is **opened**, not where its path is worked out. Those differ:
-the catalogue pickers header-peek every candidate before choosing one, `_mosaic_path` gets called
-for filters whose panel is then skipped, and several resolvers hand back a path that a later check
-rejects. Recording at resolve time would list files the analysis never read.
-
-The record survives a stage that fails partway — what it read before it died is usually the most
-useful thing about the failure — and it appears on red-flagged stages, where "the plot is empty"
-is much easier to act on with the list of what was and was not there.
+Each posted comment ends with a collapsed **Files read for this stage** block giving the full
+path of every file that stage opened, grouped by what it was used for and then by directory. The
+same list is the `inputs` key of that stage in `data_qa/metrics/<obsid>.json`. This is what makes a
+stale read visible: a stage that quietly read an old generation, another observation's catalogue,
+or one module's detectors used to look exactly like a stage that read the right thing.
 
 **Where a stage looks.** A QA field is normally one directory, `/orange/adamginsburg/jwst/<field>/`.
 Where a field's observations have been split into per-observation reduction trees, an observation's
@@ -51,11 +38,11 @@ offsets tables stayed in the base field. Every product lookup searches both, spl
 observation's whether or not its filename carries the `_oNNN` token. A field with no split tree is
 resolved exactly as before.
 
-**On large sets.** The per-exposure daophot catalogues run to hundreds of files (brick F212N: 192;
-gc2211 F200W: 592). At ~100 characters a path, one such role approaches GitHub's 65 kB comment
-limit on its own, so a directory holding more than 12 files is rendered as its full path, its
-count, the first three filenames and the last. The block **says** it did that and points at the
-metrics JSON, which always holds the complete list. The file *count* is never abbreviated.
+Because of GitHub's 65 kB comment limit, a single **directory** holding more than 12 files is
+shown as its path, its count, the first three filenames and the last — a stage that read 40 files
+spread over four directories still lists all of them. The block **says** when it summarised and
+points at `data_qa/metrics/<obsid>.json`, which always holds the complete list. The file **count**
+is never abbreviated.
 
 <a id="glossary"></a>
 ## Glossary
@@ -64,34 +51,29 @@ metrics JSON, which always holds the complete list. The file *count* is never ab
 ### Catalog tiers: MAST default, `m1` … `m8`
 
 The jicama pipeline refines a field's catalog through numbered merge/refinement stages. Higher =
-more processed; the QA always shows the **highest tier present on disk** for the observation
-(`_catalog_priority` in the source). The ordering is:
-
-> **MAST-delivered source catalog** (lowest) < `m1` < `m2` < … < `m7` < `m8` (highest).
+more processed; the QA always chooses the **highest tier present on disk** for the observation, with
+the MAST-delivered catalog being the lowest priority and `m8` the highest.
 
 - **MAST-delivered source catalog** — the STScI level-3 pipeline's own source list shipped with
   the mosaic (`*_cat.fits`). Single-band, aperture photometry, no cross-band merge. This is the
-  "raw" baseline the pipeline improves on (see [stage 7](#stage7)). It is used by the catalog
-  stages **only as a last resort**, when no jicama `mN` catalog exists yet for the field.
+  "raw" baseline the pipeline improves on (see [stage 7](#stage7)).
 - **`mN`** — the `N`th [jicama](#glossary-jicama)-pipeline pass. Successive passes add
   PSF-fit photometry, per-exposure combination, cross-band forced photometry, and quality
   vetting; `m7` seeds each filter's forced photometry at the cross-band source positions.
-- **`m8` / `m8_dedup`** — the deepest tier. `m8_dedup` is an `m8` catalog with the duplicate rows
-  that the cross-band merge can produce removed ("dedup" = duplicate-removed). `_catalog_priority`
-  gives plain `m8` and `m8_dedup` the **same** top tier, breaking the tie by most-recent-on-disk,
-  so whichever is newer wins. Exact per-stage semantics live in the
-  [jwst-gc-pipeline](https://github.com/keflavich/jwst-gc-pipeline) merge code; for QA the only
-  thing that matters is the ordering above and that a **higher tier is a more processed catalog**.
+- **`m8` / `m8_dedup`** — the final iteration. `m8_dedup` removes duplicate rows that the
+  cross-band merge can leave in `m8`. The two share the same top tier, so the
+  most-recent-on-disk of them is used. The cataloging process is described in
+  [`PHOTOMETRY_PIPELINE.md`](https://github.com/keflavich/jwst-gc-pipeline/blob/main/PHOTOMETRY_PIPELINE.md)
+  (most of the text there is AI generated for now).
 - A catalog labelled **`crossmatch`** in a caption means no single merged catalog held both
-  requested filters, so the CMD was built by cross-matching the two single-band catalogs. Its
-  colour width is set by the positional match tolerance.
+  requested filters, so the CMD was built by cross-matching the two single-band catalogs.
 
 <a id="glossary-jicama"></a>
 ### jicama
 
-`jicama` is the name of our PSF-photometry catalog pipeline (as distinct from the MAST/STScI
-source catalog, and from the `peppar` and `STARFINDER` catalogs used in method comparisons).
-"jicama catalog" = the `mN` products above.
+`jicama` is the name of our PSF-photometry catalog pipeline, distinct from the MAST/STScI
+source catalog and from the `peppar` and `STARFINDER` catalogs.
+The `mN` catalogs are the products of the `jicama` pipeline.
 
 <a id="glossary-virac"></a>
 ### VIRAC / VIRAC2 / Ks
@@ -100,23 +82,19 @@ source catalog, and from the `peppar` and `STARFINDER` catalogs used in method c
 (VizieR `II/387`). It is **tied to the Gaia DR3 frame at epoch 2014.0** and carries near-IR
 **Ks**-band (~2.15 µm) magnitudes and per-star **proper motions (PM)**. QA uses it as the
 external reference for both astrometry (stages 4/5) and photometry (zeropoint,
-stage 3). Ks (~2.15 µm) is the VIRAC band closest to JWST F212N/F210M, which is why those are
-the SW filters compared against it.
+stage 3).
 
 Before any comparison, the VIRAC positions are **proper-motion-propagated** from 2014.0 to the
-JWST observation epoch (`_obs_epoch`, read from the mosaic or a companion refcat), so a real
-stellar motion over the ~8 yr baseline is not mistaken for a frame error.
+JWST observation epoch.
 
 <a id="glossary-crossmatch"></a>
 ### JWST ↔ VIRAC cross-match and the selection criteria
 
-"The JWST catalog cross-matched to VIRAC" means: take the JWST catalog source positions (read
-straight from the jicama `mN` catalog — **never re-detected** by QA) and pair them with the
+"The JWST catalog cross-matched to VIRAC" means: take the JWST catalog source positions and pair them with the
 PM-propagated VIRAC reference. The **selection criteria** differ by what is being measured:
 
 - **Photometric zeropoint** ([stage 3](#stage3)): anchor on the sparse, Ks-bright VIRAC stars and
-  take each one's nearest JWST catalog source within **0.1″**. Anchoring on VIRAC (not the much
-  deeper JWST catalog) prevents faint JWST sources from being paired with the wrong bright VIRAC
+  take each one's nearest JWST catalog source within **0.1″**. Anchoring on VIRAC prevents faint JWST sources from being paired with the wrong bright VIRAC
   star. A sigma-clipped locus (below) then isolates the stellar ridge from the red mismatch cloud.
 - **JWST−VIRAC offset** ([stage 4](#stage4)): measured by an
   [x-correlation histogram peak](#glossary-xcorr) **per spatial cell**. Nearest-neighbour pairing
@@ -281,27 +259,46 @@ on the same panel. Above the cut the residual scatter is dominated by how well t
 <a id="stage1"></a>
 ## Stage 1 — first mosaics
 
-Stage 1 shows grayscale SW and LW `i2d` mosaic thumbnails, loaded from the `merged_i2d.fits`
-images (from MAST or the pipeline, depending on the label) in ZScale/asinh grayscale. Check these
-for double-stars or other weird visual artifacts. A nominal (proposed) filter with no mosaic on
-disk is listed explicitly, never dropped silently.
+Stage 1 shows SW and LW `i2d` mosaic thumbnails, loaded from the `merged_i2d.fits` images in
+ZScale/asinh grayscale, to provide the first look at the data.
+
+<details>
+<summary>What to do?</summary>
+<br>
+Check the images for double-stars or other visual artifacts.
+</details>
+<br>
+
+<details>
+<summary>Other details</summary>
+
+* For redundancy, if a filter was observed but no data exists on disk, that is stated explicitly here rather than dropped silently.
+
+* Each image is loaded from the pipeline folder or, when that is unavailable, from MAST. See "files read" for details.
+</details>
+<br>
 
 Source: [`data_qa/diagnostics.py` → `stage1_mosaics`](../data_qa/diagnostics.py).
 
 <a id="stage2"></a>
-## Stage 2 — colour–magnitude diagram (CMD)
+## Stage 2 — color–magnitude diagram (CMD)
 
-Stage 2 shows a 2-D density (hexbin) colour–magnitude diagram — LW magnitude versus (SW − LW)
-colour — from the highest-tier [catalog](#glossary-mtier) on disk, with the
+Stage 2 shows a 2-D density color–magnitude diagram — LW magnitude versus (SW − LW)
+color — from the highest-tier [catalog](#glossary-mtier) on disk, with the
 [luminosity function](#glossary-lf) drawn as a right-side marginal on a shared magnitude axis. Two
-versions are produced: **all stars**, and one **limited to [S/N > 10](#glossary-snr) in both bands** (the cleaner
-locus).
+versions are produced: **all stars**, and one **limited to [S/N > 10](#glossary-snr) in both bands**.
 
 `stage2_cmd` reads the jicama [`mN`](#glossary-mtier) catalog (or, if no single catalog holds both
 bands, cross-matches the two single-band catalogs — labelled `crossmatch`); the MAST L3 product is
 used only when no jicama catalog exists. `n_stars` = finite (SW, LW) pairs; `lf_turnover` =
-magnitude of the LF peak bin. Consider it passing if the CMD shows a coherent stellar locus and
-`n_stars` is not far below the field's expected depth.
+magnitude of the LF peak bin.
+
+<details>
+<summary>What to do?</summary>
+<br>
+Look for a coherent stellar locus. Check whether <code>n_stars</code> is reasonable based on other similar fields (the suggested <code>passed</code> flag is set when it exceeds 500).
+</details>
+<br>
 
 Source: [`data_qa/diagnostics.py` → `stage2_cmd`](../data_qa/diagnostics.py).
 
@@ -378,7 +375,15 @@ omitted (two-panel top row).
   the bulk A→B shift (the xcorr histogram peak) the nearest B source within 80 mas is taken for each
   A source and duplicate B are dropped (closest A kept), so the reported count is distinct overlap
   stars. A fixed-radius ball match in a crowded field returns a many-to-many pair count instead,
-  which is the ~34k figure this replaced.
+  which is the ~34k figure this replaced. The reported **offset is the peak refined on those same
+  stars**: `off = peak − median(A_aligned − B)` with `A_aligned = A + peak`, so the median is
+  **subtracted** (the xcorr peak is the shift that moves A onto B, so a peak too large by *d* leaves
+  *+d* in the residual). The refinement is needed because a histogram peak measured against a
+  catalogue tracing the same clustered field is pulled by several mas by the correlated wrong-pair
+  background, the bias [stage 4](#stage4) already corrects for. `intermodule_peak_off` records what
+  the peak alone said, and the residual cloud in the panel is drawn about the peak, so its
+  displacement from the centre is the peak's **error** — what the refinement subtracts. Below 30
+  one-to-one pairs the refinement is refused and the raw peak stands (`intermodule_bulk_source`).
 - **TOP-RIGHT** — the same comparison restricted to [S/N > 10](#glossary-snr) stars (when the field
   has flux errors), where the scatter measures how well the modules agree with the centroid noise
   of faint stars taken out of it.
