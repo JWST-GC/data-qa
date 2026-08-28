@@ -1112,29 +1112,25 @@ def stage3_calibration(o: Observation, sw):
     slope, zp, scat, n_locus, n_unclipped, clip_exit = _clipped_locus_fit(x, y)
     hb = a.hexbin(x, y, gridsize=80, bins="log", cmap="magma", mincnt=1)
     fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
-    # Draw ONLY the ideal UNIT-SLOPE (1:1) reference line -- the relation a well-calibrated
-    # zeropoint should follow.  Anchor it on the DENSE stellar locus via the MODE of (y-x): the
-    # sigma-clipped fit does not cleanly separate the bright locus from the red mismatch cloud, so
-    # a median of the clipped set lands between the two populations and the line misses the locus.
-    # The mode picks the densest ridge.  The free-slope fit is NOT drawn (its slope wanders with
-    # the cloud and reads as a bad fit); the slope is still measured and gated below.
+
     dy = y - x
     hcnt, hedge = np.histogram(dy, bins=60)
-    zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus zp
+    zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus offset
     xs = np.array([np.nanmin(x), np.nanmax(x)])
-    a.plot(xs, xs + zp1, "c-", lw=1.4, label="1:1 line")
+    a.plot(xs, xs, "c-", lw=1.4, label="1:1 reference line")
+    a.plot(xs, slope * xs + zp, "g--", lw=1.4, label="fitted locus")
     a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
     a.legend(fontsize=8, loc="upper left")
     # Say which exit the clip took: n_locus == n_matched reads the same whether the clip converged
     # with nothing to reject or was refused for want of survivors, and those are different numbers.
     locus_note = " unclipped" if clip_exit == "floor-unclipped" else ""
     a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus}{locus_note})  "
-                f"slope={slope:.2f}  scatter={scat:.2f}  locus zp={zp1:.2f}", fontsize=9)
+                f"slope={slope:.2f}  scatter={scat:.2f}  locus offset={zp1:.2f}", fontsize=9)
     # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen
     # only the SCATTER for the real narrow-vs-broad (F212N vs Ks) colour/extinction spread.
     metrics.update(n_matched=int(g.sum()), n_locus=n_locus, n_locus_unclipped=n_unclipped,
                    clip_exit=clip_exit, slope=float(slope),
-                   zeropoint=float(zp), scatter=scat,
+                   zeropoint_fit=float(zp), scatter=scat, locus_offset=float(zp1),
                    passed=(0.8 < slope < 1.2 and scat < 0.8))
     return _save(fig, f"{o.obsid}_stage3.png"), metrics
 
