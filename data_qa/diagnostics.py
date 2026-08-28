@@ -1118,7 +1118,7 @@ def stage3_calibration(o: Observation, sw):
     zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus offset
     xs = np.array([np.nanmin(x), np.nanmax(x)])
     a.plot(xs, xs, "c-", lw=1.4, label="1:1 reference line")
-    a.plot(xs, slope * xs + zp1, "r--", lw=1.4, label="fitted locus")
+    a.plot(xs, slope * xs + zp1, "g--", lw=1.4, label="fitted locus")
     a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
     a.legend(fontsize=8, loc="upper left")
     # Say which exit the clip took: n_locus == n_matched reads the same whether the clip converged
