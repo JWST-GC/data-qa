@@ -7,6 +7,7 @@ import os
 import pytest
 
 from data_qa import mast_monitor as mm
+from data_qa import paths
 from data_qa.observations import FIELDS
 
 POLL = 60000.0   # fake "now" MJD
@@ -53,8 +54,11 @@ def test_gc_fields_membership():
     """DEBLEND_SATSTARS keys off GC_FIELDS: every inner-GC/CMZ field is in, and
     the 1182 brick+w51 split must never sweep w51 (or any other non-GC field)
     into the set."""
-    assert {"gc-treasury", "brick", "cloudc", "gc2211", "sgrc", "sgrb2",
+    # gc2211 is split into one field per observation (pipeline #469, issue #119)
+    assert {"gc-treasury", "brick", "cloudc", "sgrc", "sgrb2",
             "arches", "quintuplet", "sickle", "cloudef", "sgra"} <= mm.GC_FIELDS
+    assert {"gc2211_o023", "gc2211_o028", "gc2211_o046",
+            "gc2211_o049", "gc2211_o050"} <= mm.GC_FIELDS
     assert not {"w51", "wd1", "wd2", "ngc6334"} & mm.GC_FIELDS
     # every GC field is a field the monitor can actually map to
     mappable = {f for obsmap in mm.PROGRAMS.values() for f in obsmap.values()}
@@ -1438,6 +1442,108 @@ def test_act_download_rechecks_disk_gate_per_group(monkeypatch, capsys):
     assert "SKIPPED(low-disk)" in capsys.readouterr().err
 
 
+# ------------------------------------------- mid-run download SKIPs (issue #84)
+def test_act_download_reports_the_groups_it_left_owed(monkeypatch):
+    """Each mid-run SKIP burns no 'downloaded' key, so the download is still
+    owed; act_download names those groups so main() can re-arm them."""
+    _patch_download(monkeypatch, size=1e12, free_tb=2.0)          # below floor
+    assert mm.act_download(_trigger_events("001"), execute=True,
+                           min_free_tb=5.0) == {(2221, "001", "NIRCam"):
+                                                "low-disk"}
+    _patch_download(monkeypatch, size=None, free_tb=10.0)
+    assert mm.act_download(_trigger_events("001"), execute=True,
+                           min_free_tb=5.0) == {(2221, "001", "NIRCam"):
+                                                "unknown-size"}
+    _patch_download(monkeypatch, size=6e12, free_tb=10.0)         # 5 TB headroom
+    assert mm.act_download(_trigger_events("001"), execute=True,
+                           min_free_tb=5.0) == {(2221, "001", "NIRCam"):
+                                                "oversize"}
+
+
+def test_act_download_owes_nothing_for_standing_skips(monkeypatch, tmp_path):
+    """A planned tile, an unmapped program and an already-downloaded group are
+    NOT owed: re-arming them would re-fire the same group every poll forever."""
+    _patch_download(monkeypatch, size=1e12, free_tb=10.0)
+    assert mm.act_download(_planned_events(), execute=True,
+                           min_free_tb=5.0) == {}
+    unmapped = [dict(_trigger_events("001")[0], field=None)]
+    assert mm.act_download(unmapped, execute=True, min_free_tb=5.0) == {}
+    state = {"version": 1, "downloaded": {"2221-o001-NIRCam": "2026-08-25"}}
+    assert mm.act_download(_trigger_events("001"), execute=True,
+                           min_free_tb=5.0, state=state,
+                           state_path=str(tmp_path / "s.json")) == {}
+
+
+def _patch_poll_real_download(monkeypatch, rows, gates):
+    """main() with the REAL act_download: canned MAST rows, recorded fetches,
+    and a disk gate whose verdicts are read from ``gates`` in call order."""
+    from data_qa import retrieve_data
+    fetched = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+    monkeypatch.setattr(retrieve_data, "product_list_size_bytes",
+                        lambda *a, **kw: 1e11)
+    monkeypatch.setattr(retrieve_data, "retrieve",
+                        lambda *a, **kw: fetched.append(kw) or "manifest")
+    verdicts = list(gates)
+
+    def gate(download_dir, min_free_tb):
+        ok = verdicts.pop(0) if verdicts else True
+        return (True, 10.0, "gate") if ok else (False, 1.0, "LOW DISK: gate")
+
+    monkeypatch.setattr(mm, "disk_gate", gate)
+    return fetched
+
+
+def test_main_rearms_a_group_the_disk_gate_skipped_mid_run(monkeypatch, tmp_path):
+    """The #84 loss: the between-groups re-check trips after group 1 ate the
+    headroom, group 2 is skipped, and the end-of-run commit retires group 2's
+    event -- the download owed with nothing recording it.  Now group 2 keeps
+    its pre-poll baseline and re-fires."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n"),
+            _row("jw02221-o002_t001_nircam_clear-f405n")]
+    fetched = _patch_poll_real_download(monkeypatch, rows, gates=[True, False])
+    state = tmp_path / "state.json"
+    _seed_state(state)                           # baseline: not a first run
+    args = ["--program", "2221", "--download", "--execute", "--commit-state",
+            "--state", str(state), "--download-dir", str(tmp_path)]
+    assert mm.main(args) == 0
+    assert len(fetched) == 1                     # only the first group ran
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o001_t001_nircam_clear-f405n" in committed   # retired
+    assert "jw02221-o002_t001_nircam_clear-f405n" not in committed  # re-armed
+
+    # next poll, disk healthy again: the skipped group is re-offered and the
+    # already-downloaded one is not
+    fetched2 = _patch_poll_real_download(monkeypatch, rows, gates=[True, True])
+    assert mm.main(args) == 0
+    assert len(fetched2) == 1
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o002_t001_nircam_clear-f405n" in committed
+    assert set(mm.load_state(str(state))["downloaded"]) == {"2221-o001-NIRCam",
+                                                            "2221-o002-NIRCam"}
+
+
+def test_main_notices_the_deferred_download(monkeypatch, tmp_path, capsys):
+    """The operator reads the debt on the QA issue, not only in the log: the
+    notice rides act_report's comment body and counts as a downgrade class, so
+    its first appearance posts a NOTIFYING comment."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_download(monkeypatch, rows, gates=[False])
+    reported = {}
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: reported.update(kw))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    assert mm.main(["--program", "2221", "--download", "--report", "--execute",
+                    "--commit-state", "--state", str(state),
+                    "--download-dir", str(tmp_path)]) == 0
+    assert "DOWNLOAD DEFERRED" in reported["notice"]
+    assert "2221-o001-NIRCam (low-disk)" in reported["notice"]
+    assert mm.notice_downgrade_reason(reported["notice"]) == "DOWNLOAD DEFERRED"
+    assert "DOWNLOAD DEFERRED" in capsys.readouterr().err
+
+
 def test_act_download_dry_run_skips_prechecks(monkeypatch):
     from data_qa import retrieve_data
     fetched = []
@@ -1689,9 +1795,10 @@ def test_act_download_dual_instrument_separate_keys(monkeypatch, tmp_path):
 #
 # PIPE_ROOT names the checkout; the tests workflow points it at the
 # keflavich/jwst-gc-pipeline checkout it makes, so the guard runs in CI instead
-# of skipping (the green-by-skip half of #74).
-DEFAULT_PIPE_ROOT = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
-_PIPE_ROOT = os.environ.get("PIPE_ROOT", DEFAULT_PIPE_ROOT)
+# of skipping (the green-by-skip half of #74).  data_qa.paths reads that
+# variable for the whole package now (issue #85), so this guard and the code
+# under test resolve the same checkout.
+_PIPE_ROOT = paths.pipe_root()
 _PIPE_FIELDS_PY = os.path.join(_PIPE_ROOT, "jwst_gc_pipeline", "fields.py")
 # CI sets this after checking the pipeline out: a checkout step that silently
 # produced nothing then fails the suite.  A skip would hide it.
@@ -1798,13 +1905,12 @@ def _assert_monitor_covers(mapping):
             for obsnum in str(obsid).split("-"):
                 assert obsnum in mm.PROGRAMS[prog], (prog, obsid, obsnum)
                 qa_field = mm.PROGRAMS[prog][obsnum]
-                # The pipeline may register an observation under a PER-OBS reduction key
-                # (``gc2211_o023``) while data-qa keeps one QA field for the region (``gc2211``,
-                # whose release mosaics live under gc2211/; gc2211_o023/ is only reduction
-                # intermediates).  Accept the base QA field for a ``<field>_o<obs>`` reduction key.
-                # A semantic rename such as o005 -> cloudef_controlfield is NOT this pattern and
-                # still requires the explicit mapping.
-                assert field in (qa_field, f"{qa_field}_o{obsnum}"), (prog, obsnum, field)
+                # EXACT match: PROGRAMS must name the same field the pipeline registers.  Where the
+                # pipeline split a region into per-obs reduction fields (gc2211 -> gc2211_o023 ...,
+                # pipeline #469), PROGRAMS now carries those per-obs keys too (issue #119), so no
+                # base-field relaxation is needed -- and re-tightening restores the drift guard the
+                # relaxation had been masking.
+                assert field == qa_field, (prog, obsnum, field)
 
 
 def test_pipeline_checkout_present_when_required():

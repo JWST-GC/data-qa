@@ -2,6 +2,8 @@
 
 Data-quality assessment and issue tracking for the JWST Galactic Center surveys.
 
+See [the project page](https://github.com/orgs/JWST-GC/projects/2/views/1)
+
 **This repository is for reporting and discussing data-quality issues on individual
 datasets — one GitHub issue per observation.**
 
@@ -71,6 +73,16 @@ Create/refresh the tracking issues (needs a `GITHUB_TOKEN` with `issues:write`):
 python -m data_qa.make_issues --program 2221 1182 --target Brick        # create
 python -m data_qa.make_issues --program 2221 1182 --target Brick --dry-run   # preview
 ```
+
+## The pipeline checkout (`PIPE_ROOT`)
+
+Everything that reaches into jwst-gc-pipeline — the trigger's sbatch scripts,
+the destreak-policy probe, the treasury imaging's `jwst_gc_pipeline.cmz.hips`
+import — resolves one path through `data_qa.paths.pipe_root()`:
+`$PIPE_ROOT` when set, otherwise the HiPerGator checkout
+(`/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline`). The `--pipe-root`
+flags override it explicitly; the environment variable is the non-interactive
+knob a scrontab entry and the GitHub runner both use.
 
 ## Adding a field / observation
 

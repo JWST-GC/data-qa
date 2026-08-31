@@ -19,6 +19,24 @@ def _obs(field="gc2211", obs="023", filt="F200W"):
                        instrument="NIRCam", filters=[filt], visits=[], epoch="", notes="")
 
 
+def test_base_field_and_viraccache_fallback(tmp_path, monkeypatch):
+    # a per-obs split field falls back to its base field's VIRAC Ks refcache (issue #119)
+    assert D._base_field("gc2211_o023") == "gc2211"
+    assert D._base_field("gc2211") == "gc2211"          # no suffix -> unchanged
+    assert D._base_field("cloudef_controlfield") == "cloudef_controlfield"  # not an _o<obs> split
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    o = _obs(field="gc2211_o023")
+    assert D._viraccache_path(o) is None                # nothing on disk
+    # cache only under the BASE field -> the per-obs split field still finds it
+    base = tmp_path / "gc2211" / "astrometry_diag" / "refcache"; base.mkdir(parents=True)
+    (base / "virac2.fits").write_text("x")
+    assert D._viraccache_path(o) == str(base / "virac2.fits")
+    # a per-obs cache, when present, is preferred over the base one
+    own = tmp_path / "gc2211_o023" / "astrometry_diag" / "refcache"; own.mkdir(parents=True)
+    (own / "virac2.fits").write_text("x")
+    assert D._viraccache_path(o) == str(own / "virac2.fits")
+
+
 # --------------------------------------------------------------------------- _binned_stat
 def test_binned_stat_basic():
     x = np.repeat(np.arange(10.0), 20)          # 10 bins, 20 pts each
@@ -681,6 +699,72 @@ def test_cell_offsets_adaptive_grid_fired_1x1():
     assert len(cells) == 1
 
 
+def _one_cell_field(n=400):
+    """A single dense patch: one 1x1 cell, so _cell_grid's floors are the only thing deciding."""
+    return _uniform_shift(n, 0.0, seed=3)
+
+
+def _fake_xcorr(npairs, npeak, peak_ratio=8.0):
+    return lambda a, b, **kw: dict(dra=5.0, ddec=0.0, off=5.0, npairs=npairs, npeak=npeak,
+                                   peak_ratio=peak_ratio)
+
+
+def test_cell_grid_pair_floor_is_independent_of_the_star_floor(monkeypatch):
+    # issue #65: min_pairs is a PAIR count, chosen for pairs.  With the star floor held fixed and
+    # generous, moving the pair floor alone must decide the cell -- which is only possible because
+    # the pair floor is no longer `min_pairs = min_src`.
+    jsc, ref = _one_cell_field()
+    monkeypatch.setattr(D.aa, "xcorr", _fake_xcorr(npairs=120, npeak=60))
+    kept, _ = D._cell_grid(jsc, ref, 1, 50, min_pairs=100, min_peak_pairs=10)
+    dropped_cells, dropped = D._cell_grid(jsc, ref, 1, 50, min_pairs=5000, min_peak_pairs=10)
+    assert len(kept) == 1 and dropped_cells == []
+    assert dropped[0]["reason"] == "too few pairs in the search radius"
+    # ...and the star floor still decides on its own quantity, with the pair floor generous
+    _c, star_dropped = D._cell_grid(jsc, ref, 1, 100000, min_pairs=1, min_peak_pairs=1)
+    assert star_dropped == [] or star_dropped[0]["reason"] == "too few reference stars"
+
+
+def test_cell_grid_drops_a_cell_with_plenty_of_stars_but_a_peak_no_stars_support(monkeypatch):
+    # the case the star floor cannot see: 40 000 chance pairs inside the search radius (so the
+    # total-pair floor is satisfied many times over) while the reported offset rests on 5 stars.
+    jsc, ref = _one_cell_field()
+    monkeypatch.setattr(D.aa, "xcorr", _fake_xcorr(npairs=40000, npeak=5))
+    cells, dropped = D._cell_grid(jsc, ref, 1, 50)
+    assert cells == [] and dropped[0]["reason"] == "too few pairs supporting the peak"
+    monkeypatch.setattr(D.aa, "xcorr", _fake_xcorr(npairs=40000, npeak=50))
+    cells, _ = D._cell_grid(jsc, ref, 1, 50)
+    assert len(cells) == 1 and cells[0]["npeak"] == 50
+
+
+def test_cell_offsets_passes_explicit_pair_floors_at_every_rung(monkeypatch):
+    # the floors must arrive at _cell_grid as the deliberate constants, at every adaptive rung, and
+    # must NOT track the rung's star floor (300 / 150 / 100).
+    seen = []
+
+    def _spy(jsc, ref_sc, ncell, min_src, pr_floor=None, min_pairs=None, min_peak_pairs=None):
+        seen.append(dict(ncell=ncell, min_src=min_src, min_pairs=min_pairs,
+                         min_peak_pairs=min_peak_pairs))
+        return [], []
+
+    monkeypatch.setattr(D, "_cell_grid", _spy)
+    jsc, ref = _one_cell_field()
+    D._cell_offsets(jsc, ref)
+    assert [s["min_src"] for s in seen] == [300, 150, 100]        # star floors still step down
+    assert {s["min_pairs"] for s in seen} == {D._CELL_MIN_PAIRS}
+    assert {s["min_peak_pairs"] for s in seen} == {D._CELL_MIN_PEAK_PAIRS}
+    assert all(s["min_pairs"] != s["min_src"] or s["min_peak_pairs"] != s["min_src"] for s in seen)
+
+
+def test_xcorr_reports_the_pairs_that_support_the_peak():
+    # npeak is the PEAK BIN's occupancy, so a synthetic field of N stars shifted rigidly reports
+    # ~N supporting pairs while npairs counts every pair in the 2.5" radius.
+    jsc, ref = _uniform_shift(300, 100.0, seed=5, span=0.004)
+    xc = D.aa.xcorr(jsc, ref)
+    assert xc["npeak"] <= xc["npairs"]
+    assert xc["npeak"] >= 200                 # the 300 true pairs, minus bin-edge splitting
+    assert xc["npairs"] > 2 * xc["npeak"]     # the rest of the radius is chance pairs
+
+
 def test_offset_failure_reason_reports_counts_not_cause(monkeypatch, tmp_path):
     # the reason string must report measured counts (JWST / reference / pairs) and NOT assert a
     # single cause; and a confident peak must never print "peak_ratio >=4 < 4".
@@ -689,8 +773,11 @@ def test_offset_failure_reason_reports_counts_not_cause(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "_jwst_sources", lambda o, f: (None, None, None))
     ra = 266.40 + np.linspace(0, 0.02, 300); dec = -28.90 + np.linspace(0, 0.02, 300)
     jsc = SkyCoord(ra * u.deg, dec * u.deg); ref = SkyCoord(ra * u.deg, dec * u.deg)
-    hi = D._offset_failure_reason(_obs(), "F210M", jsc, ref, {"peak_ratio": 16.0, "npairs": 250})
-    assert "300 JWST sources" in hi and "matched pairs" in hi
+    hi = D._offset_failure_reason(_obs(), "F210M", jsc, ref,
+                                  {"peak_ratio": 16.0, "npairs": 250, "npeak": 40})
+    # the pair count must be named for what it is -- pairs inside the search radius, of which only
+    # some support the peak (issue #65); "matched pairs at the best peak" described neither.
+    assert "300 JWST sources" in hi and "250 pairs within" in hi and "40 land in the peak bin" in hi
     assert "16.0" in hi and "< 4" not in hi and "≥" in hi
     lo = D._offset_failure_reason(_obs(), "F210M", jsc, ref, {"peak_ratio": 1.2, "npairs": 5})
     assert "300 JWST sources" in lo and "not determined" in lo
@@ -762,19 +849,60 @@ def test_mosaic_path_single_module_nrcb(tmp_path, monkeypatch):
     assert D._mosaic_module(D._mosaic_path(o, "F210M")) == ""
 
 
-def test_stage4_2x2_three_of_four_fails_without_spatial_check(monkeypatch):
-    # A 2x2 grid with 3 of 4 cells measured (grid_used=2, coverage 0.75 -- ABOVE the 0.5 floor) must
-    # FAIL, because <4 cells is not 'consistent'.  Coverage cannot catch this (0.75 >= 0.5), so the
-    # grid-keyed spatial gate is the only thing holding it -- reverting to an `n_cells >= 4` heuristic
-    # would flip it green (#13 re-review).
-    ij3 = [(0, 0), (0, 1), (1, 0)]                 # 3 of the 4 cells in a 2x2 grid
-    cells = [dict(i=i, j=j, ra=266.41 + 0.001 * i, dec=-28.89 + 0.001 * j, dra=5.0, dde=0.0,
-                  off=5.0, peak_ratio=8.0, n=400, n_ref=400, npairs=400) for i, j in ij3]
-    dropped = [dict(i=1, j=1, ra=266.41, dec=-28.89, n=400, n_ref=100, reason="too few reference stars")]
+def _three_of_four(dra_by_cell=None, n_by_cell=None):
+    """3 of the 4 cells of a 2x2 grid, plus the 1 dropped cell (coverage 0.75)."""
+    ij3 = [(0, 0), (0, 1), (1, 0)]
+    dra_by_cell = dra_by_cell or {}
+    n_by_cell = n_by_cell or {}
+    cells = [dict(i=i, j=j, ra=266.41 + 0.001 * i, dec=-28.89 + 0.001 * j,
+                  dra=dra_by_cell.get((i, j), 5.0), dde=0.0,
+                  off=abs(dra_by_cell.get((i, j), 5.0)), peak_ratio=8.0,
+                  n=n_by_cell.get((i, j), 400), n_ref=400, npairs=400) for i, j in ij3]
+    dropped = [dict(i=1, j=1, ra=266.41, dec=-28.89, n=400, n_ref=100,
+                    reason="too few reference stars")]
+    return cells, dropped
+
+
+def test_stage4_2x2_three_of_four_agreeing_passes_but_is_not_auto_ticked(monkeypatch):
+    # issue #66: a 2x2 grid with 3 of 4 cells measured (coverage 0.75, ABOVE the 0.5 floor) whose
+    # cells AGREE must not be failed for the thinness of its own grid.  It passes the magnitude and
+    # coverage gates, and `spatial_assessed` stays False so make_issues leaves 'frame_ok' unticked
+    # -- the same treatment the 1x1 whole-field fallback gets.  Restoring `len(cells) >= 4` inside
+    # `consistent` fails this.
+    cells, dropped = _three_of_four()
     _stage4_seams(monkeypatch, cells, dropped, grid_used=2)
     _png, m = D.stage4_offsets(_obs(), "F210M")
     assert m["grid_used"] == 2 and 0.5 <= m["cell_coverage"] < 1.0
-    assert m["spatial_assessed"] is True and m["passed"] is False
+    assert m["passed"] is True and m["spatial_assessed"] is False
+    assert m["cells_spatial_conclusive"] is False
+
+
+def test_stage4_three_of_four_with_adjacent_deviating_cells_still_fails(monkeypatch):
+    # ...and the adjacency test keeps its teeth on the same thin grid: two ORTHOGONALLY ADJACENT
+    # cells sitting 120 mas from the field value confirm each other, so the field FAILS on evidence
+    # rather than on cell count.  (0,0)-(0,1) are adjacent in j, and the third cell carries most of
+    # the sources, so the source-weighted consensus is the quiet one and the pair is the minority
+    # (13.8% of the sources -- above the 2% _CELL_BAD_FRAC).
+    cells, dropped = _three_of_four({(0, 0): 120.0, (0, 1): 120.0}, {(1, 0): 5000})
+    _stage4_seams(monkeypatch, cells, dropped, grid_used=2)
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    assert m["n_cells_confirmed"] >= 2 and m["cells_consistent"] is False
+    assert m["passed"] is False
+
+
+def test_stage4_verdict_is_monotonic_in_sampling(monkeypatch):
+    # issue #66, the inversion itself: the SAME clean field measured with a 1x1 whole-field cell and
+    # with a 2x2 grid that resolved 3 of 4 cells must not disagree.  Before the fix the better-sampled
+    # measurement scored WORSE (2x2 3-of-4 -> passed False; 1x1 -> passed True).
+    one = [dict(i=0, j=0, ra=266.41, dec=-28.89, dra=5.0, dde=0.0, off=5.0, peak_ratio=20.0,
+                n=1200, n_ref=1200, npairs=1200)]
+    _stage4_seams(monkeypatch, one, [], grid_used=1)
+    _png, m1 = D.stage4_offsets(_obs(), "F210M")
+    cells, dropped = _three_of_four()
+    _stage4_seams(monkeypatch, cells, dropped, grid_used=2)
+    _png, m2 = D.stage4_offsets(_obs(), "F210M")
+    assert m1["passed"] is True and m2["passed"] is True
+    assert m1["spatial_assessed"] is False and m2["spatial_assessed"] is False
 
 
 def test_stage4_caption_states_when_spatial_check_skipped():
@@ -2355,8 +2483,12 @@ def test_jwst1pass_psfperts_locator_and_figure(tmp_path, monkeypatch):
     assert [det for det, _ in pp] == ["NRCA1", "NRCA2", "NRCB4"]  # sorted by detector
     # obs-scoped: a different obs sees nothing
     assert D._jwst1pass_psfperts(_obs(field="brick", obs="004", filt="F182M"), "F182M") == []
-    png = D._psfperts_figure(o, "F182M", pp)
-    assert os.path.exists(png)
+    # one full-width row draws, and interior rms EXCLUDES the +/-0.1 fill (0.01 interior -> ~0.01)
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _, a = plt.subplots()
+    im, rms = D._draw_psfperts_row(a, pp[0][1], pp[0][0], "F182M")
+    assert im is not None and abs(rms - 0.01) < 1e-3
 
 
 def test_jwst1pass_matchup_per_obs_match_layout(tmp_path, monkeypatch):
@@ -2626,3 +2758,142 @@ def test_stage6_figure_excluding_draws_no_rms_jwst(tmp_path, monkeypatch):
     calls.clear()
     D._stage6_figure(o, "F212N", None)                             # normal: rms(jwst) consulted
     assert calls == ["F212N"]
+
+
+# --------------------------------------------------------------------------- _clipped_locus_fit
+def _sparse_locus_with_cloud():
+    """34 matches on a unit-slope locus, 4 of them displaced into a red mismatch cloud.
+
+    The upstream stage-3 gate admits a field at 30 matches, so a locus this sparse is where the
+    sample floor decides what gets reported (issue #97).
+    """
+    rng = np.random.default_rng(97)
+    x = np.linspace(12.0, 18.0, 34)
+    y = x + rng.normal(0.0, 0.10, x.size)         # clean locus, slope 1
+    y[-4:] += 2.0                                 # the red/mismatch cloud
+    return x, y
+
+
+def _old_clip_loop(x, y):
+    """The pre-#97 loop: the sample floor breaks BEFORE the clip is adopted."""
+    import astropy.stats as ast
+    xf, yf = x, y
+    slope, zp = np.polyfit(xf, yf, 1)
+    for _ in range(5):
+        resid = yf - (slope * xf + zp)
+        loc = np.abs(resid) < 3 * ast.mad_std(resid)
+        if loc.all() or loc.sum() < 30:
+            break
+        xf, yf = xf[loc], yf[loc]
+        slope, zp = np.polyfit(xf, yf, 1)
+    return float(slope), float(ast.mad_std(yf - (slope * xf + zp))), int(len(xf))
+
+
+def test_clipped_locus_fit_adopts_the_clip_at_the_sample_floor():
+    """A sparse locus carrying a mismatch cloud must report the CLIPPED fit.
+
+    The old loop broke on ``loc.sum() < 30`` before reassigning xf/yf, so it reported the slope,
+    scatter and n_locus of the set the clip had NOT been applied to.
+    """
+    x, y = _sparse_locus_with_cloud()
+    old_slope, _old_scat, old_n = _old_clip_loop(x, y)
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = D._clipped_locus_fit(x, y)
+    assert n_unclipped == 34
+    assert clip_exit == "floor"                   # stopped on the floor WITH the clip in hand
+    assert n_locus < old_n                        # 27 clipped stars, against 31 reported before
+    assert abs(slope - 1.0) < abs(old_slope - 1.0)    # 1.015 against 1.064
+    assert scat < 0.10
+
+
+def test_clipped_locus_fit_reports_convergence_separately_from_the_floor():
+    """A clean locus converges; the two exits must be distinguishable in the metrics."""
+    rng = np.random.default_rng(3)
+    x = np.linspace(12.0, 18.0, 400)
+    y = x + rng.normal(0.0, 0.05, x.size)
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = D._clipped_locus_fit(x, y)
+    assert clip_exit in ("converged", "maxiter")
+    assert abs(slope - 1.0) < 0.02
+
+
+def test_clipped_locus_fit_refuses_a_clip_that_strips_its_own_support(monkeypatch):
+    """A clip that would leave too few stars to fit is refused, and SAID to be refused."""
+    monkeypatch.setattr(D, "LOCUS_CLIP_MIN_FIT", 33)     # the first pass leaves 31
+    x, y = _sparse_locus_with_cloud()
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = D._clipped_locus_fit(x, y)
+    assert clip_exit == "floor-unclipped"
+    assert n_locus == n_unclipped == 34                  # nothing was thrown away
+
+
+# --------------------------------------------------------------------------- _ab_overlap
+def _ab_module_catalogs(true_dra_mas, true_ddec_mas, n=800, seed=95):
+    """Two module catalogues of the SAME stars, A displaced from B by a known offset.
+
+    ``true_dra/ddec`` is the shift that moves A onto B, the quantity ``_ab_overlap`` reports.
+    """
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.default_rng(seed)
+    ra0, dec0 = 266.5, -28.6
+    cosd = float(np.cos(np.radians(dec0)))
+    b_ra = ra0 + rng.uniform(-0.01, 0.01, n)
+    b_dec = dec0 + rng.uniform(-0.01, 0.01, n)
+    a_ra = b_ra - true_dra_mas / 1000.0 / 3600.0 / cosd
+    a_dec = b_dec - true_ddec_mas / 1000.0 / 3600.0
+    return (SkyCoord(a_ra * u.deg, a_dec * u.deg), SkyCoord(b_ra * u.deg, b_dec * u.deg))
+
+
+def test_ab_overlap_refines_a_biased_histogram_peak_onto_the_same_stars(monkeypatch):
+    """The reported A−B offset must be the peak CORRECTED by the same stars, not the raw peak.
+
+    A histogram peak measured against a catalogue tracing the same clustered field is pulled by a
+    correlated wrong-pair background (issue #95).  Inject that pull directly: hand `_ab_overlap` a
+    peak that is 6.0/-4.0 mas off truth and check the returned offset comes back to truth, with the
+    raw peak still on record.
+    """
+    from data_qa import astrometry_audit as aa
+    true_dra, true_ddec = 12.0, -7.0
+    bias_dra, bias_ddec = 6.0, -4.0
+    a_sc, b_sc = _ab_module_catalogs(true_dra, true_ddec)
+
+    def _biased_xcorr(a, b, **kw):
+        dra, ddec = true_dra + bias_dra, true_ddec + bias_ddec
+        return dict(dra=dra, ddec=ddec, off=float(np.hypot(dra, ddec)),
+                    npairs=5000, peak_ratio=25.0)
+
+    monkeypatch.setattr(aa, "xcorr", _biased_xcorr)
+    ov = D._ab_overlap(a_sc, b_sc)
+    assert ov is not None
+    assert ov["bulk_source"] == "same-star"
+    # the raw peak is 7.2 mas off truth; the refined offset is back on it
+    assert abs(ov["peak_off"] - np.hypot(true_dra + bias_dra, true_ddec + bias_ddec)) < 1e-6
+    assert abs(ov["dra"] - true_dra) < 0.5 and abs(ov["dde"] - true_ddec) < 0.5
+    assert abs(ov["off"] - np.hypot(true_dra, true_ddec)) < 0.5
+    # sign check: ADDING the residual median instead of subtracting doubles the error
+    wrong = np.hypot(true_dra + 2 * bias_dra, true_ddec + 2 * bias_ddec)
+    assert abs(ov["off"] - wrong) > 5.0
+    # ...and pin the residual's SENSE, which is what makes the verb "subtract" rather than "add":
+    # a_aligned = a + peak, so a peak too large by d leaves +d (not -d) in a_aligned - b_matched.
+    # The docstring and docs/qa_methods.md state the formula in these terms; an alignment direction
+    # flipped without updating them would keep `off` right by luck here and fail this.
+    assert abs(ov["same_star_dra"] - bias_dra) < 0.5
+    assert abs(ov["same_star_ddec"] - bias_ddec) < 0.5
+
+
+def test_ab_overlap_keeps_the_raw_peak_when_too_few_pairs_to_refine(monkeypatch):
+    """Below the pair floor the refinement is refused and the histogram peak stands, labelled."""
+    from data_qa import astrometry_audit as aa
+    true_dra, true_ddec = 12.0, -7.0
+    bias_dra, bias_ddec = 6.0, -4.0
+    a_sc, b_sc = _ab_module_catalogs(true_dra, true_ddec)
+
+    def _biased_xcorr(a, b, **kw):
+        dra, ddec = true_dra + bias_dra, true_ddec + bias_ddec
+        return dict(dra=dra, ddec=ddec, off=float(np.hypot(dra, ddec)),
+                    npairs=5000, peak_ratio=25.0)
+
+    monkeypatch.setattr(aa, "xcorr", _biased_xcorr)
+    monkeypatch.setattr(D, "AB_SAME_STAR_MINPAIRS", 10_000)
+    ov = D._ab_overlap(a_sc, b_sc)
+    assert ov is not None
+    assert ov["bulk_source"] == "histogram"
+    assert ov["off"] == ov["peak_off"]

@@ -36,6 +36,13 @@ FIELDS: Dict[str, str] = {
     "cloudef": "Cloud E/F",
     "cloudef_controlfield": "Cloud E/F control field",
     "gc2211": "GC 2211",
+    # pipeline #469 split gc2211 into one field per observation; all five keep the "GC 2211"
+    # display so the issue titles ("GC 2211 — jw02211-oNNN") are unchanged (issue #119).
+    "gc2211_o023": "GC 2211",
+    "gc2211_o028": "GC 2211",
+    "gc2211_o046": "GC 2211",
+    "gc2211_o049": "GC 2211",
+    "gc2211_o050": "GC 2211",
     "gc-treasury": "GC Treasury",
     "arches": "Arches",
     "quintuplet": "Quintuplet",

@@ -479,7 +479,7 @@ def test_deblend_satstars_set_for_gc_fields():
     """The pipeline README marks DEBLEND_SATSTARS=1 required for crowded GC
     fields; every treasury tile is inner-CMZ."""
     for field, program, obsnum in (("gc-treasury", 10678, "001"),
-                                   ("gc2211", 2211, "023"),
+                                   ("gc2211_o023", 2211, "023"),   # per-obs split field (#119)
                                    ("arches", 2045, "001")):
         step = pt.cataloging_step(program, obsnum, field, ["F212N"],
                                   pipe_root="/pipe")
@@ -908,10 +908,46 @@ def test_registry_preflight_rejects_weird_instrument(tmp_path):
 
 # ----------------------------------------------------- jobid capture (issue #68)
 def test_parse_jobids_parsable_and_submitted_lines():
-    text = "12345;hpg\nSubmitted batch job 12346\nnoise\n12345\n 12347 \n"
-    assert pt.parse_jobids(text) == ["12345", "12347", "12346"]
+    """Per step: the --parsable step's own first line, plus every step's
+    'Submitted batch job' lines, deduped in first-seen order."""
+    results = {"reduction": "12345;hpg\n",
+               "cataloging-chain": ("Submitted batch job 12346\n"
+                                    "Submitted batch job 12347\n")}
+    assert pt.parse_jobids(results) == ["12345", "12346", "12347"]
+    assert pt.parse_jobids({}) == []
     assert pt.parse_jobids("") == []
     assert pt.parse_jobids(None) == []
+
+
+def test_parse_jobids_rejects_a_bare_number_that_is_not_a_jobid():
+    """Issue #87: a year or a count printed by the cataloging chain is not a
+    SLURM job id.  Recording it would hand the planned sacct outcome probe
+    (#68c) an id sacct has never heard of, and 'no such job' would read as an
+    outcome for a submission that ran fine."""
+    results = {"cataloging-chain": "chain built 2026\n7\n"
+                                   "Submitted batch job 12346\n"}
+    assert pt.parse_jobids(results) == ["12346"]
+    # ... and the same line noise inside the --parsable step's capture: the id
+    # is read POSITIONALLY (first line), so the trailing bare numbers are not
+    # ids either
+    assert pt.parse_jobids({"reduction": "12345\n2026\n7\n"}) == ["12345"]
+    # a --parsable capture that is not a job id at all yields nothing
+    assert pt.parse_jobids({"reduction": "sbatch: error: whatever\n"}) == []
+
+
+def test_run_plan_refuses_a_reduction_capture_that_is_not_a_jobid(monkeypatch):
+    """rc=0 with unparsable stdout used to become DEP=<that text> on the
+    cataloging chain (--dependency=afterok:<garbage>)."""
+    class _Proc:
+        returncode = 0
+        stdout = "sbatch: submitted, probably\n"
+        stderr = ""
+
+    monkeypatch.setattr(pt.subprocess, "run", lambda *a, **k: _Proc())
+    plan = pt.build_plan(2221, "001", field="brick", filters=["F405N"],
+                         pipe_root="/pipe", probe=False)
+    with pytest.raises(RuntimeError, match="not a job id"):
+        pt.run_plan(plan)
 
 
 def test_submit_dry_run_returns_plan_without_jobids(tmp_path):

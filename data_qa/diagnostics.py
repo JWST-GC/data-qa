@@ -638,11 +638,27 @@ def _obs_epoch(o: Observation, mosaic_path):
     return None
 
 
+_FIELD_OBS_SUFFIX = re.compile(r"_o\d+$")
+
+
+def _base_field(field):
+    """The region field for a per-observation split key: ``gc2211_o023`` -> ``gc2211``.  When the
+    pipeline splits a region into per-obs reduction fields (pipeline #469), shared obs-independent
+    reference products stay under the base field; returns ``field`` unchanged when there is no
+    ``_o<obs>`` suffix."""
+    return _FIELD_OBS_SUFFIX.sub("", field)
+
+
 def _viraccache_path(o: Observation):
     """Raw VIRAC2 cache (has a real Ksmag column) for the photometric-calibration check.
-    The gaia_virac2 refcat carries only a blended 'refmag', unusable for a Ks zeropoint."""
-    p = f"{BASE}/{o.field}/astrometry_diag/refcache/virac2.fits"
-    return p if os.path.exists(p) else None
+    The gaia_virac2 refcat carries only a blended 'refmag', unusable for a Ks zeropoint.  VIRAC Ks
+    is a dense, obs-independent reference, so a per-obs split field (gc2211_o023) may fall back to
+    its base field's cache (gc2211) -- unlike the position refcat, whose footprint IS obs-specific."""
+    for fld in dict.fromkeys([o.field, _base_field(o.field)]):
+        p = f"{BASE}/{fld}/astrometry_diag/refcache/virac2.fits"
+        if os.path.exists(p):
+            return p
+    return None
 
 
 _DAO_OBS_RE = re.compile(r"_o(\d{3})_")     # per-exposure token is underscore-bounded: _o023_visit
@@ -997,6 +1013,55 @@ def stage2_cmd(o: Observation, sw, lw):
 
 
 # --------------------------------------------------------------------------- STAGE 3
+LOCUS_CLIP_KEEP_ITERATING = 30   # survivors below this: adopt the clip, stop iterating
+LOCUS_CLIP_MIN_FIT = 10          # survivors below this: refuse the clip, the fit loses its support
+
+
+def _clipped_locus_fit(x, y, k=3.0, maxiter=5):
+    """Sigma-clipped linear fit ``y = slope*x + zp`` to the stellar locus, and what the clip did.
+
+    The deep release catalogue matched to VIRAC carries a red/mismatch cloud above the locus
+    (Ks-bright, narrowband-faint stars), so the reported slope/scatter must describe the CLIPPED
+    locus -- the calibration -- rather than the astrophysical spread plus the cloud.
+
+    The clip is iterated to convergence, with the sample floor placed on CONTINUING rather than on
+    ADOPTING (JWST-GC/data-qa#97).  The floor used to break out of the loop before ``xf, yf`` were
+    reassigned, so a field sparse enough to hit it reported the slope, scatter and ``n_locus`` of
+    the UNCLIPPED match set -- and ``n_locus == n_matched``, which reads exactly like a locus so
+    clean that the first pass rejected nothing.  The upstream gate admits a field at 30 matches, so
+    any field between 30 and ~40 matches took that exit as soon as the clip rejected more than a
+    few stars (simulated 34 matches + a 4-star cloud: slope 1.064, 31 of 34 stars kept, against
+    slope 1.015 on the 27 the clip actually leaves).
+
+    So: adopt the clip, then stop iterating once the survivors fall under
+    ``LOCUS_CLIP_KEEP_ITERATING``; refuse a clip that would leave fewer than
+    ``LOCUS_CLIP_MIN_FIT`` stars (the fit would have no support) and report the unclipped set,
+    flagged as such.  Returns ``(slope, zp, scatter, n_locus, n_unclipped, clip_exit)`` where
+    ``clip_exit`` is one of ``converged`` (nothing left to reject -- the fit is the converged one),
+    ``floor`` (clipped fit adopted, iteration stopped on the sample floor), ``floor-unclipped``
+    (the clip was refused; slope/scatter/n_locus describe the UNCLIPPED set) or ``maxiter``."""
+    xf, yf = np.asarray(x, float), np.asarray(y, float)
+    n_unclipped = int(len(xf))
+    slope, zp = np.polyfit(xf, yf, 1)
+    clip_exit = "maxiter"
+    for _ in range(maxiter):
+        resid = yf - (slope * xf + zp)
+        loc = np.abs(resid) < k * aa.mad_std(resid)
+        if loc.all():
+            clip_exit = "converged"
+            break
+        if int(loc.sum()) < LOCUS_CLIP_MIN_FIT:
+            clip_exit = "floor-unclipped"       # reported numbers describe the UNCLIPPED set
+            break
+        xf, yf = xf[loc], yf[loc]
+        slope, zp = np.polyfit(xf, yf, 1)
+        if int(len(xf)) < LOCUS_CLIP_KEEP_ITERATING:
+            clip_exit = "floor"                 # clipped fit adopted; too few left to clip again
+            break
+    scat = float(aa.mad_std(yf - (slope * xf + zp)))
+    return float(slope), float(zp), scat, int(len(xf)), n_unclipped, clip_exit
+
+
 def stage3_calibration(o: Observation, sw):
     """JWST (SW ~ F212N) catalogue mag vs VIRAC Ks for matched stars.  The cyan 1:1 line is the
     ideal unit-slope relation (not a fit); the measured free slope and the scatter about the
@@ -1043,52 +1108,29 @@ def stage3_calibration(o: Observation, sw):
     x = ref_mag[keep]; y = jmag[idx[keep]]
     g = np.isfinite(x) & np.isfinite(y)
     x, y = x[g], y[g]
-    # robust linear fit y = slope*x + zp, sigma-clipped to the locus.  The deep release catalog
-    # matched to VIRAC has a red/mismatch cloud above the locus (Ks-bright, F212N-faint stars);
-    # one clip pass measures the CALIBRATION scatter (is the zeropoint sane) rather than the
-    # astrophysical colour spread.
-    # Iterate the 3-sigma locus clip to CONVERGENCE: stopping after one step at k=3 leaves the
-    # reported slope/scatter dependent on where the iteration happened to halt.
-    #
-    # NOTE the loop has TWO exits, and the second one changes what gets reported.  ``loc.all()``
-    # is convergence.  ``loc.sum() < 30`` is a floor on the surviving sample, and it breaks BEFORE
-    # ``xf, yf`` are reassigned, so a field sparse enough to hit it reports the slope, scatter and
-    # n_locus of the UNCLIPPED set.  The upstream gate admits a field at 30 matches, so a ~34-star
-    # locus carrying a red mismatch cloud takes that exit on the first pass and reports
-    # n_locus == n_matched -- which is indistinguishable from a locus so clean the clip rejected
-    # nothing.  See JWST-GC/data-qa#97.
-    xf, yf = x, y
-    slope, zp = np.polyfit(xf, yf, 1)
-    for _ in range(5):
-        resid = yf - (slope * xf + zp)
-        loc = np.abs(resid) < 3 * aa.mad_std(resid)
-        if loc.all() or loc.sum() < 30:
-            break
-        xf, yf = xf[loc], yf[loc]
-        slope, zp = np.polyfit(xf, yf, 1)
-    scat = float(aa.mad_std(yf - (slope * xf + zp)))
-    n_locus = int(len(xf))
+    # robust sigma-clipped linear fit to the stellar locus (see _clipped_locus_fit)
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = _clipped_locus_fit(x, y)
     hb = a.hexbin(x, y, gridsize=80, bins="log", cmap="magma", mincnt=1)
     fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
-    # Draw ONLY the ideal UNIT-SLOPE (1:1) reference line -- the relation a well-calibrated
-    # zeropoint should follow.  Anchor it on the DENSE stellar locus via the MODE of (y-x): the
-    # sigma-clipped fit does not cleanly separate the bright locus from the red mismatch cloud, so
-    # a median of the clipped set lands between the two populations and the line misses the locus.
-    # The mode picks the densest ridge.  The free-slope fit is NOT drawn (its slope wanders with
-    # the cloud and reads as a bad fit); the slope is still measured and gated below.
+
     dy = y - x
     hcnt, hedge = np.histogram(dy, bins=60)
-    zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus zp
+    zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus offset
     xs = np.array([np.nanmin(x), np.nanmax(x)])
-    a.plot(xs, xs + zp1, "c-", lw=1.4, label="1:1 line")
+    a.plot(xs, xs, "c-", lw=1.4, label="1:1 reference line")
+    a.plot(xs, slope * xs + zp, "g--", lw=1.4, label="fitted locus")
     a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
     a.legend(fontsize=8, loc="upper left")
-    a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus})  "
-                f"slope={slope:.2f}  scatter={scat:.2f}  locus zp={zp1:.2f}", fontsize=9)
+    # Say which exit the clip took: n_locus == n_matched reads the same whether the clip converged
+    # with nothing to reject or was refused for want of survivors, and those are different numbers.
+    locus_note = " unclipped" if clip_exit == "floor-unclipped" else ""
+    a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus}{locus_note})  "
+                f"slope={slope:.2f}  scatter={scat:.2f}  locus offset={zp1:.2f}", fontsize=9)
     # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen
     # only the SCATTER for the real narrow-vs-broad (F212N vs Ks) colour/extinction spread.
-    metrics.update(n_matched=int(g.sum()), n_locus=n_locus, slope=float(slope),
-                   zeropoint=float(zp), scatter=scat,
+    metrics.update(n_matched=int(g.sum()), n_locus=n_locus, n_locus_unclipped=n_unclipped,
+                   clip_exit=clip_exit, slope=float(slope),
+                   zeropoint_fit=float(zp), scatter=scat, locus_offset=float(zp1),
                    passed=(0.8 < slope < 1.2 and scat < 0.8))
     return _save(fig, f"{o.obsid}_stage3.png"), metrics
 
@@ -1229,7 +1271,10 @@ def _offset_failure_reason(o: Observation, filt, jsc, ref_sc, bulk):
     # naming one of several possible causes -- the failure could be too few reference stars, too few
     # JWST sources, or a genuine no-peak, and this function did not distinguish them.
     counts = (f"{len(jsc)} JWST sources vs {len(ref_sc)} VIRAC reference stars in the footprint"
-              + (f", {npairs} matched pairs at the best peak" if npairs is not None else ""))
+              + (f", {npairs} pairs within the {aa.XMAXSEP.to('arcsec').value:.1f}\" search radius"
+                 if npairs is not None else "")
+              + (f" of which {(bulk or {}).get('npeak')} land in the peak bin"
+                 if (bulk or {}).get("npeak") is not None else ""))
     # Report the JWST magnitude range if we have it; do NOT claim a VIRAC comparison that was not run.
     jmag = _jwst_sources(o, filt)[1]
     mag_note = ""
@@ -1256,6 +1301,15 @@ _CELL_BAD_FRAC = 0.02
 # Require at least this fraction of the field's sources to sit in cells with a measurable peak,
 # else the field is too sparsely sampled to pass.
 _CELL_MIN_COVERAGE = 0.5
+# How many measured cells the per-cell map needs before its spatial verdict is CONCLUSIVE, i.e.
+# before a PASS may be read as "the spatial-consistency check ran and found nothing".  This is a
+# statement about the map's resolving power, and it is deliberately NOT part of the consistency
+# verdict itself (issue #66): making `consistent` False for want of cells inverted the gate, since
+# a 2x2 grid with 3 of 4 cells measured hard-failed while a field too sparse for any 2x2 cell fell
+# back to 1x1, bypassed the per-cell test entirely and passed.  Better sampling then scored worse.
+# The adjacency test still runs and can still FAIL an under-sampled grid on real evidence; what an
+# under-sampled grid may not do is manufacture a failure out of its own thinness.
+_CELL_MIN_CONCLUSIVE = 4
 # Low peak floor: a cell qualifies once it has SOME peak above chance.  aa.MIN_PEAK_RATIO (4.0)
 # anti-correlates with source count -- the background it divides by, median(H[H>0]), grows with the
 # chance-pair count -- so a 4.0 cut keeps the SPARSE cells and drops the dense ones, which makes the
@@ -1284,25 +1338,41 @@ _CELL_SPURIOUS_WT = 0.02
 _CELL_SPREAD_ABSURD = 300.0
 # Trust the isolated-star bulk as the override only when it rests on a solid clean sample.
 _ISO_OVERRIDE_MIN_N = 50
+# --- the PAIR floors, chosen on pair counts and independent of the star floors above (issue #65) ---
+# Total pairs within the xcorr search radius.  A sanity floor only: it scales with the product of
+# the two densities and the search area, so at GC crowding it is never the binding gate (measured
+# 2026-08-25: sickle 2x2 cells 39k-46k pairs, brick 4x4 cells 13k-48k).  Held at the most permissive
+# of the values the rungs used to inherit from ``min_src`` (300/150/100), so no rung tightens.
+_CELL_MIN_PAIRS = 100
+# Pairs in the PEAK BIN: how many common stars actually support the offset the cell reports.  THIS
+# is the floor that means something -- a cell can hold 40 000 chance pairs and a peak built on five
+# stars.  Real cells measure 37-55 (sickle 2x2), 44-114 (brick 4x4), 156 (sickle whole field), so 10
+# sits ~4x below the thinnest measured real cell while rejecting a peak no star population supports.
+_CELL_MIN_PEAK_PAIRS = 10
 
 
-def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=None):
+def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=_CELL_MIN_PAIRS,
+               min_peak_pairs=_CELL_MIN_PEAK_PAIRS):
     """One ``ncell`` x ``ncell`` pass of the per-cell xcorr offset (see ``_cell_offsets``).
 
-    Three DISTINCT thresholds, each on its own quantity.  Collapsing them into one constant is what
-    produced the _ab_overlap 9.6x inflation, by counting stars where pairs were meant:
+    FOUR DISTINCT thresholds, each on its own quantity, each chosen for that quantity.  Collapsing
+    them into one constant is what produced the _ab_overlap 9.6x inflation, by counting stars where
+    pairs were meant:
       * ``min_src`` -- minimum STAR occupancy required of BOTH the JWST cell and the (2"-margin)
         reference crop before xcorr is attempted.  At GC density the VIRAC *reference* crop is the
         binding one, since VIRAC is far sparser than JWST: a cell can hold 1000+ JWST sources and
         still fall short of ``min_src`` reference stars, in which case xcorr is never called.  That
         is why sickle's 4x4 cells drop with peak_ratio=None -- the REFERENCE stars ran out.
       * ``pr_floor`` -- minimum xcorr peak_ratio (peak height / chance background) to trust a peak.
-      * ``min_pairs`` -- minimum number of matched PAIRS in the accepted peak (a pair count, not a
-        star count); defaults to ``min_src``.
+      * ``min_pairs`` -- minimum TOTAL pairs inside the xcorr search radius (``aa.xcorr``'s
+        ``npairs``).  A star count and a pair count are different quantities: this one used to
+        default to ``min_src``, which made one number gate three things and left the pair threshold
+        an accident of the star threshold.  It is now an explicit constant the caller passes.
+      * ``min_peak_pairs`` -- minimum pairs in the PEAK BIN (``aa.xcorr``'s ``npeak``), i.e. the
+        common stars supporting the reported offset.  This is the pair floor with teeth; the total
+        count above is dominated by chance pairs at GC density.
 
     Returns (cells, dropped)."""
-    if min_pairs is None:
-        min_pairs = min_src
     ra = jsc.ra.deg; dec = jsc.dec.deg
     rra = ref_sc.ra.deg; rde = ref_sc.dec.deg
     # RA-wrap guard: a footprint straddling RA=0 would give bogus linear bins (no GC field does).
@@ -1323,16 +1393,26 @@ def _cell_grid(jsc, ref_sc, ncell, min_src, pr_floor=_CELL_PR_FLOOR, min_pairs=N
                   (rde >= de_[j] - mrg) & (rde <= de_[j + 1] + mrg))
             n_ref = int(rm.sum())
             xc = aa.xcorr(jsc[m], ref_sc[rm]) if n_ref >= min_src else None
-            if xc and xc.get("peak_ratio", 0) >= pr_floor and xc.get("npairs", 0) >= min_pairs:
+            npeak = int(xc.get("npeak", 0)) if xc else 0
+            if (xc and xc.get("peak_ratio", 0) >= pr_floor
+                    and xc.get("npairs", 0) >= min_pairs and npeak >= min_peak_pairs):
                 cells.append(dict(i=i, j=j, ra=cra, dec=cdec, dra=float(xc["dra"]),
                                   dde=float(xc["ddec"]), off=float(xc["off"]),
                                   peak_ratio=float(xc["peak_ratio"]), n=n, n_ref=n_ref,
-                                  npairs=int(xc["npairs"])))
+                                  npairs=int(xc["npairs"]), npeak=npeak))
             else:
-                # record WHY it dropped: no reference stars to correlate against, vs a real no-peak.
-                dropped.append(dict(i=i, j=j, ra=cra, dec=cdec, n=n, n_ref=n_ref,
-                                    reason=("too few reference stars" if n_ref < min_src
-                                            else "no clear peak")))
+                # record WHY it dropped: no reference stars to correlate against, a peak no star
+                # population supports, or a real no-peak.  Naming the pair floors separately keeps
+                # "the reference ran out" distinguishable from "the peak rests on five stars".
+                if n_ref < min_src:
+                    reason = "too few reference stars"
+                elif xc and xc.get("npairs", 0) < min_pairs:
+                    reason = "too few pairs in the search radius"
+                elif xc and npeak < min_peak_pairs:
+                    reason = "too few pairs supporting the peak"
+                else:
+                    reason = "no clear peak"
+                dropped.append(dict(i=i, j=j, ra=cra, dec=cdec, n=n, n_ref=n_ref, reason=reason))
     return cells, dropped
 
 
@@ -1351,6 +1431,11 @@ def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
     confident-peak gate (``aa.MIN_PEAK_RATIO``).  A handful of common stars measures a field
     offset; the fine grid adds the spatial information on top of it.
 
+    Only the STAR floor and the peak-ratio floor step down across the rungs: a coarser cell spans
+    more sky, so what it takes to call a cell occupied changes with the rung.  The PAIR floors do
+    not -- how many common stars it takes to believe a histogram peak is a property of the peak,
+    not of the grid -- so both are passed as the same explicit constants at every rung (issue #65).
+
     Returns (cells, dropped, grid_used).  ``grid_used`` is the ncell of the grid that produced the
     measurement (1 = whole-field fallback, carrying no per-cell spatial information), so the caller
     can set the coverage/consistency gates from it directly."""
@@ -1360,7 +1445,9 @@ def _cell_offsets(jsc, ref_sc, ncell=4, min_per_cell=300):
     attempts.append((1, 100, aa.MIN_PEAK_RATIO))     # whole-field offset, confident peak required
     last_dropped = []
     for nc, mpc, prf in attempts:
-        cells, dropped = _cell_grid(jsc, ref_sc, nc, mpc, prf)
+        cells, dropped = _cell_grid(jsc, ref_sc, nc, mpc, prf,
+                                    min_pairs=_CELL_MIN_PAIRS,
+                                    min_peak_pairs=_CELL_MIN_PEAK_PAIRS)
         last_dropped = dropped
         if cells:
             return cells, dropped, nc
@@ -1388,7 +1475,7 @@ def _cell_consistency(cells, dropped):
 
     Returns a dict of the numbers plus per-cell ``deviating``/``confirmed`` flags for plotting."""
     if not cells:
-        return dict(n_cells=0, consistent=False)
+        return dict(n_cells=0, consistent=False, spatial_conclusive=False)
     def _wmed(v, w):
         o = np.argsort(v); vs, ws = v[o], w[o]; cw = np.cumsum(ws)
         return float(vs[np.searchsorted(cw, 0.5 * cw[-1])])
@@ -1454,11 +1541,17 @@ def _cell_consistency(cells, dropped):
     # cells are added.  Stage 8 measures its significance against
     # a shuffled-position null for the same reason.
     spread = float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))) if len(cells) >= 2 else None
-    consistent = bool(len(cells) >= 4 and bad_frac < _CELL_BAD_FRAC and coverage >= _CELL_MIN_COVERAGE)
+    # The consistency verdict is the ADJACENCY evidence plus coverage, at whatever cell count the
+    # grid yielded.  Whether that verdict is conclusive is reported separately as
+    # ``spatial_conclusive`` (issue #66); the caller ticks the checklist off that flag and gates the
+    # PASS off this one, so a thin grid stays un-ticked without being failed.
+    consistent = bool(bad_frac < _CELL_BAD_FRAC and coverage >= _CELL_MIN_COVERAGE)
+    spatial_conclusive = bool(len(cells) >= _CELL_MIN_CONCLUSIVE)
     return dict(off_med=off_med, off_dra=mdra, off_dde=mdde, spread=spread,
                 n_cells=len(cells), n_dropped=len(dropped), n_deviating=int(deviating.sum()),
                 n_confirmed=int(confirmed.sum()), n_spurious=n_spurious, bad_src_frac=bad_frac,
-                coverage=coverage, consistent=consistent, deviating=deviating, confirmed=confirmed,
+                coverage=coverage, consistent=consistent,
+                spatial_conclusive=spatial_conclusive, deviating=deviating, confirmed=confirmed,
                 cells=cells, dropped=dropped)     # spurious-filtered; caller plots THESE
 
 
@@ -1773,8 +1866,16 @@ def stage4_offsets(o: Observation, sw):
     # fallback (grid_used == 1) is the one case that skips it.  A low cell count still faces it: a
     # large field with 3/16 measurable cells is 21% coverage and must fail (issue #13 review).
     # Coverage is enforced in EVERY branch.
+    #
+    # MONOTONIC IN SAMPLING (issue #66): a grid that measured too few cells to be conclusive is
+    # reported as NOT ASSESSED, exactly like the whole-field fallback, instead of being failed for
+    # thinness.  Adding a cell to a field can now only leave the verdict alone or reveal a real
+    # discontinuity through the adjacency test -- it can no longer turn a PASS into a FAIL with no
+    # evidence behind it.  The checklist tick still requires ``spatial_assessed``, so nothing
+    # under-sampled is auto-ticked; coverage still fails the sparse large field.
     whole_field = (grid_used == 1)
-    spatial_assessed = not whole_field and not cell_map_unreliable
+    spatial_assessed = bool(not whole_field and not cell_map_unreliable
+                            and cc.get("spatial_conclusive", False))
     coverage_ok = cc["coverage"] >= _CELL_MIN_COVERAGE
     # A garbage cell map cannot pronounce a spatial discontinuity: its adjacency-confirmed "deviating"
     # cells are noise agreeing with noise, so do not fail the field on them.
@@ -1786,7 +1887,7 @@ def stage4_offsets(o: Observation, sw):
     metrics.update(offset_med_mas=off_med, offset_scatter_mas=spread,
                    bulk_off=off_med,                        # reported offset (same-star when available)
                    gate_off_mas=gate_off,                   # value the magnitude gate tests (cell histogram)
-                   spatial_assessed=spatial_assessed,       # False -> whole-field fallback, no per-cell map
+                   spatial_assessed=spatial_assessed,       # False -> whole-field fallback or a grid too thin to conclude
                    grid_used=grid_used, cell_map_unreliable=cell_map_unreliable,
                    offset_unmeasurable=offset_unmeasurable,
                    bulk_source=bulk_source, cell_off_med=cell_off_med,
@@ -1797,7 +1898,8 @@ def stage4_offsets(o: Observation, sw):
                    n_cells_spurious=cc.get("n_spurious", 0),
                    n_cells_deviating=cc["n_deviating"], n_cells_confirmed=cc["n_confirmed"],
                    bad_src_frac=cc["bad_src_frac"], cell_coverage=cc["coverage"],
-                   cells_consistent=cc["consistent"], passed=passed)
+                   cells_consistent=cc["consistent"],
+                   cells_spatial_conclusive=cc.get("spatial_conclusive", False), passed=passed)
 
     # Guard A -- cross-check the histogram-peak bulk against the CLEAN isolated matches (computed
     # above), which suffer neither the nearest-neighbour collapse nor the spurious-peak failure.  A
@@ -2153,13 +2255,43 @@ def _module_positions(o, filt):
     return a_sc, b_sc, dict(a=a_info, b=b_info)
 
 
+AB_SAME_STAR_MINPAIRS = 30      # below this, keep the raw peak (matches aa.same_star_tie's floor)
+
+
 def _ab_overlap(a_sc, b_sc):
     """How far a star seen in NRCA sits from the same star seen in NRCB, from two module position
     lists and no external catalogue.
 
-    ``off`` is the bulk A->B shift, taken as the ``aa.xcorr`` histogram PEAK.  A
-    search_around_sky median would fabricate pairs at this density.  ``rms`` is the scatter left in
-    the SAME stars after A is aligned onto B by that peak: ``hypot`` of the two axes' ``mad_std``.
+    ``off`` is the bulk A->B shift.  It is measured in two steps: the ``aa.xcorr`` histogram PEAK
+    detects it (a search_around_sky median would fabricate pairs at this density), and the SAME
+    STARS the peak then pairs one-to-one refine it.  Written out with the residual's sense
+    explicit, so the verb does not depend on a convention the reader supplies:
+
+        a_aligned = a + peak
+        off       = peak - median(a_aligned - b_matched)
+
+    ``aa.xcorr(a, b)`` returns ``median(b - a)``, the shift that MOVES A ONTO B, so A is aligned by
+    ADDING the peak and a peak too large by ``d`` leaves ``+d`` in ``a_aligned - b_matched``.  The
+    refinement therefore SUBTRACTS that median; adding it would double the peak's error instead of
+    removing it.  (Measured: inject a peak biased +6.0/-4.0 mas off a truth of 12.0/-7.0 and the
+    median residual comes back exactly +6.0/-4.0, ``peak - median`` lands on truth and
+    ``peak + median`` at twice the error.  Both the value and the residual's sign are pinned by
+    ``test_ab_overlap_refines_a_biased_histogram_peak_onto_the_same_stars``.)  ``peak_off`` reports
+    what the histogram alone said, so the size of the correction is visible per field.
+
+    The refinement is the same correction stage 4 applies (``aa.same_star_tie``), for the same
+    reason (JWST-GC/data-qa#95): two catalogues tracing one clustered field make a correlated,
+    non-uniform wrong-pair background that pulls the histogram peak by several mas.  Stage 5's case
+    is denser on BOTH sides than stage 4's -- ~400,000 chance pairs within 0.3" against ~32,000 for
+    JWST-VIRAC -- and the gate is 15 mas, so a several-mas bias spends a third of it.  The pairs and
+    their residuals are computed here anyway, so the refinement costs nothing.  It is guarded the
+    way ``same_star_tie`` guards it: the peak must be unambiguous (already required above) and
+    enough one-to-one pairs must survive, so the nearest pair is the RIGHT star rather than a dense
+    nearest-neighbour median.
+
+    ``rms`` is the scatter left in the SAME stars after A is aligned onto B by that peak: ``hypot``
+    of the two axes' ``mad_std``.  A shift does not change it, so it describes the peak-aligned and
+    the refined solution alike.
 
     Two factors separate that from a stage-6 curve, and both have to be applied to compare them:
     ``hypot`` COMBINES the axes where stage 6 divides by sqrt(2) to stay per-axis, and each
@@ -2206,7 +2338,21 @@ def _ab_overlap(a_sc, b_sc):
         return None
     dra = (a_al[ia].ra - b_sc[ib].ra).to(u.mas).value * cosd
     dde = (a_al[ia].dec - b_sc[ib].dec).to(u.mas).value
-    return dict(dra=float(xc["dra"]), dde=float(xc["ddec"]), off=float(xc["off"]),
+    # SAME-STAR refinement of the peak.  These residuals ARE the peak's error, measured on stars
+    # already matched one to one, so the A->B offset is the peak MINUS their median: ``dra`` is
+    # a_al - b, and a_al is A already moved BY the peak, so a peak too large by d leaves +d here and
+    # has to be reduced by d.  (Adding it -- the sketch in #95 -- doubles the error instead of
+    # removing it; verified against an injected peak bias.)  Refuse below AB_SAME_STAR_MINPAIRS
+    # pairs (aa.same_star_tie's floor) and keep the raw peak.
+    same_star = len(ia) >= AB_SAME_STAR_MINPAIRS
+    mdra = float(np.median(dra)) if same_star else 0.0
+    mdde = float(np.median(dde)) if same_star else 0.0
+    off_dra, off_dde = float(xc["dra"]) - mdra, float(xc["ddec"]) - mdde
+    return dict(dra=off_dra, dde=off_dde, off=float(np.hypot(off_dra, off_dde)),
+                peak_dra=float(xc["dra"]), peak_ddec=float(xc["ddec"]),
+                peak_off=float(xc["off"]),
+                same_star_dra=mdra, same_star_ddec=mdde, same_star_n=int(len(ia)),
+                bulk_source="same-star" if same_star else "histogram",
                 rms=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
                 n=int(len(ia)), peak_ratio=float(xc["peak_ratio"]),
                 dra_arr=dra, dde_arr=dde,
@@ -2226,9 +2372,14 @@ def _draw_ab_panel(ax, ovd, title):
     lim = max(50.0, 4.0 * ovd["rms"])
     ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
     axt, _axr = _add_marginals(ax, dra_a, dde_a, color="#5566aa", bins=40)
+    # The residuals are drawn about the histogram PEAK, so their displacement from (0,0) IS the
+    # peak's error -- what the same-star refinement in ``off`` takes back out.  Name both numbers,
+    # otherwise a visibly off-centre cloud reads as a plotting bug rather than as the correction.
+    peak = ovd.get("peak_off")
+    peak_note = f"   (histogram peak alone = {peak:.1f})" if peak is not None else ""
     axt.set_title(f"{title}  ({ovd['n']} stars)\n"
-                  f"offset = {ovd['off']:.1f} mas   scatter = {ovd['rms']:.1f} mas (ΔRA,ΔDec "
-                  f"combined)", fontsize=8)
+                  f"offset = {ovd['off']:.1f} mas{peak_note}   scatter = {ovd['rms']:.1f} mas "
+                  f"(ΔRA,ΔDec combined)", fontsize=8)
 
 
 def _draw_ab_footprint(ax, ovd, label):
@@ -2330,7 +2481,10 @@ def stage5_intermodule(o: Observation, sw):
         single_module = "NRCA" if a_sc is not None else "NRCB"
     ov = _ab_overlap(a_sc, b_sc)
     if ov:
-        metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"])
+        metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"],
+                       # what the histogram peak alone said, so the size of its bias is on record
+                       intermodule_peak_off=ov["peak_off"],
+                       intermodule_bulk_source=ov["bulk_source"])
     # The same comparison restricted to flux S/N > 10 (the best-measured stars), where the
     # residual scatter measures how well the two modules agree rather than how well a faint star's
     # centroid is known.  This adds a panel; the all-stars panel above stays.
@@ -2340,7 +2494,9 @@ def stage5_intermodule(o: Observation, sw):
         ov_hi = _ab_overlap(a_hi, b_hi)
         if ov_hi:
             metrics.update(intermodule_off_hi=ov_hi["off"], intermodule_rms_hi=ov_hi["rms"],
-                           n_overlap_hi=ov_hi["n"], sn_cut=10.0)
+                           n_overlap_hi=ov_hi["n"], sn_cut=10.0,
+                           intermodule_peak_off_hi=ov_hi["peak_off"],
+                           intermodule_bulk_source_hi=ov_hi["bulk_source"])
 
     # (1) per-detector residuals vs VIRAC, bulk-subtracted
     det = _per_detector_offsets(o, filt, ref_sc) if ref_sc is not None else {}
@@ -2833,39 +2989,32 @@ def _jwst1pass_psfperts(o: Observation, filt):
     return out
 
 
-def _psfperts_figure(o, filt, det_paths, vlim=_PSFPERTS_VLIM):
-    """Montage of the per-detector perturbation-PSF residual images, one panel per chip, on the
-    shared diverging +/-0.1 scale jwst1pass clips to; each panel titled with the detector and the
-    interior rms amplitude (the frame lines and unused montage cells sit at +/-0.1 and are excluded
-    from that rms so it reflects the actual perturbation, not the montage border)."""
-    import matplotlib
-    matplotlib.use("Agg")
+def _draw_psfperts_row(a, path, det, filt, vlim=_PSFPERTS_VLIM):
+    """Draw one detector's perturbation-PSF residual image (``LOG.psfperts.fits``) into axis ``a`` as
+    a full-width panel, on the diverging +/-0.1 scale jwst1pass clips to.  Returns (mappable, rms) --
+    rms over the UNCLIPPED interior (|v| < 0.0999), since the montage's frame lines and unused cells
+    sit at +/-0.1 and would otherwise dominate.  (None, None) if the file cannot be read."""
     import matplotlib.pyplot as plt
     from astropy.io import fits
-    n = len(det_paths)
-    ncol = min(4, n); nrow = int(np.ceil(n / ncol))
-    fig, ax = plt.subplots(nrow, ncol, figsize=(2.7 * ncol, 1.15 * nrow + 0.8), squeeze=False)
-    im = None
-    for k, (det, p) in enumerate(det_paths):
-        a = ax[k // ncol][k % ncol]
-        try:
-            img = np.asarray(fits.getdata(_used(p, f"{filt} {det} psfperts")), float)
-        except (OSError, ValueError, KeyError):
-            a.axis("off"); continue
-        interior = img[np.abs(img) < _PSFPERTS_CLIP]
-        rms = float(np.sqrt(np.nanmean(interior ** 2))) if interior.size else float("nan")
-        im = a.imshow(img, origin="lower", cmap="RdBu_r", vmin=-vlim, vmax=vlim, aspect="auto")
-        a.set_title(f"{det}  rms={rms:.3f}", fontsize=7.5)
-        a.set_xticks([]); a.set_yticks([])
-    for k in range(n, nrow * ncol):
-        ax[k // ncol][k % ncol].axis("off")
-    if im is not None:
-        fig.colorbar(im, ax=ax.ravel().tolist(), fraction=0.03, pad=0.02,
-                     label="fractional flux residual")
-    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS perturbation-PSF residual ({filt})",
-                 fontsize=10, y=0.99)
-    fig.subplots_adjust(top=0.84, hspace=0.5, wspace=0.08)
-    return _save(fig, f"{o.obsid}_stage10psf.png")
+    try:
+        img = np.asarray(fits.getdata(_used(path, f"{filt} {det} psfperts")), float)
+    except (OSError, ValueError, KeyError):
+        a.axis("off"); return None, None
+    content = np.abs(img) < _PSFPERTS_CLIP
+    # crop to the content bounding box (drops pure-margin rows/cols) ...
+    rows = np.where(content.any(1))[0]; cols = np.where(content.any(0))[0]
+    if rows.size and cols.size:
+        sl = (slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1))
+        img = img[sl]; content = content[sl]
+    rms = float(np.sqrt(np.nanmean(img[content] ** 2))) if content.any() else float("nan")
+    # ... and blank the +/-0.1 fill + frame lines to white, so the panel shows only the actual
+    # perturbation stamps rather than a large dark fill block (the fill is Jay's unused montage cells).
+    disp = np.where(content, img, np.nan)
+    cmap = plt.get_cmap("RdBu_r").copy(); cmap.set_bad("white")
+    im = a.imshow(disp, origin="lower", cmap=cmap, vmin=-vlim, vmax=vlim, aspect="auto")
+    a.set_title(f"perturbation-PSF residual — {det}   interior rms = {rms:.3f}", fontsize=8.5)
+    a.set_xticks([]); a.set_yticks([])
+    return im, rms
 
 
 def _saturation_turnover(m, sig, floor):
@@ -2915,12 +3064,23 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
     if filt.upper() in _LW_PREF:
         metrics["meta_scale_assumed_sw"] = True
 
-    fig, ax = _fig(2, 2, 5.4, 4.3)
+    import matplotlib.pyplot as plt
+    # One integrated figure: the 2x2 across-exposure consistency panels on top, then -- when
+    # jwst1pass ran with PERT -- one FULL-WIDTH per-detector perturbation-PSF residual row per chip
+    # below (LOG.psfperts.fits).  Both belong to the same stage-10 check, so they share one comment.
+    pp = _jwst1pass_psfperts(o, filt)
+    ndet = len(pp)
+    W = 11.0
+    hr = [4.0, 4.0] + [3.0] * ndet                       # 2 consistency rows + 1 per psfperts chip
+    fig = plt.figure(figsize=(W, sum(hr) + 1.0))
+    gs = fig.add_gridspec(2 + ndet, 2, height_ratios=hr, hspace=0.6, wspace=0.24)
+    axc = [[fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])],
+           [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1])]]
     panels = [
-        (ax[0][0], exm, "X RMS (mas)", "x_rms_floor_mas", 3.0 * _META_PIX_MAS),
-        (ax[0][1], eym, "Y RMS (mas)", "y_rms_floor_mas", 3.0 * _META_PIX_MAS),
-        (ax[1][0], d["em"], "magnitude RMS (mag)", "mag_rms_floor", 0.25),
-        (ax[1][1], d["q"], "quality of fit", "qfit_floor", 0.25),
+        (axc[0][0], exm, "X RMS (mas)", "x_rms_floor_mas", 3.0 * _META_PIX_MAS),
+        (axc[0][1], eym, "Y RMS (mas)", "y_rms_floor_mas", 3.0 * _META_PIX_MAS),
+        (axc[1][0], d["em"], "magnitude RMS (mag)", "mag_rms_floor", 0.25),
+        (axc[1][1], d["q"], "quality of fit", "qfit_floor", 0.25),
     ]
     for a, y, ylab, mkey, ytop in panels:
         a.plot(m, y, ".", ms=1.4, color="#666666", alpha=0.35, rasterized=True)
@@ -2939,18 +3099,23 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
         turn = _saturation_turnover(m, d["em"], metrics["mag_rms_floor"])
         if turn is not None:
             metrics["saturation_turnover_mag"] = turn
-            ax[1][0].axvline(turn, color="#3366cc", ls="--", lw=1.0)
-    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency ({filt}, "
-                 f"n={metrics['n_stars']}, {metrics['n_exposures']} exp)", fontsize=11, y=0.99)
-    metrics["passed"] = True
-    # Second figure: the per-detector perturbation-PSF residual (LOG.psfperts.fits), posted under
-    # its own marker by main.  jwst1pass PERT=1 fits one perturbation from the bright-star residuals
-    # and adds it to the library STDPSF; a strong or structured one flags a PSF-model mismatch.
-    pp = _jwst1pass_psfperts(o, filt)
+            axc[1][0].axvline(turn, color="#3366cc", ls="--", lw=1.0)
+    # full-width perturbation-PSF residual rows (jwst1pass PERT=1: the perturbation fit from the
+    # bright-star residuals + added to the library STDPSF; a strong/structured one flags a PSF-model
+    # mismatch for that chip).
     if pp:
-        metrics["psfperts_png"] = _psfperts_figure(o, filt, pp[:16])
+        rms_by_det = {}
+        for k, (det, path) in enumerate(pp):
+            a = fig.add_subplot(gs[2 + k, :])
+            im, rms = _draw_psfperts_row(a, path, det, filt)
+            if im is not None:
+                fig.colorbar(im, ax=a, fraction=0.012, pad=0.01, label="frac. flux")
+                rms_by_det[det] = rms
         metrics["psfperts_dets"] = [det for det, _ in pp]
-        metrics["psfperts_filter"] = filt
+        metrics["psfperts_rms"] = rms_by_det
+    fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency ({filt}, "
+                 f"n={metrics['n_stars']}, {metrics['n_exposures']} exp)", fontsize=11, y=0.995)
+    metrics["passed"] = True
     return _save(fig, f"{o.obsid}_stage10.png"), metrics
 
 
@@ -4889,14 +5054,6 @@ def _caption_for_impl(n, metrics):
                 base += (f"{f} peppar frame-to-frame σ floor: {full:.2f} → **{clean:.2f} mas** "
                          f"with the bad exposure(s) excluded. ")
         return base + "([how this is made](DOCROOT#stage6))"
-    if n == "10psf":
-        filt = metrics.get("psfperts_filter", "?")
-        dets = metrics.get("psfperts_dets") or []
-        return (f"**Stage 10 (JWST1PASS) — perturbation-PSF residual ({filt}).** Each panel is one "
-                f"detector's `LOG.psfperts.fits`: the perturbation jwst1pass fit from the bright-star "
-                f"fit residuals and added to the library STDPSF (fractional flux, diverging ± scale), "
-                f"titled with its rms amplitude. {len(dets)} detector(s): {', '.join(dets)}. "
-                f"([how this is made](DOCROOT#stage10))")
     if n == 8:
         return _caption_stage8(metrics)
     # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
@@ -5053,13 +5210,23 @@ def _caption_for_impl(n, metrics):
         elif metrics.get("spatial_assessed", True):
             base += ("A pass needs a small field offset AND cells that agree with each other. "
                      "([how this is made](DOCROOT#stage4))")
-        else:
+        elif (metrics.get("n_cells") or 0) <= 1:
             # whole-field fallback: only one cell measured, so the per-cell spatial check did not
             # run.  Say so, since a caption claiming it ran would be false.
             base += ("NOTE: too few stars in common to sub-divide the field, so the offset was "
                      "measured WHOLE-FIELD (one cell). A small value passes the magnitude gate; "
                      "the per-cell spatial-consistency check did not run, and a sub-region "
                      "discontinuity would go unseen here. ([how this is made](DOCROOT#stage4))")
+        else:
+            # a grid ran, but too few of its cells held enough reference stars for the adjacency
+            # test to conclude.  It still fires on real evidence (adjacent cells at a different
+            # offset fail the field); what it cannot do here is certify the field as clean.
+            base += (f"NOTE: only {metrics.get('n_cells')} cells held enough reference stars to "
+                     f"measure, too few for the per-cell spatial-consistency check to be "
+                     f"conclusive. The magnitude and coverage gates still apply, and adjacent "
+                     f"cells at a different offset would still fail the field; a subtle "
+                     f"sub-region discontinuity could go unseen. "
+                     f"([how this is made](DOCROOT#stage4))")
         if str(metrics.get("source", "")).startswith("release-dao"):
             base += (" (Positions here come from a per-filter DAO catalogue. This observation has "
                      "yet to be photometrically catalogued, which is what stage 3 red-flags.)")
@@ -5096,6 +5263,12 @@ def _caption_for_impl(n, metrics):
                 f"{ov_pos} panel: [JWST against itself](DOCROOT#glossary-reffree) in the "
                 f"NRCA∩NRCB overlap — {off:.1f} mas offset, {rms:.1f} mas scatter (ΔRA and ΔDec "
                 f"combined) over {no} shared stars, with ΔRA/ΔDec marginal histograms.")
+        pk = metrics.get("intermodule_peak_off")
+        if pk is not None and off is not None:
+            base += (f" The offset is the [xcorr histogram peak](DOCROOT#glossary-xcorr) refined on "
+                     f"the SAME stars the peak pairs; the peak alone reads {pk:.1f} mas. The "
+                     f"residual cloud is drawn about the peak, so its displacement from the centre "
+                     f"is the peak's error, which the refinement takes out.")
         if metrics.get("n_overlap_hi"):
             base += (f"\n\nThe panel to its right repeats it for "
                      f"[S/N > 10](DOCROOT#glossary-snr) stars ({metrics['n_overlap_hi']} stars, "
@@ -5227,6 +5400,12 @@ def _caption_for_impl(n, metrics):
         if metrics.get("saturation_turnover_mag") is not None:
             base += (f"The mag-RMS doubles above its floor brighter than "
                      f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation onset). ")
+        dets = metrics.get("psfperts_dets") or []
+        if dets:
+            base += (f"\n\nBelow, one full-width row per detector ({', '.join(dets)}) shows that "
+                     f"chip's **perturbation-PSF residual** (`LOG.psfperts.fits`): the correction "
+                     f"jwst1pass fit from the bright-star fit residuals and added to the library "
+                     f"STDPSF, on a ±0.1 fractional-flux scale, titled with its interior rms. ")
         return base + "([how this is made](DOCROOT#stage10))"
     if n == 11:
         # Built in code so the streak-flag sentence is only stated when an exposure is actually
@@ -5444,13 +5623,6 @@ def main(argv=None):
                                caption_for("6clean", metrics), args.repo)
                     print(f"  stage 6clean: {metrics['clean_png']}  "
                           f"excluding {metrics.get('excluded_exposures')}")
-                # Stage 10 emits a SECOND figure: the per-detector JWST1PASS perturbation-PSF
-                # residual (LOG.psfperts.fits).  Post it under its own marker beside the main panels.
-                if n == 10 and metrics.get("psfperts_png"):
-                    post_stage(o, "10psf", metrics["psfperts_png"],
-                               caption_for("10psf", metrics), args.repo)
-                    print(f"  stage 10psf: {metrics['psfperts_png']}  "
-                          f"dets {metrics.get('psfperts_dets')}")
             except (PostError, OSError) as e:
                 print(f"  stage {n}: post FAILED (figure built OK): {e}", file=sys.stderr)
     print(f"metrics -> {mpath}")
