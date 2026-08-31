@@ -7,7 +7,7 @@ This guide is for those getting started with Quality Assessment of the JWST-GC T
 
 - **QA starting point:**  https://github.com/orgs/JWST-GC/projects/2
 
-- **Detailed explanation of all QA plots and numbers:**  https://github.com/JWST-GC/data-qa/blob/main/docs/qa_methods.md
+- **Detailed explanation of all QA plots and numbers**: https://github.com/JWST-GC/data-qa/blob/main/docs/qa_methods.md
 
 
 ## Brief Description
@@ -59,7 +59,7 @@ In short, the catalogs are created by iteratively fitting and subtracting PSFs o
 
 
 You can download data and catalogs by selecting the relevant field here:
-https://starformation.astro.ufl.edu/jwst-gc/index.htm.l The downloads are done through Globus, and the products are stored on UF's supercomputer.
+https://starformation.astro.ufl.edu/jwst-gc/index.html. The downloads are done through Globus, and the products are stored on UF's supercomputer.
 
 There are about two dozen issues for data other than the JWST-GC 10678 program. These can generally be ignored, but might be useful as a reference.
 
