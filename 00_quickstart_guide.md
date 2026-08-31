@@ -23,11 +23,11 @@ Each issue has **stages** for QA review posted as individual comments. The stage
 
 The very basic summary of each stage is:
 
-- Stage 1 Do data exist?
-- Stage 2 Do catalogs exist?
-- Stage 3 How is the absolute photometry?
-- Stage 4 How is the absolute astrometry?
-- Stage 5 Are detectors well-aligned astrometrically?
+- Stage 1: Do data exist?
+- Stage 2: Do catalogs exist?
+- Stage 3: How is the absolute photometry?
+- Stage 4: How is the absolute astrometry?
+- Stage 5: Are detectors well-aligned astrometrically?
 - Stage 6: What is the astrometric precision?
 - Stage 7: How do jicama pipeline products compare to MAST-delivered products?
 - Stage 8: What is the relative spatial distortion between two filters?
