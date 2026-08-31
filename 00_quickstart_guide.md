@@ -5,11 +5,9 @@ This guide is for those getting started with Quality Assessment of the JWST-GC T
 
 ## Important Links
 
-- **QA starting point:**  
-  https://github.com/orgs/JWST-GC/projects/2
+- **QA starting point:**  https://github.com/orgs/JWST-GC/projects/2
 
-- **Detailed explanation of all QA plots and numbers:**  
-  https://github.com/JWST-GC/data-qa/blob/main/docs/qa_methods.md
+- **Detailed explanation of all QA plots and numbers:**  https://github.com/JWST-GC/data-qa/blob/main/docs/qa_methods.md
 
 
 ## Brief Description
