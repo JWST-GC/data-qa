@@ -221,3 +221,41 @@ def test_post_status_missing_issue_still_fails_without_create_labels(monkeypatch
     monkeypatch.setattr(_github, "get_token", lambda: "tok")
     monkeypatch.setattr(_github, "existing_issues", lambda token, repo: {})
     assert sr.post_status("Nope", "B", dry_run=False, issue_cache={}) == 3
+
+
+def _patch_create(monkeypatch):
+    created, posted = [], []
+    monkeypatch.setattr(_github, "get_token", lambda: "tok")
+    monkeypatch.setattr(_github, "existing_issues", lambda token, repo: {})
+    monkeypatch.setattr(_github, "ensure_labels", lambda token, repo, names: None)
+    monkeypatch.setattr(_github, "create_issue",
+                        lambda token, repo, title, body, labels=():
+                        created.append((title, body, list(labels)))
+                        or (201, {"number": 9}))
+    monkeypatch.setattr(_github, "list_comments", lambda *a: [])
+    monkeypatch.setattr(_github, "post_comment",
+                        lambda token, repo, number, body:
+                        posted.append((number, body)) or (201, {}))
+    return created, posted
+
+
+def test_post_status_create_body_seeds_the_new_issue(monkeypatch):
+    """create_body is the BODY of an issue opened by the create_labels path
+    (the per-tile treasury issue opens with the full QA template); the event
+    text still goes in as the first COMMENT."""
+    created, posted = _patch_create(monkeypatch)
+    rc = sr.post_status("GC Treasury — jw10678-o088 (NIRCam)", "EVENTS",
+                        dry_run=False, issue_cache={},
+                        create_labels=["QA", "NIRCam"],
+                        create_body="TEMPLATE BODY")
+    assert rc == 0
+    assert created == [("GC Treasury — jw10678-o088 (NIRCam)", "TEMPLATE BODY",
+                        ["QA", "NIRCam"])]
+    assert posted == [(9, "EVENTS")]
+
+
+def test_post_status_create_body_default_is_the_rolling_text(monkeypatch):
+    created, _ = _patch_create(monkeypatch)
+    assert sr.post_status("T", "EVENTS", dry_run=False, issue_cache={},
+                          create_labels=["QA"]) == 0
+    assert "Rolling monitor issue" in created[0][1]
