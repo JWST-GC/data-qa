@@ -259,3 +259,23 @@ def test_post_status_create_body_default_is_the_rolling_text(monkeypatch):
     assert sr.post_status("T", "EVENTS", dry_run=False, issue_cache={},
                           create_labels=["QA"]) == 0
     assert "Rolling monitor issue" in created[0][1]
+
+
+def test_ensure_labels_posts_each_label_once_per_process(monkeypatch):
+    """Every created issue asks for the same four label names, and the API has
+    no create-if-absent, so an uncached ensure_labels spends 4 content-creating
+    POSTs per issue against the ~500/hour limit.  Opening ~100 treasury tile
+    issues in one run would exhaust it on labels alone and the POSTs that fail
+    are the issue creations (issue #147 review, B3)."""
+    calls = []
+    monkeypatch.setattr(_github, "_LABELS_ENSURED", set())
+    monkeypatch.setattr(_github, "request",
+                        lambda method, url, token, data=None:
+                        calls.append(data["name"]) or (201, {}))
+    for _ in range(3):                       # three issues, same labels
+        _github.ensure_labels("tok", "JWST-GC/data-qa",
+                              ["QA", "NIRCam", "program:10678",
+                               "target:GC Treasury"])
+    assert calls == ["QA", "NIRCam", "program:10678", "target:GC Treasury"]
+    _github.ensure_labels("tok", "other/repo", ["QA"])   # per-repo, not global
+    assert calls[-1] == "QA" and len(calls) == 5

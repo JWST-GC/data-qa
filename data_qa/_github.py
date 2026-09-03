@@ -69,12 +69,28 @@ def existing_issues(token, repo):
     return {it["title"]: it for it in items if "pull_request" not in it}
 
 
+_LABELS_ENSURED: set = set()             # (repo, label) already POSTed this process
+
+
 def ensure_labels(token, repo, names,
                   palette={"QA": "0e8a16", "NIRCam": "1d76db", "MIRI": "5319e7"}):
-    """Create any missing labels (best-effort; ignores 'already exists')."""
+    """Create any missing labels (best-effort; ignores 'already exists').
+
+    Deduplicated per (repo, label) for the life of the process.  The API has no
+    create-if-absent, so each name here is a CONTENT-CREATING POST against the
+    ~500/hour secondary rate limit, and it is the same four names every time
+    (QA, NIRCam|MIRI, program:N, target:X).  A monitor run that opens N treasury
+    tile issues would otherwise spend 4N of that budget re-creating labels that
+    exist, and the POSTs it loses to the limit are issue creations -- the
+    failure that B3 of the #147 review is about.  Labels are never deleted by
+    this code, so a cached name staying cached is safe."""
     for n in names:
+        key = (repo, n)
+        if key in _LABELS_ENSURED:
+            continue
         request("POST", f"{API}/repos/{repo}/labels", token,
                 {"name": n, "color": palette.get(n, "ededed")})
+        _LABELS_ENSURED.add(key)
 
 
 # ------------------------------------------------------------------- issues/comments

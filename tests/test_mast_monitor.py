@@ -3,6 +3,7 @@ import datetime
 import inspect
 import json
 import os
+import sys
 
 import pytest
 
@@ -2721,3 +2722,189 @@ def test_treasury_issue_body_falls_back_when_the_template_cannot_import(monkeypa
     assert body.startswith(make_issues.AUTOGEN_MARKER)   # make_issues still owns it
     assert "jw10678-o088" in body and "GC_88" in body
     assert "QA template unavailable" in capsys.readouterr().err
+
+
+# ----------------------------- a tile issue that could not be opened (#147 B3)
+def test_act_report_hands_back_the_arrivals_whose_tile_issue_failed(monkeypatch,
+                                                                    capsys):
+    """post_status rc != 0 on the per-tile issue means the issue was NOT opened
+    (rate limit, 5xx, revoked token).  Nothing else in the system ever opens one
+    -- registry() returns [] for 10678 and the per-program seed only fires for an
+    unseeded program -- so act_report hands those events back instead of letting
+    the caller commit the arrival as reported."""
+    from data_qa import status_report
+    seen = []
+
+    def _post(title, body, **kw):
+        seen.append(title)
+        return 4 if "o088" in title else 0        # the o088 tile issue fails
+
+    monkeypatch.setattr(status_report, "post_status", _post)
+    failed = _treasury_arrivals("088", "GC_88", n_rows=3)
+    ok = _treasury_arrivals("089", "GC_89")
+    unposted = mm.act_report(failed + ok, execute=True)
+    assert [ev["obs_id"] for ev in unposted] == [ev["obs_id"] for ev in failed]
+    assert "FAILED" in capsys.readouterr().err
+    # the rolling issue and the o089 tile went out, so they are NOT re-armed
+    assert seen == [mm.TREASURY_ISSUE_TITLE,
+                    "GC Treasury — jw10678-o088 (NIRCam)",
+                    "GC Treasury — jw10678-o089 (NIRCam)"]
+
+
+def test_act_report_returns_nothing_to_re_arm_when_every_post_lands(monkeypatch):
+    _patch_post_status(monkeypatch)
+    assert mm.act_report(_treasury_arrivals("088", "GC_88", n_rows=2),
+                         execute=True) == []
+
+
+def _treasury_released_row(obsnum="088", tile="GC_88"):
+    return _row(f"jw10678-o{obsnum}_t001_nircam_clear-f212n",
+                filters="F212N;F480M", target=tile)
+
+
+def test_main_report_failure_keeps_the_arrival_uncommitted(monkeypatch, tmp_path):
+    """End to end: save_state runs unconditionally, so a tile issue that could
+    not be created has to leave the arrival OUT of the committed baseline -- it
+    re-fires next poll and the creation is retried.  Committing it would retire
+    the delivery for good (issue #147 review, B3)."""
+    from data_qa import status_report
+    rc_holder = {"rc": 4}
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, **kw:
+                        rc_holder["rc"] if "o088" in title else 0)
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_treasury_released_row()])
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o001_x")
+    obs_id = "jw10678-o088_t001_nircam_clear-f212n"
+
+    assert mm.main(["--program", "10678", "--commit-state", "--report",
+                    "--execute", "--state", str(state)]) == 0
+    committed = mm.load_state(str(state))
+    assert obs_id not in committed["programs"]["10678"]["obs"]
+
+    rc_holder["rc"] = 0                          # next poll: GitHub is back
+    assert mm.main(["--program", "10678", "--commit-state", "--report",
+                    "--execute", "--state", str(state)]) == 0
+    assert obs_id in mm.load_state(str(state))["programs"]["10678"]["obs"]
+
+
+# ------------------------- refresh_all_issues.sh work list + rc (#147 B1, B2)
+def _refresh_script_text():
+    import pathlib
+    return (pathlib.Path(__file__).resolve().parents[1]
+            / "scripts" / "refresh_all_issues.sh").read_text()
+
+
+def _run_refresh_work_list(titles, **env):
+    """Run the work-list builder EMBEDDED IN THE SCRIPT (extracted from the
+    script text, so an edit to the script is what is under test) over a list of
+    issue titles, and return its stdout rows."""
+    import os
+    import pathlib
+    import re
+    import subprocess
+    src = _refresh_script_text()
+    # a shell single-quoted block cannot contain a "'", so this is unambiguous
+    m = re.search(r"python3 -c '([^']*)'", src)
+    assert m, "could not find the work-list python block in refresh_all_issues.sh"
+    root = pathlib.Path(__file__).resolve().parents[1]
+    e = dict(os.environ, PYTHONPATH=str(root),
+             QA_EXCLUDE_FIELDS="w51 wd1 wd2 ngc6334",
+             QA_EXCLUDE_RE="westerlund|ngc ?6334|globular|w51")
+    e.update({k: str(v) for k, v in env.items()})
+    p = subprocess.run([sys.executable, "-c", m.group(1)], input="\n".join(titles),
+                       capture_output=True, text=True, env=e)
+    assert p.returncode == 0, p.stderr
+    return [row.split("\t") for row in p.stdout.splitlines()]
+
+
+_REFRESH_TITLES = [                              # the API order: NEWEST FIRST
+    "GC Treasury — jw10678-o089 (NIRCam)",
+    "GC Treasury — jw10678-o088 (MIRI)",
+    "GC Treasury — jw10678-o088 (NIRCam)",
+    "Brick — jw02221-o001 (NIRCam)",
+    "Cloud C — jw02221-o002 (MIRI)",
+    "W51 — jw01182-o004 (NIRCam)",               # non-GC: skipped outright
+]
+
+
+def test_refresh_work_list_orders_treasury_tiles_last(monkeypatch):
+    """The walltime guard (issue #147 review, B1): the refresh job is already
+    hitting its 2 h wall at 21 issues and the issue API returns NEWEST FIRST,
+    so the tile issues this PR creates would otherwise sort ahead of the
+    established field issues and the truncation would fall on the fields.  The
+    tiles go last, keeping their own order; the established issues keep theirs."""
+    rows = _run_refresh_work_list(_REFRESH_TITLES)
+    assert [(r[0], r[2]) for r in rows] == [
+        ("2221", "NIRCam"), ("2221", "MIRI"),          # established, API order
+        ("10678", "NIRCam"), ("10678", "MIRI"), ("10678", "NIRCam")]
+    assert [r[1] for r in rows if r[0] == "10678"] == ["089", "088", "088"]
+    assert all("W51" not in r[3] for r in rows)        # skip list still applies
+
+
+def test_refresh_work_list_interleaves_when_the_partition_is_off():
+    """QA_TREASURY_LAST=0 restores the plain API order (the escape hatch)."""
+    rows = _run_refresh_work_list(_REFRESH_TITLES, QA_TREASURY_LAST="0")
+    assert [r[0] for r in rows] == ["10678", "10678", "10678", "2221", "2221"]
+
+
+def _run_refresh_rc(program, output, rc=1):
+    """Run the script's own note_failure/pending_tile classifiers (extracted
+    from the script text) over one captured diagnostics output and its exit
+    code, and report the verdict the loop would reach."""
+    import os
+    import re
+    import subprocess
+    src = _refresh_script_text()
+    note = re.search(r"^note_failure\(\) \{.*$", src, re.M)
+    pending = re.search(r"^pending_tile\(\) \{.*?^\}", src, re.S | re.M)
+    assert note and pending, "classifier functions not found in the script"
+    prog = re.search(r'^TREASURY_PROGRAM="\$\{QA_TREASURY_PROGRAM:-(\d+)\}"',
+                     src, re.M)
+    assert prog, "TREASURY_PROGRAM not found in the script"
+    script = (f'set -u\nTREASURY_PROGRAM="{prog.group(1)}"\n'
+              f'{note.group(0)}\n{pending.group(0)}\n'
+              'if pending_tile "$PROG" "$OUT"; then echo PENDING\n'
+              'elif note_failure "$OUT" "$DRC"; then echo FAILURE\n'
+              'else echo CLEAN; fi\n')
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       env=dict(os.environ, PROG=str(program), OUT=output,
+                                DRC=str(rc)))
+    assert p.returncode == 0, p.stderr
+    return p.stdout.strip()
+
+
+_NO_OBS = "no obs for program 10678 obs 088 (portal + on-disk both empty)"
+
+
+def test_refresh_pending_treasury_tile_does_not_turn_the_job_red():
+    """A tile's issue opens when MAST releases it; the products land on our disk
+    days-to-weeks later, and diagnostics exits 1 until they do.  That is the
+    expected state of a fresh tile and must not flip rc_any, which is the single
+    pass/fail signal shared with the 20+ curated field issues (#147 review B2)."""
+    assert _run_refresh_rc(10678, _NO_OBS) == "PENDING"
+    assert _run_refresh_rc(
+        10678, "no MIRI obs for program 10678 obs 088 (portal + on-disk empty)"
+    ) == "PENDING"
+
+
+def test_refresh_pending_exemption_is_treasury_only_and_failure_only():
+    """The exemption is narrow: a CURATED field with no products on disk is
+    still a failure, and any other failure on a treasury tile still counts."""
+    assert _run_refresh_rc(
+        2221, "no obs for program 2221 obs 001 (portal + on-disk both empty)"
+    ) == "FAILURE"
+    assert _run_refresh_rc(10678, "stage 4: FAILED (traceback)") == "FAILURE"
+    assert _run_refresh_rc(10678, "jw10678-o088: SW=F212N LW=F480M",
+                           rc=0) == "CLEAN"
+
+
+def test_refresh_script_treasury_program_matches_the_module():
+    """The script's constant is a copy of mast_monitor.TREASURY_PROGRAM; this is
+    what keeps the two from drifting."""
+    import re
+    m = re.search(r'^TREASURY_PROGRAM="\$\{QA_TREASURY_PROGRAM:-(\d+)\}"',
+                  _refresh_script_text(), re.M)
+    assert m and int(m.group(1)) == mm.TREASURY_PROGRAM

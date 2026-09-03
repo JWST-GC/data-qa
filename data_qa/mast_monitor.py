@@ -1311,6 +1311,14 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
     notifies: those arrivals were never announced, and the seed notice itself
     is not a downgrade (``notice_downgrade_reason`` -> None).
 
+    RETURNS the events whose per-tile treasury issue could NOT be opened or
+    commented on (post_status rc != 0).  The caller re-arms them
+    (``_revert_deferred``) so the arrival re-fires next poll: without that the
+    end-of-run ``save_state`` commits an arrival whose issue was never
+    created, ``_observations_for_program`` never produces a treasury tile of
+    its own accord, and the delivery is lost until somebody hand-edits the
+    state file (issue #147 review, B3).
+
     The anti-spam memo is written on an executing run immediately after EVERY
     notifying downgrade comment in the batch posted successfully (a partial
     failure leaves it unarmed, so the next poll re-notifies: a duplicate
@@ -1356,6 +1364,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
     # rate-limit hazard); post_status fills it on first use.
     issue_cache: dict = {}
     posts: List[tuple] = []                      # (update_last, rc) per issue
+    unposted: List[dict] = []                    # events to re-arm (see above)
     treasury = [ev for ev in events if ev.get("field") == TREASURY_FIELD]
     regular = [ev for ev in events if ev.get("field") != TREASURY_FIELD]
     for (program, obsnum, instr), evs in sorted(_group_by_obs(regular).items()):
@@ -1403,14 +1412,27 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             # classified on the TILE's own events, like every other issue: an
             # arrival posts a notifying comment (update_last False)
             tile_edit = _update_last(evs)
-            posts.append((tile_edit, status_report.post_status(
+            rc = status_report.post_status(
                 o.issue_title,
                 status_report.render_events_comment(evs, notice=notice),
                 repo=repo, update_last=tile_edit,
                 marker=status_report.MONITOR_MARKER, dry_run=not execute,
                 issue_cache=issue_cache,
                 create_labels=make_issues.labels_for(o),
-                create_body=treasury_issue_body(o))))
+                create_body=treasury_issue_body(o))
+            posts.append((tile_edit, rc))
+            if rc:
+                # The issue was NOT opened (a create/label/comment POST failed:
+                # rate limit, 5xx, a revoked token).  Nothing else in the system
+                # opens a treasury tile issue -- the registry returns [] for
+                # 10678 and the per-program seed only fires for an UNSEEDED
+                # program -- so committing this arrival would retire it for
+                # good.  Hand it back to the caller to re-arm, exactly as a
+                # low-disk deferred download is re-armed.
+                print(f"--report: per-tile issue {o.issue_title!r} FAILED "
+                      f"(post_status rc={rc}); the arrival keeps its pre-poll "
+                      f"baseline and re-fires next poll", file=sys.stderr)
+                unposted.extend(evs)
     if execute and state_path:
         notifying = [rc for edit, rc in posts if not edit]
         # EVERY notifying comment must have landed before repeats are
@@ -1426,6 +1448,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             # downgrade-free batch: the episode is over; the NEXT downgrade
             # notice posts a fresh (notifying) comment
             _memo_notified_downgrade(state_path, None, state=state)
+    return unposted
 
 
 # ------------------------------------------------------------------------------- main
@@ -1746,8 +1769,20 @@ def main(argv=None):
             # report EVERYTHING (incl. per-program-seed-suppressed events);
             # state/state_path carry the last-notified-downgrade memo that
             # decides new-comment-vs-edit (see act_report)
-            act_report(all_events, execute=args.execute, repo=args.repo,
-                       notice=notice, state=state, state_path=args.state)
+            unposted = act_report(all_events, execute=args.execute,
+                                  repo=args.repo, notice=notice, state=state,
+                                  state_path=args.state) or []
+            if unposted:
+                # A treasury arrival whose OWN QA issue could not be opened.
+                # save_state below is unconditional, so without this the
+                # arrival is retired having produced no issue and nothing ever
+                # re-fires it (issue #147 review, B3).  Same re-arm as a
+                # deferred download: restore the pre-poll baseline.
+                _revert_deferred(state, old_obs_by_prog, unposted)
+                print(f"--report: REPORT DEFERRED — {len(unposted)} treasury "
+                      f"arrival event(s) whose per-tile QA issue could not be "
+                      f"opened keep their pre-poll baselines and re-fire next "
+                      f"run.", file=sys.stderr)
 
     if args.commit_state:
         # end the downgrade episode when this run was not itself downgraded,
