@@ -2824,6 +2824,83 @@ def test_clipped_locus_fit_refuses_a_clip_that_strips_its_own_support(monkeypatc
     assert n_locus == n_unclipped == 34                  # nothing was thrown away
 
 
+# ------------------------------------------------------- split per-observation reduction trees
+def _split_field_tree(tmp_path):
+    """A field whose observations were split into per-observation reduction trees, HALF migrated:
+    the frames and the per-obs catalogues moved to ``gc2211_o023``, the mosaic and the pooled
+    five-pointing catalogue stayed under ``gc2211`` (the real gc2211 layout)."""
+    base = tmp_path / "gc2211"
+    (base / "catalogs").mkdir(parents=True)
+    (base / "images-merged").mkdir(parents=True)
+    (base / "offsets").mkdir(parents=True)
+    _touch(base / "catalogs", "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7.fits")
+    _touch(base / "images-merged", "jw02211-o023_t001_nircam_clear-f200w-merged_i2d.fits")
+    _touch(base / "offsets", "Offsets_JWST_gc2211_VIRAC2locked.csv")
+
+    split = tmp_path / "gc2211_o023"
+    (split / "catalogs").mkdir(parents=True)
+    (split / "F200W").mkdir(parents=True)
+    _touch(split / "catalogs",
+           "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7_o023.fits")
+    _touch(split / "catalogs", "gaia_virac2_refcat_epoch2023.71.fits")
+    for det in ("nrca1", "nrcb1"):
+        _touch(split / "F200W", f"f200w_{det}_o023_visit001_exp1_m3_daophot_basic.fits")
+    return base, split
+
+
+def test_split_field_reads_the_per_observation_tree_and_the_base_field(tmp_path, monkeypatch):
+    """A half-migrated field must resolve products from BOTH trees.
+
+    Before this, the field name alone was the path: the five gc2211 observations found the pooled
+    catalogue and zero per-exposure catalogues, and all reported the same stage 2/3/4 numbers
+    (#94, #119).
+    """
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    base, split = _split_field_tree(tmp_path)
+    o = _obs(field="gc2211", obs="023")
+
+    assert D._field_roots(o) == [str(split), str(base)]
+    # the per-exposure catalogues live ONLY in the split tree
+    got = D._daophot_glob(o, "F200W")
+    assert len(got) == 2 and all(str(split) in g for g in got)
+    # the mosaic lives ONLY in the base field
+    assert D._mosaic_path(o, "F200W") == str(base / "images-merged" /
+                                             "jw02211-o023_t001_nircam_clear-f200w-merged_i2d.fits")
+    # this observation's own catalogue wins over the pooled multi-pointing one
+    cands = [os.path.basename(p) for p, _k, _t, _m in D._catalog_candidates(o)]
+    assert "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7_o023.fits" in cands
+    # the POOLED five-pointing catalogue is out: it is not this observation's
+    assert "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7.fits" not in cands
+    # the split tree's untokened refcat is this obs's by location
+    assert D._refcat_path(o) == str(split / "catalogs" / "gaia_virac2_refcat_epoch2023.71.fits")
+
+
+def test_split_field_peppar_cal_resolves_into_the_sibling_tree(tmp_path, monkeypatch):
+    """peppar catalogues stay in the base field while their cal frames move; stage 11 and the
+    peppar half of stage 6 go blank unless the sibling split tree is searched."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    base, split = _split_field_tree(tmp_path)
+    pdir = base / "peppar" / "F200W" / "NRCA1"
+    pdir.mkdir(parents=True)
+    cat = pdir / "jw02211023001_02101_00001_nrca1_cal_gc2211_iter1_cat.fits"
+    _touch(pdir, cat.name)
+    (split / "F200W" / "pipeline").mkdir(parents=True)
+    _touch(split / "F200W" / "pipeline", "jw02211023001_02101_00001_nrca1_cal.fits")
+
+    assert D._peppar_cal_for_cat(str(cat)) == str(
+        split / "F200W" / "pipeline" / "jw02211023001_02101_00001_nrca1_cal.fits")
+
+
+def test_field_without_a_split_tree_is_unchanged(tmp_path, monkeypatch):
+    """One root, the old behaviour: no field without a ``<field>_o<obs>`` directory moves."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "brick" / "F212N"; d.mkdir(parents=True)
+    _touch(d, "f212n_nrca1_visit001_exp1_m3_daophot_basic.fits")
+    o = _obs(field="brick", obs="001", filt="F212N")
+    assert D._field_roots(o) == [str(tmp_path / "brick")]
+    assert len(D._daophot_glob(o, "F212N")) == 1
+
+
 # --------------------------------------------------------------------------- _ab_overlap
 def _ab_module_catalogs(true_dra_mas, true_ddec_mas, n=800, seed=95):
     """Two module catalogues of the SAME stars, A displaced from B by a known offset.
