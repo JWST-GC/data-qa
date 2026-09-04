@@ -83,6 +83,13 @@ Safety gates on acting runs (--auto, or --download/--trigger/--peppar with
                     MIRI on the trigger path).  They consume no slot.
       fan-out       act_peppar's per-filter/per-detector job submission for
                     one obs -- many SLURM jobs from one event.
+  * TRIGGER DEFERRED (--trigger): a group act_trigger reached without
+    submitting -- in-flight, unregistered, no filters known -- burns no
+    ``triggered`` key, so its submission is still owed; its pre-poll baseline
+    is restored so the event re-fires next poll instead of being retired by
+    the commit (issue #151).  The download side defers the same way
+    (DOWNLOAD DEFERRED, issue #84).  A standing skip -- unmapped program,
+    planned tile, MIRI, already-triggered -- is retired as before.
   * IN-FLIGHT DEDUP (--trigger): a group is skipped when squeue already has a
     job named ``<field><program>-o<obs>-*`` or when the state file's
     ``triggered`` map marks the obs as already submitted (the map is written
@@ -95,7 +102,8 @@ Safety gates on acting runs (--auto, or --download/--trigger/--peppar with
   * REGISTRY PREFLIGHT (--trigger): pipeline_trigger.build_plan verifies the
     obs is registered in the pipeline's fields.yaml BEFORE any sbatch; an
     unregistered obs prints SKIPPED(not-registered) and the one-shot key
-    stays armed for the poll after the registration lands.
+    stays armed -- and its event is deferred, so a later poll re-offers it --
+    for the poll after the registration lands.
 
 Events:
   NEW_OBSERVATION  obs_id not previously in the state file
@@ -967,6 +975,27 @@ def _revert_deferred(state, old_obs_by_prog, deferred_events):
             obs_map[ev["obs_id"]] = prev
 
 
+def _defer_owed(state, old_obs_by_prog, actionable, owed, label, verb, key_name):
+    """Re-arm the groups an act_* function REACHED and left owed, and return
+    the notice clause that names them.
+
+    A group reached without acting burned no one-shot key, so the action is
+    still owed -- but its post-poll records are already in ``state``, and the
+    end-of-run commit would retire the event that carries it, after which
+    ``diff_events`` can never re-emit it (issues #84, #151).  Restore the
+    pre-poll baseline exactly as a capped-deferred group is re-armed: the
+    group re-fires, and counts against --max-submit again, next poll."""
+    by_group = _group_by_obs(actionable)
+    _revert_deferred(state, old_obs_by_prog,
+                     [ev for key in owed for ev in by_group.get(key, [])])
+    reasons = ", ".join(f"{_group_label(k)} ({r})"
+                        for k, r in sorted(owed.items(),
+                                           key=lambda kv: str(kv[0])))
+    return (f"{label} — {len(owed)} group(s) reached but not {verb}: "
+            f"{reasons}.  They keep their pre-poll baselines and re-fire next "
+            f"run; no '{key_name}' key was burned, so nothing was lost.")
+
+
 # -------------------------------------------------------------------------- disk gate
 DEFAULT_MIN_FREE_TB = 5.0
 DEFAULT_MAX_SUBMIT = 4
@@ -1104,10 +1133,28 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
 
 
 def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=None):
+    """Submit the reduction chain for each actionable NIRCam (program, obs) group.
+
+    Returns ``{group key: SKIP reason}`` for the groups this run REACHED and
+    left owed -- no-filters, in-flight, not-registered (issue #151).  Those
+    skips burn no ``triggered`` key, so the submission is still owed, and
+    main() re-arms them (``_defer_owed``) so the group re-fires next poll.
+    Without that, the end-of-run commit retires the event that carried the
+    trigger, ``diff_events`` never re-emits it, and the obs is never submitted
+    for reduction at all -- the whole loss being one stderr line.
+
+    The skips NOT reported: no field mapping, planned/unreleased, MIRI and
+    already-triggered.  Each is a standing property of the group rather than
+    something this run did to it -- an unmapped program stays unmapped until
+    someone edits PROGRAMS, a planned tile re-fires on its own when the data
+    lands (a NEWLY_RELEASED / CALIB_LEVEL_UP event), MIRI has no automated
+    trigger path to owe, and an already-triggered group is done.  Mirrors
+    act_download's split."""
     from . import pipeline_trigger   # stdlib-only
     from .pipeline_trigger import NotRegisteredInPipelineError
     triggered = (state or {}).get("triggered", {})
     inflight = inflight_job_names() if execute else None
+    owed: Dict[tuple, str] = {}
     for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
         field = evs[0]["field"]
         if not field:
@@ -1137,8 +1184,9 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
                 if tok not in filters:
                     filters.append(tok)
         if not filters:
-            print(f"--trigger: SKIP program {program} obs {obsnum}: no filters known",
-                  file=sys.stderr)
+            print(f"--trigger: SKIP program {program} obs {obsnum}: no filters "
+                  "known -- trigger stays owed", file=sys.stderr)
+            owed[(program, obsnum, instr)] = "no-filters"
             continue
         key = trigger_key(program, obsnum)
         if key in triggered:
@@ -1152,6 +1200,7 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
         if inflight and any(name.startswith(prefix) for name in inflight):
             print(f"--trigger: SKIPPED(in-flight) program {program} obs {obsnum}: "
                   f"squeue --me already has a job named {prefix}*", file=sys.stderr)
+            owed[(program, obsnum, instr)] = "in-flight"
             continue
         try:
             outcome = pipeline_trigger.submit(
@@ -1161,10 +1210,13 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
             # the registry preflight failed in-process, BEFORE any sbatch:
             # report-only, and crucially does NOT record_triggered -- the
             # one-shot key stays armed for the poll after the registration
-            # lands in the pipeline's fields.yaml
+            # lands in the pipeline's fields.yaml.  The armed key alone is not
+            # enough: the EVENT has to survive the commit too, which is what
+            # reporting the group as owed buys (issue #151).
             print(f"--trigger: SKIPPED(not-registered) program {program} obs "
                   f"{obsnum}: {ex} -- register it in the pipeline's "
                   "fields.yaml; trigger stays armed", file=sys.stderr)
+            owed[(program, obsnum, instr)] = "not-registered"
             continue
         if execute and state_path:
             # written IMMEDIATELY (not at the end-of-run commit) so a partial
@@ -1174,6 +1226,7 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
                       if isinstance(outcome, dict) else [])
             record_triggered(state_path, key, mjd_to_iso(now_mjd()),
                              state=state, jobids=jobids)
+    return owed
 
 
 def act_peppar(events, execute=False):
@@ -1613,29 +1666,30 @@ def main(argv=None):
             if owed:
                 # A group act_download REACHED and did not download (low-disk /
                 # unknown-size / oversize) burned no 'downloaded' key, so the
-                # download is still owed -- but its post-poll records are in
-                # `state`, and the end-of-run commit would retire the event that
-                # carries it.  Re-arm exactly as a capped-deferred group is
-                # re-armed: restore the pre-poll baseline so the group re-fires
-                # (and counts against --max-submit again) next poll (issue #84).
-                by_group = _group_by_obs(actionable)
-                _revert_deferred(state, old_obs_by_prog,
-                                 [ev for key in owed
-                                  for ev in by_group.get(key, [])])
-                reasons = ", ".join(f"{_group_label(k)} ({r})"
-                                    for k, r in sorted(owed.items(),
-                                                       key=lambda kv: str(kv[0])))
-                deferred_download = (
-                    f"DOWNLOAD DEFERRED — {len(owed)} group(s) reached but not "
-                    f"downloaded: {reasons}.  They keep their pre-poll "
-                    "baselines and re-fire next run; no 'downloaded' key was "
-                    "burned, so nothing was lost.")
+                # download is still owed (issue #84).
+                deferred_download = _defer_owed(
+                    state, old_obs_by_prog, actionable, owed,
+                    "DOWNLOAD DEFERRED", "downloaded", "downloaded")
                 notice = (f"{notice}  {deferred_download}" if notice
                           else deferred_download)
                 print(f"--download: {deferred_download}", file=sys.stderr)
         if args.trigger:
-            act_trigger(actionable, execute=args.execute, pipe_root=args.pipe_root,
-                        state=state, state_path=args.state)
+            owed = act_trigger(actionable, execute=args.execute,
+                               pipe_root=args.pipe_root, state=state,
+                               state_path=args.state) or {}
+            if owed:
+                # Same loss on the trigger side (issue #151): a group
+                # act_trigger reached and did not submit (no-filters /
+                # in-flight / not-registered) burned no 'triggered' key, so
+                # the submission is still owed -- and an in-flight skip is the
+                # ORDINARY outcome while a treasury delivery queue is busy, so
+                # without this the tile is simply never reduced.
+                deferred_trigger = _defer_owed(
+                    state, old_obs_by_prog, actionable, owed,
+                    "TRIGGER DEFERRED", "submitted", "triggered")
+                notice = (f"{notice}  {deferred_trigger}" if notice
+                          else deferred_trigger)
+                print(f"--trigger: {deferred_trigger}", file=sys.stderr)
         if args.peppar:
             act_peppar(actionable, execute=args.execute)
         if args.report:

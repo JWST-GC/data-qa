@@ -1556,6 +1556,117 @@ def test_act_download_dry_run_skips_prechecks(monkeypatch):
     assert fetched[0]["dry_run"] is True
 
 
+# --------------------------------------- mid-run trigger SKIPs (issue #151)
+def test_act_trigger_reports_the_groups_it_left_owed(monkeypatch, tmp_path):
+    """Each mid-run SKIP burns no 'triggered' key, so the submission is still
+    owed; act_trigger names those groups so main() can re-arm them."""
+    from data_qa import pipeline_trigger
+    key = (2221, "001", "NIRCam")
+    state_path = str(tmp_path / "state.json")
+
+    _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names",
+                        lambda: {"brick2221-o001-reduce-F405N"})
+    assert mm.act_trigger(_trigger_events("001"), execute=True, state={},
+                          state_path=state_path) == {key: "in-flight"}
+
+    def deny(**kw):
+        raise pipeline_trigger.NotRegisteredInPipelineError("not registered")
+
+    monkeypatch.setattr(pipeline_trigger, "submit", deny)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    assert mm.act_trigger(_trigger_events("001"), execute=True, state={},
+                          state_path=state_path) == {key: "not-registered"}
+
+    _patch_submit(monkeypatch)
+    assert mm.act_trigger(_trigger_events("001", filters="CLEAR;GRISMR"),
+                          execute=True, state={},
+                          state_path=state_path) == {key: "no-filters"}
+
+
+def test_act_trigger_owes_nothing_for_standing_skips(monkeypatch, tmp_path):
+    """A planned tile, an unmapped program, a MIRI delivery and an
+    already-triggered group are NOT owed: re-arming them would re-fire the
+    same group every poll forever, and the trigger is not owed on any of
+    them."""
+    _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = str(tmp_path / "state.json")
+    assert mm.act_trigger(_planned_events(), execute=True, state={},
+                          state_path=state_path) == {}
+    unmapped = [dict(_trigger_events("001")[0], field=None)]
+    assert mm.act_trigger(unmapped, execute=True, state={},
+                          state_path=state_path) == {}
+    miri = [ev for ev in _dual_instrument_events()
+            if ev["instrument_name"].startswith("MIRI")]
+    assert mm.act_trigger(miri, execute=True, state={},
+                          state_path=state_path) == {}
+    state = {"triggered": {"2221-o001": "2026-07-21 00:00 UTC"}}
+    assert mm.act_trigger(_trigger_events("001"), execute=True, state=state,
+                          state_path=state_path) == {}
+
+
+def _patch_poll_real_trigger(monkeypatch, rows, inflight=()):
+    """main() with the REAL act_trigger: canned MAST rows, recorded
+    submissions, and a canned squeue."""
+    from data_qa import pipeline_trigger
+    submitted = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set(inflight))
+    monkeypatch.setattr(pipeline_trigger, "submit",
+                        lambda **kw: submitted.append(kw))
+    return submitted
+
+
+def test_main_rearms_a_group_the_queue_skipped_mid_run(monkeypatch, tmp_path):
+    """The #151 loss: obs 001 is skipped because a job of its own is still in
+    the queue, and the end-of-run commit retires obs 001's event -- the
+    reduction owed with nothing recording it, so no later poll ever submits
+    it.  Now obs 001 keeps its pre-poll baseline and re-fires."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n"),
+            _row("jw02221-o002_t001_nircam_clear-f405n")]
+    submitted = _patch_poll_real_trigger(
+        monkeypatch, rows, inflight=["brick2221-o001-reduce-F405N"])
+    state = tmp_path / "state.json"
+    _seed_state(state)                           # baseline: not a first run
+    args = ["--program", "2221", "--trigger", "--execute", "--commit-state",
+            "--state", str(state)]
+    assert mm.main(args) == 0
+    assert [kw["obs"] for kw in submitted] == ["002"]   # 001 was in flight
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o002_t001_nircam_clear-f405n" in committed       # retired
+    assert "jw02221-o001_t001_nircam_clear-f405n" not in committed   # re-armed
+
+    # next poll, queue drained: the skipped group is re-offered and submits,
+    # and the one already triggered is refused by its burned one-shot key
+    submitted2 = _patch_poll_real_trigger(monkeypatch, rows)
+    assert mm.main(args) == 0
+    assert [kw["obs"] for kw in submitted2] == ["001"]
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o001_t001_nircam_clear-f405n" in committed
+    assert set(mm.load_state(str(state))["triggered"]) == {"2221-o001",
+                                                           "2221-o002"}
+
+
+def test_main_notices_the_deferred_trigger(monkeypatch, tmp_path, capsys):
+    """The operator reads the debt on the QA issue, not only in the scrontab
+    log: the deferral clause rides act_report's comment body."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows,
+                             inflight=["brick2221-o001-reduce-F405N"])
+    reported = {}
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: reported.update(kw))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    assert mm.main(["--program", "2221", "--trigger", "--report", "--execute",
+                    "--commit-state", "--state", str(state)]) == 0
+    assert "TRIGGER DEFERRED" in reported["notice"]
+    assert "2221-o001-NIRCam (in-flight)" in reported["notice"]
+    assert "TRIGGER DEFERRED" in capsys.readouterr().err
+
+
 # ------------------------------------------------------------------------- LOW items
 def test_act_download_skips_unmapped_program(monkeypatch, capsys):
     from data_qa import retrieve_data
