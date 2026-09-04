@@ -214,8 +214,8 @@ def post_status(title: str, body: str, repo=None, update_last=False, dry_run=Tru
         return 0
     token = _github.get_token()
     if not token:
-        print("no GitHub token (GITHUB_TOKEN/GH_TOKEN or `gh auth login`)",
-              file=sys.stderr)
+        print("no GitHub token (GITHUB_TOKEN/GH_TOKEN, "
+              f"{_github.TOKEN_FILE}, or `gh auth login`)", file=sys.stderr)
         return 2
     if issue_cache is not None and "issues" in issue_cache:
         existing = issue_cache["issues"]

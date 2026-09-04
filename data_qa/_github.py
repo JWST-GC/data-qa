@@ -1,9 +1,10 @@
 """Shared GitHub REST helpers (stdlib-only urllib).
 
 Used by ``make_issues.py`` (issue create/update) and ``status_report.py`` (status
-comments).  Token comes from ``GITHUB_TOKEN``/``GH_TOKEN``, with a ``gh auth token``
-fallback for interactive use on the cluster.  No third-party dependencies so the CI
-issue-sync stays stdlib-only.
+comments).  Token comes from ``GITHUB_TOKEN``/``GH_TOKEN``, else the PAT file at
+``~/.config/data-qa/github_token``, else a ``gh auth token`` fallback for interactive
+use on the cluster.  No third-party dependencies so the CI issue-sync stays
+stdlib-only.
 """
 from __future__ import annotations
 
@@ -17,9 +18,27 @@ REPO = os.environ.get("QA_REPO", "JWST-GC/data-qa")
 API = "https://api.github.com"
 
 
+# 600-perm PAT file, the headless-safe source.  scripts/refresh_all_issues.sh reads the
+# same path and records why: under scron/cron `gh auth token` can hand back an INVALID
+# token, so the file has to be tried BEFORE the `gh` rung, not after it.
+TOKEN_FILE = "~/.config/data-qa/github_token"
+
+
+def token_from_file(path=None):
+    """Token read from `path` (default TOKEN_FILE); None if unreadable/empty."""
+    try:
+        with open(os.path.expanduser(path or TOKEN_FILE), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def get_token():
-    """GITHUB_TOKEN / GH_TOKEN, else `gh auth token` (None if unavailable)."""
+    """GITHUB_TOKEN / GH_TOKEN, else the PAT file, else `gh auth token` (else None)."""
     tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if tok:
+        return tok
+    tok = token_from_file()
     if tok:
         return tok
     try:

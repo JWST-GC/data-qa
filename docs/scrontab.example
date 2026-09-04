@@ -28,6 +28,13 @@
 #      the metadata poll + a handful of submissions.  If you EXPECT --auto to
 #      be actively downloading new releases (large uncal/i2d batches), raise
 #      to --time=04:00:00 so the transfer itself has room.
+#
+#      PATH=...:$HOME/bin:$PATH -- these entries post to the QA issue
+#      (act_report), and a scron job has no login env.  The token ladder is
+#      GITHUB_TOKEN / GH_TOKEN -> ~/.config/data-qa/github_token (600-perm PAT,
+#      the headless-safe source) -> `gh auth token`; that last rung needs `gh`
+#      on PATH, and gh lives in $HOME/bin.  Same shape as
+#      scripts/refresh_all_issues.scrontab.
 #SCRON --account=astronomy-dept
 #SCRON --qos=astronomy-dept-b
 #SCRON --job-name=jwstgc-mastmon-daily
@@ -35,7 +42,7 @@
 #SCRON --mem=4gb
 #SCRON --time=00:30:00
 #SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_%j.log
-17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --auto --min-free-tb 5 --max-submit 16 --download-dir /orange/adamginsburg/jwst/ops/downloads
+17 7 * * * cd /blue/adamginsburg/adamginsburg/repos/data-qa && PATH=/blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin:$HOME/bin:$PATH /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --auto --min-free-tb 5 --max-submit 16 --download-dir /orange/adamginsburg/jwst/ops/downloads
 
 # ---- report-only alternative (the pre-AUTO daily entry): poll + print, touch
 #      nothing.  TO SWAP: comment out the AUTO entry above and delete ONE
@@ -65,4 +72,4 @@
 #SCRON --mem=4gb
 #SCRON --time=00:30:00
 #SCRON --output=/blue/adamginsburg/adamginsburg/logs/jwst/mast_monitor_commit_%j.log
-47 7 * * 1 cd /blue/adamginsburg/adamginsburg/repos/data-qa && /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --commit-state --report --execute
+47 7 * * 1 cd /blue/adamginsburg/adamginsburg/repos/data-qa && PATH=/blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin:$HOME/bin:$PATH /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python -m data_qa.mast_monitor --commit-state --report --execute
