@@ -34,7 +34,11 @@
 #      GITHUB_TOKEN / GH_TOKEN -> ~/.config/data-qa/github_token (600-perm PAT,
 #      the headless-safe source) -> `gh auth token`; that last rung needs `gh`
 #      on PATH, and gh lives in $HOME/bin.  Same shape as
-#      scripts/refresh_all_issues.scrontab.
+#      scripts/refresh_all_issues.scrontab.  The PAT file must hold ONE token on
+#      ONE line: a second line is skipped with a stderr line naming the file.
+#      Whatever the ladder returns is checked with a `GET /user` preflight before
+#      anything is posted, so an EXPIRED PAT says so in this job's log instead of
+#      reading as "no issue titled ...".
 #SCRON --account=astronomy-dept
 #SCRON --qos=astronomy-dept-b
 #SCRON --job-name=jwstgc-mastmon-daily

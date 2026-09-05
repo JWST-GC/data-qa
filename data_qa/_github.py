@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 
@@ -23,21 +25,69 @@ API = "https://api.github.com"
 # token, so the file has to be tried BEFORE the `gh` rung, not after it.
 TOKEN_FILE = "~/.config/data-qa/github_token"
 
+# Failure statuses `request()` returns instead of raising.  Both are >= 300 and != 200,
+# so every existing caller (`status >= 300`, `status != 200`) already reads them as the
+# failures they are -- nothing here turns an error into a success.
+BAD_TOKEN_STATUS = 598          # malformed token: the request was never sent
+NETWORK_ERROR_STATUS = 599      # transport failure (DNS/refused/timeout): nothing landed
+
+# A GitHub token is ONE line of printable, space-free ASCII (`ghp_`, `github_pat_`,
+# `gho_`, 40-hex).  Anything else -- a PAT file saved with a second line, a pasted
+# "Bearer x", a stray CR -- must never reach an Authorization header: http.client
+# raises ValueError("Invalid header value b'token <the token>...'"), which both ECHOES
+# THE TOKEN into the log and, from the monitor's report path, aborts mast_monitor.main()
+# three lines before its save_state().  Reject at the source instead.
+_PRINTABLE_ASCII_RUN = re.compile(r"\A[!-~]+\Z")
+
+_MALFORMED = ("not a single line of printable ASCII (whitespace or control "
+              "characters); expected ONE token on ONE line")
+
+
+def valid_token(tok) -> bool:
+    """True when `tok` can be sent in an Authorization header."""
+    return bool(tok) and _PRINTABLE_ASCII_RUN.match(tok) is not None
+
+
+def _accept(tok, source):
+    """`tok` if it is well-formed, else None plus a stderr line naming the SOURCE.
+
+    The token's VALUE is never printed -- only where it came from.
+    """
+    if not tok:
+        return None
+    if valid_token(tok):
+        return tok
+    print(f"ignoring the GitHub token from {source}: {_MALFORMED}", file=sys.stderr)
+    return None
+
 
 def token_from_file(path=None):
-    """Token read from `path` (default TOKEN_FILE); None if unreadable/empty."""
+    """Token read from `path` (default TOKEN_FILE); None if unreadable, empty or
+    malformed.
+
+    Never raises: this runs inside the monitor's report path, which sits before
+    ``mast_monitor.main()``'s ``save_state``, so anything raising out of here loses a
+    whole poll's committed state.
+    """
+    path = os.path.expanduser(path or TOKEN_FILE)
     try:
-        with open(os.path.expanduser(path or TOKEN_FILE), encoding="utf-8") as fh:
-            return fh.read().strip() or None
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
     except (OSError, UnicodeDecodeError):
         return None
+    return _accept(raw.strip(), path)
 
 
 def get_token():
-    """GITHUB_TOKEN / GH_TOKEN, else the PAT file, else `gh auth token` (else None)."""
-    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if tok:
-        return tok
+    """GITHUB_TOKEN / GH_TOKEN, else the PAT file, else `gh auth token` (else None).
+
+    A malformed rung is skipped (with a stderr line naming it) rather than returned:
+    a token carrying an interior newline is not usable and raises when sent.
+    """
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        tok = _accept((os.environ.get(var) or "").strip(), f"${var}")
+        if tok:
+            return tok
     tok = token_from_file()
     if tok:
         return tok
@@ -48,11 +98,52 @@ def get_token():
         return None
     if r.returncode != 0:
         return None
-    return r.stdout.strip() or None
+    return _accept(r.stdout.strip(), "`gh auth token`")
+
+
+_AUTH_CHECKED: dict = {}
+
+
+def check_auth(token, force=False):
+    """``(ok, detail)`` from ``GET /user`` -- the preflight this package lacked.
+
+    ``scripts/refresh_all_issues.sh`` pairs the same token ladder with a loud
+    ``gh api user`` check (:43-51) because an invalid/expired token gives a 401 that
+    the enumeration swallows: ``_paginate`` breaks on a non-200, ``existing_issues``
+    returns ``{}``, and the caller reports ``no issue titled '<t>'`` rc=3 -- a message
+    that names nothing about auth.  A PAT file never refreshes itself, so this is the
+    expiry path, not a hypothetical.
+
+    Memoized per token, so a run posting to many issues costs ONE extra request rather
+    than one per issue.  A TRANSPORT failure is not an auth verdict: it returns
+    ``ok=True`` ("unchecked"), leaving an offline run to fail where it failed before
+    instead of being blocked by the preflight.
+    """
+    if not force and token in _AUTH_CHECKED:
+        return _AUTH_CHECKED[token]
+    status, data = request("GET", f"{API}/user", token)
+    if status == 200:
+        result = (True, str(data.get("login") or ""))
+    elif status == NETWORK_ERROR_STATUS:
+        result = (True, f"unchecked -- {data.get('message')}")
+    else:
+        result = (False, f"HTTP {status}: {data.get('message') or ''}".strip())
+    _AUTH_CHECKED[token] = result
+    return result
 
 
 def request(method, url, token, data=None):
-    """One API call -> (status, decoded json). HTTP errors return (code, body)."""
+    """One API call -> (status, decoded json). HTTP errors return (code, body).
+
+    Returns a FAILURE status instead of raising for the two non-HTTP ways this can go
+    wrong, because the monitor's report path runs before ``save_state``: a malformed
+    token (``BAD_TOKEN_STATUS``, nothing sent -- and the token itself is never put in
+    the message) and a transport failure (``NETWORK_ERROR_STATUS``).
+    """
+    if not valid_token(token):
+        # do not build the header: http.client would raise ValueError AND put the
+        # token in the exception text
+        return BAD_TOKEN_STATUS, {"message": f"malformed GitHub token: {_MALFORMED}"}
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, method=method)
     req.add_header("Authorization", f"token {token}")
@@ -64,7 +155,14 @@ def request(method, url, token, data=None):
         with urllib.request.urlopen(req) as r:
             return r.status, json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode() or "{}")
+        # an error body is not always JSON (a proxy or rate-limit page is HTML)
+        raw = e.read().decode(errors="replace")
+        try:
+            return e.code, json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            return e.code, {"message": raw.strip()[:200] or f"HTTP {e.code}"}
+    except urllib.error.URLError as e:                  # DNS/refused/timeout
+        return NETWORK_ERROR_STATUS, {"message": f"network error: {e.reason}"}
 
 
 def _paginate(token, url_fmt):

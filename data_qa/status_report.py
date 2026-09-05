@@ -205,7 +205,8 @@ def post_status(title: str, body: str, repo=None, update_last=False, dry_run=Tru
     (with these labels) instead of failing rc=3 -- the rolling-issue path
     (mast_monitor treasury channel).
 
-    Returns 0 on success / dry-run, nonzero on failure."""
+    Returns 0 on success / dry-run, nonzero on failure: 2 no token, 5 the token was
+    rejected (auth preflight), 3 no issue with this title, 4 the API call failed."""
     repo = repo or _github.REPO
     if dry_run:
         print(f"DRY-RUN: would {'update last status comment' if update_last else 'comment'} "
@@ -217,6 +218,16 @@ def post_status(title: str, body: str, repo=None, update_last=False, dry_run=Tru
         print("no GitHub token (GITHUB_TOKEN/GH_TOKEN, "
               f"{_github.TOKEN_FILE}, or `gh auth login`)", file=sys.stderr)
         return 2
+    ok, detail = _github.check_auth(token)
+    if not ok:
+        # the preflight scripts/refresh_all_issues.sh runs as `gh api user`: without
+        # it a rejected token reads as rc=3 "no issue titled ..." (the listing came
+        # back empty) or rc=4 "failed to create issue", neither of which says auth
+        print(f"FATAL: GitHub auth failed for {repo} ({detail}); the token was "
+              f"rejected, so nothing below could have been found or posted.  Put a "
+              f"valid PAT (Issues+Contents write on {repo}) in {_github.TOKEN_FILE}, "
+              "or export GITHUB_TOKEN.", file=sys.stderr)
+        return 5
     if issue_cache is not None and "issues" in issue_cache:
         existing = issue_cache["issues"]
     else:
