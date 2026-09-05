@@ -88,8 +88,12 @@ _DET_RE = re.compile(r"_(nrc[ab](?:[1-4]|long))_cal\.fits$", re.I)
 # (issue #82): m4 and ngc6397 keep every cal file under F150W2/ and F322W2/, so without it
 # both fields resolved in ``field_for`` and then enumerated nothing.  Those products are
 # genuine wide-filter imaging -- the cal headers read FILTER='F150W2'/'F322W2' with
-# PUPIL='CLEAR', so the dir name IS the bandpass -- and ``peppar.setup_filter_props()``
-# carries both, so they photometer like any other filter.  Live scope of the widening
+# PUPIL='CLEAR', so the dir name IS the bandpass.  Reaching them was necessary but not
+# sufficient: both bandpasses ALSO needed two fixes in ``scripts/peppar/run_peppar_generic.py``
+# (the F150W2 PSF grid cannot be built at stpsf's default spectral sampling, and peppar
+# keys the LW detectors NRCA5/NRCB5) before a job emitted here could write a catalog.
+# ``peppar.setup_filter_props()`` carrying both filters says only that the zeropoint/FWHM
+# table has a row -- it does not exercise either of those paths.  Live scope of the widening
 # (census 2026-08-25 over /orange/adamginsburg/jwst): m4 F150W2 120 cal files / 8 SW
 # detectors + F322W2 30 / 2 LW, ngc6397 F150W2 96 / 8 + F322W2 24 / 2, and no other field
 # holds a wide-filter dir -- 20 new (filter, detector) jobs.  All 20 are manual-CLI only:
