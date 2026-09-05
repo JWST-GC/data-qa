@@ -651,6 +651,19 @@ offset from VIRAC: `_offset_cloud`).
 
 
 
+## Where the stages look for products
+
+Every product lookup searches the field trees (`<QA_BASE>/<field>/`, plus a
+`<field>_o<obs>` split tree where one exists), then — for MAST deliveries — a sibling-field
+wildcard, and finally **the monitor's own download tree**: `mast_monitor` downloads into
+`<QA_BASE>/ops/downloads/` and astroquery builds a `mastDownload/JWST/<product>/` under it,
+one level deeper than a field tree, so a single-level `<QA_BASE>/*/mastDownload` wildcard
+misses it entirely. That tree is field-less (it holds every program the monitor fetched), so
+it is searched **last** and only by patterns pinned to the observation's obsid or its
+`jw<prog><obs>` exposure prefix. `QA_DOWNLOAD_DIR` overrides it, for a monitor run given
+`--download-dir`; otherwise it tracks `mast_monitor.DEFAULT_DOWNLOAD_DIR`.
+
+
 <a id="stagemiri"></a>
 ## MIRI basics (posted on MIRI issues)
 
@@ -659,8 +672,12 @@ The NIRCam stages above don't apply to MIRI; MIRI issues instead get a **basics*
 
 - **i2d image** — the MIRI level-3 mosaic, grayscale (ZScale/asinh). Check for delivery and
   gross artifacts. The MAST delivery is preferred; where none is staged (a tile we reduced
-  ourselves, with no MAST copy in any field tree) the reduction's own resampled mosaic
-  `<field>/<FILT>/pipeline/<obsid>_t<nnn>_miri_<filt>_i2d.fits` is used instead.
+  ourselves, with no MAST copy in any field tree) our own mosaic under
+  `<field>/<FILT>/pipeline/` is used instead — the reduction's stage-3 product
+  `<obsid>_t<nnn>_miri_<filt>_i2d.fits` first, else the cataloging stage's resampled
+  `<obsid>_t<nnn>_miri_clear-<filt>-mirimage_data_i2d.fits` (sgrb2 `jw05365-o002` F2550W has
+  only the latter). The **panel title and the caption name which of the three the figure
+  shows**, so a locally-reduced mosaic is never labelled a MAST delivery.
 - **Spitzer side-by-side** — the nearer archival Spitzer band, **reprojected onto the MIRI WCS +
   pixel grid** (GLIMPSE is GLON-CAR and MIPSGAL is RA-TAN north-up, both a quarter-turn from the
   MIRI observing PA, so a raw cutout would not line up): **IRAC 8 µm** (GLIMPSE) below ~14 µm (the

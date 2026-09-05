@@ -240,11 +240,24 @@ def _fglob(o: Observation, relpat, **kw):
 # ``{BASE}/*/mastDownload`` wildcard every MAST glob uses cannot reach it and a tile the
 # monitor fetched is invisible to every MAST-side stage (JWST-GC/data-qa#163).  A function,
 # not a constant, so it follows a monkeypatched BASE.
+_DEFAULT_BASE = "/orange/adamginsburg/jwst"      # the QA_BASE default, above
+
+
 def _download_root():
-    """The monitor's own download tree (``mast_monitor.DEFAULT_DOWNLOAD_DIR``), which holds a
-    ``mastDownload/`` of its own.  Pinned to that module by
-    ``test_download_root_matches_the_monitor``."""
-    return os.environ.get("QA_DOWNLOAD_DIR", f"{BASE}/ops/downloads")
+    """The monitor's own download tree, which holds a ``mastDownload/`` of its own.
+
+    READ OFF ``mast_monitor.DEFAULT_DOWNLOAD_DIR`` rather than restated here, so the two
+    declarations cannot drift and silently reintroduce #163; it is only re-rooted onto the
+    current ``BASE`` (which a test or ``QA_BASE`` can move) when it sits inside the default
+    base.  ``QA_DOWNLOAD_DIR`` overrides both, for a monitor run given ``--download-dir``.
+    Pinned by ``test_download_root_follows_the_monitor_declaration``."""
+    env = os.environ.get("QA_DOWNLOAD_DIR")
+    if env:
+        return env
+    from .mast_monitor import DEFAULT_DOWNLOAD_DIR as mon
+    if mon.startswith(_DEFAULT_BASE + os.sep):
+        return os.path.join(BASE, os.path.relpath(mon, _DEFAULT_BASE))
+    return mon                                   # the monitor downloads outside the QA base
 
 
 def _mast_roots(o: Observation, cross_field=True):
@@ -3967,6 +3980,38 @@ _MIRI_WAVE = {"F560W": 5.6, "F770W": 7.7, "F1000W": 10.0, "F1130W": 11.3, "F1280
               "F1500W": 15.0, "F1800W": 18.0, "F2100W": 21.0, "F2550W": 25.5}
 
 
+# How `metrics["i2d_source"]` reads in the figure title and in the caption (which starts the
+# sentence, so it capitalises).  An absent key -- an older metrics JSON written before #163, or
+# the no-image red-flag path -- names no provenance at all rather than guessing one.
+_MIRI_I2D_TITLE = {"mast": "MAST i2d", "reduced": "reduced i2d"}
+_MIRI_I2D_CAPTION = {"mast": "MAST i2d image", "reduced": "Reduced i2d image"}
+
+
+# The two names our own reduction gives a MIRI level-3 mosaic in ``<field>/<FILT>/pipeline/``,
+# in preference order: the reduction's stage-3 product first, the cataloging stage's resampled
+# ``_data`` mosaic second.  Both exact -- see ``_miri_i2d``.
+_MIRI_REDUCED_STEMS = ("{obsid}_t*_miri_{filt}_i2d.fits",
+                       "{obsid}_t*_miri_*{filt}*_data_i2d.fits")
+
+# The filter a MIRI level-3 mosaic basename declares, for BOTH of those stems and for the MAST
+# delivery -- and nothing else.  An outlier intermediate (``..._f770w_0_o002_outlier_i2d.fits``)
+# or a model/residual mosaic declares no filter, which is what lets ``_miri_obs_from_disk`` glob
+# loosely and still refuse a directory holding only by-products.
+_MIRI_FILT_RES = (re.compile(r"miri_([a-z0-9]+)_i2d\.fits$"),
+                  re.compile(r"miri_(?:[a-z0-9]+-)?(f\d+[wn])(?:-[a-z0-9]+)?_data_i2d\.fits$"))
+
+
+def _miri_filters(paths):
+    """Uppercase filters declared by ``paths`` under ``_MIRI_FILT_RES``, sorted; ``[]`` if none."""
+    out = set()
+    for p in paths:
+        b = os.path.basename(p).lower()
+        for rx in _MIRI_FILT_RES:
+            if (m := rx.search(b)):
+                out.add(m.group(1).upper()); break
+    return sorted(out)
+
+
 def _miri_i2d(o, filt):
     """MIRI level-3 mosaic for one filter, or None.
 
@@ -3977,15 +4022,27 @@ def _miri_i2d(o, filt):
     field-scoped hit; the field-scoped hit is PREFERRED (tried first) so the wildcard cannot
     grab a wrong field's file when a scoped one exists.
 
-    A MAST copy is not guaranteed to exist.  Our own reduction resamples to
-    ``<field>/<FILT>/pipeline/<obsid>_t<nnn>_miri_<filt>_i2d.fits`` (sgrb2, sickle, w51, brick and
-    cloudc each carry one), and a treasury F770W tile reduced with no MAST copy staged into a field
-    tree has ONLY that -- so MIRI QA saw nothing for it (JWST-GC/data-qa#163).  Searched AFTER the
-    MAST delivery, so no observation that resolves today resolves differently.
+    A MAST copy is not guaranteed to exist.  Our own reduction writes into
+    ``<field>/<FILT>/pipeline/`` and a treasury F770W tile reduced with no MAST copy staged into a
+    field tree has ONLY that -- so MIRI QA saw nothing for it (JWST-GC/data-qa#163).  Searched
+    AFTER the MAST delivery, so no observation that resolves today resolves differently.
 
-    That stem is exact on purpose: the same directories hold outlier-detection intermediates
+    TWO stems live there, and both are matched (``_MIRI_REDUCED_STEMS``):
+
+    * ``<obsid>_t<nnn>_miri_<filt>_i2d.fits`` -- the reduction's own level-3 mosaic
+      (``PipelineMIRI`` names the stage-3 association product ``...-o<obs>_t001_miri_<filt>``).
+      Preferred, because it is the same product stage 1 shows for NIRCam: the reduction mosaic,
+      not a cataloging by-product.
+    * ``<obsid>_t<nnn>_miri_clear-<filt>-mirimage_data_i2d.fits`` -- the cataloging stage's
+      resample of the input data onto its own grid.  A ``<FILT>/pipeline/`` dir can hold ONLY
+      this one: sgrb2 ``jw05365-o002`` F2550W has no stage-3 mosaic of its own there (it is
+      served from MAST today, so nothing regressed, but the fallback could not have caught it).
+
+    Both stems are EXACT: the same directories hold outlier-detection intermediates
     (``..._miri_f770w_0_o002_outlier_i2d.fits``) and photometry model/residual mosaics, and a
-    trailing wildcard sorts an outlier intermediate AHEAD of the science mosaic."""
+    trailing wildcard sorts an outlier intermediate AHEAD of the science mosaic.  ``_data_i2d``
+    discriminates on its own -- every by-product beside it ends ``_model_i2d`` /
+    ``_residual_i2d`` / ``_residual_smoothed_bg_i2d`` / ``_outlier_i2d``."""
     filt = filt.lower()
     for pat in [f"{root}/mastDownload/**/{o.obsid}_t*_miri_*{filt}*_i2d.fits"
                 for root in _mast_roots(o)]:
@@ -3993,9 +4050,10 @@ def _miri_i2d(o, filt):
         if hits:
             return sorted(hits)[0]
     for d in _field_dirs(o, f"{filt.upper()}/pipeline", "*/pipeline"):
-        hits = sorted(glob.glob(f"{d}/{o.obsid}_t*_miri_{filt}_i2d.fits"))
-        if hits:
-            return hits[0]
+        for stem in _MIRI_REDUCED_STEMS:
+            hits = sorted(glob.glob(f"{d}/{stem.format(obsid=o.obsid, filt=filt)}"))
+            if hits:
+                return hits[0]
     return None
 
 
@@ -4072,15 +4130,18 @@ def miri_overview(o: Observation, filt=None):
         mpath = _miri_i2d(o, f)
         if mpath:
             filt = f; break
-    metrics = dict(stage="miri", filt=filt,
-                   i2d_source="mast" if "/mastDownload/" in (mpath or "") else "reduced")
+    metrics = dict(stage="miri", filt=filt)
     if not mpath:
+        # No image, so no provenance: leave `i2d_source` absent rather than recording "reduced"
+        # for a figure that shows nothing.
         png = _red_flag_figure(o, "miri", "NO MIRI i2d ON DISK",
                                f"No MIRI i2d for {o.obsid} in mastDownload/ or in a "
                                f"<FILT>/pipeline/ reduction dir "
                                f"(filters tried: {', '.join(filts)}).")
         metrics.update(red_flag=True, red_flag_reason="no MIRI i2d on disk", passed=False)
         return png, metrics
+    # Which image the figure shows, so the panel TITLE and the caption can both name it.
+    metrics["i2d_source"] = "mast" if "/mastDownload/" in mpath else "reduced"
 
     with fits.open(_used(mpath, f"MIRI {filt} mosaic")) as h:
         sci = h["SCI"] if "SCI" in h else h[1]
@@ -4102,7 +4163,10 @@ def miri_overview(o: Observation, filt=None):
         a.set_xticks([]); a.set_yticks([]); a.set_title(title, fontsize=9)
 
     a0 = ax[0][col]; col += 1
-    _gray(a0, mdata, f"MIRI {filt} MAST i2d")
+    # Name the image the panel ACTUALLY shows.  This title was hardcoded "MAST i2d", so on the
+    # locally-reduced fallback added for #163 the PNG a human opens labelled our own mosaic as a
+    # MAST delivery.  Same idiom as the stage-1 panel (`kind = "reduced mosaic" / "MAST i2d"`).
+    _gray(a0, mdata, f"MIRI {filt} {_MIRI_I2D_TITLE.get(metrics.get('i2d_source'), 'i2d')}")
 
     if spz:                                              # Spitzer, reprojected onto the MIRI grid
         lbl, spath = spz
@@ -5587,9 +5651,17 @@ def _json_default(o):
 
 
 def _miri_obs_from_disk(program, obs, base=BASE):
-    """Construct a MIRI Observation from the MAST MIRI i2d(s) on disk (portal-independent)."""
+    """Construct a MIRI Observation from the MIRI i2d(s) on disk (portal-independent)."""
     from .observations import FIELDS, CURATED
     obsid = f"jw{int(program):05d}-o{obs}"
+
+    def _made(fld, filts):
+        cur = CURATED.get(obsid, {})
+        return Observation(program=str(int(program)), obs=obs, target=FIELDS.get(fld, fld.title()),
+                           release_field=fld, instrument="MIRI", filters=filts,
+                           visits=cur.get("visits", []), epoch=cur.get("epoch", ""),
+                           notes=cur.get("notes", ""))
+
     for d in sorted(glob.glob(f"{base}/*/")):
         fld = os.path.basename(d.rstrip("/"))
         # recurse into mastDownload/JWST/<product>/ and accept any tile token (_t001_../_t003_);
@@ -5597,26 +5669,36 @@ def _miri_obs_from_disk(program, obs, base=BASE):
         hits = (glob.glob(f"{base}/{fld}/mastDownload/**/{obsid}_t*_miri_*_i2d.fits",
                           recursive=True)
                 + glob.glob(f"{base}/{fld}/*/pipeline/{obsid}_t*_miri_*_i2d.fits"))
-        # The filter regex is what makes the loose pipeline glob safe: it matches the science
-        # stem only, so an outlier intermediate or a model/residual mosaic contributes no filter.
+        # `_miri_filters` is what makes the loose pipeline glob safe: it matches the two science
+        # stems only, so an outlier intermediate or a model/residual mosaic contributes no filter.
         # Gate on the FILTERS rather than on the raw hits, or a directory holding only those
         # byproducts would claim the observation and hand back an Observation with no filters.
-        filts = sorted({m.group(1).upper() for h in hits
-                        if (m := re.search(r"miri_([a-z0-9]+)_i2d", os.path.basename(h).lower()))})
+        filts = _miri_filters(hits)
         if not filts:
             continue
-        cur = CURATED.get(obsid, {})
-        return Observation(program=str(int(program)), obs=obs, target=FIELDS.get(fld, fld.title()),
-                           release_field=fld, instrument="MIRI", filters=filts,
-                           visits=cur.get("visits", []), epoch=cur.get("epoch", ""),
-                           notes=cur.get("notes", ""))
+        return _made(fld, filts)
+
+    # Last: a tile the monitor auto-downloaded and that no field tree has a copy of.  That tree is
+    # field-less, so the release_field cannot come from a directory name -- take it from the
+    # monitor's own program->field map, the same one it files the download under.  Without this a
+    # 10678 MIRI parallel that has arrived but not yet been staged into `gc-treasury/` reads
+    # "portal + on-disk empty" and gets no MIRI stage at all (#166 review, non-blocking 3).
+    filts = _miri_filters(glob.glob(
+        f"{_download_root()}/mastDownload/**/{obsid}_t*_miri_*_i2d.fits", recursive=True))
+    if filts:
+        from .mast_monitor import field_for
+        fld = field_for(program, obs)
+        if fld:                       # an unregistered program maps to "" -- no field, no guess
+            return _made(fld, filts)
     return None
 
 
 def _miri_caption(metrics, repo):
     doc = f"https://github.com/{repo}/blob/main/docs/qa_methods.md#stagemiri"
-    parts = [f"**MIRI {metrics.get('filt','')} basics.** "
-             f"{'MAST' if metrics.get('i2d_source') == 'mast' else 'Reduced'} i2d image"]
+    # An older metrics JSON (written before #163) carries no `i2d_source`; say "i2d image" rather
+    # than guess a provenance for it.  A caption must never assert where an image came from.
+    src = _MIRI_I2D_CAPTION.get(metrics.get("i2d_source"), "i2d image")
+    parts = [f"**MIRI {metrics.get('filt','')} basics.** {src}"]
     if metrics.get("spitzer"):
         # only claim a shared footprint when the Spitzer cutout was reprojected onto the MIRI grid
         # AND actually covers the field; otherwise the panel is only wavelength-matched.

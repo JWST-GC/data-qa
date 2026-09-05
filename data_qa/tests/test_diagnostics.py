@@ -5,6 +5,7 @@ Covers the pure numeric helpers (`_binned_stat`), the caption fallback that once
 per-exposure daophot glob (`_daophot_glob`) that keeps one observation's cats out of another's
 QA on multi-obs fields.  No I/O beyond touching empty files under a temporary QA_BASE.
 """
+import glob
 import os
 
 import numpy as np
@@ -2987,15 +2988,30 @@ def _miri_obs(field="brick", program="2221", obs="001", filts=("F770W",)):
                        instrument="MIRI", filters=list(filts), visits=[], epoch="", notes="")
 
 
-def test_download_root_matches_the_monitor(monkeypatch):
-    """The QA download root and the dir the monitor actually downloads into are the same path.
+def test_download_root_follows_the_monitor_declaration(monkeypatch):
+    """The QA download root is READ OFF `mast_monitor.DEFAULT_DOWNLOAD_DIR`, not restated.
 
-    They are declared in two modules; if `mast_monitor.DEFAULT_DOWNLOAD_DIR` moves and this one
-    does not, QA silently stops seeing auto-downloaded products again -- the defect of #163."""
+    Restating it (`f"{BASE}/ops/downloads"`) makes the two declarations able to drift, which is
+    exactly how QA stopped seeing auto-downloaded products (#163) -- and a pin that compares a
+    restatement to the constant is green under the default even after the constant moves.  So
+    MOVE the constant and require the QA root to follow it."""
     from data_qa import mast_monitor
-    monkeypatch.setattr(D, "BASE", "/orange/adamginsburg/jwst")     # the default QA_BASE
     monkeypatch.delenv("QA_DOWNLOAD_DIR", raising=False)
+    monkeypatch.setattr(D, "BASE", "/orange/adamginsburg/jwst")     # the default QA_BASE
     assert D._download_root() == mast_monitor.DEFAULT_DOWNLOAD_DIR
+
+    monkeypatch.setattr(mast_monitor, "DEFAULT_DOWNLOAD_DIR",
+                        "/orange/adamginsburg/jwst/ops/downloads2")
+    assert D._download_root() == "/orange/adamginsburg/jwst/ops/downloads2"
+    # ... and it is still re-rooted onto a moved BASE, so a tmp_path test tree lines up
+    monkeypatch.setattr(D, "BASE", "/tmp/qa")
+    assert D._download_root() == "/tmp/qa/ops/downloads2"
+    # a monitor downloading OUTSIDE the QA base is taken literally, not spliced onto BASE
+    monkeypatch.setattr(mast_monitor, "DEFAULT_DOWNLOAD_DIR", "/scratch/dl")
+    assert D._download_root() == "/scratch/dl"
+    # an explicit --download-dir run overrides both
+    monkeypatch.setenv("QA_DOWNLOAD_DIR", "/elsewhere/dl")
+    assert D._download_root() == "/elsewhere/dl"
 
 
 def test_mast_globs_reach_the_monitor_download_tree(tmp_path, monkeypatch):
@@ -3065,6 +3081,9 @@ def test_miri_i2d_reduced_layout_skips_outlier_and_residual_products(tmp_path, m
     o = _miri_obs(field="w51", program="6151", obs="002")
     got = D._miri_i2d(o, "F770W")
     assert os.path.basename(got) == "jw06151-o002_t001_miri_f770w_i2d.fits"
+    stem = D._MIRI_REDUCED_STEMS[0].format(obsid=o.obsid, filt="f770w")
+    assert [os.path.basename(q) for q in sorted(glob.glob(f"{pipe}/{stem}"))] == \
+        ["jw06151-o002_t001_miri_f770w_i2d.fits"]
 
 
 def test_miri_i2d_prefers_the_mast_delivery_over_the_reduced_mosaic(tmp_path, monkeypatch):
@@ -3094,11 +3113,148 @@ def test_miri_obs_from_disk_reads_the_reduced_layout(tmp_path, monkeypatch):
 
 def test_miri_obs_from_disk_skips_a_field_with_only_byproducts(tmp_path, monkeypatch):
     """A field dir holding only outlier/model/residual mosaics for this obsid must not claim the
-    observation: it would return an Observation with no filters and mask the real field."""
+    observation: it would return an Observation with no filters and mask the real field.
+
+    Widening the filter regex to also read the cataloging `_data_i2d` stem (#166 review) must not
+    widen it to the model/residual mosaics that sit beside it under the SAME `clear-<filt>-
+    mirimage_` prefix -- so the decoy dir carries one of each."""
     monkeypatch.setattr(D, "BASE", str(tmp_path))
     junk = tmp_path / "aaa_scratch" / "F770W" / "pipeline"; junk.mkdir(parents=True)
-    _touch(junk, "jw03958-o002_t001_miri_f770w_3_o002_outlier_i2d.fits")
+    for name in ("jw03958-o002_t001_miri_f770w_3_o002_outlier_i2d.fits",
+                 "jw03958-o002_t001_miri_clear-f770w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_model_i2d.fits",
+                 "jw03958-o002_t001_miri_clear-f770w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_i2d.fits",
+                 "jw03958-o002_t001_miri_clear-f770w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_smoothed_bg_i2d.fits"):
+        _touch(junk, name)
+    assert D._miri_filters(sorted(junk.glob("*.fits"))) == []
     pipe = tmp_path / "sickle" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
     _touch(pipe, "jw03958-o002_t001_miri_f770w_i2d.fits")
     o = D._miri_obs_from_disk("3958", "002", base=str(tmp_path))
     assert o is not None and o.release_field == "sickle" and o.filters == ["F770W"]
+
+
+def test_miri_i2d_finds_the_cataloging_data_mosaic(tmp_path, monkeypatch):
+    """Some observations have ONLY the cataloging stage's `_data_i2d` resample under
+    `<FILT>/pipeline/` -- sgrb2 `jw05365-o002` F2550W on disk today has no plain
+    `jw05365-o002_t001_miri_f2550w_i2d.fits`.  Matching only the reduction stem left it
+    unreachable (#166 review B2)."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "sgrb2" / "F2550W" / "pipeline"; pipe.mkdir(parents=True)
+    for name in ("jw05365-o002_t001_miri_clear-f2550w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_model_i2d.fits",
+                 "jw05365-o002_t001_miri_clear-f2550w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_i2d.fits",
+                 "jw05365-o002_t001_miri_clear-f2550w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_smoothed_bg_i2d.fits",
+                 "jw05365-o002_t001_miri_clear-f2550w-mirimage_data_i2d.fits"):
+        _touch(pipe, name)
+    o = _miri_obs(field="sgrb2", program="5365", obs="002", filts=("F2550W",))
+    got = D._miri_i2d(o, "F2550W")
+    assert os.path.basename(got) == \
+        "jw05365-o002_t001_miri_clear-f2550w-mirimage_data_i2d.fits"
+    # EXACTNESS, not sort-luck: `_data_i2d` admits exactly one of the four real names above, so
+    # a by-product cannot become the science mosaic by happening to sort ahead of it.  (Today
+    # `data` < `group_` < `resbgsub_` lexically, so a loose `*<filt>*_i2d.fits` would return the
+    # right file anyway -- and would stop doing so the day a mosaic sorts before `data`.)
+    stem = D._MIRI_REDUCED_STEMS[1].format(obsid=o.obsid, filt="f2550w")
+    assert [os.path.basename(q) for q in sorted(glob.glob(f"{pipe}/{stem}"))] == \
+        ["jw05365-o002_t001_miri_clear-f2550w-mirimage_data_i2d.fits"]
+    # ... and it is a FALLBACK: where the reduction's own stage-3 mosaic is there too, it wins
+    _touch(pipe, "jw05365-o002_t001_miri_f2550w_i2d.fits")
+    assert os.path.basename(D._miri_i2d(o, "F2550W")) == \
+        "jw05365-o002_t001_miri_f2550w_i2d.fits"
+    # the `_data` stem also declares its filter to `_miri_obs_from_disk`
+    os.remove(os.path.join(str(pipe), "jw05365-o002_t001_miri_f2550w_i2d.fits"))
+    disk = D._miri_obs_from_disk("5365", "002", base=str(tmp_path))
+    assert disk is not None and disk.release_field == "sgrb2" and disk.filters == ["F2550W"]
+
+
+def test_miri_panel_title_names_the_image_it_shows(tmp_path, monkeypatch):
+    """The panel title was hardcoded `MIRI <filt> MAST i2d`, so on the locally-reduced fallback
+    the PNG a human opens labelled our own mosaic a MAST delivery (#166 review B1)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from astropy.io import fits
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setattr(D, "_spitzer_for_miri", lambda f: None)
+    monkeypatch.setattr(D, "_saturation_mask", lambda o: None)
+    titles = []
+
+    def _grab(fig, name):
+        titles.append(fig.axes[0].get_title()); plt.close(fig); return name
+    monkeypatch.setattr(D, "_save", _grab)
+
+    def _make(path):
+        hdu = fits.HDUList([fits.PrimaryHDU(),
+                            fits.ImageHDU(np.arange(64, dtype="float32").reshape(8, 8),
+                                          name="SCI")])
+        hdu[1].header.update(dict(CTYPE1="RA---TAN", CTYPE2="DEC--TAN", CRPIX1=4, CRPIX2=4,
+                                  CRVAL1=266.0, CRVAL2=-28.9, CDELT1=-3e-5, CDELT2=3e-5))
+        hdu.writeto(path, overwrite=True)
+
+    o = _miri_obs(field="w51", program="6151", obs="002")
+    pipe = tmp_path / "w51" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    _make(str(pipe / "jw06151-o002_t001_miri_f770w_i2d.fits"))
+    _png, m = D.miri_overview(o)
+    assert m["i2d_source"] == "reduced"
+    assert titles[-1] == "MIRI F770W reduced i2d"
+    assert "MAST" not in titles[-1]
+
+    md = tmp_path / "w51" / "mastDownload" / "JWST" / "p"; md.mkdir(parents=True)
+    _make(str(md / "jw06151-o002_t001_miri_f770w_i2d.fits"))
+    _png, m = D.miri_overview(o)
+    assert m["i2d_source"] == "mast"
+    assert titles[-1] == "MIRI F770W MAST i2d"
+
+
+def test_miri_caption_never_guesses_a_provenance():
+    """A metrics JSON written before #163 carries no `i2d_source`, and the no-image red-flag path
+    records none either -- the caption must not then assert one."""
+    cap = D._miri_caption(dict(filt="F770W"), "JWST-GC/data-qa")
+    assert "i2d image" in cap and "MAST" not in cap and "Reduced" not in cap
+
+
+def test_miri_obs_from_disk_reads_the_monitor_download_tree(tmp_path, monkeypatch):
+    """A tile the monitor auto-downloaded that no field tree has a copy of.  The tree is
+    field-less, so `release_field` comes from the monitor's own program->field map -- without it
+    `_run_miri` reports "portal + on-disk empty" and the observation gets no MIRI stage at all
+    (#166 review, non-blocking 3)."""
+    from data_qa import mast_monitor
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.delenv("QA_DOWNLOAD_DIR", raising=False)
+    monkeypatch.setattr(mast_monitor, "DEFAULT_DOWNLOAD_DIR",
+                        "/orange/adamginsburg/jwst/ops/downloads")
+    (tmp_path / "gc-treasury").mkdir()                    # field tree exists but holds nothing
+    sub = (tmp_path / "ops" / "downloads" / "mastDownload" / "JWST"
+           / "jw10678-o088_t001_miri_f770w")
+    sub.mkdir(parents=True)
+    _touch(sub, "jw10678-o088_t001_miri_f770w_i2d.fits")
+    o = D._miri_obs_from_disk("10678", "088", base=str(tmp_path))
+    assert o is not None and o.instrument == "MIRI" and o.filters == ["F770W"]
+    assert o.release_field == mast_monitor.field_for(10678, "088") == "gc-treasury"
+
+    # a program the monitor has no field for is NOT guessed at -- no Observation, no wrong field
+    assert mast_monitor.field_for(99999, "001") == ""
+    assert D._miri_obs_from_disk("99999", "001", base=str(tmp_path)) is None
+
+
+def test_mast_lookups_reach_a_split_field_tree(tmp_path, monkeypatch):
+    """`_mast_source_catalog`, `_mast_catalog_positions`, `_mast_i2d` and `_saturation_mask` used
+    a literal `{BASE}/{o.field}`, so on a split field (`<field>_o<obs>`, issue #119) they saw only
+    the one tree the registry names.  They go through `_field_roots` now, like every other
+    lookup, so the split tree and the base field are both reachable."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    (tmp_path / "gc2211_o023").mkdir()                   # the split tree: frames went here
+    md = (tmp_path / "gc2211" / "mastDownload" / "JWST"      # the MAST copy stayed in the base
+          / "jw02211-o023_t001_nircam_clear-f200w")
+    md.mkdir(parents=True)
+    _touch(md, "jw02211-o023_t001_nircam_clear-f200w_i2d.fits")
+    _touch(md, "jw02211-o023_t001_nircam_clear-f200w_cat.ecsv")
+    o = Observation(program="2211", obs="023", target="T", release_field="gc2211_o023",
+                    instrument="NIRCam", filters=["F200W"], visits=[], epoch="", notes="")
+    assert D._field_roots(o)[0].endswith("gc2211_o023")
+    assert D._mast_i2d(o, "F200W").endswith("clear-f200w_i2d.fits")
+    assert D._mast_source_catalog(o, "F200W").endswith("clear-f200w_cat.ecsv")
