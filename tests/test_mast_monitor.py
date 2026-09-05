@@ -1556,6 +1556,285 @@ def test_act_download_dry_run_skips_prechecks(monkeypatch):
     assert fetched[0]["dry_run"] is True
 
 
+# --------------------------------------- mid-run trigger SKIPs (issue #151)
+def test_act_trigger_reports_the_groups_it_left_owed(monkeypatch, tmp_path):
+    """A mid-run SKIP with NOTHING RUNNING for the group burns no 'triggered'
+    key, so the submission is still owed; act_trigger names those groups so
+    main() can re-arm them."""
+    from data_qa import pipeline_trigger
+    key = (2221, "001", "NIRCam")
+    state_path = str(tmp_path / "state.json")
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+
+    def deny(**kw):
+        raise pipeline_trigger.NotRegisteredInPipelineError("not registered")
+
+    monkeypatch.setattr(pipeline_trigger, "submit", deny)
+    assert mm.act_trigger(_trigger_events("001"), execute=True, state={},
+                          state_path=state_path) == {key: "not-registered"}
+
+    _patch_submit(monkeypatch)
+    assert mm.act_trigger(_trigger_events("001", filters="CLEAR;GRISMR"),
+                          execute=True, state={},
+                          state_path=state_path) == {key: "no-filters"}
+
+
+def test_act_trigger_does_not_owe_an_inflight_group(monkeypatch, tmp_path):
+    """B3 of the PR #165 review.  The already-triggered map is consulted
+    BEFORE the queue, so a queued job this map does not know about was
+    submitted by something other than the monitor (on this account, by hand).
+    Re-arming it would queue a duplicate chain behind that job once the queue
+    drains, so the group is reported -- for the notice -- but NOT owed."""
+    _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names",
+                        lambda: {"brick2221-o001-reduce-F405N"})
+    skips = mm.act_trigger(_trigger_events("001"), execute=True, state={},
+                           state_path=str(tmp_path / "state.json"))
+    assert skips == {(2221, "001", "NIRCam"): "in-flight"}
+    assert "in-flight" not in mm.TRIGGER_REARM_REASONS
+
+
+def test_act_trigger_owes_nothing_for_standing_skips(monkeypatch, tmp_path):
+    """A planned tile, an unmapped program, a MIRI delivery and an
+    already-triggered group are NOT owed: re-arming them would re-fire the
+    same group every poll forever, and the trigger is not owed on any of
+    them."""
+    _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = str(tmp_path / "state.json")
+    assert mm.act_trigger(_planned_events(), execute=True, state={},
+                          state_path=state_path) == {}
+    unmapped = [dict(_trigger_events("001")[0], field=None)]
+    assert mm.act_trigger(unmapped, execute=True, state={},
+                          state_path=state_path) == {}
+    miri = [ev for ev in _dual_instrument_events()
+            if ev["instrument_name"].startswith("MIRI")]
+    assert mm.act_trigger(miri, execute=True, state={},
+                          state_path=state_path) == {}
+    state = {"triggered": {"2221-o001": "2026-07-21 00:00 UTC"}}
+    assert mm.act_trigger(_trigger_events("001"), execute=True, state=state,
+                          state_path=state_path) == {}
+
+
+def _patch_poll_real_trigger(monkeypatch, rows, inflight=(), deny=False):
+    """main() with the REAL act_trigger: canned MAST rows, recorded
+    submissions, and a canned squeue.  ``deny`` makes the registry preflight
+    refuse, the skip that leaves a trigger genuinely owed."""
+    from data_qa import pipeline_trigger
+    submitted = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set(inflight))
+
+    def submit(**kw):
+        if deny:
+            raise pipeline_trigger.NotRegisteredInPipelineError("not registered")
+        submitted.append(kw)
+
+    monkeypatch.setattr(pipeline_trigger, "submit", submit)
+    return submitted
+
+
+def test_main_rearms_a_group_the_registry_refused(monkeypatch, tmp_path):
+    """The #151 loss: obs 001's preflight refuses before any sbatch, and the
+    end-of-run commit retires obs 001's event -- the reduction owed with
+    nothing recording it, so no later poll ever submits it.  Now obs 001 keeps
+    its pre-poll baseline and re-fires."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows, deny=True)
+    state = tmp_path / "state.json"
+    _seed_state(state)                           # baseline: not a first run
+    args = ["--program", "2221", "--trigger", "--execute", "--commit-state",
+            "--state", str(state)]
+    assert mm.main(args) == 0
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o001_t001_nircam_clear-f405n" not in committed   # re-armed
+
+    # next poll, the obs registered: the deferred group is re-offered and submits
+    submitted2 = _patch_poll_real_trigger(monkeypatch, rows)
+    assert mm.main(args) == 0
+    assert [kw["obs"] for kw in submitted2] == ["001"]
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o001_t001_nircam_clear-f405n" in committed
+    assert set(mm.load_state(str(state))["triggered"]) == {"2221-o001"}
+
+
+def test_main_never_queues_a_second_chain_behind_an_inflight_job(monkeypatch,
+                                                                 tmp_path):
+    """B3 of the PR #165 review.  A job of obs 001 is in the queue that the
+    'triggered' map does not know about (a hand-run reduction).  The event is
+    retired, so when the queue drains the monitor does NOT submit its own
+    chain over the products that job just wrote."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows,
+                             inflight=["brick2221-o001-reduce-F405N"])
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    args = ["--program", "2221", "--trigger", "--execute", "--commit-state",
+            "--state", str(state)]
+    assert mm.main(args) == 0
+
+    submitted2 = _patch_poll_real_trigger(monkeypatch, rows)   # queue drained
+    assert mm.main(args) == 0
+    assert submitted2 == []                       # no duplicate chain
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o001_t001_nircam_clear-f405n" in committed        # retired
+    assert mm.OWED_GROUPS_KEY not in mm.load_state(str(state))
+
+
+def test_main_notices_the_deferred_trigger(monkeypatch, tmp_path, capsys):
+    """The operator reads the debt on the QA issue, not only in the scrontab
+    log: the deferral clause rides act_report's comment body."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows, deny=True)
+    reported = {}
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: reported.update(kw))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    assert mm.main(["--program", "2221", "--trigger", "--report", "--execute",
+                    "--commit-state", "--state", str(state)]) == 0
+    assert "TRIGGER DEFERRED" in reported["notice"]
+    assert "2221-o001-NIRCam (not-registered)" in reported["notice"]
+    assert "TRIGGER DEFERRED" in capsys.readouterr().err
+
+
+def test_main_notices_the_inflight_skip(monkeypatch, tmp_path, capsys):
+    """An in-flight skip is retired rather than deferred, so the QA issue is
+    the only place the operator can see it happened."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows,
+                             inflight=["brick2221-o001-reduce-F405N"])
+    reported = {}
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: reported.update(kw))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    assert mm.main(["--program", "2221", "--trigger", "--report", "--execute",
+                    "--commit-state", "--state", str(state)]) == 0
+    assert "TRIGGER SKIPPED(in-flight)" in reported["notice"]
+    assert "2221-o001-NIRCam" in reported["notice"]
+    assert "TRIGGER DEFERRED" not in reported["notice"]
+
+
+def test_a_deferred_group_keeps_notifying_every_poll(monkeypatch, tmp_path):
+    """B1 of the PR #165 review, pinned as INTENDED rather than assumed.
+
+    A re-armed group re-fires its arrival event, and act_report posts a NEW
+    (notifying) comment for an arrival -- so a deferral that persists posts one
+    comment per poll.  That is the same behaviour DOWNLOAD DEFERRED has carried
+    since #84, and it is wanted here: every remaining deferral reason
+    (not-registered, no-filters) needs a human to clear it, and a silent daily
+    edit is exactly the #71 defect.  The in-flight case -- routine, clears
+    itself, needs nobody -- is retired instead, so it never reaches this path.
+    """
+    from data_qa import status_report
+    posts = []
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, repo=None, update_last=None, **kw:
+                        (posts.append(update_last), 0)[1])
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    args = ["--program", "2221", "--trigger", "--report", "--execute",
+            "--commit-state", "--state", str(state)]
+    for _ in range(3):
+        _patch_poll_real_trigger(monkeypatch, rows, deny=True)
+        assert mm.main(args) == 0
+    assert posts == [False, False, False]        # three notifying comments
+
+    # the in-flight skip does not: it is retired on the first poll, so the
+    # second poll carries no event and posts nothing at all
+    posts.clear()
+    state2 = tmp_path / "state2.json"
+    _seed_state(state2)
+    args2 = [a if a != str(state) else str(state2) for a in args]
+    for _ in range(3):
+        _patch_poll_real_trigger(monkeypatch, rows,
+                                 inflight=["brick2221-o001-reduce-F405N"])
+        assert mm.main(args2) == 0
+    assert posts == [False]
+
+
+def test_cap_yields_the_slot_to_a_group_it_never_offered(monkeypatch, tmp_path):
+    """B2 of the PR #165 review.  obs 001 is older and permanently owed (its
+    obs is not registered); obs 002 is ready.  With --max-submit 1 a strictly
+    age-ordered cap re-selects 001 every poll, submits nothing, and 002 is
+    never reached.  Sorting a previously-owed group last hands 002 the slot."""
+    from data_qa import pipeline_trigger
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n", release=59900.0),
+            _row("jw02221-o002_t001_nircam_clear-f405n", release=59901.0)]
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    args = ["--program", "2221", "--trigger", "--execute", "--commit-state",
+            "--max-submit", "1", "--state", str(state)]
+
+    def _poll():
+        submitted = []
+        monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+        monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+        monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+
+        def submit(**kw):
+            if kw["obs"] == "001":
+                raise pipeline_trigger.NotRegisteredInPipelineError("nope")
+            submitted.append(kw)
+
+        monkeypatch.setattr(pipeline_trigger, "submit", submit)
+        assert mm.main(args) == 0
+        return [kw["obs"] for kw in submitted]
+
+    assert _poll() == []                     # poll 1: 001 selected, refused
+    assert mm.load_state(str(state))[mm.OWED_GROUPS_KEY] == ["2221-o001-NIRCam"]
+    assert _poll() == ["002"]                # poll 2: 001 yields its turn
+    # 001 still owed, still re-firing, still counted -- only its turn yielded
+    assert ("jw02221-o001_t001_nircam_clear-f405n"
+            not in mm.load_state(str(state))["programs"]["2221"]["obs"])
+    # poll 2 deferred it at the cap without reaching it, so the memo clears and
+    # poll 3 offers it the slot again: the owed group is retried, not dropped
+    assert mm.OWED_GROUPS_KEY not in mm.load_state(str(state))
+    assert _poll() == []
+    assert mm.load_state(str(state))[mm.OWED_GROUPS_KEY] == ["2221-o001-NIRCam"]
+
+
+def test_yielding_does_not_lift_the_cap(monkeypatch, tmp_path, capsys):
+    """The re-ordering must not turn the cap into a pass: with three groups,
+    one of them previously owed, --max-submit 1 still acts on exactly one and
+    still defers the rest with a CAPPED notice."""
+    from data_qa import pipeline_trigger
+    rows = [_row(f"jw10678-o{i:03d}_t001_nircam_clear-f405n",
+                 release=59900.0 + i) for i in (1, 2, 3)]
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o099_x")
+    mm.save_state(str(state), dict(mm.load_state(str(state)),
+                                   **{mm.OWED_GROUPS_KEY: ["10678-o001-NIRCam"]}))
+    submitted = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    monkeypatch.setattr(pipeline_trigger, "submit",
+                        lambda **kw: submitted.append(kw))
+    assert mm.main(["--program", "10678", "--trigger", "--execute",
+                    "--commit-state", "--max-submit", "1",
+                    "--state", str(state)]) == 0
+    assert [kw["obs"] for kw in submitted] == ["002"]      # exactly one acts
+    err = capsys.readouterr().err
+    assert "3 actionable group(s) exceed --max-submit 1" in err
+    assert "10678-o001-NIRCam" in err.split("deferred to later runs:")[1]
+
+
+def test_yield_to_fresh_keeps_the_cap_and_the_age_order(monkeypatch):
+    """The re-ordering must not weaken the cap: it only moves owed groups to
+    the back, keeps age order inside each half, and is a no-op with no memo."""
+    keys = [(2221, f"{i:03d}", "NIRCam") for i in (1, 2, 3, 4)]
+    groups = {k: [] for k in keys}
+    assert list(mm._yield_to_fresh(groups, [])) == keys
+    assert list(mm._yield_to_fresh(groups, ["2221-o001-NIRCam",
+                                            "2221-o002-NIRCam"])) == [
+        keys[2], keys[3], keys[0], keys[1]]
+    assert len(mm._yield_to_fresh(groups, ["2221-o001-NIRCam"])) == 4
+
+
 # ------------------------------------------------------------------------- LOW items
 def test_act_download_skips_unmapped_program(monkeypatch, capsys):
     from data_qa import retrieve_data

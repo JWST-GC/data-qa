@@ -83,6 +83,22 @@ Safety gates on acting runs (--auto, or --download/--trigger/--peppar with
                     MIRI on the trigger path).  They consume no slot.
       fan-out       act_peppar's per-filter/per-detector job submission for
                     one obs -- many SLURM jobs from one event.
+  * TRIGGER DEFERRED (--trigger): a group act_trigger reached without
+    submitting and with NOTHING RUNNING for it -- unregistered, no filters
+    known -- burns no ``triggered`` key, so its submission is still owed; its
+    pre-poll baseline is restored so the event re-fires next poll instead of
+    being retired by the commit (issue #151).  The download side defers the
+    same way (DOWNLOAD DEFERRED, issue #84).  A standing skip -- unmapped
+    program, planned tile, MIRI, already-triggered -- is retired as before,
+    and so is an in-flight skip (TRIGGER SKIPPED(in-flight) below).
+    A deferred group is sorted LAST by the next poll's --max-submit cap so it
+    cannot starve the arrivals behind it.
+  * TRIGGER SKIPPED(in-flight) (--trigger): squeue already holds a job of this
+    obs that the ``triggered`` map does not know about -- something other than
+    this monitor submitted that reduction.  The event is RETIRED, not deferred:
+    re-arming would queue a second chain behind the first once the queue
+    drains.  The group is named in the run notice so the retirement reaches the
+    QA issue.
   * IN-FLIGHT DEDUP (--trigger): a group is skipped when squeue already has a
     job named ``<field><program>-o<obs>-*`` or when the state file's
     ``triggered`` map marks the obs as already submitted (the map is written
@@ -95,7 +111,8 @@ Safety gates on acting runs (--auto, or --download/--trigger/--peppar with
   * REGISTRY PREFLIGHT (--trigger): pipeline_trigger.build_plan verifies the
     obs is registered in the pipeline's fields.yaml BEFORE any sbatch; an
     unregistered obs prints SKIPPED(not-registered) and the one-shot key
-    stays armed for the poll after the registration lands.
+    stays armed -- and its event is deferred, so a later poll re-offers it --
+    for the poll after the registration lands.
 
 Events:
   NEW_OBSERVATION  obs_id not previously in the state file
@@ -967,6 +984,88 @@ def _revert_deferred(state, old_obs_by_prog, deferred_events):
             obs_map[ev["obs_id"]] = prev
 
 
+def _defer_owed(state, old_obs_by_prog, actionable, owed, label, verb, key_name):
+    """Re-arm the groups an act_* function REACHED and left owed, and return
+    the notice clause that names them.
+
+    A group reached without acting burned no one-shot key, so the action is
+    still owed -- but its post-poll records are already in ``state``, and the
+    end-of-run commit would retire the event that carries it, after which
+    ``diff_events`` can never re-emit it (issues #84, #151).  Restore the
+    pre-poll baseline exactly as a capped-deferred group is re-armed: the
+    group re-fires, and counts against --max-submit again, next poll."""
+    by_group = _group_by_obs(actionable)
+    _revert_deferred(state, old_obs_by_prog,
+                     [ev for key in owed for ev in by_group.get(key, [])])
+    reasons = ", ".join(f"{_group_label(k)} ({r})"
+                        for k, r in sorted(owed.items(),
+                                           key=lambda kv: str(kv[0])))
+    return (f"{label} — {len(owed)} group(s) reached but not {verb}: "
+            f"{reasons}.  They keep their pre-poll baselines and re-fire next "
+            f"run; no '{key_name}' key was burned, so nothing was lost.")
+
+
+# The mid-run act_trigger skips main() RE-ARMS.  'in-flight' is deliberately
+# absent: see act_trigger's docstring and PR #165 review B3 -- that branch means
+# a reduction of the obs is already queued outside this monitor, so re-arming
+# would submit a duplicate chain once the queue drains.
+TRIGGER_REARM_REASONS = ("no-filters", "not-registered")
+
+
+def _inflight_notice(keys) -> str:
+    """The clause naming the groups act_trigger skipped because squeue already
+    holds a job of their own.  They are RETIRED, not re-armed: the queued job
+    is a reduction of that observation submitted outside this monitor (the
+    ``triggered`` map is checked first), so re-arming would queue a second
+    chain behind it (PR #165 review, B3).  The clause exists so the decision
+    reaches the QA issue instead of only the scrontab log -- the complaint
+    that opened issue #151."""
+    named = ", ".join(_group_label(k) for k in sorted(keys, key=str))
+    return (f"TRIGGER SKIPPED(in-flight) — {len(keys)} group(s) already have a "
+            f"queued job named <field><program>-o<obs>-*: {named}.  Their "
+            "event is retired and NOT re-armed, so no duplicate chain is "
+            "queued behind that job.  If that job is not this observation's "
+            "reduction, submit it by hand (python -m data_qa.pipeline_trigger).")
+
+
+# Top-level state key: the group labels the PREVIOUS poll reached and left
+# owed.  Read by the --max-submit cap (see _yield_to_fresh).
+OWED_GROUPS_KEY = "owed_groups"
+
+
+def _memo_owed(state, labels) -> None:
+    """Record (or clear) in ``state`` the group labels this poll REACHED and
+    left owed, for the next poll's --max-submit cap to read.
+
+    Rides the end-of-run commit rather than its own write: a run that commits
+    nothing retires nothing, so every group re-fires anyway and there is no
+    starvation to prevent."""
+    if labels:
+        state[OWED_GROUPS_KEY] = sorted(labels)
+    else:
+        state.pop(OWED_GROUPS_KEY, None)
+
+
+def _yield_to_fresh(groups, owed_labels):
+    """Re-order the cap's age-ordered groups so the ones a PREVIOUS poll
+    reached and left owed sort BEHIND the ones it has never offered a slot.
+
+    A deferred group re-fires with its original (old) release date, so a
+    strictly age-ordered cap re-selects it first every poll.  A group that is
+    owed because a human has to act -- an obs missing from the pipeline's
+    fields.yaml, MAST metadata carrying no filters -- can therefore hold the
+    oldest N slots forever and starve every arrival behind it, which is the
+    #67 wedge shape.  It keeps its debt, its event and its slot; it yields
+    only its turn.  The cap itself is unchanged: at most --max-submit groups
+    still act, and the rest are still deferred (PR #165 review, B2)."""
+    owed = set(owed_labels or ())
+    if not owed:
+        return groups
+    fresh = {k: v for k, v in groups.items() if _group_label(k) not in owed}
+    fresh.update({k: v for k, v in groups.items() if _group_label(k) in owed})
+    return fresh
+
+
 # -------------------------------------------------------------------------- disk gate
 DEFAULT_MIN_FREE_TB = 5.0
 DEFAULT_MAX_SUBMIT = 4
@@ -1104,10 +1203,43 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
 
 
 def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=None):
+    """Submit the reduction chain for each actionable NIRCam (program, obs) group.
+
+    Returns ``{group key: SKIP reason}`` for the MID-RUN skips -- the ones
+    this run reached and made itself: ``no-filters``, ``not-registered``,
+    ``in-flight``.  main() re-arms the subset named by
+    ``TRIGGER_REARM_REASONS`` and names the rest in the run notice.
+
+    ``no-filters`` / ``not-registered`` are OWED: nothing is running for that
+    obs and no ``triggered`` key was burned, so the submission is still due,
+    and main() restores the pre-poll baseline (``_defer_owed``) so the group
+    re-fires next poll.  Without that, the end-of-run commit retires the event
+    that carried the trigger, ``diff_events`` never re-emits it, and the obs is
+    never submitted for reduction at all -- the whole loss being one stderr
+    line (issue #151).
+
+    ``in-flight`` is NOT owed, and is not re-armed.  That branch is reached
+    only when the ``triggered`` map does NOT know about the queued job (it is
+    checked first), i.e. the reduction of this observation was submitted by
+    something other than this monitor -- on this account most often by hand.
+    Re-arming would hold the event open until the queue drains and then submit
+    a SECOND chain over the products the first one just wrote (PR #165 review,
+    B3).  The event is retired as before; main() names the group in the run
+    notice, so the retirement reaches the QA issue rather than only the
+    scrontab log.
+
+    The skips reported nowhere: no field mapping, planned/unreleased, MIRI and
+    already-triggered.  Each is a standing property of the group rather than
+    something this run did to it -- an unmapped program stays unmapped until
+    someone edits PROGRAMS, a planned tile re-fires on its own when the data
+    lands (a NEWLY_RELEASED / CALIB_LEVEL_UP event), MIRI has no automated
+    trigger path to owe, and an already-triggered group is done.  Mirrors
+    act_download's split."""
     from . import pipeline_trigger   # stdlib-only
     from .pipeline_trigger import NotRegisteredInPipelineError
     triggered = (state or {}).get("triggered", {})
     inflight = inflight_job_names() if execute else None
+    skips: Dict[tuple, str] = {}
     for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
         field = evs[0]["field"]
         if not field:
@@ -1137,8 +1269,9 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
                 if tok not in filters:
                     filters.append(tok)
         if not filters:
-            print(f"--trigger: SKIP program {program} obs {obsnum}: no filters known",
-                  file=sys.stderr)
+            print(f"--trigger: SKIP program {program} obs {obsnum}: no filters "
+                  "known -- trigger stays owed", file=sys.stderr)
+            skips[(program, obsnum, instr)] = "no-filters"
             continue
         key = trigger_key(program, obsnum)
         if key in triggered:
@@ -1150,8 +1283,15 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
             continue
         prefix = f"{field}{int(program)}-o{obsnum}-"
         if inflight and any(name.startswith(prefix) for name in inflight):
+            # NOT owed: the already-triggered map was consulted first, so a
+            # queued job of this obs that the map does not know about was
+            # submitted by something other than this monitor.  Re-arming would
+            # queue a duplicate chain behind it.
             print(f"--trigger: SKIPPED(in-flight) program {program} obs {obsnum}: "
-                  f"squeue --me already has a job named {prefix}*", file=sys.stderr)
+                  f"squeue --me already has a job named {prefix}*; the event is "
+                  "retired, NOT re-armed -- a second chain would duplicate it",
+                  file=sys.stderr)
+            skips[(program, obsnum, instr)] = "in-flight"
             continue
         try:
             outcome = pipeline_trigger.submit(
@@ -1161,10 +1301,13 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
             # the registry preflight failed in-process, BEFORE any sbatch:
             # report-only, and crucially does NOT record_triggered -- the
             # one-shot key stays armed for the poll after the registration
-            # lands in the pipeline's fields.yaml
+            # lands in the pipeline's fields.yaml.  The armed key alone is not
+            # enough: the EVENT has to survive the commit too, which is what
+            # reporting the group as owed buys (issue #151).
             print(f"--trigger: SKIPPED(not-registered) program {program} obs "
                   f"{obsnum}: {ex} -- register it in the pipeline's "
                   "fields.yaml; trigger stays armed", file=sys.stderr)
+            skips[(program, obsnum, instr)] = "not-registered"
             continue
         if execute and state_path:
             # written IMMEDIATELY (not at the end-of-run commit) so a partial
@@ -1174,6 +1317,7 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
                       if isinstance(outcome, dict) else [])
             record_triggered(state_path, key, mjd_to_iso(now_mjd()),
                              state=state, jobids=jobids)
+    return skips
 
 
 def act_peppar(events, execute=False):
@@ -1569,6 +1713,12 @@ def main(argv=None):
         groups = actionable_groups(state, actionable,
                                    **{flag: getattr(args, flag)
                                       for flag in ACTION_FLAGS})
+        # anti-starvation: a group the PREVIOUS poll reached and left owed
+        # re-fires with its original (old) release date, so a strictly
+        # age-ordered cap would re-select it ahead of every arrival behind it,
+        # every poll, for as long as it stays owed
+        previously_owed = state.get(OWED_GROUPS_KEY) or []
+        groups = _yield_to_fresh(groups, previously_owed)
         if len(groups) > args.max_submit:
             keys = list(groups)
             acted_keys = keys[:args.max_submit]
@@ -1592,6 +1742,12 @@ def main(argv=None):
                 commit_clause = (
                     "This run commits no state (--commit-state is off), so "
                     "every group in this poll re-fires next run.")
+            yielded = sorted(set(previously_owed)
+                             & {_group_label(k) for k in deferred_keys})
+            if yielded:
+                commit_clause += (
+                    "  Sorted last because a previous poll reached them and "
+                    f"left the action owed: {', '.join(yielded)}.")
             capped = (f"CAPPED — {len(groups)} actionable group(s) exceed "
                       f"--max-submit {args.max_submit}: acting on the "
                       f"{len(acted_keys)} oldest "
@@ -1604,6 +1760,7 @@ def main(argv=None):
             print(f"--max-submit: {capped}", file=sys.stderr)
 
     if all_events:
+        owed_labels: List[str] = []
         if args.download:
             owed = act_download(actionable, execute=args.execute,
                                 download_dir=args.download_dir,
@@ -1613,29 +1770,46 @@ def main(argv=None):
             if owed:
                 # A group act_download REACHED and did not download (low-disk /
                 # unknown-size / oversize) burned no 'downloaded' key, so the
-                # download is still owed -- but its post-poll records are in
-                # `state`, and the end-of-run commit would retire the event that
-                # carries it.  Re-arm exactly as a capped-deferred group is
-                # re-armed: restore the pre-poll baseline so the group re-fires
-                # (and counts against --max-submit again) next poll (issue #84).
-                by_group = _group_by_obs(actionable)
-                _revert_deferred(state, old_obs_by_prog,
-                                 [ev for key in owed
-                                  for ev in by_group.get(key, [])])
-                reasons = ", ".join(f"{_group_label(k)} ({r})"
-                                    for k, r in sorted(owed.items(),
-                                                       key=lambda kv: str(kv[0])))
-                deferred_download = (
-                    f"DOWNLOAD DEFERRED — {len(owed)} group(s) reached but not "
-                    f"downloaded: {reasons}.  They keep their pre-poll "
-                    "baselines and re-fire next run; no 'downloaded' key was "
-                    "burned, so nothing was lost.")
+                # download is still owed (issue #84).
+                deferred_download = _defer_owed(
+                    state, old_obs_by_prog, actionable, owed,
+                    "DOWNLOAD DEFERRED", "downloaded", "downloaded")
                 notice = (f"{notice}  {deferred_download}" if notice
                           else deferred_download)
                 print(f"--download: {deferred_download}", file=sys.stderr)
+                owed_labels += [_group_label(k) for k in owed]
         if args.trigger:
-            act_trigger(actionable, execute=args.execute, pipe_root=args.pipe_root,
-                        state=state, state_path=args.state)
+            skips = act_trigger(actionable, execute=args.execute,
+                                pipe_root=args.pipe_root, state=state,
+                                state_path=args.state) or {}
+            owed = {k: r for k, r in skips.items()
+                    if r in TRIGGER_REARM_REASONS}
+            in_flight = [k for k, r in skips.items() if r == "in-flight"]
+            if owed:
+                # Same loss on the trigger side (issue #151): a group
+                # act_trigger reached and did not submit, with nothing running
+                # for it (no-filters / not-registered), burned no 'triggered'
+                # key, so the submission is still owed and the commit must not
+                # retire the event that carries it.
+                deferred_trigger = _defer_owed(
+                    state, old_obs_by_prog, actionable, owed,
+                    "TRIGGER DEFERRED", "submitted", "triggered")
+                notice = (f"{notice}  {deferred_trigger}" if notice
+                          else deferred_trigger)
+                print(f"--trigger: {deferred_trigger}", file=sys.stderr)
+                owed_labels += [_group_label(k) for k in owed]
+            if in_flight:
+                # NOT re-armed (a duplicate chain would be queued behind the
+                # job already running), but named on the QA issue so the
+                # retirement is not a single stderr line.
+                skipped = _inflight_notice(in_flight)
+                notice = f"{notice}  {skipped}" if notice else skipped
+                print(f"--trigger: {skipped}", file=sys.stderr)
+        if args.download or args.trigger:
+            # what the NEXT poll's cap must sort last (see _yield_to_fresh);
+            # only an acting poll may rewrite it -- a report-only run reached
+            # no group and knows nothing about the debt
+            _memo_owed(state, owed_labels)
         if args.peppar:
             act_peppar(actionable, execute=args.execute)
         if args.report:
