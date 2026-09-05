@@ -82,7 +82,8 @@ def ensure_labels(token, repo, names,
     (QA, NIRCam|MIRI, program:N, target:X).  A monitor run that opens N treasury
     tile issues would otherwise spend 4N of that budget re-creating labels that
     exist, and the POSTs it loses to the limit are issue creations -- the
-    failure that B3 of the #147 review is about.  Labels are never deleted by
+    failure the re-arm in ``mast_monitor.act_report`` is about.  Labels are
+    never deleted by
     this code, so a cached name staying cached is safe."""
     for n in names:
         key = (repo, n)

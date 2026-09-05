@@ -1295,7 +1295,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
     Per-issue rather than batch-global: one brick arrival must not make the
     planned-only treasury tiles post notifying comments too.
 
-    TREASURY CHANNEL (issue #70): every 10678 event goes to the rolling
+    TREASURY CHANNEL (#161): every 10678 event goes to the rolling
     ``TREASURY_ISSUE_TITLE`` issue, and a treasury event that is an ARRIVAL
     additionally gets its own per-observation QA issue, created on first
     arrival (``treasury_observation`` / ``treasury_issue_body``).  10678 is
@@ -1317,7 +1317,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
     end-of-run ``save_state`` commits an arrival whose issue was never
     created, ``_observations_for_program`` never produces a treasury tile of
     its own accord, and the delivery is lost until somebody hand-edits the
-    state file (issue #147 review, B3).
+    state file.
 
     The anti-spam memo is written on an executing run immediately after EVERY
     notifying downgrade comment in the batch posted successfully (a partial
@@ -1390,7 +1390,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             issue_cache=issue_cache,
             create_labels=["QA", f"program:{TREASURY_PROGRAM}"])))
         # ... and, for a tile whose calibrated data actually LANDED, its own
-        # per-observation QA issue, opened on first arrival (issue #70).  The
+        # per-observation QA issue, opened on first arrival (#161).  The
         # registry cannot produce these (10678 is uncurated -> registry() ->
         # []), so without this no treasury tile has an issue, and
         # scripts/refresh_all_issues.sh -- whose work list is the OPEN ISSUE
@@ -1776,7 +1776,7 @@ def main(argv=None):
                 # A treasury arrival whose OWN QA issue could not be opened.
                 # save_state below is unconditional, so without this the
                 # arrival is retired having produced no issue and nothing ever
-                # re-fires it (issue #147 review, B3).  Same re-arm as a
+                # re-fires it.  Same re-arm as a
                 # deferred download: restore the pre-poll baseline.
                 _revert_deferred(state, old_obs_by_prog, unposted)
                 print(f"--report: REPORT DEFERRED — {len(unposted)} treasury "

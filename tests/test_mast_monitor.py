@@ -2237,7 +2237,7 @@ def test_act_report_arrival_classified_per_issue(monkeypatch):
     """Classification is per ISSUE, not batch-global: a treasury tile that
     landed notifies on the treasury issue while a planned-only brick batch
     keeps editing in place.  The landed tile also opens its own per-tile QA
-    issue (issue #70), which notifies for the same reason."""
+    issue (#161), which notifies for the same reason."""
     posted = _patch_post_status(monkeypatch)
     landed = dict(_planned_events()[0], event="NEWLY_RELEASED",
                   released=True, calib_level=3, t_obs_release=59900.0)
@@ -2766,7 +2766,7 @@ def test_main_report_failure_keeps_the_arrival_uncommitted(monkeypatch, tmp_path
     """End to end: save_state runs unconditionally, so a tile issue that could
     not be created has to leave the arrival OUT of the committed baseline -- it
     re-fires next poll and the creation is retried.  Committing it would retire
-    the delivery for good (issue #147 review, B3)."""
+    the delivery for good."""
     from data_qa import status_report
     rc_holder = {"rc": 4}
     monkeypatch.setattr(status_report, "post_status",
@@ -2790,17 +2790,21 @@ def test_main_report_failure_keeps_the_arrival_uncommitted(monkeypatch, tmp_path
     assert obs_id in mm.load_state(str(state))["programs"]["10678"]["obs"]
 
 
-# ------------------------- refresh_all_issues.sh work list + rc (#147 B1, B2)
+# ------------------------- refresh_all_issues.sh work list + rc (#161, #162, #163)
+_UNSET = object()
+
+
 def _refresh_script_text():
     import pathlib
     return (pathlib.Path(__file__).resolve().parents[1]
             / "scripts" / "refresh_all_issues.sh").read_text()
 
 
-def _run_refresh_work_list(titles, **env):
+def _run_refresh_work_list(titles, created=None, **env):
     """Run the work-list builder EMBEDDED IN THE SCRIPT (extracted from the
     script text, so an edit to the script is what is under test) over a list of
-    issue titles, and return its stdout rows."""
+    issue titles, and return its stdout rows.  The script feeds it the API's
+    "<title>\t<created_at>" rows; ``created`` supplies the timestamps."""
     import os
     import pathlib
     import re
@@ -2814,7 +2818,9 @@ def _run_refresh_work_list(titles, **env):
              QA_EXCLUDE_FIELDS="w51 wd1 wd2 ngc6334",
              QA_EXCLUDE_RE="westerlund|ngc ?6334|globular|w51")
     e.update({k: str(v) for k, v in env.items()})
-    p = subprocess.run([sys.executable, "-c", m.group(1)], input="\n".join(titles),
+    created = created or [""] * len(titles)
+    stdin = "\n".join(f"{t}\t{c}" for t, c in zip(titles, created))
+    p = subprocess.run([sys.executable, "-c", m.group(1)], input=stdin,
                        capture_output=True, text=True, env=e)
     assert p.returncode == 0, p.stderr
     return [row.split("\t") for row in p.stdout.splitlines()]
@@ -2831,7 +2837,7 @@ _REFRESH_TITLES = [                              # the API order: NEWEST FIRST
 
 
 def test_refresh_work_list_orders_treasury_tiles_last(monkeypatch):
-    """The walltime guard (issue #147 review, B1): the refresh job is already
+    """The walltime guard (#162): the refresh job is already
     hitting its 2 h wall at 21 issues and the issue API returns NEWEST FIRST,
     so the tile issues this PR creates would otherwise sort ahead of the
     established field issues and the truncation would fall on the fields.  The
@@ -2850,30 +2856,45 @@ def test_refresh_work_list_interleaves_when_the_partition_is_off():
     assert [r[0] for r in rows] == ["10678", "10678", "10678", "2221", "2221"]
 
 
-def _run_refresh_rc(program, output, rc=1):
-    """Run the script's own note_failure/pending_tile classifiers (extracted
-    from the script text) over one captured diagnostics output and its exit
-    code, and report the verdict the loop would reach."""
+def _run_refresh_rc(program, output, rc=1, age_days=0, created=_UNSET):
+    """Run the script's own classifier block (extracted VERBATIM between the
+    `--- classifiers` sentinels) over one captured diagnostics output, its exit
+    code and the tile issue's created_at, and report the verdict the loop would
+    reach: CLEAN, PENDING, STALE (red, named) or FAILURE (red)."""
+    import datetime
     import os
     import re
     import subprocess
     src = _refresh_script_text()
-    note = re.search(r"^note_failure\(\) \{.*$", src, re.M)
-    pending = re.search(r"^pending_tile\(\) \{.*?^\}", src, re.S | re.M)
-    assert note and pending, "classifier functions not found in the script"
+    block = re.search(r"^# --- classifiers.*?^# --- end classifiers$", src, re.S | re.M)
+    assert block, "classifier block not found in refresh_all_issues.sh"
     prog = re.search(r'^TREASURY_PROGRAM="\$\{QA_TREASURY_PROGRAM:-(\d+)\}"',
                      src, re.M)
-    assert prog, "TREASURY_PROGRAM not found in the script"
-    script = (f'set -u\nTREASURY_PROGRAM="{prog.group(1)}"\n'
-              f'{note.group(0)}\n{pending.group(0)}\n'
-              'if pending_tile "$PROG" "$OUT"; then echo PENDING\n'
-              'elif note_failure "$OUT" "$DRC"; then echo FAILURE\n'
-              'else echo CLEAN; fi\n')
+    days = re.search(r'^TREASURY_PENDING_DAYS="\$\{QA_TREASURY_PENDING_DAYS:-(\d+)\}"',
+                     src, re.M)
+    assert prog and days, "TREASURY_* constants not found in the script"
+    if created is _UNSET:
+        created = (datetime.datetime.now(datetime.timezone.utc)
+                   - datetime.timedelta(days=age_days, hours=1)
+                   ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    script = (f'set -uo pipefail\nTREASURY_PROGRAM="{prog.group(1)}"\n'
+              f'TREASURY_PENDING_DAYS="${{QA_TREASURY_PENDING_DAYS:-{days.group(1)}}}"\n'
+              f'rc_any=0\n{block.group(0)}\n'
+              'classify "$PROG" "$OUT" "$DRC" "$CREATED" "no products on disk yet"\n'
+              'echo "rc_any=$rc_any"\n')
     p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                        env=dict(os.environ, PROG=str(program), OUT=output,
-                                DRC=str(rc)))
+                                DRC=str(rc), CREATED=created))
     assert p.returncode == 0, p.stderr
-    return p.stdout.strip()
+    out = p.stdout
+    red = "rc_any=1" in out
+    if "PENDING treasury tile" in out:
+        assert not red, out
+        return "PENDING"
+    if "stale treasury tile" in out:
+        assert red, out
+        return "STALE"
+    return "FAILURE" if red else "CLEAN"
 
 
 _NO_OBS = "no obs for program 10678 obs 088 (portal + on-disk both empty)"
@@ -2883,7 +2904,7 @@ def test_refresh_pending_treasury_tile_does_not_turn_the_job_red():
     """A tile's issue opens when MAST releases it; the products land on our disk
     days-to-weeks later, and diagnostics exits 1 until they do.  That is the
     expected state of a fresh tile and must not flip rc_any, which is the single
-    pass/fail signal shared with the 20+ curated field issues (#147 review B2)."""
+    pass/fail signal shared with the 20+ curated field issues (#161)."""
     assert _run_refresh_rc(10678, _NO_OBS) == "PENDING"
     assert _run_refresh_rc(
         10678, "no MIRI obs for program 10678 obs 088 (portal + on-disk empty)"
@@ -2899,6 +2920,49 @@ def test_refresh_pending_exemption_is_treasury_only_and_failure_only():
     assert _run_refresh_rc(10678, "stage 4: FAILED (traceback)") == "FAILURE"
     assert _run_refresh_rc(10678, "jw10678-o088: SW=F212N LW=F480M",
                            rc=0) == "CLEAN"
+
+
+def test_refresh_pending_exemption_never_absorbs_a_co_occurring_failure():
+    """The exemption must not be able to swallow an unrelated failure that
+    happens to share the run with the pending message.  The pending line is
+    stripped and the keyword test re-applied to what is left, so output
+    carrying BOTH the pending message and a real failure is a FAILURE."""
+    for other in ("stage 4: FAILED (traceback)",
+                  "no issue for jw10678-o088",
+                  "stage 7: FAILED"):
+        assert _run_refresh_rc(10678, f"{_NO_OBS}\n{other}") == "FAILURE", other
+        assert _run_refresh_rc(10678, f"{other}\n{_NO_OBS}") == "FAILURE", other
+    # ...and the exit code must be diagnostics' own no-obs 1, not any non-zero
+    assert _run_refresh_rc(10678, _NO_OBS, rc=2) == "FAILURE"
+
+
+def test_refresh_pending_window_is_bounded_and_escalates():
+    """PENDING is a WAIT, not a verdict.  A tile whose issue has been open past
+    QA_TREASURY_PENDING_DAYS with still nothing visible turns the job red and is
+    named as stale -- that is what escalates a stalled delivery, and a QA glob
+    that cannot reach products that ARE on disk (#163: the monitor's own
+    ops/downloads/mastDownload tree is one level below every MAST glob), instead
+    of letting either sit green for the rest of the campaign."""
+    assert _run_refresh_rc(10678, _NO_OBS, age_days=13) == "PENDING"
+    assert _run_refresh_rc(10678, _NO_OBS, age_days=14) == "STALE"
+    assert _run_refresh_rc(10678, _NO_OBS, age_days=90) == "STALE"
+
+
+def test_refresh_pending_window_fails_closed_on_an_unknown_age():
+    """No created_at (an API shape change, a hand-fed work list) means the wait
+    cannot be bounded, so the tile is a failure rather than a free pass."""
+    assert _run_refresh_rc(10678, _NO_OBS, created="") == "FAILURE"
+    assert _run_refresh_rc(10678, _NO_OBS, created="not-a-date") == "FAILURE"
+
+
+def test_refresh_work_list_carries_the_issue_created_at():
+    """pending_tile bounds the window on the tile issue's own created_at, so the
+    work list has to carry it -- and the enumeration has to ASK for it."""
+    rows = _run_refresh_work_list(
+        ["GC Treasury — jw10678-o088 (NIRCam)", "Brick — jw02221-o001 (NIRCam)"],
+        created=["2026-09-10T04:05:06Z", "2024-01-02T03:04:05Z"])
+    assert [r[-1] for r in rows] == ["2024-01-02T03:04:05Z", "2026-09-10T04:05:06Z"]
+    assert ".created_at" in _refresh_script_text()
 
 
 def test_refresh_script_treasury_program_matches_the_module():

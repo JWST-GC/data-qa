@@ -266,7 +266,7 @@ def test_ensure_labels_posts_each_label_once_per_process(monkeypatch):
     no create-if-absent, so an uncached ensure_labels spends 4 content-creating
     POSTs per issue against the ~500/hour limit.  Opening ~100 treasury tile
     issues in one run would exhaust it on labels alone and the POSTs that fail
-    are the issue creations (issue #147 review, B3)."""
+    are the issue creations."""
     calls = []
     monkeypatch.setattr(_github, "_LABELS_ENSURED", set())
     monkeypatch.setattr(_github, "request",
