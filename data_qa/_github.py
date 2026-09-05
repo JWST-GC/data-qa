@@ -104,6 +104,17 @@ def get_token():
 _AUTH_CHECKED: dict = {}
 
 
+#: A 403 whose body names the rate limit.  GitHub uses 403 for both "your token
+#: may not do this" and "you are going too fast"; only the first is an auth
+#: verdict, and the body is what separates them.
+_RATE_LIMIT_HINTS = ("rate limit", "abuse detection", "secondary rate")
+
+
+def _is_rate_limited(status, message):
+    """Is this 403 the rate limiter rather than a permission refusal?"""
+    return status == 403 and any(h in message.lower() for h in _RATE_LIMIT_HINTS)
+
+
 def check_auth(token, force=False):
     """``(ok, detail)`` from ``GET /user`` -- the preflight this package lacked.
 
@@ -115,19 +126,32 @@ def check_auth(token, force=False):
     expiry path, not a hypothetical.
 
     Memoized per token, so a run posting to many issues costs ONE extra request rather
-    than one per issue.  A TRANSPORT failure is not an auth verdict: it returns
-    ``ok=True`` ("unchecked"), leaving an offline run to fail where it failed before
-    instead of being blocked by the preflight.
+    than one per issue.
+
+    Three statuses are NOT auth verdicts and return ``ok=True`` ("unchecked"),
+    leaving the run to fail where it would have failed before rather than being
+    blocked by the preflight: a transport failure, any 5xx, and a 403 whose body
+    names the rate limit.  Answering ``False`` to any of those refuses a post
+    that would have landed -- and a run touching the ~1668 treasury groups is
+    where a secondary rate limit actually appears.
     """
     if not force and token in _AUTH_CHECKED:
         return _AUTH_CHECKED[token]
     status, data = request("GET", f"{API}/user", token)
+    msg = str(data.get("message") or "")
     if status == 200:
         result = (True, str(data.get("login") or ""))
-    elif status == NETWORK_ERROR_STATUS:
-        result = (True, f"unchecked -- {data.get('message')}")
+    elif status == NETWORK_ERROR_STATUS or status >= 500 or _is_rate_limited(
+            status, msg):
+        # NOT an auth verdict.  A 5xx is GitHub being unwell, and a 403 naming
+        # the rate limit is the token working too well -- neither says the
+        # token is bad, and answering `False` here refuses a post that would
+        # have landed.  A run touching the ~1668 treasury groups is exactly
+        # where a secondary rate limit shows up, so this is the delivery-window
+        # path, not a hypothetical.  Fail where it would have failed before.
+        result = (True, f"unchecked -- HTTP {status}: {msg}".strip())
     else:
-        result = (False, f"HTTP {status}: {data.get('message') or ''}".strip())
+        result = (False, f"HTTP {status}: {msg}".strip())
     _AUTH_CHECKED[token] = result
     return result
 

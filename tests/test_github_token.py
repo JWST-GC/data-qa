@@ -9,6 +9,7 @@ No test reads or prints the real ~/.config/data-qa/github_token: every case poin
 _github.TOKEN_FILE at a tmp_path.
 """
 import subprocess
+from unittest import mock
 
 import pytest
 
@@ -253,3 +254,31 @@ def test_dry_run_still_needs_no_token_or_network(monkeypatch, capsys):
                         lambda: pytest.fail("dry run must not resolve a token"))
     assert status_report.post_status("T", "BODY", dry_run=True) == 0
     assert "DRY-RUN" in capsys.readouterr().out
+
+
+def test_a_5xx_or_a_rate_limit_is_not_an_auth_verdict():
+    """`check_auth` may only report failure for an auth failure.
+
+    GitHub answers 403 both for "this token may not do that" and for "you are
+    going too fast", and a 503 with an HTML body is GitHub being unwell while
+    the rest of the API is healthy.  Reporting any of those as `ok=False`
+    refuses a post that would have landed.  A run touching the ~1668 treasury
+    groups is exactly where a secondary rate limit turns up.
+    """
+    cases = [
+        (503, "<html>unavailable</html>", True),
+        (500, "Internal Server Error", True),
+        (403, "API rate limit exceeded for user", True),
+        (403, "You have exceeded a secondary rate limit", True),
+        (_github.NETWORK_ERROR_STATUS, "network error: timed out", True),
+        (403, "Resource not accessible by personal access token", False),
+        (401, "Bad credentials", False),
+    ]
+    for status, message, expected_ok in cases:
+        _github._AUTH_CHECKED.clear()
+        with mock.patch.object(_github, "request",
+                               return_value=(status, {"message": message})):
+            ok, detail = _REAL_CHECK_AUTH("github_pat_" + "A" * 20)
+        assert ok is expected_ok, (status, message, detail)
+        if expected_ok and status != 200:
+            assert "unchecked" in detail, (status, message, detail)

@@ -1282,7 +1282,11 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
     # post_status call below (a per-group refetch is the ~1668-treasury-group
     # rate-limit hazard); post_status fills it on first use.
     issue_cache: dict = {}
-    posts: List[tuple] = []                      # (update_last, rc) per issue
+    # (update_last, rc, that issue's events) per issue.  The events ride along so
+    # a FAILED post can be re-armed: the caller reverts them to their pre-poll
+    # baseline, and the group re-fires next poll instead of being retired by a
+    # commit that followed a report nobody received (#148 review).
+    posts: List[tuple] = []
     treasury = [ev for ev in events if ev.get("field") == TREASURY_FIELD]
     regular = [ev for ev in events if ev.get("field") != TREASURY_FIELD]
     for (program, obsnum, instr), evs in sorted(_group_by_obs(regular).items()):
@@ -1296,7 +1300,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
         posts.append((edit, status_report.post_status(
             title, body, repo=repo, update_last=edit,
             marker=status_report.MONITOR_MARKER,
-            dry_run=not execute, issue_cache=issue_cache)))
+            dry_run=not execute, issue_cache=issue_cache), evs))
     if treasury:
         # single rolling issue (auto-created if absent) instead of per-obs
         # rc=3 "no issue titled ..." failures for every treasury tile
@@ -1306,9 +1310,10 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             TREASURY_ISSUE_TITLE, body, repo=repo, update_last=edit,
             marker=status_report.MONITOR_MARKER, dry_run=not execute,
             issue_cache=issue_cache,
-            create_labels=["QA", f"program:{TREASURY_PROGRAM}"])))
+            create_labels=["QA", f"program:{TREASURY_PROGRAM}"]), treasury))
+    failed = [ev for _edit, rc, evs in posts if rc != 0 for ev in evs]
     if execute and state_path:
-        notifying = [rc for edit, rc in posts if not edit]
+        notifying = [rc for edit, rc, _evs in posts if not edit]
         # EVERY notifying comment must have landed before repeats are
         # suppressed: arming on a partial success (issue A posted, issue B
         # returned rc!=0) would leave B editing quietly forever and B's
@@ -1322,6 +1327,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             # downgrade-free batch: the episode is over; the NEXT downgrade
             # notice posts a fresh (notifying) comment
             _memo_notified_downgrade(state_path, None, state=state)
+    return failed
 
 
 # ------------------------------------------------------------------------------- main
@@ -1642,8 +1648,18 @@ def main(argv=None):
             # report EVERYTHING (incl. per-program-seed-suppressed events);
             # state/state_path carry the last-notified-downgrade memo that
             # decides new-comment-vs-edit (see act_report)
-            act_report(all_events, execute=args.execute, repo=args.repo,
-                       notice=notice, state=state, state_path=args.state)
+            report_failed = act_report(
+                all_events, execute=args.execute, repo=args.repo,
+                notice=notice, state=state, state_path=args.state)
+            if report_failed:
+                # A report that did not land must not be retired by the commit
+                # three lines below.  Without this, one api.github.com blip
+                # during a delivery window posts nothing, commits state, and
+                # the arrival never re-fires -- the same shape as a deferred
+                # download, and re-armed the same way.
+                _revert_deferred(state, old_obs_by_prog, report_failed)
+                print(f"report FAILED for {len(report_failed)} event(s); "
+                      f"their groups were re-armed and re-fire next poll")
 
     if args.commit_state:
         # end the downgrade episode when this run was not itself downgraded,

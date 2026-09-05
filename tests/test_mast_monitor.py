@@ -2551,3 +2551,50 @@ def test_main_seed_run_keeps_low_disk_notice_and_memo(monkeypatch, tmp_path):
     # the seed commits the baseline even though the disk gate cleared
     # commit_state: the polled observation is now in the state file
     assert "jw10678-o101_t101_nircam" in committed["programs"]["10678"]["obs"]
+
+
+def test_a_failed_report_returns_its_events_so_the_commit_cannot_retire_them(
+        monkeypatch):
+    """A report that did not land must not be retired by the state commit.
+
+    `act_report` runs BEFORE `save_state`, and its return value used to be
+    discarded.  So a single api.github.com failure during a delivery window
+    posted nothing, committed the post-poll records anyway, and the arrival
+    never re-fired -- the notification was retired permanently by a report
+    nobody received.
+
+    The events now ride back out with their post's rc, and the caller re-arms
+    them through `_revert_deferred`, the same path a deferred download takes.
+    """
+    from data_qa import status_report
+    rcs = iter([0, 5])           # first issue posts, second fails
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, **kw: next(rcs))
+    # regular fields, so each observation gets its own issue and its own rc;
+    # the treasury events collapse into ONE rolling issue and cannot show a
+    # partial failure
+    evs = (_planned_events(obsnum="101", program=2221, field="brick",
+                           tile="BRICK")
+           + _planned_events(obsnum="102", program=2221, field="cloudc",
+                             tile="CLOUDC"))
+    failed = mm.act_report(evs, execute=True)
+    assert [e["obsnum"] for e in failed] == ["102"], failed
+
+
+def test_a_report_that_lands_returns_nothing_to_re_arm(monkeypatch):
+    """The other half: a clean run retires its groups as it always did."""
+    from data_qa import status_report
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, **kw: 0)
+    assert mm.act_report(_planned_events(), execute=True) == []
+
+
+def test_the_re_armed_events_restore_their_pre_poll_baseline():
+    """`_revert_deferred` is what makes the re-arm real: a record absent from
+    the baseline is popped (re-fires as NEW_OBSERVATION), a changed one is put
+    back.  Asserted here on the report path's own events so the two halves are
+    pinned together rather than only in the download path's tests."""
+    (ev,) = _planned_events(obsnum="101")
+    state = {"programs": {"10678": {"obs": {ev["obs_id"]: {"calib_level": 3}}}}}
+    mm._revert_deferred(state, {"10678": {}}, [ev])
+    assert state["programs"]["10678"]["obs"] == {}
