@@ -2049,6 +2049,11 @@ def test_miri_caption_variants():
     rf = D._miri_caption(dict(filt="F770W", red_flag=True, red_flag_reason="no MIRI i2d on disk"),
                          "JWST-GC/data-qa")
     assert rf.startswith("🚩") and "no MIRI i2d" in rf
+    # the caption names the image it actually shows: a reduced mosaic is not labelled MAST (#163)
+    assert "MAST i2d image" in D._miri_caption(dict(filt="F770W", i2d_source="mast"),
+                                               "JWST-GC/data-qa")
+    assert "Reduced i2d image" in D._miri_caption(dict(filt="F770W", i2d_source="reduced"),
+                                                  "JWST-GC/data-qa")
 
 
 def test_miri_i2d_pathing(tmp_path, monkeypatch):
@@ -2974,3 +2979,126 @@ def test_ab_overlap_keeps_the_raw_peak_when_too_few_pairs_to_refine(monkeypatch)
     assert ov is not None
     assert ov["bulk_source"] == "histogram"
     assert ov["off"] == ov["peak_off"]
+
+
+# --------------------------------------------------------------- product globs (issue #163)
+def _miri_obs(field="brick", program="2221", obs="001", filts=("F770W",)):
+    return Observation(program=program, obs=obs, target="T", release_field=field,
+                       instrument="MIRI", filters=list(filts), visits=[], epoch="", notes="")
+
+
+def test_download_root_matches_the_monitor(monkeypatch):
+    """The QA download root and the dir the monitor actually downloads into are the same path.
+
+    They are declared in two modules; if `mast_monitor.DEFAULT_DOWNLOAD_DIR` moves and this one
+    does not, QA silently stops seeing auto-downloaded products again -- the defect of #163."""
+    from data_qa import mast_monitor
+    monkeypatch.setattr(D, "BASE", "/orange/adamginsburg/jwst")     # the default QA_BASE
+    monkeypatch.delenv("QA_DOWNLOAD_DIR", raising=False)
+    assert D._download_root() == mast_monitor.DEFAULT_DOWNLOAD_DIR
+
+
+def test_mast_globs_reach_the_monitor_download_tree(tmp_path, monkeypatch):
+    """A product the monitor downloaded lands in `<BASE>/ops/downloads/mastDownload/JWST/...`,
+    one level below the `{BASE}/*/mastDownload` wildcard, so no MAST-side stage could see it."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    (tmp_path / "gc-treasury").mkdir()                    # field tree exists but holds nothing
+    sub = (tmp_path / "ops" / "downloads" / "mastDownload" / "JWST"
+           / "jw10678-o088_t001_nircam_clear-f212n")
+    sub.mkdir(parents=True)
+    _touch(sub, "jw10678-o088_t001_nircam_clear-f212n_i2d.fits")
+    _touch(sub, "jw10678-o088_t001_nircam_clear-f212n_cat.fits")
+    o = Observation(program="10678", obs="088", target="GC Treasury",
+                    release_field="gc-treasury", instrument="NIRCam", filters=["F212N"],
+                    visits=[], epoch="", notes="")
+    got = D._mast_i2d(o, "F212N")
+    assert got is not None and got.endswith("clear-f212n_i2d.fits")
+    cat = D._mast_l3_catalog(o, "F212N", allow_download=False)
+    assert cat is not None and cat.endswith("clear-f212n_cat.fits")
+
+    # MIRI parallel of the same tile, downloaded into the same tree
+    msub = (tmp_path / "ops" / "downloads" / "mastDownload" / "JWST"
+            / "jw10678-o088_t001_miri_f770w")
+    msub.mkdir(parents=True)
+    _touch(msub, "jw10678-o088_t001_miri_f770w_i2d.fits")
+    mo = _miri_obs(field="gc-treasury", program="10678", obs="088")
+    assert D._miri_i2d(mo, "F770W").endswith("jw10678-o088_t001_miri_f770w_i2d.fits")
+
+
+def test_download_tree_cannot_pull_in_another_observation(tmp_path, monkeypatch):
+    """The download tree is field-less and holds every program the monitor fetched, so the added
+    root must stay pinned to this obsid -- a sibling obs's mosaic in the same tree is not a hit."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    sub = tmp_path / "ops" / "downloads" / "mastDownload" / "JWST" / "other"
+    sub.mkdir(parents=True)
+    _touch(sub, "jw10678-o089_t001_nircam_clear-f212n_i2d.fits")     # a DIFFERENT observation
+    o = Observation(program="10678", obs="088", target="GC Treasury",
+                    release_field="gc-treasury", instrument="NIRCam", filters=["F212N"],
+                    visits=[], epoch="", notes="")
+    assert D._mast_i2d(o, "F212N") is None
+
+
+def test_miri_i2d_finds_the_locally_reduced_mosaic(tmp_path, monkeypatch):
+    """A treasury F770W tile reduced into `<field>/F770W/pipeline/` with no MAST copy anywhere:
+    the MIRI stage globbed mastDownload only, so it red-flagged 'no MIRI i2d on disk'."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "gc-treasury" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw10678-o088_t003_miri_f770w_i2d.fits")            # non-t001 tile token
+    o = _miri_obs(field="gc-treasury", program="10678", obs="088")
+    got = D._miri_i2d(o, "F770W")
+    assert got is not None and got.endswith("jw10678-o088_t003_miri_f770w_i2d.fits")
+    assert D._miri_i2d(o, "F1130W") is None            # a filter with no product stays None
+
+
+def test_miri_i2d_reduced_layout_skips_outlier_and_residual_products(tmp_path, monkeypatch):
+    """`<FILT>/pipeline/` also holds outlier-detection intermediates and photometry model/
+    residual mosaics.  `..._f770w_0_o002_outlier_i2d.fits` sorts BEFORE `..._f770w_i2d.fits`,
+    so a trailing wildcard would hand the MIRI stage an intermediate as the science mosaic."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "w51" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    for name in ("jw06151-o002_t001_miri_f770w_0_o002_outlier_i2d.fits",
+                 "jw06151-o002_t001_miri_f770w_15_o002_outlier_i2d.fits",
+                 "jw06151-o002_t001_miri_clear-f770w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_i2d.fits",
+                 "jw06151-o002_t001_miri_f770w_i2d.fits"):
+        _touch(pipe, name)
+    o = _miri_obs(field="w51", program="6151", obs="002")
+    got = D._miri_i2d(o, "F770W")
+    assert os.path.basename(got) == "jw06151-o002_t001_miri_f770w_i2d.fits"
+
+
+def test_miri_i2d_prefers_the_mast_delivery_over_the_reduced_mosaic(tmp_path, monkeypatch):
+    """The reduced layout is a FALLBACK: where a MAST copy exists it still wins, so no
+    observation that resolves today resolves to a different file."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    md = tmp_path / "brick" / "mastDownload"; md.mkdir(parents=True)
+    _touch(md, "jw02221-o001_t001_miri_f770w_i2d.fits")
+    pipe = tmp_path / "brick" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw02221-o001_t001_miri_f770w_i2d.fits")
+    got = D._miri_i2d(_miri_obs(field="brick"), "F770W")
+    assert "/mastDownload/" in got
+
+
+def test_miri_obs_from_disk_reads_the_reduced_layout(tmp_path, monkeypatch):
+    """Portal-independent MIRI discovery: a locally-reduced tile with no MAST copy."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    for filt in ("F770W", "F1130W"):
+        pipe = tmp_path / "sickle" / filt / "pipeline"; pipe.mkdir(parents=True)
+        _touch(pipe, f"jw03958-o002_t001_miri_{filt.lower()}_i2d.fits")
+        _touch(pipe, f"jw03958-o002_t001_miri_{filt.lower()}_4_o002_outlier_i2d.fits")
+    o = D._miri_obs_from_disk("3958", "002", base=str(tmp_path))
+    assert o is not None and o.instrument == "MIRI"
+    assert o.release_field == "sickle"
+    assert o.filters == ["F1130W", "F770W"]          # the outlier intermediates add no filter
+
+
+def test_miri_obs_from_disk_skips_a_field_with_only_byproducts(tmp_path, monkeypatch):
+    """A field dir holding only outlier/model/residual mosaics for this obsid must not claim the
+    observation: it would return an Observation with no filters and mask the real field."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    junk = tmp_path / "aaa_scratch" / "F770W" / "pipeline"; junk.mkdir(parents=True)
+    _touch(junk, "jw03958-o002_t001_miri_f770w_3_o002_outlier_i2d.fits")
+    pipe = tmp_path / "sickle" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw03958-o002_t001_miri_f770w_i2d.fits")
+    o = D._miri_obs_from_disk("3958", "002", base=str(tmp_path))
+    assert o is not None and o.release_field == "sickle" and o.filters == ["F770W"]

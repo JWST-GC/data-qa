@@ -657,8 +657,10 @@ offset from VIRAC: `_offset_cloud`).
 The NIRCam stages above don't apply to MIRI; MIRI issues instead get a **basics** overview
 (`miri_overview`, posted with the `data-qa:diag:stagemiri` marker):
 
-- **MAST i2d image** — the MIRI level-3 mosaic, grayscale (ZScale/asinh). Check for delivery and
-  gross artifacts.
+- **i2d image** — the MIRI level-3 mosaic, grayscale (ZScale/asinh). Check for delivery and
+  gross artifacts. The MAST delivery is preferred; where none is staged (a tile we reduced
+  ourselves, with no MAST copy in any field tree) the reduction's own resampled mosaic
+  `<field>/<FILT>/pipeline/<obsid>_t<nnn>_miri_<filt>_i2d.fits` is used instead.
 - **Spitzer side-by-side** — the nearer archival Spitzer band, **reprojected onto the MIRI WCS +
   pixel grid** (GLIMPSE is GLON-CAR and MIPSGAL is RA-TAN north-up, both a quarter-turn from the
   MIRI observing PA, so a raw cutout would not line up): **IRAC 8 µm** (GLIMPSE) below ~14 µm (the
