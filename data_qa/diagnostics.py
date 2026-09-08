@@ -1908,7 +1908,7 @@ def stage4_offsets(o: Observation, sw):
     # is already declared unreliable the isolated bulk IS the reported value, so no disagreement.
     if ib is not None:
         mdra, mdde, nclean = ib
-        disagree = 0.0 if cell_map_unreliable else float(np.hypot(cc["off_dra"] - mdra, cc["off_dde"] - mdde))
+        disagree = 0.0 if cell_map_unreliable else float(np.hypot(cc["off_dra"] + mdra, cc["off_dde"] + mdde))
         metrics.update(isolated_bulk_off_mas=float(np.hypot(mdra, mdde)),
                        isolated_bulk_n=nclean, bulk_vs_isolated_disagree_mas=disagree,
                        bulk_low_confidence=bool(not cell_map_unreliable and disagree > _BULK_DISAGREE_MAX))
