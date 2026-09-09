@@ -36,6 +36,7 @@ STAGE_FUNC = {
     8: "stage8_distortion",
     9: "stage9_psf_vs_aper",
     10: "stage10_photometric_consistency", 11: "stage11_effective_psf",
+    12: "stage12_photometric_linearity",
     "6clean": "stage6_astrom_error",          # stage 6 recomputed excluding bad-PSF exposures
     "miri": "miri_overview",
 }
@@ -165,8 +166,25 @@ def _find_stage_comment(repo, token, num, marker):
         page += 1
 
 
-def post_stage(o: Observation, stage, png_path, caption, repo, token=None):
-    """Idempotently post/update the stage-N comment on ``o``'s issue with the figure."""
+def _details_block(repo, token, o, stage, extra_images):
+    """Upload each ``(label, png_path)`` and return an expandable ``<details>`` block embedding them,
+    so a multi-figure stage (stage 12: one plot per filter) shows one plot by default and hides the
+    rest.  Each extra asset is named ``{obsid}_stage{stage}_{label}.png`` so it updates in place."""
+    labels = ", ".join(label for label, _ in extra_images)
+    parts = [f"\n\n<details><summary>Other {len(extra_images)} filter(s): {labels}</summary>\n"]
+    for label, path in extra_images:
+        aname = f"{o.obsid}_stage{stage}_{label}.png"
+        url = upload_asset(repo, token, path, aname)
+        parts.append(f"\n**{label}**\n\n![{aname}]({url})\n")
+    parts.append("\n</details>")
+    return "".join(parts)
+
+
+def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra_images=None):
+    """Idempotently post/update the stage-N comment on ``o``'s issue with the figure.
+
+    ``extra_images`` (optional) is a list of ``(label, png_path)`` for a multi-figure stage; they
+    are uploaded and embedded in a collapsed ``<details>`` block after the primary image."""
     token = token or _token()
     num = _issue_number(repo, token, o.issue_title)
     if num is None:
@@ -178,9 +196,11 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None):
     existing = _find_stage_comment(repo, token, num, marker)
     asset_name = f"{o.obsid}_stage{stage}.png"
     img_url = upload_asset(repo, token, png_path, asset_name)
+    extra_block = _details_block(repo, token, o, stage, extra_images) if extra_images else ""
     body = (f"{marker}\n### QA diagnostic — stage {stage}\n\n"
             f"{caption}\n\n"
-            f"![{asset_name}]({img_url})\n\n"
+            f"![{asset_name}]({img_url})\n"
+            f"{extra_block}\n\n"
             f"<sub>{_provenance_footer(repo, stage)}</sub>\n"
             f"<sub>auto-posted by `data_qa.diagnostics`; updates in place as the pipeline advances.</sub>")
     if existing:
