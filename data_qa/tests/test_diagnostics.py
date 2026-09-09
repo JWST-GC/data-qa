@@ -3091,3 +3091,64 @@ def test_details_block_embeds_extra(monkeypatch):
     assert "Other 2 filter(s): F405N, F444W" in block
     assert "**F405N**" in block and "**F444W**" in block
     assert f"{o.obsid}_stage12_F405N.png" in block
+
+
+# --------------------------------------------------------------------------- pagination robustness
+def _fake_req(script):
+    """Return a stand-in for post_diagnostics._req that yields (200, data, {'Link': link}) for each
+    scripted (data, link) in order, so pagination can be exercised without the network."""
+    calls = {"n": 0}
+
+    def fake(method, url, token, data=None, headers=None, raw=False, want_headers=False):
+        d, link = script[min(calls["n"], len(script) - 1)]
+        calls["n"] += 1
+        return (200, d, {"Link": link}) if want_headers else (200, d)
+    return fake, calls
+
+
+def test_paged_get_follows_next_cursor(monkeypatch):
+    from data_qa import post_diagnostics as P
+    page1 = [{"number": i} for i in range(100)]
+    page2 = [{"number": 100 + i} for i in range(30)]
+    nxt = '<https://api.github.com/x?page=2&after=cur>; rel="next"'
+    fake, _ = _fake_req([(page1, nxt), (page2, "")])
+    monkeypatch.setattr(P, "_req", fake)
+    monkeypatch.setattr(P.time, "sleep", lambda *a: None)
+    out = P._paged_get("https://api.github.com/x?page={page}", "tok", "test")
+    assert len(out) == 130                         # both pages, cursor followed to the end
+
+
+def test_paged_get_retries_spurious_empty_next_page(monkeypatch):
+    # page 1 advertises a next page; that next page comes back EMPTY once (spurious) then real.
+    from data_qa import post_diagnostics as P
+    page1 = [{"number": i} for i in range(100)]
+    page2 = [{"number": 100 + i} for i in range(20)]
+    nxt = '<https://api.github.com/x?page=2&after=cur>; rel="next"'
+    fake, _ = _fake_req([(page1, nxt), ([], nxt), (page2, "")])   # empty page2 then real page2
+    monkeypatch.setattr(P, "_req", fake)
+    monkeypatch.setattr(P.time, "sleep", lambda *a: None)
+    out = P._paged_get("https://api.github.com/x?page={page}", "tok", "test")
+    assert len(out) == 120                         # the spurious empty did not truncate the listing
+
+
+def test_issue_number_unions_truncated_scans(monkeypatch):
+    # first scan is TRUNCATED (a short page 1, no next, missing the target); a later scan sees it.
+    from data_qa import post_diagnostics as P
+    target = {"number": 1, "state": "open", "title": "Brick — jw02221-o001 (NIRCam)"}
+    truncated = [{"number": 9, "state": "open", "title": "something else"}]
+    full = truncated + [target]
+    seq = {"n": 0}
+
+    def fake_paged(url, token, what):
+        seq["n"] += 1
+        return truncated if seq["n"] == 1 else full
+    monkeypatch.setattr(P, "_paged_get", fake_paged)
+    n = P._issue_number("JWST-GC/data-qa", "tok", "Brick — jw02221-o001 (NIRCam)")
+    assert n == 1                                   # union across attempts recovered it
+
+
+def test_issue_number_absent_title_returns_none(monkeypatch):
+    from data_qa import post_diagnostics as P
+    monkeypatch.setattr(P, "_paged_get",
+                        lambda url, token, what: [{"number": 9, "state": "open", "title": "x"}])
+    assert P._issue_number("JWST-GC/data-qa", "tok", "NOPE") is None
