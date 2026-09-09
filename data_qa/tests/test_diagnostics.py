@@ -3012,6 +3012,32 @@ def test_linearity_fit_detects_bright_turnover():
     assert abs(fit["slope"]) < 0.02               # faint (linear) range is flat
 
 
+def test_linearity_fit_recovers_injected_slope_and_trips_flag():
+    # A KNOWN linear trend must be recovered (would fail if the slope were hardcoded to 0), and a
+    # slope beyond _LIN_SLOPE_FLAG must set the flag path -- the flag's only exercise.
+    rng = np.random.default_rng(2)
+    m = np.repeat(np.arange(15.0, 21.0, 0.5), 30)
+    for s, expect_flag in [(0.005, False), (0.050, True)]:
+        dmag = 0.40 + s * (m - 18.0) + rng.normal(0, 0.002, size=m.size)
+        fit = D._linearity_fit(m, dmag)
+        assert fit is not None and fit["slope"] is not None
+        assert abs(fit["slope"] - s) < 5 * fit["slope_err"]        # trend recovered
+        assert abs(fit["slope"] - s) < 0.01                        # and quantitatively close
+        assert (abs(fit["slope"]) > D._LIN_SLOPE_FLAG) is expect_flag
+
+
+def test_linearity_fit_no_turnover_on_pure_trend():
+    # A pure global slope with NO saturation feature must NOT report a turn-over: the turn-over is
+    # measured against the fitted trend, so a constant slope alone does not trip it.
+    rng = np.random.default_rng(3)
+    m = np.repeat(np.arange(15.0, 21.0, 0.5), 30)
+    dmag = 0.40 + 0.05 * (m - 18.0) + rng.normal(0, 0.002, size=m.size)
+    fit = D._linearity_fit(m, dmag)
+    assert fit is not None
+    assert fit["turnover"] is None
+    assert abs(fit["slope"] - 0.05) < 0.01        # the slope still measures the real trend
+
+
 def _synth_mosaic(tmp_path, name="m.fits", nstars=100):
     """A WCS mosaic with a grid of well-separated Gaussians spanning a range of fluxes; returns
     (path, SkyCoord positions, flux array)."""

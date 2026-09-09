@@ -4977,8 +4977,13 @@ def _measure_psf_aper(o: Observation, filt, r_ap=3.0, r_in=6.0, r_out=9.0, iso_p
 def _linearity_fit(m_psf, dmag, turnover_dmag=_LIN_TURNOVER_DMAG):
     """Bin ``dmag`` (aper − PSF) by magnitude and fit its trend with brightness.  Returns a dict:
     binned centres/medians/counts, the faint-baseline aperture correction, the bright turn-over
-    magnitude (where the binned median first departs the baseline by more than ``turnover_dmag``
-    going bright, or None), and the linear-range slope (mag per mag) + its standard error."""
+    magnitude, and the linear-range slope (mag per mag) + its standard error.
+
+    The turn-over is measured as a departure from the fitted LINEAR TREND (a line fit to the faint
+    60% of bins), not from a flat baseline: a filter with a global brightness-dependent slope but no
+    saturation feature then reports NO turn-over (the bins lie on the trend line), and the turn-over
+    marks a genuine roll-over away from linearity.  The slope is refit over the resulting linear
+    range (bins fainter than the turn-over)."""
     m_psf = np.asarray(m_psf, float); dmag = np.asarray(dmag, float)
     lo, hi = np.nanpercentile(m_psf, [1, 99])
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -4998,16 +5003,22 @@ def _linearity_fit(m_psf, dmag, turnover_dmag=_LIN_TURNOVER_DMAG):
     if len(centres) < _LIN_MIN_BINS:
         return None
     centres = np.array(centres); medians = np.array(medians); counts = np.array(counts)
-    # Faint-baseline aperture correction: the median over the faint 60% of bins, which the bright
-    # roll-over does not touch (so the turn-over is measured against a clean reference).
+    # Faint 60% of bins: the clean linear part the bright roll-over does not reach.  The reported
+    # aperture correction is the faint-baseline median; the turn-over reference is a LINE fit there.
     faint = centres >= np.percentile(centres, 40)
     baseline = float(np.median(medians[faint])) if faint.any() else float(np.median(medians))
-    # Bright turn-over: brightest→faint, the first (brightest) bin still within turnover_dmag of the
-    # baseline is the linear bright edge; the departure begins one bin brighter than that.
-    order = np.argsort(centres)                      # faint→bright is decreasing mag, so ascending
-    dev = np.abs(medians - baseline) > turnover_dmag
+    if int(faint.sum()) >= 2:
+        ref = np.polyfit(centres[faint], medians[faint], 1, w=np.sqrt(counts[faint]))
+    else:
+        ref = np.array([0.0, baseline])              # too few faint bins: fall back to a flat trend
+    model = np.polyval(ref, centres)
+    # Bright turn-over: brightest→faint, the run of bins whose median departs the trend line by more
+    # than turnover_dmag; the turn-over is the faintest bin of that contiguous bright run (None if
+    # the brightest bin is already on the trend).
+    order = np.argsort(centres)                      # ascending magnitude = bright→faint
+    dev = np.abs(medians - model) > turnover_dmag
     turnover = None
-    for i in order:                                  # ascending magnitude = bright→faint
+    for i in order:
         if dev[i]:
             turnover = float(centres[i])
         else:
@@ -5015,13 +5026,15 @@ def _linearity_fit(m_psf, dmag, turnover_dmag=_LIN_TURNOVER_DMAG):
     # Linear range: bins fainter than the turn-over (or all bins if no turn-over).
     lin = centres > turnover if turnover is not None else np.ones(centres.shape, bool)
     slope = slope_err = None
+    lin_coef = None
     if int(lin.sum()) >= _LIN_MIN_BINS:
         wts = np.sqrt(counts[lin])
         coef, cov = np.polyfit(centres[lin], medians[lin], 1, w=wts, cov=True)
         slope = float(coef[0]); slope_err = float(np.sqrt(cov[0, 0]))
+        lin_coef = (float(coef[0]), float(coef[1]))
     return dict(centres=centres, medians=medians, counts=counts, baseline=baseline,
                 turnover=turnover, slope=slope, slope_err=slope_err, lin_mask=lin,
-                n_lin_bins=int(lin.sum()))
+                lin_coef=lin_coef, n_lin_bins=int(lin.sum()))
 
 
 def _stage12_figure_one(o, filt, m_psf, dmag, fit, meta):
@@ -5038,14 +5051,12 @@ def _stage12_figure_one(o, filt, m_psf, dmag, fit, meta):
                mec="black", mew=0.7, ecolor="black", zorder=5, label="binned median")
     a.axhline(base, color="cyan", lw=1.3, zorder=4,
               label=f"aper. corr. (faint baseline) {base:+.3f}")
-    if fit["slope"] is not None:
+    if fit["slope"] is not None and fit.get("lin_coef"):
         cl = fit["centres"][fit["lin_mask"]]
         xx = np.array([cl.min(), cl.max()])
-        # slope line through the baseline at the linear-range midpoint
-        mid = float(np.median(cl))
-        yy = base + fit["slope"] * (xx - mid)
+        yy = np.polyval(fit["lin_coef"], xx)         # the actual linear-range fit
         a.plot(xx, yy, color="red", lw=1.6, zorder=6,
-               label=f"slope {fit['slope']:+.3f} ± {fit['slope_err']:.3f} mag/mag")
+               label=f"linear-range slope {fit['slope']:+.3f} ± {fit['slope_err']:.3f} mag/mag")
     if fit["turnover"] is not None:
         a.axvline(fit["turnover"], color="orange", lw=1.4, ls="--", zorder=4,
                   label=f"bright turn-over {fit['turnover']:.1f} mag")
@@ -5349,9 +5360,10 @@ def _caption_stage12(metrics):
             f"local-annulus background, recentred < 3 px), and the aperture-minus-PSF magnitude is "
             f"binned against PSF magnitude. A flat line at the aperture correction is a linear "
             f"response; the fitted **slope (mag per mag)** is the brightness-dependent trend and the "
-            f"**bright turn-over** is the magnitude where the binned median departs the faint "
-            f"baseline by more than {_LIN_TURNOVER_DMAG:.2f} mag. The plot shown is **{prim}**; the "
-            f"other filters are in the expandable block below. ")
+            f"**bright turn-over** is the magnitude where the binned median departs the fitted linear "
+            f"trend by more than {_LIN_TURNOVER_DMAG:.2f} mag (a roll-over away from linearity, "
+            f"measured against the trend so a constant slope alone does not trip it). The plot shown "
+            f"is **{prim}**; the other filters are in the expandable block below. ")
     dprim = pf.get(prim)
     if dprim and dprim.get("slope") is not None:
         to = dprim.get("turnover_mag")

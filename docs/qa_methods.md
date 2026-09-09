@@ -630,10 +630,16 @@ aperture-minus-PSF magnitude is then binned against PSF magnitude (0.5 mag bins,
 **The numbers.** On a linear response the binned `aperture − PSF` is a flat line at the aperture
 correction. Stage 12 reports, per filter: the **aperture correction** (the median of the binned
 values over the faint 60% of the range, the linear baseline); the **bright turn-over magnitude**,
-where the binned median first departs the baseline by more than `_LIN_TURNOVER_DMAG` (0.05 mag)
-going bright — the onset of non-linearity; and the **slope** (mag per mag, with its standard error)
-of a count-weighted straight-line fit over the linear range (fainter than the turn-over). A filter
-whose `|slope|` exceeds `_LIN_SLOPE_FLAG` (0.02 mag per mag) is flagged in the caption table.
+where the binned median departs the **fitted linear trend** by more than `_LIN_TURNOVER_DMAG`
+(0.05 mag) going bright — the onset of non-linearity; and the **slope** (mag per mag, with its
+standard error) of a count-weighted straight-line fit over the linear range (fainter than the
+turn-over). A filter whose `|slope|` exceeds `_LIN_SLOPE_FLAG` (0.02 mag per mag) is flagged in the
+caption table.
+
+The turn-over is measured against the trend line (a line fit to the faint 60% of bins), not against
+a flat baseline. A filter with a genuine global brightness-dependent slope but no saturation feature
+therefore reports no turn-over — its bins lie on the trend — so the turn-over marks a real roll-over
+away from linearity rather than the point where a constant slope has accumulated to 0.05 mag.
 
 **The figure.** One panel per filter: `aperture − PSF` versus PSF magnitude (hexbin, brighter to the
 left), the binned median, the faint-baseline aperture correction, the linear-range slope fit, and
