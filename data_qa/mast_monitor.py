@@ -1204,9 +1204,70 @@ def act_peppar(events, execute=False):
             print(f"--peppar: SKIP program {program} obs {obsnum}: {e}", file=sys.stderr)
 
 
-# All treasury deliveries report into ONE rolling issue: per-obs issues would
-# mean ~1668 title lookups/creations (rate-limit hazard + issue spam).
+# Every treasury EVENT (planned tiles included) reports into ONE rolling issue:
+# a per-obs post for each of the ~1668 planned exposure-level rows would be
+# ~1668 title lookups/creations -- a rate-limit hazard and issue spam.
 TREASURY_ISSUE_TITLE = f"GC Treasury — program {TREASURY_PROGRAM} deliveries"
+
+
+def treasury_observation(program, obsnum, instrument, evs):
+    """The :class:`~data_qa.observations.Observation` one treasury DELIVERY is
+    keyed on -- one per (program, obs, instrument), never one per MAST row.
+
+    ``observations.registry`` cannot build these: 10678 has no curated
+    obsnum->field map, so ``_observations_for_program`` returns ``[]`` for it
+    (observations.py, ``if not want: return []``) and no treasury tile ever
+    reaches ``make_issues``.  The monitor is the only place that knows a tile
+    landed, so it builds the Observation from the delivery events themselves.
+
+    ``o.issue_title`` is the repository's standard per-observation title
+    ("GC Treasury — jw10678-o088 (NIRCam)"), which is what
+    ``scripts/refresh_all_issues.sh`` regexes its work list out of.  The GC_<n>
+    tile name rides in ``notes`` (the title's display name has to stay the
+    plain FIELDS entry: refresh_all_issues reverse-maps it to the field key)."""
+    from .observations import FIELDS, Observation
+    filters, tiles = [], []
+    for ev in evs:
+        for f in parse_filters(ev.get("filters")):
+            if f not in filters:
+                filters.append(f)
+        tile = ev.get("tile") or ev.get("target_name")
+        if tile and tile not in tiles:
+            tiles.append(tile)
+    notes = ""
+    if tiles:
+        notes = (f"GC Treasury tile {', '.join(f'`{t}`' for t in tiles)} "
+                 f"(MAST `target_name`). Issue opened by "
+                 f"`data_qa.mast_monitor --report` when the delivery landed.")
+    return Observation(program=str(int(program)), obs=obsnum,
+                       target=FIELDS[TREASURY_FIELD],
+                       release_field=TREASURY_FIELD,
+                       instrument=instrument or "NIRCam",
+                       filters=sorted(filters), notes=notes)
+
+
+def treasury_issue_body(o) -> str:
+    """Body a lazily-created per-tile treasury QA issue opens with: the same
+    ``make_issues`` QA template a curated observation gets (checklist, product
+    links, AUTOGEN_MARKER), so a later ``make_issues`` sync updates it in place
+    rather than treating it as hand-written.
+
+    ``render_body`` reaches into ``astrometry_audit`` for the flag thresholds,
+    which imports numpy/astropy; a --report run in a bare env must still open
+    the issue, so a missing dependency falls back to a short seed body."""
+    from . import make_issues
+    try:
+        return make_issues.render_body(o)
+    except ImportError as ex:
+        print(f"treasury issue body: QA template unavailable "
+              f"({ex.__class__.__name__}: {ex}); opening {o.issue_title!r} "
+              f"with a seed body", file=sys.stderr)
+        return (f"{make_issues.AUTOGEN_MARKER}\n"
+                f"**Observation `{o.obsid}`** — {o.target} / {o.instrument}\n\n"
+                f"{o.notes}\n\n"
+                f"Filters: {', '.join(f'`{f}`' for f in o.filters) or '—'}\n\n"
+                f"_Seed body; run `python -m data_qa.make_issues` to render the "
+                f"full QA checklist._")
 
 
 def act_report(events, execute=False, repo=None, update_last=None, notice=None,
@@ -1234,9 +1295,29 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
     Per-issue rather than batch-global: one brick arrival must not make the
     planned-only treasury tiles post notifying comments too.
 
+    TREASURY CHANNEL (#161): every 10678 event goes to the rolling
+    ``TREASURY_ISSUE_TITLE`` issue, and a treasury event that is an ARRIVAL
+    additionally gets its own per-observation QA issue, created on first
+    arrival (``treasury_observation`` / ``treasury_issue_body``).  10678 is
+    uncurated, so ``observations.registry`` returns ``[]`` for it and
+    ``make_issues`` never files one; without the lazy creation here no
+    treasury tile has an issue and ``scripts/refresh_all_issues.sh`` -- which
+    reads its work list from open-issue TITLES -- runs no diagnostics for the
+    survey.  Creation is per (program, obs, instrument) and gated on
+    ``event_is_arrival``, so the ~1668 planned rows cost nothing, and it is
+    idempotent through the shared ``issue_cache``.
+
     A SEED RUN / PER-PROGRAM SEED backlog that contains released observations
     notifies: those arrivals were never announced, and the seed notice itself
     is not a downgrade (``notice_downgrade_reason`` -> None).
+
+    RETURNS the events whose per-tile treasury issue could NOT be opened or
+    commented on (post_status rc != 0).  The caller re-arms them
+    (``_revert_deferred``) so the arrival re-fires next poll: without that the
+    end-of-run ``save_state`` commits an arrival whose issue was never
+    created, ``_observations_for_program`` never produces a treasury tile of
+    its own accord, and the delivery is lost until somebody hand-edits the
+    state file.
 
     The anti-spam memo is written on an executing run immediately after EVERY
     notifying downgrade comment in the batch posted successfully (a partial
@@ -1283,6 +1364,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
     # rate-limit hazard); post_status fills it on first use.
     issue_cache: dict = {}
     posts: List[tuple] = []                      # (update_last, rc) per issue
+    unposted: List[dict] = []                    # events to re-arm (see above)
     treasury = [ev for ev in events if ev.get("field") == TREASURY_FIELD]
     regular = [ev for ev in events if ev.get("field") != TREASURY_FIELD]
     for (program, obsnum, instr), evs in sorted(_group_by_obs(regular).items()):
@@ -1307,6 +1389,50 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             marker=status_report.MONITOR_MARKER, dry_run=not execute,
             issue_cache=issue_cache,
             create_labels=["QA", f"program:{TREASURY_PROGRAM}"])))
+        # ... and, for a tile whose calibrated data actually LANDED, its own
+        # per-observation QA issue, opened on first arrival (#161).  The
+        # registry cannot produce these (10678 is uncurated -> registry() ->
+        # []), so without this no treasury tile has an issue, and
+        # scripts/refresh_all_issues.sh -- whose work list is the OPEN ISSUE
+        # TITLES -- runs zero diagnostics for the largest program in the
+        # campaign (the rolling issue's title carries no obsid, so its regex
+        # drops it as a meta issue).
+        #
+        # Bounded by DELIVERIES, not by MAST rows: grouped per (program, obs,
+        # instrument), gated on event_is_arrival, so the 1668 planned
+        # exposure-level rows of 10678 create nothing and a delivered tile
+        # creates one issue (two if the MIRI parallel is delivered as well).
+        # Idempotent: post_status keys on the exact title and reuses the ONE
+        # existing_issues() listing in issue_cache, so a re-poll of a tile that
+        # already has an issue comments on it instead of opening a second one.
+        from . import make_issues
+        arrivals = [ev for ev in treasury if event_is_arrival(ev)]
+        for (program, obsnum, instr), evs in sorted(_group_by_obs(arrivals).items()):
+            o = treasury_observation(program, obsnum, instr, evs)
+            # classified on the TILE's own events, like every other issue: an
+            # arrival posts a notifying comment (update_last False)
+            tile_edit = _update_last(evs)
+            rc = status_report.post_status(
+                o.issue_title,
+                status_report.render_events_comment(evs, notice=notice),
+                repo=repo, update_last=tile_edit,
+                marker=status_report.MONITOR_MARKER, dry_run=not execute,
+                issue_cache=issue_cache,
+                create_labels=make_issues.labels_for(o),
+                create_body=treasury_issue_body(o))
+            posts.append((tile_edit, rc))
+            if rc:
+                # The issue was NOT opened (a create/label/comment POST failed:
+                # rate limit, 5xx, a revoked token).  Nothing else in the system
+                # opens a treasury tile issue -- the registry returns [] for
+                # 10678 and the per-program seed only fires for an UNSEEDED
+                # program -- so committing this arrival would retire it for
+                # good.  Hand it back to the caller to re-arm, exactly as a
+                # low-disk deferred download is re-armed.
+                print(f"--report: per-tile issue {o.issue_title!r} FAILED "
+                      f"(post_status rc={rc}); the arrival keeps its pre-poll "
+                      f"baseline and re-fires next poll", file=sys.stderr)
+                unposted.extend(evs)
     if execute and state_path:
         notifying = [rc for edit, rc in posts if not edit]
         # EVERY notifying comment must have landed before repeats are
@@ -1322,6 +1448,7 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             # downgrade-free batch: the episode is over; the NEXT downgrade
             # notice posts a fresh (notifying) comment
             _memo_notified_downgrade(state_path, None, state=state)
+    return unposted
 
 
 # ------------------------------------------------------------------------------- main
@@ -1642,8 +1769,20 @@ def main(argv=None):
             # report EVERYTHING (incl. per-program-seed-suppressed events);
             # state/state_path carry the last-notified-downgrade memo that
             # decides new-comment-vs-edit (see act_report)
-            act_report(all_events, execute=args.execute, repo=args.repo,
-                       notice=notice, state=state, state_path=args.state)
+            unposted = act_report(all_events, execute=args.execute,
+                                  repo=args.repo, notice=notice, state=state,
+                                  state_path=args.state) or []
+            if unposted:
+                # A treasury arrival whose OWN QA issue could not be opened.
+                # save_state below is unconditional, so without this the
+                # arrival is retired having produced no issue and nothing ever
+                # re-fires it.  Same re-arm as a
+                # deferred download: restore the pre-poll baseline.
+                _revert_deferred(state, old_obs_by_prog, unposted)
+                print(f"--report: REPORT DEFERRED — {len(unposted)} treasury "
+                      f"arrival event(s) whose per-tile QA issue could not be "
+                      f"opened keep their pre-poll baselines and re-fire next "
+                      f"run.", file=sys.stderr)
 
     if args.commit_state:
         # end the downgrade episode when this run was not itself downgraded,

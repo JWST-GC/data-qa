@@ -221,3 +221,61 @@ def test_post_status_missing_issue_still_fails_without_create_labels(monkeypatch
     monkeypatch.setattr(_github, "get_token", lambda: "tok")
     monkeypatch.setattr(_github, "existing_issues", lambda token, repo: {})
     assert sr.post_status("Nope", "B", dry_run=False, issue_cache={}) == 3
+
+
+def _patch_create(monkeypatch):
+    created, posted = [], []
+    monkeypatch.setattr(_github, "get_token", lambda: "tok")
+    monkeypatch.setattr(_github, "existing_issues", lambda token, repo: {})
+    monkeypatch.setattr(_github, "ensure_labels", lambda token, repo, names: None)
+    monkeypatch.setattr(_github, "create_issue",
+                        lambda token, repo, title, body, labels=():
+                        created.append((title, body, list(labels)))
+                        or (201, {"number": 9}))
+    monkeypatch.setattr(_github, "list_comments", lambda *a: [])
+    monkeypatch.setattr(_github, "post_comment",
+                        lambda token, repo, number, body:
+                        posted.append((number, body)) or (201, {}))
+    return created, posted
+
+
+def test_post_status_create_body_seeds_the_new_issue(monkeypatch):
+    """create_body is the BODY of an issue opened by the create_labels path
+    (the per-tile treasury issue opens with the full QA template); the event
+    text still goes in as the first COMMENT."""
+    created, posted = _patch_create(monkeypatch)
+    rc = sr.post_status("GC Treasury — jw10678-o088 (NIRCam)", "EVENTS",
+                        dry_run=False, issue_cache={},
+                        create_labels=["QA", "NIRCam"],
+                        create_body="TEMPLATE BODY")
+    assert rc == 0
+    assert created == [("GC Treasury — jw10678-o088 (NIRCam)", "TEMPLATE BODY",
+                        ["QA", "NIRCam"])]
+    assert posted == [(9, "EVENTS")]
+
+
+def test_post_status_create_body_default_is_the_rolling_text(monkeypatch):
+    created, _ = _patch_create(monkeypatch)
+    assert sr.post_status("T", "EVENTS", dry_run=False, issue_cache={},
+                          create_labels=["QA"]) == 0
+    assert "Rolling monitor issue" in created[0][1]
+
+
+def test_ensure_labels_posts_each_label_once_per_process(monkeypatch):
+    """Every created issue asks for the same four label names, and the API has
+    no create-if-absent, so an uncached ensure_labels spends 4 content-creating
+    POSTs per issue against the ~500/hour limit.  Opening ~100 treasury tile
+    issues in one run would exhaust it on labels alone and the POSTs that fail
+    are the issue creations."""
+    calls = []
+    monkeypatch.setattr(_github, "_LABELS_ENSURED", set())
+    monkeypatch.setattr(_github, "request",
+                        lambda method, url, token, data=None:
+                        calls.append(data["name"]) or (201, {}))
+    for _ in range(3):                       # three issues, same labels
+        _github.ensure_labels("tok", "JWST-GC/data-qa",
+                              ["QA", "NIRCam", "program:10678",
+                               "target:GC Treasury"])
+    assert calls == ["QA", "NIRCam", "program:10678", "target:GC Treasury"]
+    _github.ensure_labels("tok", "other/repo", ["QA"])   # per-repo, not global
+    assert calls[-1] == "QA" and len(calls) == 5

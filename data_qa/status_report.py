@@ -192,7 +192,8 @@ def find_last_status_comment(token, repo, number) -> Optional[dict]:
 
 
 def post_status(title: str, body: str, repo=None, update_last=False, dry_run=True,
-                marker=STATUS_MARKER, issue_cache=None, create_labels=None):
+                marker=STATUS_MARKER, issue_cache=None, create_labels=None,
+                create_body=None):
     """Post (or, update_last, edit-in-place) the status comment on the issue with
     this exact title.  ``marker`` selects WHICH bot comment update_last edits
     (STATUS_MARKER for status reports, MONITOR_MARKER for monitor events).
@@ -203,7 +204,14 @@ def post_status(title: str, body: str, repo=None, update_last=False, dry_run=Tru
 
     ``create_labels``: when set and no issue with this title exists, CREATE it
     (with these labels) instead of failing rc=3 -- the rolling-issue path
-    (mast_monitor treasury channel).
+    (mast_monitor treasury channel).  Creation is keyed on the exact title and
+    the cache learns the new issue, so a re-poll of the same delivery comments
+    on the issue that exists instead of opening a second one.
+
+    ``create_body``: the body of an issue created that way (default: the short
+    rolling-issue text).  ``mast_monitor``'s per-tile treasury channel passes
+    the standard ``make_issues`` QA template here, so a lazily-opened tile issue
+    carries the same checklist as a curated one.
 
     Returns 0 on success / dry-run, nonzero on failure."""
     repo = repo or _github.REPO
@@ -231,14 +239,14 @@ def post_status(title: str, body: str, repo=None, update_last=False, dry_run=Tru
         _github.ensure_labels(token, repo, create_labels)
         status, data = _github.create_issue(
             token, repo, title,
-            "Rolling monitor issue (auto-created by `data_qa`); events arrive "
-            "as comments below.",
+            create_body or ("Rolling monitor issue (auto-created by `data_qa`); "
+                            "events arrive as comments below."),
             labels=create_labels)
         if status >= 300:
             print(f"failed to create issue {title!r} in {repo} ({status}): "
                   f"{data.get('message')}", file=sys.stderr)
             return 4
-        print(f"created rolling issue #{data['number']}: {title}")
+        print(f"created issue #{data['number']}: {title}")
         existing[title] = data          # keep the shared cache consistent
         issue = data
     number = issue["number"]
