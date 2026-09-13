@@ -4891,6 +4891,245 @@ def stage11_effective_psf(o: Observation, sw, lw):
     return _save(fig, f"{o.obsid}_stage11.png"), metrics
 
 
+# --------------------------------------------------------------------------- STAGE 12
+# Photometric linearity: does measured flux scale with true brightness at a CONSTANT ratio across
+# the dynamic range, or does the ratio drift with brightness (a saturation roll-over at the bright
+# end, a PSF-model / crowding bias, or a brighter-fatter response)?  Measured PER FILTER as the
+# aperture-minus-PSF magnitude (aper − PSF) versus PSF magnitude: on a linear detector this is a
+# FLAT line at the aperture correction; a non-zero slope is a brightness-dependent photometric
+# systematic, and a bright-end departure marks where the photometry stops being linear.  Reuses the
+# stage-9 aperture re-measurement machinery (isolated stars, recentroid, local-annulus background,
+# SNR/recentroid quality gate); stage 9 reports the single aperture correction + its scatter, this
+# stage reports the SLOPE of that offset with brightness and the turn-over magnitude.
+
+# Bright-end departure (mag) of the binned aper−PSF median from the faint-baseline aperture
+# correction that marks the onset of non-linearity (saturation roll-over).
+_LIN_TURNOVER_DMAG = 0.05
+# |slope| (mag per mag, over the linear range) above which the filter is flagged as showing a
+# brightness-dependent photometric trend.  Informational: stage 12 is display-only (does not drive
+# an issue-body checkbox); the flag surfaces the number, it does not gate a release.
+_LIN_SLOPE_FLAG = 0.02
+_LIN_BIN_WIDTH = 0.5                     # magnitude bin width for the binned median
+_LIN_MIN_PER_BIN = 8                     # a bin with fewer stars than this is dropped from the fit
+_LIN_MIN_BINS = 4                        # need at least this many linear-range bins to fit a slope
+
+
+def _measure_psf_aper(o: Observation, filt, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px=12.0, maxn=20000):
+    """Re-measure aperture photometry on the ``filt`` mosaic at the catalog PSF-flux positions and
+    return ``(m_psf, dmag, meta)`` for the clean isolated stars, where ``m_psf`` is the PSF
+    instrumental magnitude and ``dmag = m_aper − m_psf``.  Returns ``(None, None, reason)`` (a short
+    string) when the filter cannot be measured.  This is the stage-9 measurement, factored so
+    stage 12 can run it per filter; the gates match stage 9 (isolation, recentroid < 3 px, aperture
+    SNR > ``_APER_SNR_MIN``, no NaN in the aperture)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry, ApertureStats
+    from scipy.spatial import cKDTree
+    sc, psf_flux, src = _psf_flux_positions(o, filt)
+    mpath = _mosaic_path(o, filt)
+    if sc is None:
+        return None, None, "no jicama catalogue with a PSF flux column"
+    if not mpath:
+        return None, None, "no mosaic on disk"
+    try:
+        with fits.open(_used(mpath, f"{filt} mosaic (linearity aperture photometry)")) as h:
+            sci = h["SCI"] if "SCI" in h else h[1]
+            data = sci.data.astype("float32"); w = WCS(sci.header)
+    except (OSError, ValueError, KeyError):
+        return None, None, "mosaic unreadable"
+    x, y = w.world_to_pixel(sc)
+    ny, nx = data.shape
+    inb = (x > r_out + 1) & (x < nx - r_out - 1) & (y > r_out + 1) & (y < ny - r_out - 1)
+    xy = np.c_[x, y]
+    nn = cKDTree(xy).query(xy, k=2)[0][:, 1]
+    keep = inb & (nn > iso_px)
+    if int(keep.sum()) < 50:
+        return None, None, f"only {int(keep.sum())} isolated in-bounds stars"
+    idx = np.where(keep)[0]
+    if idx.size > maxn:
+        idx = idx[np.argsort(psf_flux[idx])[::-1][:maxn]]
+    xr, yr, moved = _recentroid_com(data, x[idx], y[idx], box=11)
+    pos = np.c_[xr, yr]
+    ap = CircularAperture(pos, r=r_ap)
+    ann = CircularAnnulus(pos, r_in=r_in, r_out=r_out)
+    apstats = ApertureStats(data, ann)
+    bkg = apstats.median
+    bkg_std = np.asarray(apstats.std, float)
+    raw = aperture_photometry(np.nan_to_num(data, nan=0.0), ap)["aperture_sum"]
+    aper_flux = np.asarray(raw, float) - np.asarray(bkg, float) * ap.area
+    nanmask = (~np.isfinite(data)).astype("float32")
+    nan_in_ap = np.asarray(aperture_photometry(nanmask, ap)["aperture_sum"], float) > 0.5
+    pf = psf_flux[idx]
+    aper_noise = bkg_std * np.sqrt(float(ap.area))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        snr = aper_flux / aper_noise
+    good = (np.isfinite(aper_flux) & (aper_flux > 0) & np.isfinite(pf) & (pf > 0) & (~nan_in_ap)
+            & np.isfinite(snr) & (snr > _APER_SNR_MIN) & (moved < 3.0))
+    if int(good.sum()) < 50:
+        return None, None, f"only {int(good.sum())} clean stars after quality gate"
+    m_psf = -2.5 * np.log10(pf[good]); m_aper = -2.5 * np.log10(aper_flux[good])
+    dmag = m_aper - m_psf
+    return m_psf, dmag, dict(src=src, n=int(good.sum()), r_ap=r_ap, iso_px=iso_px)
+
+
+def _linearity_fit(m_psf, dmag, turnover_dmag=_LIN_TURNOVER_DMAG):
+    """Bin ``dmag`` (aper − PSF) by magnitude and fit its trend with brightness.  Returns a dict:
+    binned centres/medians/counts, the faint-baseline aperture correction, the bright turn-over
+    magnitude, and the linear-range slope (mag per mag) + its standard error.
+
+    The turn-over is measured as a departure from the fitted LINEAR TREND (a line fit to the faint
+    60% of bins), not from a flat baseline: a filter with a global brightness-dependent slope but no
+    saturation feature then reports NO turn-over (the bins lie on the trend line), and the turn-over
+    marks a genuine roll-over away from linearity.  The slope is refit over the resulting linear
+    range (bins fainter than the turn-over)."""
+    m_psf = np.asarray(m_psf, float); dmag = np.asarray(dmag, float)
+    lo, hi = np.nanpercentile(m_psf, [1, 99])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return None
+    edges = np.arange(lo, hi + _LIN_BIN_WIDTH, _LIN_BIN_WIDTH)
+    if edges.size < 3:
+        return None
+    centres, medians, counts = [], [], []
+    for b in range(1, len(edges)):
+        sel = (m_psf >= edges[b - 1]) & (m_psf < edges[b])
+        c = int(sel.sum())
+        if c < _LIN_MIN_PER_BIN:
+            continue
+        centres.append(0.5 * (edges[b - 1] + edges[b]))
+        medians.append(float(np.median(dmag[sel])))
+        counts.append(c)
+    if len(centres) < _LIN_MIN_BINS:
+        return None
+    centres = np.array(centres); medians = np.array(medians); counts = np.array(counts)
+    # Faint 60% of bins: the clean linear part the bright roll-over does not reach.  The reported
+    # aperture correction is the faint-baseline median; the turn-over reference is a LINE fit there.
+    faint = centres >= np.percentile(centres, 40)
+    baseline = float(np.median(medians[faint])) if faint.any() else float(np.median(medians))
+    if int(faint.sum()) >= 2:
+        ref = np.polyfit(centres[faint], medians[faint], 1, w=np.sqrt(counts[faint]))
+    else:
+        ref = np.array([0.0, baseline])              # too few faint bins: fall back to a flat trend
+    model = np.polyval(ref, centres)
+    # Bright turn-over: brightest→faint, the run of bins whose median departs the trend line by more
+    # than turnover_dmag; the turn-over is the faintest bin of that contiguous bright run (None if
+    # the brightest bin is already on the trend).
+    order = np.argsort(centres)                      # ascending magnitude = bright→faint
+    dev = np.abs(medians - model) > turnover_dmag
+    turnover = None
+    for i in order:
+        if dev[i]:
+            turnover = float(centres[i])
+        else:
+            break
+    # Linear range: bins fainter than the turn-over (or all bins if no turn-over).
+    lin = centres > turnover if turnover is not None else np.ones(centres.shape, bool)
+    slope = slope_err = None
+    lin_coef = None
+    if int(lin.sum()) >= _LIN_MIN_BINS:
+        wts = np.sqrt(counts[lin])
+        coef, cov = np.polyfit(centres[lin], medians[lin], 1, w=wts, cov=True)
+        slope = float(coef[0]); slope_err = float(np.sqrt(cov[0, 0]))
+        lin_coef = (float(coef[0]), float(coef[1]))
+    return dict(centres=centres, medians=medians, counts=counts, baseline=baseline,
+                turnover=turnover, slope=slope, slope_err=slope_err, lin_mask=lin,
+                lin_coef=lin_coef, n_lin_bins=int(lin.sum()))
+
+
+def _stage12_figure_one(o, filt, m_psf, dmag, fit, meta):
+    """One filter's linearity panel: aper−PSF vs PSF magnitude (hexbin), the binned median, the
+    faint-baseline aperture correction, the linear-range slope fit, and the turn-over marker."""
+    import matplotlib.pyplot as plt
+    fig, ax = _fig(1, 1, 6.4, 4.6)
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.88, bottom=0.13)
+    a = ax[0][0]
+    hb = a.hexbin(m_psf, dmag, gridsize=55, bins="log", cmap="viridis", mincnt=1)
+    fig.colorbar(hb, ax=a, label="log N", shrink=0.85)
+    base = fit["baseline"]
+    a.errorbar(fit["centres"], fit["medians"], fmt="o", ms=5, color="white",
+               mec="black", mew=0.7, ecolor="black", zorder=5, label="binned median")
+    a.axhline(base, color="cyan", lw=1.3, zorder=4,
+              label=f"aper. corr. (faint baseline) {base:+.3f}")
+    if fit["slope"] is not None and fit.get("lin_coef"):
+        cl = fit["centres"][fit["lin_mask"]]
+        xx = np.array([cl.min(), cl.max()])
+        yy = np.polyval(fit["lin_coef"], xx)         # the actual linear-range fit
+        a.plot(xx, yy, color="red", lw=1.6, zorder=6,
+               label=f"linear-range slope {fit['slope']:+.3f} ± {fit['slope_err']:.3f} mag/mag")
+    if fit["turnover"] is not None:
+        a.axvline(fit["turnover"], color="orange", lw=1.4, ls="--", zorder=4,
+                  label=f"bright turn-over {fit['turnover']:.1f} mag")
+    dlo, dhi = np.nanpercentile(dmag, [1, 99])
+    pad = 0.15 * (dhi - dlo + 1e-3)
+    a.set_ylim(min(dlo, base - 0.1) - pad, max(dhi, base + 0.1) + pad)
+    a.set_xlabel("PSF instrumental magnitude  (brighter at left)")
+    a.set_ylabel("aperture − PSF  [mag]")
+    a.legend(fontsize=7.5, loc="best", framealpha=0.9)
+    a.set_title(f"{filt}: {meta['n']} isolated stars (>{meta['iso_px']:.0f} px), "
+                f"r_ap={meta['r_ap']:.0f}px", fontsize=9)
+    fig.suptitle(f"{o.target} {o.obsid} — photometric linearity ({filt})", fontsize=11, y=0.97)
+    suffix = f"_{filt}"
+    return _save(fig, f"{o.obsid}_stage12{suffix}.png")
+
+
+def stage12_photometric_linearity(o: Observation, sw, lw=None, r_ap=3.0, iso_px=12.0):
+    """Per-filter photometric-linearity check.  For every filter with a mosaic + PSF-flux catalogue,
+    re-measure aperture photometry on isolated stars and fit the aperture-minus-PSF magnitude as a
+    function of brightness: the slope (mag per mag) is the brightness-dependent photometric trend and
+    the bright turn-over marks where linearity ends.  One figure per filter; the representative SW
+    filter is the primary figure and the rest are returned in ``metrics['extra_figures']`` for the
+    poster to fold into an expandable block."""
+    metrics = dict(stage=12, sw=sw, lw=lw)
+    filts = _available_filters(o) or list(o.filters)
+    # measure every filter; keep the order stable and SW-first so the primary is a short-wave filter
+    per_filter, figures, reasons = {}, [], {}
+    for filt in filts:
+        m_psf, dmag, meta = _measure_psf_aper(o, filt, r_ap=r_ap, iso_px=iso_px)
+        if m_psf is None:
+            reasons[filt] = meta
+            continue
+        fit = _linearity_fit(m_psf, dmag)
+        if fit is None:
+            reasons[filt] = "too few binned points for a linearity fit"
+            continue
+        png = _stage12_figure_one(o, filt, m_psf, dmag, fit, meta)
+        per_filter[filt] = dict(
+            slope=fit["slope"], slope_err=fit["slope_err"], turnover_mag=fit["turnover"],
+            aper_corr=fit["baseline"], n=meta["n"], n_lin_bins=fit["n_lin_bins"],
+            catalog=meta["src"], png=png,
+            flagged=(fit["slope"] is not None and abs(fit["slope"]) > _LIN_SLOPE_FLAG),
+        )
+        figures.append((filt, png))
+    metrics["reasons"] = reasons
+    if not figures:
+        why = "no filter had a mosaic + PSF-flux catalogue with enough clean isolated stars"
+        png = _red_flag_figure(o, "stage12", "LINEARITY UNMEASURABLE",
+                               f"Cannot measure photometric linearity: {why}.")
+        metrics.update(red_flag=True, red_flag_reason=why, passed=False,
+                       filters_measured=[], per_filter={})
+        return png, metrics
+    # primary = representative SW filter if it was measured, else the first measured filter
+    primary = sw if (sw in per_filter) else figures[0][0]
+    metrics["primary_filter"] = primary
+    metrics["filters_measured"] = [f for f, _ in figures]
+    metrics["per_filter"] = {f: {k: v for k, v in d.items() if k != "png"}
+                             for f, d in per_filter.items()}
+    # flat convenience keys for the primary filter (what tests / a quick scan read)
+    pf = per_filter[primary]
+    metrics.update(slope=pf["slope"], slope_err=pf["slope_err"], turnover_mag=pf["turnover_mag"],
+                   aper_corr=pf["aper_corr"], n_isolated=pf["n"],
+                   n_flagged=sum(1 for d in per_filter.values() if d["flagged"]),
+                   passed=not any(d["flagged"] for d in per_filter.values()))
+    # the primary figure is ALSO saved under the canonical stage asset name so the in-place asset
+    # (obsid_stage12.png) is stable across runs even if the SW pick changes
+    import shutil
+    primary_png = os.path.join(OUTDIR, f"{o.obsid}_stage12.png")
+    shutil.copyfile(per_filter[primary]["png"], primary_png)
+    metrics["extra_figures"] = [(f, per_filter[f]["png"]) for f, _ in figures if f != primary]
+    return primary_png, metrics
+
+
 def _dispatch_stage(o, n, sw, lw):
     if n == 1:
         return stage1_mosaics(o, sw, lw)
@@ -4914,6 +5153,8 @@ def _dispatch_stage(o, n, sw, lw):
         return stage10_photometric_consistency(o, sw, lw)
     if n == 11:
         return stage11_effective_psf(o, sw, lw)
+    if n == 12:
+        return stage12_photometric_linearity(o, sw, lw)
     raise ValueError(n)
 
 
@@ -4963,6 +5204,7 @@ _HEADLINE = {
     9: "**Stage 9 — PSF vs aperture photometry.**",
     10: "**Stage 10 — JWST1PASS across-exposure consistency.**",
     11: "**Stage 11 — effective PSF per exposure.**",
+    12: "**Stage 12 — photometric linearity.**",
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
@@ -5102,6 +5344,53 @@ def _caption_stage8(metrics):
     return base + "([how this is made](DOCROOT#stage8))"
 
 
+def _caption_stage12(metrics):
+    """Stage-12 caption: the method, the primary filter's numbers, and a per-filter table so every
+    filter's slope and turn-over appear even though only the primary plot is shown inline (the rest
+    are in the expandable block)."""
+    if metrics.get("red_flag"):
+        return (f"🚩 **Stage 12 — photometric linearity: unmeasurable.** "
+                f"{metrics.get('red_flag_reason', 'no measurable filter')}. "
+                f"([how this is made](DOCROOT#stage12))")
+    prim = metrics.get("primary_filter", metrics.get("sw", "SW"))
+    pf = metrics.get("per_filter", {})
+    base = (f"**Stage 12 — photometric linearity.** For each filter, aperture photometry is "
+            f"[re-measured](DOCROOT#stage9) on the mosaic at the catalogue PSF-flux positions of "
+            f"isolated stars (nearest neighbour > 12 px, [aperture S/N > 30](DOCROOT#glossary-snr), "
+            f"local-annulus background, recentred < 3 px), and the aperture-minus-PSF magnitude is "
+            f"binned against PSF magnitude. A flat line at the aperture correction is a linear "
+            f"response; the fitted **slope (mag per mag)** is the brightness-dependent trend and the "
+            f"**bright turn-over** is the magnitude where the binned median departs the fitted linear "
+            f"trend by more than {_LIN_TURNOVER_DMAG:.2f} mag (a roll-over away from linearity, "
+            f"measured against the trend so a constant slope alone does not trip it). The plot shown "
+            f"is **{prim}**; the other filters are in the expandable block below. ")
+    dprim = pf.get(prim)
+    if dprim and dprim.get("slope") is not None:
+        to = dprim.get("turnover_mag")
+        to_str = f"{to:.1f} mag" if to is not None else "none within range"
+        base += (f"{prim}: slope {dprim['slope']:+.3f} ± {dprim['slope_err']:.3f} mag/mag, "
+                 f"aperture correction {dprim['aper_corr']:+.3f} mag, bright turn-over {to_str}, "
+                 f"{dprim['n']} stars. ")
+    if len(pf) > 1:
+        rows = ["", "| filter | slope (mag/mag) | turn-over (mag) | aper. corr. | N |",
+                "|---|---|---|---|---|"]
+        for f in metrics.get("filters_measured", sorted(pf)):
+            d = pf.get(f) or {}
+            sl = d.get("slope"); se = d.get("slope_err"); to = d.get("turnover_mag")
+            sl_str = f"{sl:+.3f} ± {se:.3f}" if sl is not None else "—"
+            to_str = f"{to:.1f}" if to is not None else "—"
+            flag = " 🚩" if d.get("flagged") else ""
+            ac = d.get("aper_corr")
+            ac_str = f"{ac:+.3f}" if ac is not None else "—"
+            rows.append(f"| {f}{flag} | {sl_str} | {to_str} | {ac_str} | {d.get('n', '—')} |")
+        base += "\n".join(rows) + "\n\n"
+    nfl = metrics.get("n_flagged") or 0
+    if nfl:
+        base += (f"🚩 {nfl} filter(s) show |slope| > {_LIN_SLOPE_FLAG:.2f} mag/mag "
+                 f"(flagged in the table). ")
+    return base + "([how this is made](DOCROOT#stage12))"
+
+
 def _caption_for_impl(n, metrics):
     if n == "6clean":
         exps = ", ".join(metrics.get("excluded_exposures") or [])
@@ -5125,6 +5414,8 @@ def _caption_for_impl(n, metrics):
         return base + "([how this is made](DOCROOT#stage6))"
     if n == 8:
         return _caption_stage8(metrics)
+    if n == 12:
+        return _caption_stage12(metrics)
     # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
     # so the generic "the plot is empty" wording would not fit).
     if metrics.get("red_flag") and n != 7:
@@ -5620,7 +5911,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    ap.add_argument("--stage", nargs="+", type=int,
+                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
@@ -5684,7 +5976,8 @@ def main(argv=None):
         if args.post:
             try:
                 from .post_diagnostics import post_stage, PostError
-                post_stage(o, n, png, caption_for(n, metrics), args.repo)
+                post_stage(o, n, png, caption_for(n, metrics), args.repo,
+                           extra_images=metrics.get("extra_figures"))
                 # Stage 6 emits a SECOND figure recomputed excluding stage-11-flagged bad-PSF
                 # exposures; post it under its own marker so it sits beside, not over, the main one.
                 if n == 6 and metrics.get("clean_png"):
