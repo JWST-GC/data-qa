@@ -9,11 +9,15 @@ so the stub hides nothing they assert.
 """
 import pytest
 
-from data_qa import _github
-
 
 @pytest.fixture(autouse=True)
 def _offline_auth_preflight(monkeypatch):
+    # Import inside the fixture, not at module top: CI runs ``pytest tests data_qa`` (no editable
+    # install, no ``python -m``), and pytest imports this conftest during collection BOOTSTRAP --
+    # before the repo root reaches sys.path -- so a top-level ``from data_qa import _github`` here
+    # dies with ModuleNotFoundError and takes the whole suite down. By fixture-run time the path is
+    # set up and the import succeeds.
+    from data_qa import _github
     _github._AUTH_CHECKED.clear()
     monkeypatch.setattr(_github, "check_auth", lambda token, force=False:
                         (True, "pytest-stub"))
