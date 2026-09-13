@@ -257,10 +257,16 @@ def reduction_step(program, obs, field, filters, pipe_root=None,
     # SKYMATCH: submit_reduction.sbatch reads it from the environment
     # (--skymatch-method).  Passed through ONLY when the operator sets it; the
     # trigger invents no default.
-    # TODO(keflavich/jwst-gc-pipeline#419): once the treasury F480M skymatch
-    # policy decision lands (a skymatch_policy module beside destreak_policy, or
-    # SKYMATCH=match for program 10678), derive this from the policy probe the
-    # same way EACH_SUFFIX is.
+    #
+    # That is settled, not pending.  Maintainer, 2026-09-06
+    # (keflavich/jwst-gc-pipeline#419), asked before the first program-10678
+    # treasury reduce: "Leave skymatch off.  We will only turn it on given strong
+    # evidence for the need."  So there is no skymatch policy module to probe --
+    # unlike EACH_SUFFIX, which reads destreak_policy -- and the trigger should
+    # not acquire a per-program default.  The bar for changing that is strong
+    # evidence of need, recorded at the driver's --skymatch-method option; the
+    # cost of leaving it off, measured 2026-08-25, is per-exposure sky levels
+    # spread 34-53% of the sky in F480M and 75-159% in F212N.
     skymatch = os.environ.get("SKYMATCH")
     if skymatch:
         if skymatch not in SKYMATCH_METHODS:

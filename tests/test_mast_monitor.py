@@ -3,6 +3,7 @@ import datetime
 import inspect
 import json
 import os
+import sys
 
 import pytest
 
@@ -1556,6 +1557,285 @@ def test_act_download_dry_run_skips_prechecks(monkeypatch):
     assert fetched[0]["dry_run"] is True
 
 
+# --------------------------------------- mid-run trigger SKIPs (issue #151)
+def test_act_trigger_reports_the_groups_it_left_owed(monkeypatch, tmp_path):
+    """A mid-run SKIP with NOTHING RUNNING for the group burns no 'triggered'
+    key, so the submission is still owed; act_trigger names those groups so
+    main() can re-arm them."""
+    from data_qa import pipeline_trigger
+    key = (2221, "001", "NIRCam")
+    state_path = str(tmp_path / "state.json")
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+
+    def deny(**kw):
+        raise pipeline_trigger.NotRegisteredInPipelineError("not registered")
+
+    monkeypatch.setattr(pipeline_trigger, "submit", deny)
+    assert mm.act_trigger(_trigger_events("001"), execute=True, state={},
+                          state_path=state_path) == {key: "not-registered"}
+
+    _patch_submit(monkeypatch)
+    assert mm.act_trigger(_trigger_events("001", filters="CLEAR;GRISMR"),
+                          execute=True, state={},
+                          state_path=state_path) == {key: "no-filters"}
+
+
+def test_act_trigger_does_not_owe_an_inflight_group(monkeypatch, tmp_path):
+    """B3 of the PR #165 review.  The already-triggered map is consulted
+    BEFORE the queue, so a queued job this map does not know about was
+    submitted by something other than the monitor (on this account, by hand).
+    Re-arming it would queue a duplicate chain behind that job once the queue
+    drains, so the group is reported -- for the notice -- but NOT owed."""
+    _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names",
+                        lambda: {"brick2221-o001-reduce-F405N"})
+    skips = mm.act_trigger(_trigger_events("001"), execute=True, state={},
+                           state_path=str(tmp_path / "state.json"))
+    assert skips == {(2221, "001", "NIRCam"): "in-flight"}
+    assert "in-flight" not in mm.TRIGGER_REARM_REASONS
+
+
+def test_act_trigger_owes_nothing_for_standing_skips(monkeypatch, tmp_path):
+    """A planned tile, an unmapped program, a MIRI delivery and an
+    already-triggered group are NOT owed: re-arming them would re-fire the
+    same group every poll forever, and the trigger is not owed on any of
+    them."""
+    _patch_submit(monkeypatch)
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    state_path = str(tmp_path / "state.json")
+    assert mm.act_trigger(_planned_events(), execute=True, state={},
+                          state_path=state_path) == {}
+    unmapped = [dict(_trigger_events("001")[0], field=None)]
+    assert mm.act_trigger(unmapped, execute=True, state={},
+                          state_path=state_path) == {}
+    miri = [ev for ev in _dual_instrument_events()
+            if ev["instrument_name"].startswith("MIRI")]
+    assert mm.act_trigger(miri, execute=True, state={},
+                          state_path=state_path) == {}
+    state = {"triggered": {"2221-o001": "2026-07-21 00:00 UTC"}}
+    assert mm.act_trigger(_trigger_events("001"), execute=True, state=state,
+                          state_path=state_path) == {}
+
+
+def _patch_poll_real_trigger(monkeypatch, rows, inflight=(), deny=False):
+    """main() with the REAL act_trigger: canned MAST rows, recorded
+    submissions, and a canned squeue.  ``deny`` makes the registry preflight
+    refuse, the skip that leaves a trigger genuinely owed."""
+    from data_qa import pipeline_trigger
+    submitted = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set(inflight))
+
+    def submit(**kw):
+        if deny:
+            raise pipeline_trigger.NotRegisteredInPipelineError("not registered")
+        submitted.append(kw)
+
+    monkeypatch.setattr(pipeline_trigger, "submit", submit)
+    return submitted
+
+
+def test_main_rearms_a_group_the_registry_refused(monkeypatch, tmp_path):
+    """The #151 loss: obs 001's preflight refuses before any sbatch, and the
+    end-of-run commit retires obs 001's event -- the reduction owed with
+    nothing recording it, so no later poll ever submits it.  Now obs 001 keeps
+    its pre-poll baseline and re-fires."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows, deny=True)
+    state = tmp_path / "state.json"
+    _seed_state(state)                           # baseline: not a first run
+    args = ["--program", "2221", "--trigger", "--execute", "--commit-state",
+            "--state", str(state)]
+    assert mm.main(args) == 0
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o001_t001_nircam_clear-f405n" not in committed   # re-armed
+
+    # next poll, the obs registered: the deferred group is re-offered and submits
+    submitted2 = _patch_poll_real_trigger(monkeypatch, rows)
+    assert mm.main(args) == 0
+    assert [kw["obs"] for kw in submitted2] == ["001"]
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o001_t001_nircam_clear-f405n" in committed
+    assert set(mm.load_state(str(state))["triggered"]) == {"2221-o001"}
+
+
+def test_main_never_queues_a_second_chain_behind_an_inflight_job(monkeypatch,
+                                                                 tmp_path):
+    """B3 of the PR #165 review.  A job of obs 001 is in the queue that the
+    'triggered' map does not know about (a hand-run reduction).  The event is
+    retired, so when the queue drains the monitor does NOT submit its own
+    chain over the products that job just wrote."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows,
+                             inflight=["brick2221-o001-reduce-F405N"])
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    args = ["--program", "2221", "--trigger", "--execute", "--commit-state",
+            "--state", str(state)]
+    assert mm.main(args) == 0
+
+    submitted2 = _patch_poll_real_trigger(monkeypatch, rows)   # queue drained
+    assert mm.main(args) == 0
+    assert submitted2 == []                       # no duplicate chain
+    committed = mm.load_state(str(state))["programs"]["2221"]["obs"]
+    assert "jw02221-o001_t001_nircam_clear-f405n" in committed        # retired
+    assert mm.OWED_GROUPS_KEY not in mm.load_state(str(state))
+
+
+def test_main_notices_the_deferred_trigger(monkeypatch, tmp_path, capsys):
+    """The operator reads the debt on the QA issue, not only in the scrontab
+    log: the deferral clause rides act_report's comment body."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows, deny=True)
+    reported = {}
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: reported.update(kw))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    assert mm.main(["--program", "2221", "--trigger", "--report", "--execute",
+                    "--commit-state", "--state", str(state)]) == 0
+    assert "TRIGGER DEFERRED" in reported["notice"]
+    assert "2221-o001-NIRCam (not-registered)" in reported["notice"]
+    assert "TRIGGER DEFERRED" in capsys.readouterr().err
+
+
+def test_main_notices_the_inflight_skip(monkeypatch, tmp_path, capsys):
+    """An in-flight skip is retired rather than deferred, so the QA issue is
+    the only place the operator can see it happened."""
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    _patch_poll_real_trigger(monkeypatch, rows,
+                             inflight=["brick2221-o001-reduce-F405N"])
+    reported = {}
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: reported.update(kw))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    assert mm.main(["--program", "2221", "--trigger", "--report", "--execute",
+                    "--commit-state", "--state", str(state)]) == 0
+    assert "TRIGGER SKIPPED(in-flight)" in reported["notice"]
+    assert "2221-o001-NIRCam" in reported["notice"]
+    assert "TRIGGER DEFERRED" not in reported["notice"]
+
+
+def test_a_deferred_group_keeps_notifying_every_poll(monkeypatch, tmp_path):
+    """B1 of the PR #165 review, pinned as INTENDED rather than assumed.
+
+    A re-armed group re-fires its arrival event, and act_report posts a NEW
+    (notifying) comment for an arrival -- so a deferral that persists posts one
+    comment per poll.  That is the same behaviour DOWNLOAD DEFERRED has carried
+    since #84, and it is wanted here: every remaining deferral reason
+    (not-registered, no-filters) needs a human to clear it, and a silent daily
+    edit is exactly the #71 defect.  The in-flight case -- routine, clears
+    itself, needs nobody -- is retired instead, so it never reaches this path.
+    """
+    from data_qa import status_report
+    posts = []
+    monkeypatch.setattr(status_report, "post_status",
+                        lambda title, body, repo=None, update_last=None, **kw:
+                        (posts.append(update_last), 0)[1])
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    args = ["--program", "2221", "--trigger", "--report", "--execute",
+            "--commit-state", "--state", str(state)]
+    for _ in range(3):
+        _patch_poll_real_trigger(monkeypatch, rows, deny=True)
+        assert mm.main(args) == 0
+    assert posts == [False, False, False]        # three notifying comments
+
+    # the in-flight skip does not: it is retired on the first poll, so the
+    # second poll carries no event and posts nothing at all
+    posts.clear()
+    state2 = tmp_path / "state2.json"
+    _seed_state(state2)
+    args2 = [a if a != str(state) else str(state2) for a in args]
+    for _ in range(3):
+        _patch_poll_real_trigger(monkeypatch, rows,
+                                 inflight=["brick2221-o001-reduce-F405N"])
+        assert mm.main(args2) == 0
+    assert posts == [False]
+
+
+def test_cap_yields_the_slot_to_a_group_it_never_offered(monkeypatch, tmp_path):
+    """B2 of the PR #165 review.  obs 001 is older and permanently owed (its
+    obs is not registered); obs 002 is ready.  With --max-submit 1 a strictly
+    age-ordered cap re-selects 001 every poll, submits nothing, and 002 is
+    never reached.  Sorting a previously-owed group last hands 002 the slot."""
+    from data_qa import pipeline_trigger
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n", release=59900.0),
+            _row("jw02221-o002_t001_nircam_clear-f405n", release=59901.0)]
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    args = ["--program", "2221", "--trigger", "--execute", "--commit-state",
+            "--max-submit", "1", "--state", str(state)]
+
+    def _poll():
+        submitted = []
+        monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+        monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+        monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+
+        def submit(**kw):
+            if kw["obs"] == "001":
+                raise pipeline_trigger.NotRegisteredInPipelineError("nope")
+            submitted.append(kw)
+
+        monkeypatch.setattr(pipeline_trigger, "submit", submit)
+        assert mm.main(args) == 0
+        return [kw["obs"] for kw in submitted]
+
+    assert _poll() == []                     # poll 1: 001 selected, refused
+    assert mm.load_state(str(state))[mm.OWED_GROUPS_KEY] == ["2221-o001-NIRCam"]
+    assert _poll() == ["002"]                # poll 2: 001 yields its turn
+    # 001 still owed, still re-firing, still counted -- only its turn yielded
+    assert ("jw02221-o001_t001_nircam_clear-f405n"
+            not in mm.load_state(str(state))["programs"]["2221"]["obs"])
+    # poll 2 deferred it at the cap without reaching it, so the memo clears and
+    # poll 3 offers it the slot again: the owed group is retried, not dropped
+    assert mm.OWED_GROUPS_KEY not in mm.load_state(str(state))
+    assert _poll() == []
+    assert mm.load_state(str(state))[mm.OWED_GROUPS_KEY] == ["2221-o001-NIRCam"]
+
+
+def test_yielding_does_not_lift_the_cap(monkeypatch, tmp_path, capsys):
+    """The re-ordering must not turn the cap into a pass: with three groups,
+    one of them previously owed, --max-submit 1 still acts on exactly one and
+    still defers the rest with a CAPPED notice."""
+    from data_qa import pipeline_trigger
+    rows = [_row(f"jw10678-o{i:03d}_t001_nircam_clear-f405n",
+                 release=59900.0 + i) for i in (1, 2, 3)]
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o099_x")
+    mm.save_state(str(state), dict(mm.load_state(str(state)),
+                                   **{mm.OWED_GROUPS_KEY: ["10678-o001-NIRCam"]}))
+    submitted = []
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    monkeypatch.setattr(pipeline_trigger, "submit",
+                        lambda **kw: submitted.append(kw))
+    assert mm.main(["--program", "10678", "--trigger", "--execute",
+                    "--commit-state", "--max-submit", "1",
+                    "--state", str(state)]) == 0
+    assert [kw["obs"] for kw in submitted] == ["002"]      # exactly one acts
+    err = capsys.readouterr().err
+    assert "3 actionable group(s) exceed --max-submit 1" in err
+    assert "10678-o001-NIRCam" in err.split("deferred to later runs:")[1]
+
+
+def test_yield_to_fresh_keeps_the_cap_and_the_age_order(monkeypatch):
+    """The re-ordering must not weaken the cap: it only moves owed groups to
+    the back, keeps age order inside each half, and is a no-op with no memo."""
+    keys = [(2221, f"{i:03d}", "NIRCam") for i in (1, 2, 3, 4)]
+    groups = {k: [] for k in keys}
+    assert list(mm._yield_to_fresh(groups, [])) == keys
+    assert list(mm._yield_to_fresh(groups, ["2221-o001-NIRCam",
+                                            "2221-o002-NIRCam"])) == [
+        keys[2], keys[3], keys[0], keys[1]]
+    assert len(mm._yield_to_fresh(groups, ["2221-o001-NIRCam"])) == 4
+
+
 # ------------------------------------------------------------------------- LOW items
 def test_act_download_skips_unmapped_program(monkeypatch, capsys):
     from data_qa import retrieve_data
@@ -2257,7 +2537,8 @@ def test_act_report_arrival_posts_new_comment(monkeypatch):
 def test_act_report_arrival_classified_per_issue(monkeypatch):
     """Classification is per ISSUE, not batch-global: a treasury tile that
     landed notifies on the treasury issue while a planned-only brick batch
-    keeps editing in place."""
+    keeps editing in place.  The landed tile also opens its own per-tile QA
+    issue (#161), which notifies for the same reason."""
     posted = _patch_post_status(monkeypatch)
     landed = dict(_planned_events()[0], event="NEWLY_RELEASED",
                   released=True, calib_level=3, t_obs_release=59900.0)
@@ -2266,7 +2547,8 @@ def test_act_report_arrival_classified_per_issue(monkeypatch):
     mm.act_report([planned_brick, landed], execute=True)
     assert [(title, kw["update_last"]) for title, _, kw in posted] == [
         ("Brick — jw02221-o001 (NIRCam)", True),       # planned only: edit
-        (mm.TREASURY_ISSUE_TITLE, False)]              # arrival: notify
+        (mm.TREASURY_ISSUE_TITLE, False),              # arrival: notify
+        ("GC Treasury — jw10678-o101 (NIRCam)", False)]
 
 
 def test_act_report_fresh_downgrade_notifies_every_issue(monkeypatch, tmp_path):
@@ -2575,51 +2857,422 @@ def test_main_seed_run_keeps_low_disk_notice_and_memo(monkeypatch, tmp_path):
     assert "jw10678-o101_t101_nircam" in committed["programs"]["10678"]["obs"]
 
 
-def test_a_failed_report_returns_its_events_so_the_commit_cannot_retire_them(
-        monkeypatch):
-    """A report that did not land must not be retired by the state commit.
+# ---------------------------------------- per-tile treasury QA issues (#70)
+def _treasury_arrivals(obsnum="088", tile="GC_88", n_rows=1,
+                       instrument_name="NIRCAM/IMAGE", filters="F212N;F480M"):
+    """MAST rows for ONE delivered treasury tile.  10678 has ~1668 planned
+    exposure-level rows, so a delivery can diff into several events for the
+    same observation: they must cost ONE issue, not one per row."""
+    return [dict(event="NEWLY_RELEASED", program=10678, obsnum=obsnum,
+                 obs_id=f"jw10678-o{obsnum}_t001_nircam_clear-f212n_{i}",
+                 field=mm.TREASURY_FIELD, tile=tile, calib_level=3,
+                 released=True, t_obs_release=59900.0,
+                 instrument_name=instrument_name, filters=filters,
+                 target_name=tile)
+            for i in range(n_rows)]
 
-    `act_report` runs BEFORE `save_state`, and its return value used to be
-    discarded.  So a single api.github.com failure during a delivery window
-    posted nothing, committed the post-poll records anyway, and the arrival
-    never re-fired -- the notification was retired permanently by a report
-    nobody received.
 
-    The events now ride back out with their post's rc, and the caller re-arms
-    them through `_revert_deferred`, the same path a deferred download takes.
-    """
+def test_treasury_observation_title_is_the_standard_per_obs_title():
+    """The lazily-created issue uses the repository's standard title, the one
+    make_issues would have produced had 10678 been curated -- display name
+    from FIELDS, no tile suffix (the tile rides in the body)."""
     from data_qa import status_report
-    rcs = iter([0, 5])           # first issue posts, second fails
-    monkeypatch.setattr(status_report, "post_status",
-                        lambda title, body, **kw: next(rcs))
-    # regular fields, so each observation gets its own issue and its own rc;
-    # the treasury events collapse into ONE rolling issue and cannot show a
-    # partial failure
-    evs = (_planned_events(obsnum="101", program=2221, field="brick",
-                           tile="BRICK")
-           + _planned_events(obsnum="102", program=2221, field="cloudc",
-                             tile="CLOUDC"))
-    failed = mm.act_report(evs, execute=True)
-    assert [e["obsnum"] for e in failed] == ["102"], failed
+    o = mm.treasury_observation(10678, "088", "NIRCam", _treasury_arrivals())
+    assert o.issue_title == "GC Treasury — jw10678-o088 (NIRCam)"
+    assert o.issue_title == status_report.issue_title_for(
+        10678, "088", field=mm.TREASURY_FIELD, instrument="NIRCam")
+    assert o.filters == ["F212N", "F480M"]
+    assert "GC_88" in o.notes                    # tile identity kept
+    miri = mm.treasury_observation(10678, "088", "MIRI",
+                                   _treasury_arrivals(instrument_name="MIRI/IMAGE",
+                                                      filters="F770W"))
+    assert miri.issue_title == "GC Treasury — jw10678-o088 (MIRI)"
 
 
-def test_a_report_that_lands_returns_nothing_to_re_arm(monkeypatch):
-    """The other half: a clean run retires its groups as it always did."""
+def _refresh_title_regex():
+    """The work-list regex, read out of scripts/refresh_all_issues.sh itself so
+    a change to the script (not just to a copy of it here) is caught."""
+    import ast
+    import pathlib
+    import re
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "scripts" / "refresh_all_issues.sh").read_text()
+    m = re.search(r"pat = re\.compile\((r\"[^\"]*\")", src)
+    assert m, "could not find the work-list regex in refresh_all_issues.sh"
+    return re.compile(ast.literal_eval(m.group(1)), re.I)
+
+
+def test_treasury_tile_title_is_picked_up_by_the_refresh_work_list():
+    """The point of the per-tile issue: refresh_all_issues.sh builds its work
+    list from open-issue TITLES, so the title must parse to (program, obs,
+    instrument) AND its display name must reverse-map to the field key (that
+    map drives the non-GC skip list and the --target passed to diagnostics).
+    The rolling issue's title carries no obsid and is dropped as a meta issue,
+    which is why it cannot serve as the work list."""
+    pat = _refresh_title_regex()
+    o = mm.treasury_observation(10678, "088", "NIRCam", _treasury_arrivals())
+    m = pat.match(o.issue_title)
+    assert m, o.issue_title
+    disp, prog, obs, inst = m.groups()
+    assert (int(prog), obs, inst) == (10678, "088", "NIRCam")
+    rev = {d.lower(): f for f, d in FIELDS.items()}
+    assert rev[disp.lower()] == mm.TREASURY_FIELD
+    assert pat.match(mm.TREASURY_ISSUE_TITLE) is None
+
+
+def test_act_report_treasury_arrival_opens_one_issue_per_observation(monkeypatch):
+    """An arrival opens the tile's own QA issue -- one per (obs, instrument),
+    regardless of how many MAST rows the delivery diffed into -- alongside the
+    unchanged rolling digest, sharing the run's single issue cache."""
+    posted = _patch_post_status(monkeypatch)
+    evs = (_treasury_arrivals("088", "GC_88", n_rows=6)
+           + _treasury_arrivals("089", "GC_89", n_rows=4))
+    mm.act_report(evs, execute=False)
+    titles = [t for t, _, _ in posted]
+    assert titles == [mm.TREASURY_ISSUE_TITLE,
+                      "GC Treasury — jw10678-o088 (NIRCam)",
+                      "GC Treasury — jw10678-o089 (NIRCam)"]
+    tile = [(t, b, kw) for t, b, kw in posted if "o088" in t][0]
+    assert tile[2]["create_labels"] == ["QA", "NIRCam", "program:10678",
+                                        "target:GC Treasury"]
+    assert "QA checklist" in tile[2]["create_body"]      # the standard template
+    assert tile[2]["update_last"] is False               # arrival: notifies
+    assert len({id(kw["issue_cache"]) for _, _, kw in posted}) == 1
+
+
+def test_act_report_treasury_planned_tiles_open_no_issue(monkeypatch):
+    """The anti-spam gate: planned/unreleased rows (all 1668 of 10678 today)
+    report on the rolling issue and create NOTHING."""
+    posted = _patch_post_status(monkeypatch)
+    evs = []
+    for n in (101, 102, 103):
+        evs += _planned_events(obsnum=str(n), tile=f"GC_{n}")
+    mm.act_report(evs, execute=False)
+    assert [t for t, _, _ in posted] == [mm.TREASURY_ISSUE_TITLE]
+
+
+def test_act_report_treasury_calib_up_above_threshold_opens_no_issue(monkeypatch):
+    """A routine reprocessing bump (calib 2 -> 3) is not an arrival, so it
+    comments without opening a second-generation issue."""
+    posted = _patch_post_status(monkeypatch)
+    evs = [dict(_treasury_arrivals()[0], event="CALIB_LEVEL_UP",
+                previous_calib_level=2)]
+    mm.act_report(evs, execute=False)
+    assert [t for t, _, _ in posted] == [mm.TREASURY_ISSUE_TITLE]
+
+
+def _fake_github(monkeypatch):
+    """A GitHub double: issues live in a dict, so a second act_report run sees
+    the issue the first one created (the re-poll case)."""
+    from data_qa import _github
+    st = {"issues": {}, "created": [], "comments": [], "listings": 0}
+
+    def existing(token, repo):
+        st["listings"] += 1
+        return dict(st["issues"])              # a snapshot, as the real one is
+
+    def create(token, repo, title, body, labels=()):
+        st["created"].append((title, body, list(labels)))
+        num = 100 + len(st["created"])
+        st["issues"][title] = {"number": num, "body": body}
+        return 201, {"number": num}
+
+    monkeypatch.setattr(_github, "get_token", lambda: "tok")
+    monkeypatch.setattr(_github, "existing_issues", existing)
+    monkeypatch.setattr(_github, "ensure_labels", lambda t, r, names: None)
+    monkeypatch.setattr(_github, "create_issue", create)
+    monkeypatch.setattr(_github, "list_comments", lambda t, r, n: [])
+    monkeypatch.setattr(_github, "post_comment",
+                        lambda t, r, n, body:
+                        st["comments"].append((n, body)) or (201, {}))
+    return st
+
+
+def test_treasury_per_tile_issue_creation_is_idempotent(monkeypatch):
+    """Re-polling a tile that already has an issue (an uncommitted run re-fires
+    its events every poll) COMMENTS on the existing issue: no duplicate issue,
+    and one existing_issues() listing per run however many tiles arrived."""
+    st = _fake_github(monkeypatch)
+    evs = (_treasury_arrivals("088", "GC_88", n_rows=3)
+           + _treasury_arrivals("089", "GC_89"))
+    mm.act_report(evs, execute=True)
+    assert [t for t, _, _ in st["created"]] == [
+        mm.TREASURY_ISSUE_TITLE,
+        "GC Treasury — jw10678-o088 (NIRCam)",
+        "GC Treasury — jw10678-o089 (NIRCam)"]
+    assert st["listings"] == 1                   # one listing for 2 tiles
+    mm.act_report(evs, execute=True)             # same delivery, re-polled
+    assert len(st["created"]) == 3               # nothing new opened
+    assert st["listings"] == 2                   # one more listing, not one/tile
+    assert len(st["comments"]) == 6              # 3 issues x 2 runs
+
+
+def test_treasury_issue_body_falls_back_when_the_template_cannot_import(monkeypatch,
+                                                                        capsys):
+    """render_body pulls astrometry_audit (numpy/astropy) in for its thresholds.
+    A --report run in an env without them must still OPEN the issue -- a seed
+    body a later make_issues sync overwrites -- rather than lose the delivery."""
+    from data_qa import make_issues
+
+    def _boom(o):
+        raise ImportError("No module named 'numpy'")
+
+    monkeypatch.setattr(make_issues, "render_body", _boom)
+    o = mm.treasury_observation(10678, "088", "NIRCam", _treasury_arrivals())
+    body = mm.treasury_issue_body(o)
+    assert body.startswith(make_issues.AUTOGEN_MARKER)   # make_issues still owns it
+    assert "jw10678-o088" in body and "GC_88" in body
+    assert "QA template unavailable" in capsys.readouterr().err
+
+
+# ----------------------------- a tile issue that could not be opened (#147 B3)
+def test_act_report_hands_back_the_arrivals_whose_tile_issue_failed(monkeypatch,
+                                                                    capsys):
+    """post_status rc != 0 on the per-tile issue means the issue was NOT opened
+    (rate limit, 5xx, revoked token).  Nothing else in the system ever opens one
+    -- registry() returns [] for 10678 and the per-program seed only fires for an
+    unseeded program -- so act_report hands those events back instead of letting
+    the caller commit the arrival as reported."""
     from data_qa import status_report
+    seen = []
+
+    def _post(title, body, **kw):
+        seen.append(title)
+        return 4 if "o088" in title else 0        # the o088 tile issue fails
+
+    monkeypatch.setattr(status_report, "post_status", _post)
+    failed = _treasury_arrivals("088", "GC_88", n_rows=3)
+    ok = _treasury_arrivals("089", "GC_89")
+    unposted = mm.act_report(failed + ok, execute=True)
+    assert [ev["obs_id"] for ev in unposted] == [ev["obs_id"] for ev in failed]
+    assert "FAILED" in capsys.readouterr().err
+    # the rolling issue and the o089 tile went out, so they are NOT re-armed
+    assert seen == [mm.TREASURY_ISSUE_TITLE,
+                    "GC Treasury — jw10678-o088 (NIRCam)",
+                    "GC Treasury — jw10678-o089 (NIRCam)"]
+
+
+def test_act_report_returns_nothing_to_re_arm_when_every_post_lands(monkeypatch):
+    _patch_post_status(monkeypatch)
+    assert mm.act_report(_treasury_arrivals("088", "GC_88", n_rows=2),
+                         execute=True) == []
+
+
+def _treasury_released_row(obsnum="088", tile="GC_88"):
+    return _row(f"jw10678-o{obsnum}_t001_nircam_clear-f212n",
+                filters="F212N;F480M", target=tile)
+
+
+def test_main_report_failure_keeps_the_arrival_uncommitted(monkeypatch, tmp_path):
+    """End to end: save_state runs unconditionally, so a tile issue that could
+    not be created has to leave the arrival OUT of the committed baseline -- it
+    re-fires next poll and the creation is retried.  Committing it would retire
+    the delivery for good."""
+    from data_qa import status_report
+    rc_holder = {"rc": 4}
     monkeypatch.setattr(status_report, "post_status",
-                        lambda title, body, **kw: 0)
-    assert mm.act_report(_planned_events(), execute=True) == []
+                        lambda title, body, **kw:
+                        rc_holder["rc"] if "o088" in title else 0)
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program",
+                        lambda prog: [_treasury_released_row()])
+    state = tmp_path / "state.json"
+    _seed_state(state, program=10678, obs_id="jw10678-o001_x")
+    obs_id = "jw10678-o088_t001_nircam_clear-f212n"
+
+    assert mm.main(["--program", "10678", "--commit-state", "--report",
+                    "--execute", "--state", str(state)]) == 0
+    committed = mm.load_state(str(state))
+    assert obs_id not in committed["programs"]["10678"]["obs"]
+
+    rc_holder["rc"] = 0                          # next poll: GitHub is back
+    assert mm.main(["--program", "10678", "--commit-state", "--report",
+                    "--execute", "--state", str(state)]) == 0
+    assert obs_id in mm.load_state(str(state))["programs"]["10678"]["obs"]
 
 
-def test_the_re_armed_events_restore_their_pre_poll_baseline():
-    """`_revert_deferred` is what makes the re-arm real: a record absent from
-    the baseline is popped (re-fires as NEW_OBSERVATION), a changed one is put
-    back.  Asserted here on the report path's own events so the two halves are
-    pinned together rather than only in the download path's tests."""
-    (ev,) = _planned_events(obsnum="101")
-    state = {"programs": {"10678": {"obs": {ev["obs_id"]: {"calib_level": 3}}}}}
-    mm._revert_deferred(state, {"10678": {}}, [ev])
-    assert state["programs"]["10678"]["obs"] == {}
+# ------------------------- refresh_all_issues.sh work list + rc (#161, #162, #163)
+_UNSET = object()
+
+
+def _refresh_script_text():
+    import pathlib
+    return (pathlib.Path(__file__).resolve().parents[1]
+            / "scripts" / "refresh_all_issues.sh").read_text()
+
+
+def _run_refresh_work_list(titles, created=None, **env):
+    """Run the work-list builder EMBEDDED IN THE SCRIPT (extracted from the
+    script text, so an edit to the script is what is under test) over a list of
+    issue titles, and return its stdout rows.  The script feeds it the API's
+    "<title>\t<created_at>" rows; ``created`` supplies the timestamps."""
+    import os
+    import pathlib
+    import re
+    import subprocess
+    src = _refresh_script_text()
+    # a shell single-quoted block cannot contain a "'", so this is unambiguous
+    m = re.search(r"python3 -c '([^']*)'", src)
+    assert m, "could not find the work-list python block in refresh_all_issues.sh"
+    root = pathlib.Path(__file__).resolve().parents[1]
+    e = dict(os.environ, PYTHONPATH=str(root),
+             QA_EXCLUDE_FIELDS="w51 wd1 wd2 ngc6334",
+             QA_EXCLUDE_RE="westerlund|ngc ?6334|globular|w51")
+    e.update({k: str(v) for k, v in env.items()})
+    created = created or [""] * len(titles)
+    stdin = "\n".join(f"{t}\t{c}" for t, c in zip(titles, created))
+    p = subprocess.run([sys.executable, "-c", m.group(1)], input=stdin,
+                       capture_output=True, text=True, env=e)
+    assert p.returncode == 0, p.stderr
+    return [row.split("\t") for row in p.stdout.splitlines()]
+
+
+_REFRESH_TITLES = [                              # the API order: NEWEST FIRST
+    "GC Treasury — jw10678-o089 (NIRCam)",
+    "GC Treasury — jw10678-o088 (MIRI)",
+    "GC Treasury — jw10678-o088 (NIRCam)",
+    "Brick — jw02221-o001 (NIRCam)",
+    "Cloud C — jw02221-o002 (MIRI)",
+    "W51 — jw01182-o004 (NIRCam)",               # non-GC: skipped outright
+]
+
+
+def test_refresh_work_list_orders_treasury_tiles_last(monkeypatch):
+    """The walltime guard (#162): the refresh job is already
+    hitting its 2 h wall at 21 issues and the issue API returns NEWEST FIRST,
+    so the tile issues this PR creates would otherwise sort ahead of the
+    established field issues and the truncation would fall on the fields.  The
+    tiles go last, keeping their own order; the established issues keep theirs."""
+    rows = _run_refresh_work_list(_REFRESH_TITLES)
+    assert [(r[0], r[2]) for r in rows] == [
+        ("2221", "NIRCam"), ("2221", "MIRI"),          # established, API order
+        ("10678", "NIRCam"), ("10678", "MIRI"), ("10678", "NIRCam")]
+    assert [r[1] for r in rows if r[0] == "10678"] == ["089", "088", "088"]
+    assert all("W51" not in r[3] for r in rows)        # skip list still applies
+
+
+def test_refresh_work_list_interleaves_when_the_partition_is_off():
+    """QA_TREASURY_LAST=0 restores the plain API order (the escape hatch)."""
+    rows = _run_refresh_work_list(_REFRESH_TITLES, QA_TREASURY_LAST="0")
+    assert [r[0] for r in rows] == ["10678", "10678", "10678", "2221", "2221"]
+
+
+def _run_refresh_rc(program, output, rc=1, age_days=0, created=_UNSET):
+    """Run the script's own classifier block (extracted VERBATIM between the
+    `--- classifiers` sentinels) over one captured diagnostics output, its exit
+    code and the tile issue's created_at, and report the verdict the loop would
+    reach: CLEAN, PENDING, STALE (red, named) or FAILURE (red)."""
+    import datetime
+    import os
+    import re
+    import subprocess
+    src = _refresh_script_text()
+    block = re.search(r"^# --- classifiers.*?^# --- end classifiers$", src, re.S | re.M)
+    assert block, "classifier block not found in refresh_all_issues.sh"
+    prog = re.search(r'^TREASURY_PROGRAM="\$\{QA_TREASURY_PROGRAM:-(\d+)\}"',
+                     src, re.M)
+    days = re.search(r'^TREASURY_PENDING_DAYS="\$\{QA_TREASURY_PENDING_DAYS:-(\d+)\}"',
+                     src, re.M)
+    assert prog and days, "TREASURY_* constants not found in the script"
+    if created is _UNSET:
+        created = (datetime.datetime.now(datetime.timezone.utc)
+                   - datetime.timedelta(days=age_days, hours=1)
+                   ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    script = (f'set -uo pipefail\nTREASURY_PROGRAM="{prog.group(1)}"\n'
+              f'TREASURY_PENDING_DAYS="${{QA_TREASURY_PENDING_DAYS:-{days.group(1)}}}"\n'
+              f'rc_any=0\n{block.group(0)}\n'
+              'classify "$PROG" "$OUT" "$DRC" "$CREATED" "no products on disk yet"\n'
+              'echo "rc_any=$rc_any"\n')
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       env=dict(os.environ, PROG=str(program), OUT=output,
+                                DRC=str(rc), CREATED=created))
+    assert p.returncode == 0, p.stderr
+    out = p.stdout
+    red = "rc_any=1" in out
+    if "PENDING treasury tile" in out:
+        assert not red, out
+        return "PENDING"
+    if "stale treasury tile" in out:
+        assert red, out
+        return "STALE"
+    return "FAILURE" if red else "CLEAN"
+
+
+_NO_OBS = "no obs for program 10678 obs 088 (portal + on-disk both empty)"
+
+
+def test_refresh_pending_treasury_tile_does_not_turn_the_job_red():
+    """A tile's issue opens when MAST releases it; the products land on our disk
+    days-to-weeks later, and diagnostics exits 1 until they do.  That is the
+    expected state of a fresh tile and must not flip rc_any, which is the single
+    pass/fail signal shared with the 20+ curated field issues (#161)."""
+    assert _run_refresh_rc(10678, _NO_OBS) == "PENDING"
+    assert _run_refresh_rc(
+        10678, "no MIRI obs for program 10678 obs 088 (portal + on-disk empty)"
+    ) == "PENDING"
+
+
+def test_refresh_pending_exemption_is_treasury_only_and_failure_only():
+    """The exemption is narrow: a CURATED field with no products on disk is
+    still a failure, and any other failure on a treasury tile still counts."""
+    assert _run_refresh_rc(
+        2221, "no obs for program 2221 obs 001 (portal + on-disk both empty)"
+    ) == "FAILURE"
+    assert _run_refresh_rc(10678, "stage 4: FAILED (traceback)") == "FAILURE"
+    assert _run_refresh_rc(10678, "jw10678-o088: SW=F212N LW=F480M",
+                           rc=0) == "CLEAN"
+
+
+def test_refresh_pending_exemption_never_absorbs_a_co_occurring_failure():
+    """The exemption must not be able to swallow an unrelated failure that
+    happens to share the run with the pending message.  The pending line is
+    stripped and the keyword test re-applied to what is left, so output
+    carrying BOTH the pending message and a real failure is a FAILURE."""
+    for other in ("stage 4: FAILED (traceback)",
+                  "no issue for jw10678-o088",
+                  "stage 7: FAILED"):
+        assert _run_refresh_rc(10678, f"{_NO_OBS}\n{other}") == "FAILURE", other
+        assert _run_refresh_rc(10678, f"{other}\n{_NO_OBS}") == "FAILURE", other
+    # ...and the exit code must be diagnostics' own no-obs 1, not any non-zero
+    assert _run_refresh_rc(10678, _NO_OBS, rc=2) == "FAILURE"
+
+
+def test_refresh_pending_window_is_bounded_and_escalates():
+    """PENDING is a WAIT, not a verdict.  A tile whose issue has been open past
+    QA_TREASURY_PENDING_DAYS with still nothing visible turns the job red and is
+    named as stale -- that is what escalates a stalled delivery, and a QA glob
+    that cannot reach products that ARE on disk (#163: the monitor's own
+    ops/downloads/mastDownload tree is one level below every MAST glob), instead
+    of letting either sit green for the rest of the campaign."""
+    assert _run_refresh_rc(10678, _NO_OBS, age_days=13) == "PENDING"
+    assert _run_refresh_rc(10678, _NO_OBS, age_days=14) == "STALE"
+    assert _run_refresh_rc(10678, _NO_OBS, age_days=90) == "STALE"
+
+
+def test_refresh_pending_window_fails_closed_on_an_unknown_age():
+    """No created_at (an API shape change, a hand-fed work list) means the wait
+    cannot be bounded, so the tile is a failure rather than a free pass."""
+    assert _run_refresh_rc(10678, _NO_OBS, created="") == "FAILURE"
+    assert _run_refresh_rc(10678, _NO_OBS, created="not-a-date") == "FAILURE"
+
+
+def test_refresh_work_list_carries_the_issue_created_at():
+    """pending_tile bounds the window on the tile issue's own created_at, so the
+    work list has to carry it -- and the enumeration has to ASK for it."""
+    rows = _run_refresh_work_list(
+        ["GC Treasury — jw10678-o088 (NIRCam)", "Brick — jw02221-o001 (NIRCam)"],
+        created=["2026-09-10T04:05:06Z", "2024-01-02T03:04:05Z"])
+    assert [r[-1] for r in rows] == ["2024-01-02T03:04:05Z", "2026-09-10T04:05:06Z"]
+    assert ".created_at" in _refresh_script_text()
+
+
+def test_refresh_script_treasury_program_matches_the_module():
+    """The script's constant is a copy of mast_monitor.TREASURY_PROGRAM; this is
+    what keeps the two from drifting."""
+    import re
+    m = re.search(r'^TREASURY_PROGRAM="\$\{QA_TREASURY_PROGRAM:-(\d+)\}"',
+                  _refresh_script_text(), re.M)
+    assert m and int(m.group(1)) == mm.TREASURY_PROGRAM
 def test_a_gc_program_cannot_be_excused_from_the_monitor():
     """The exclusion set is a footprint claim, not an escape hatch.
 
