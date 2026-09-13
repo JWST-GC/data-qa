@@ -252,6 +252,10 @@ def test_caption_anchors_exist_in_docs():
                 n_overlap=100, n_overlap_hi=50, intermodule_rms_hi=4.0),
         6: dict(red_flag=True, red_flag_reason="x"),
         9: dict(stage=9, n_isolated=19812, aper_corr_med=0.45, aper_psf_scatter=0.07),
+        12: dict(stage=12, sw="F212N", primary_filter="F212N", filters_measured=["F212N"],
+                 per_filter={"F212N": dict(slope=0.006, slope_err=0.004, turnover_mag=None,
+                                           aper_corr=0.42, n=1800, flagged=False)},
+                 slope=0.006, slope_err=0.004, turnover_mag=None, aper_corr=0.42, n_flagged=0),
     }
     for n, m in samples.items():
         cap = D.caption_for(n, m)
@@ -2824,6 +2828,83 @@ def test_clipped_locus_fit_refuses_a_clip_that_strips_its_own_support(monkeypatc
     assert n_locus == n_unclipped == 34                  # nothing was thrown away
 
 
+# ------------------------------------------------------- split per-observation reduction trees
+def _split_field_tree(tmp_path):
+    """A field whose observations were split into per-observation reduction trees, HALF migrated:
+    the frames and the per-obs catalogues moved to ``gc2211_o023``, the mosaic and the pooled
+    five-pointing catalogue stayed under ``gc2211`` (the real gc2211 layout)."""
+    base = tmp_path / "gc2211"
+    (base / "catalogs").mkdir(parents=True)
+    (base / "images-merged").mkdir(parents=True)
+    (base / "offsets").mkdir(parents=True)
+    _touch(base / "catalogs", "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7.fits")
+    _touch(base / "images-merged", "jw02211-o023_t001_nircam_clear-f200w-merged_i2d.fits")
+    _touch(base / "offsets", "Offsets_JWST_gc2211_VIRAC2locked.csv")
+
+    split = tmp_path / "gc2211_o023"
+    (split / "catalogs").mkdir(parents=True)
+    (split / "F200W").mkdir(parents=True)
+    _touch(split / "catalogs",
+           "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7_o023.fits")
+    _touch(split / "catalogs", "gaia_virac2_refcat_epoch2023.71.fits")
+    for det in ("nrca1", "nrcb1"):
+        _touch(split / "F200W", f"f200w_{det}_o023_visit001_exp1_m3_daophot_basic.fits")
+    return base, split
+
+
+def test_split_field_reads_the_per_observation_tree_and_the_base_field(tmp_path, monkeypatch):
+    """A half-migrated field must resolve products from BOTH trees.
+
+    Before this, the field name alone was the path: the five gc2211 observations found the pooled
+    catalogue and zero per-exposure catalogues, and all reported the same stage 2/3/4 numbers
+    (#94, #119).
+    """
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    base, split = _split_field_tree(tmp_path)
+    o = _obs(field="gc2211", obs="023")
+
+    assert D._field_roots(o) == [str(split), str(base)]
+    # the per-exposure catalogues live ONLY in the split tree
+    got = D._daophot_glob(o, "F200W")
+    assert len(got) == 2 and all(str(split) in g for g in got)
+    # the mosaic lives ONLY in the base field
+    assert D._mosaic_path(o, "F200W") == str(base / "images-merged" /
+                                             "jw02211-o023_t001_nircam_clear-f200w-merged_i2d.fits")
+    # this observation's own catalogue wins over the pooled multi-pointing one
+    cands = [os.path.basename(p) for p, _k, _t, _m in D._catalog_candidates(o)]
+    assert "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7_o023.fits" in cands
+    # the POOLED five-pointing catalogue is out: it is not this observation's
+    assert "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7.fits" not in cands
+    # the split tree's untokened refcat is this obs's by location
+    assert D._refcat_path(o) == str(split / "catalogs" / "gaia_virac2_refcat_epoch2023.71.fits")
+
+
+def test_split_field_peppar_cal_resolves_into_the_sibling_tree(tmp_path, monkeypatch):
+    """peppar catalogues stay in the base field while their cal frames move; stage 11 and the
+    peppar half of stage 6 go blank unless the sibling split tree is searched."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    base, split = _split_field_tree(tmp_path)
+    pdir = base / "peppar" / "F200W" / "NRCA1"
+    pdir.mkdir(parents=True)
+    cat = pdir / "jw02211023001_02101_00001_nrca1_cal_gc2211_iter1_cat.fits"
+    _touch(pdir, cat.name)
+    (split / "F200W" / "pipeline").mkdir(parents=True)
+    _touch(split / "F200W" / "pipeline", "jw02211023001_02101_00001_nrca1_cal.fits")
+
+    assert D._peppar_cal_for_cat(str(cat)) == str(
+        split / "F200W" / "pipeline" / "jw02211023001_02101_00001_nrca1_cal.fits")
+
+
+def test_field_without_a_split_tree_is_unchanged(tmp_path, monkeypatch):
+    """One root, the old behaviour: no field without a ``<field>_o<obs>`` directory moves."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "brick" / "F212N"; d.mkdir(parents=True)
+    _touch(d, "f212n_nrca1_visit001_exp1_m3_daophot_basic.fits")
+    o = _obs(field="brick", obs="001", filt="F212N")
+    assert D._field_roots(o) == [str(tmp_path / "brick")]
+    assert len(D._daophot_glob(o, "F212N")) == 1
+
+
 # --------------------------------------------------------------------------- _ab_overlap
 def _ab_module_catalogs(true_dra_mas, true_ddec_mas, n=800, seed=95):
     """Two module catalogues of the SAME stars, A displaced from B by a known offset.
@@ -2897,3 +2978,203 @@ def test_ab_overlap_keeps_the_raw_peak_when_too_few_pairs_to_refine(monkeypatch)
     assert ov is not None
     assert ov["bulk_source"] == "histogram"
     assert ov["off"] == ov["peak_off"]
+
+
+# --------------------------------------------------------------------------- STAGE 12 linearity
+def test_linearity_fit_flat_is_zero_slope():
+    # a constant aperture-minus-PSF offset across brightness = a linear response: ~zero slope, no
+    # bright turn-over, baseline at the constant offset.
+    rng = np.random.default_rng(0)
+    m = np.repeat(np.arange(15.0, 21.0, 0.5), 20)
+    dmag = 0.40 + rng.normal(0, 0.002, size=m.size)
+    fit = D._linearity_fit(m, dmag)
+    assert fit is not None
+    assert abs(fit["slope"]) < 0.01
+    assert fit["turnover"] is None
+    assert abs(fit["baseline"] - 0.40) < 0.02
+
+
+def test_linearity_fit_detects_bright_turnover():
+    # flat at the faint end, departing at the bright end (a saturation roll-over): the turn-over is
+    # detected on the bright side and the linear-range slope stays small.
+    rng = np.random.default_rng(1)
+    centres = np.arange(15.0, 21.0, 0.5)
+    parts_m, parts_d = [], []
+    for c in centres:
+        base = 0.40 if c >= 17.0 else 0.40 + (17.0 - c) * 0.15   # rises going bright
+        parts_m.append(np.full(20, c))
+        parts_d.append(base + rng.normal(0, 0.002, size=20))
+    m = np.concatenate(parts_m); dmag = np.concatenate(parts_d)
+    fit = D._linearity_fit(m, dmag)
+    assert fit is not None
+    assert fit["turnover"] is not None
+    assert 16.0 < fit["turnover"] < 17.5          # departure begins around m ~ 16.8
+    assert abs(fit["slope"]) < 0.02               # faint (linear) range is flat
+
+
+def test_linearity_fit_recovers_injected_slope_and_trips_flag():
+    # A KNOWN linear trend must be recovered (would fail if the slope were hardcoded to 0), and a
+    # slope beyond _LIN_SLOPE_FLAG must set the flag path -- the flag's only exercise.
+    rng = np.random.default_rng(2)
+    m = np.repeat(np.arange(15.0, 21.0, 0.5), 30)
+    for s, expect_flag in [(0.005, False), (0.050, True)]:
+        dmag = 0.40 + s * (m - 18.0) + rng.normal(0, 0.002, size=m.size)
+        fit = D._linearity_fit(m, dmag)
+        assert fit is not None and fit["slope"] is not None
+        assert abs(fit["slope"] - s) < 5 * fit["slope_err"]        # trend recovered
+        assert abs(fit["slope"] - s) < 0.01                        # and quantitatively close
+        assert (abs(fit["slope"]) > D._LIN_SLOPE_FLAG) is expect_flag
+
+
+def test_linearity_fit_no_turnover_on_pure_trend():
+    # A pure global slope with NO saturation feature must NOT report a turn-over: the turn-over is
+    # measured against the fitted trend, so a constant slope alone does not trip it.
+    rng = np.random.default_rng(3)
+    m = np.repeat(np.arange(15.0, 21.0, 0.5), 30)
+    dmag = 0.40 + 0.05 * (m - 18.0) + rng.normal(0, 0.002, size=m.size)
+    fit = D._linearity_fit(m, dmag)
+    assert fit is not None
+    assert fit["turnover"] is None
+    assert abs(fit["slope"] - 0.05) < 0.01        # the slope still measures the real trend
+
+
+def _synth_mosaic(tmp_path, name="m.fits", nstars=100):
+    """A WCS mosaic with a grid of well-separated Gaussians spanning a range of fluxes; returns
+    (path, SkyCoord positions, flux array)."""
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
+    ny = nx = 520
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    g = np.linspace(40, nx - 40, 10)
+    XX, YY = np.meshgrid(g, g)
+    xs = XX.ravel(); ys = YY.ravel()
+    flux = np.geomspace(3e3, 3e5, len(xs)); sig = 1.5
+    img = np.zeros((ny, nx), "float32")
+    for xi, yi, f in zip(xs, ys, flux):
+        img += (f / (2 * np.pi * sig ** 2)) * np.exp(-((xx - xi) ** 2 + (yy - yi) ** 2) / (2 * sig ** 2))
+    w = WCS(naxis=2)
+    w.wcs.crpix = [nx / 2, ny / 2]; w.wcs.cdelt = [-1 / 3600.0, 1 / 3600.0]
+    w.wcs.crval = [266.4, -28.7]; w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    mp = str(tmp_path / name)
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.ImageHDU(img, header=w.to_header(), name="SCI")]).writeto(mp)
+    sc = w.pixel_to_world(xs, ys); sc = SkyCoord(sc.ra, sc.dec)
+    return mp, sc, flux
+
+
+def test_stage12_end_to_end_synthetic(tmp_path, monkeypatch):
+    pytest.importorskip("photutils"); pytest.importorskip("scipy")
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path))
+    mp, sc, flux = _synth_mosaic(tmp_path)
+    monkeypatch.setattr(D, "_psf_flux_positions", lambda o, f: (sc, flux.copy(), "synth.fits"))
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: mp)
+    o = Observation(program="1182", obs="004", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N", "F444W"], visits=[], epoch="", notes="")
+    png, m = D.stage12_photometric_linearity(o, "F212N", "F444W")
+    assert not m.get("red_flag")
+    assert m["primary_filter"] == "F212N"
+    assert set(m["filters_measured"]) == {"F212N", "F444W"}
+    # a constant Gaussian shape at every brightness -> the aperture misses the same fraction ->
+    # flat aper-minus-PSF -> ~zero linearity slope
+    assert abs(m["per_filter"]["F212N"]["slope"]) < 0.03
+    # one plot shown by default (primary) + the rest hidden in extra_figures
+    assert [f for f, _ in m["extra_figures"]] == ["F444W"]
+    assert os.path.exists(png)
+    for _f, p in m["extra_figures"]:
+        assert os.path.exists(p)
+
+
+def test_caption_stage12_table_and_primary():
+    m = dict(stage=12, sw="F212N", primary_filter="F212N",
+             filters_measured=["F212N", "F405N"],
+             per_filter={
+                 "F212N": dict(slope=0.006, slope_err=0.004, turnover_mag=15.5,
+                               aper_corr=0.42, n=1800, flagged=False),
+                 "F405N": dict(slope=0.031, slope_err=0.005, turnover_mag=14.0,
+                               aper_corr=0.55, n=900, flagged=True),
+             },
+             slope=0.006, slope_err=0.004, turnover_mag=15.5, aper_corr=0.42, n_isolated=1800,
+             n_flagged=1)
+    cap = D.caption_for(12, m)
+    assert "DOCROOT" not in cap and "qa_methods.md#stage12" in cap
+    assert "photometric linearity" in cap
+    assert "| filter |" in cap                       # per-filter table present
+    assert "F405N" in cap and "🚩" in cap            # flagged filter marked
+    assert "+0.006" in cap                           # primary slope reported
+    assert "expandable block" in cap                 # says the rest are hidden
+
+
+def test_details_block_embeds_extra(monkeypatch):
+    from data_qa import post_diagnostics as P
+    monkeypatch.setattr(P, "upload_asset",
+                        lambda repo, token, path, name: f"https://cdn/{name}")
+    o = Observation(program="1182", obs="004", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    block = P._details_block("JWST-GC/data-qa", "tok", o, 12,
+                             [("F405N", "/tmp/a.png"), ("F444W", "/tmp/b.png")])
+    assert "<details>" in block and "</details>" in block
+    assert "Other 2 filter(s): F405N, F444W" in block
+    assert "**F405N**" in block and "**F444W**" in block
+    assert f"{o.obsid}_stage12_F405N.png" in block
+
+
+# --------------------------------------------------------------------------- pagination robustness
+def _fake_req(script):
+    """Return a stand-in for post_diagnostics._req that yields (200, data, {'Link': link}) for each
+    scripted (data, link) in order, so pagination can be exercised without the network."""
+    calls = {"n": 0}
+
+    def fake(method, url, token, data=None, headers=None, raw=False, want_headers=False):
+        d, link = script[min(calls["n"], len(script) - 1)]
+        calls["n"] += 1
+        return (200, d, {"Link": link}) if want_headers else (200, d)
+    return fake, calls
+
+
+def test_paged_get_follows_next_cursor(monkeypatch):
+    from data_qa import post_diagnostics as P
+    page1 = [{"number": i} for i in range(100)]
+    page2 = [{"number": 100 + i} for i in range(30)]
+    nxt = '<https://api.github.com/x?page=2&after=cur>; rel="next"'
+    fake, _ = _fake_req([(page1, nxt), (page2, "")])
+    monkeypatch.setattr(P, "_req", fake)
+    monkeypatch.setattr(P.time, "sleep", lambda *a: None)
+    out = P._paged_get("https://api.github.com/x?page={page}", "tok", "test")
+    assert len(out) == 130                         # both pages, cursor followed to the end
+
+
+def test_paged_get_retries_spurious_empty_next_page(monkeypatch):
+    # page 1 advertises a next page; that next page comes back EMPTY once (spurious) then real.
+    from data_qa import post_diagnostics as P
+    page1 = [{"number": i} for i in range(100)]
+    page2 = [{"number": 100 + i} for i in range(20)]
+    nxt = '<https://api.github.com/x?page=2&after=cur>; rel="next"'
+    fake, _ = _fake_req([(page1, nxt), ([], nxt), (page2, "")])   # empty page2 then real page2
+    monkeypatch.setattr(P, "_req", fake)
+    monkeypatch.setattr(P.time, "sleep", lambda *a: None)
+    out = P._paged_get("https://api.github.com/x?page={page}", "tok", "test")
+    assert len(out) == 120                         # the spurious empty did not truncate the listing
+
+
+def test_issue_number_unions_truncated_scans(monkeypatch):
+    # first scan is TRUNCATED (a short page 1, no next, missing the target); a later scan sees it.
+    from data_qa import post_diagnostics as P
+    target = {"number": 1, "state": "open", "title": "Brick — jw02221-o001 (NIRCam)"}
+    truncated = [{"number": 9, "state": "open", "title": "something else"}]
+    full = truncated + [target]
+    seq = {"n": 0}
+
+    def fake_paged(url, token, what):
+        seq["n"] += 1
+        return truncated if seq["n"] == 1 else full
+    monkeypatch.setattr(P, "_paged_get", fake_paged)
+    n = P._issue_number("JWST-GC/data-qa", "tok", "Brick — jw02221-o001 (NIRCam)")
+    assert n == 1                                   # union across attempts recovered it
+
+
+def test_issue_number_absent_title_returns_none(monkeypatch):
+    from data_qa import post_diagnostics as P
+    monkeypatch.setattr(P, "_paged_get",
+                        lambda url, token, what: [{"number": 9, "state": "open", "title": "x"}])
+    assert P._issue_number("JWST-GC/data-qa", "tok", "NOPE") is None

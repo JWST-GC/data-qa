@@ -187,6 +187,53 @@ def _available_filters(o: Observation):
 
 
 # --------------------------------------------------------------------------- product lookup
+def _field_roots(o: Observation):
+    """Every on-disk root that can hold THIS observation's products, most specific first.
+
+    A QA field is normally one directory, ``<BASE>/<field>/``.  When a field's observations are
+    split into per-observation REDUCTION trees the split is partial on disk, and an observation's
+    products then live in BOTH: gc2211 (keflavich/jwst-gc-pipeline#469, five pointings 8-13' apart
+    at five epochs) has its frames and per-observation catalogues under ``gc2211_o023`` ...
+    ``gc2211_o050`` while the mosaics, the peppar catalogues and the offsets tables stayed under
+    ``gc2211``.  Resolving only the base field finds the mosaics and misses the frames; resolving
+    only the split tree does the reverse (JWST-GC/data-qa#119).
+
+    So search both, split tree first.  A field with no split tree gets exactly the old behaviour --
+    one root, the same glob -- so this is inert everywhere else."""
+    roots = []
+    split = f"{BASE}/{o.field}_o{o.obs}"
+    if os.path.isdir(split):
+        roots.append(split)
+    roots.append(f"{BASE}/{o.field}")
+    # The registry may name EITHER end of the split: `gc2211` (the base, where the
+    # mosaics and offsets stayed) or `gc2211_o023` (the split tree, where the frames
+    # went).  Resolving only forwards finds the frames from a base-named field and
+    # misses the mosaics from a split-named one, which is the same half-answer this
+    # helper exists to stop -- so the base field is a root too whenever the field is
+    # itself a split name.
+    base = f"{BASE}/{_base_field(o.field)}"
+    if base not in roots:
+        roots.append(base)
+    return roots
+
+
+def _field_dirs(o: Observation, *rels):
+    """``rels`` expanded against every field root, PATTERN-major: each relative directory is tried
+    under the split tree and then the base field before moving to the next one, so a caller's
+    existing directory PRIORITY (e.g. ``<filt>/pipeline`` before ``images-merged``) is preserved."""
+    return [f"{root}/{rel}" for rel in rels for root in _field_roots(o)]
+
+
+def _fglob(o: Observation, relpat, **kw):
+    """``glob`` one relative pattern under every field root, split tree first, deduped."""
+    out, seen = [], set()
+    for root in _field_roots(o):
+        for hit in sorted(glob.glob(f"{root}/{relpat}", **kw)):
+            if hit not in seen:
+                seen.add(hit); out.append(hit)
+    return out
+
+
 def _mosaic_path(o: Observation, filt):
     """Released science mosaic for this obs+filter, or None.  Prefers the all-detector 'merged'
     drizzle.  A genuinely single-module observation (e.g. sickle jw03958-o007, NRCB-only) names its
@@ -200,11 +247,9 @@ def _mosaic_path(o: Observation, filt):
     case return None so the deliverable reads incomplete (#13 review)."""
     if not filt:                     # obs with no filter for this channel (e.g. a single-band obs)
         return None
-    dir_pats = [
-        f"{BASE}/{o.field}/{filt}/pipeline",
-        f"{BASE}/{o.field}/*/pipeline",
-        f"{BASE}/{o.field}/images-merged",   # not-yet-released fields (e.g. gc2211) land mosaics here
-    ]
+    # not-yet-released fields (e.g. gc2211) land mosaics in images-merged; a split field
+    # (<field>_o<obs>) keeps its frames in its own tree and its mosaics in the base one.
+    dir_pats = _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")
 
     def find(tag):
         stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits"
@@ -291,9 +336,16 @@ def _catalog_candidates(o: Observation):
       * always drop ``_YYYYMMDD`` dated snapshots when a non-dated catalog remains (a later
         dedup pass makes the live catalog SMALLER, so size-based tie-breaks would otherwise
         prefer a stale pre-dedup snapshot -- a provenance violation).
+    A catalogue sitting in this observation's SPLIT tree (``<field>_o<obs>/catalogs/``) is this
+    observation's by location, whether or not its filename carries the token, so it counts as
+    tokened here.  That matters: gc2211's per-observation merged catalogues moved into the split
+    trees and the pooled five-pointing catalogue stayed behind, so without this every one of the
+    five observations reads the pooled catalogue and they all report the same stage 2/3/4 numbers
+    (JWST-GC/data-qa#94, #119).
+
     Skips residual/model/region sidecars."""
     cand = []
-    for p in sorted(glob.glob(f"{BASE}/{o.field}/catalogs/*.fits")):
+    for p in _fglob(o, "catalogs/*.fits"):
         low = os.path.basename(p).lower()
         if any(s in low for s in ("_residual", "_model", "_reproject", "region")):
             continue
@@ -302,9 +354,10 @@ def _catalog_candidates(o: Observation):
         except OSError:
             mtime = 0.0
         tier, kind = _catalog_priority(low)
-        cand.append((p, kind, tier, mtime, low))
+        insplit = os.path.dirname(os.path.dirname(p)).endswith(f"_o{o.obs}")
+        cand.append((p, kind, tier, mtime, low, insplit))
     this = [c for c in cand
-            if (m := _OBS_TOK_RE.search(c[4])) and m.group(1) == o.obs]
+            if c[5] or ((m := _OBS_TOK_RE.search(c[4])) and m.group(1) == o.obs)]
     if this:
         cand = this
     else:
@@ -312,7 +365,7 @@ def _catalog_candidates(o: Observation):
     nondated = [c for c in cand if not _DATED_RE.search(c[4])]
     if nondated:
         cand = nondated
-    return [(p, kind, tier, mtime) for (p, kind, tier, mtime, _low) in cand]
+    return [(p, kind, tier, mtime) for (p, kind, tier, mtime, _low, _sp) in cand]
 
 
 def _catalog_for(o: Observation, sw, lw):
@@ -411,8 +464,7 @@ def _mast_source_catalog(o: Observation, filt):
          excluded."""
     fl = filt.lower()
     _bad = ("nrca", "nrcb", "destreak", "segm")
-    for d in (f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/*/pipeline",
-              f"{BASE}/{o.field}/images-merged"):
+    for d in _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged"):
         hits = [p for p in glob.glob(f"{d}/{o.obsid}_t*_nircam_*{fl}*_cat.fits")
                 if not any(t in os.path.basename(p).lower() for t in _bad)]
         if hits:
@@ -495,7 +547,7 @@ def _dao_position_catalog(o: Observation, filt):
     but no merged photometry table and no MAST ``_cat.fits``) still has real positions, so the
     offset the reader cares about stays measurable and the obs need not be red-flagged.  Prefers the
     vetted science catalog at the highest pipeline stage; excludes carta/seed helper files."""
-    pats = [p for p in glob.glob(f"{BASE}/{o.field}/catalogs/{filt.lower()}_*dao_basic*_o{o.obs}_vetted.fits")
+    pats = [p for p in _fglob(o, f"catalogs/{filt.lower()}_*dao_basic*_o{o.obs}_vetted.fits")
             if "carta" not in p and "seed" not in p]
     if not pats:
         return None
@@ -609,15 +661,19 @@ def _refcat_path(o: Observation):
     the rule is epoch-blind and should be revisited if per-epoch refcats proliferate.  Related:
     the untokened gc2211 refcat carries no pmRA/pmDE, so aa.load_reference does no PM propagation
     and _obs_epoch has no effect on the reference here (the ~128 mas offset is flat in dt anyway)."""
-    hits = sorted(glob.glob(f"{BASE}/{o.field}/catalogs/gaia_virac2_refcat_epoch*.fits"))
-    if not hits:
-        return None
-    tok = [h for h in hits if (m := _OBS_TOK_RE.search(os.path.basename(h))) and m.group(1) == o.obs]
-    if tok:
-        return sorted(tok)[-1]
-    unt = [h for h in hits if not _OBS_TOK_RE.search(os.path.basename(h))]
-    if unt:
-        return sorted(unt)[-1]
+    # Roots in order (split tree first): a refcat inside <field>_o<obs>/catalogs/ belongs to THIS
+    # observation by location even when its filename carries no token, so it wins outright.
+    for root in _field_roots(o):
+        hits = sorted(glob.glob(f"{root}/catalogs/gaia_virac2_refcat_epoch*.fits"))
+        if not hits:
+            continue
+        tok = [h for h in hits
+               if (m := _OBS_TOK_RE.search(os.path.basename(h))) and m.group(1) == o.obs]
+        if tok:
+            return sorted(tok)[-1]
+        unt = [h for h in hits if not _OBS_TOK_RE.search(os.path.basename(h))]
+        if unt:
+            return sorted(unt)[-1]
     return None                                  # only other-obs tokened refcats exist -> refuse
 
 
@@ -654,11 +710,8 @@ def _viraccache_path(o: Observation):
     The gaia_virac2 refcat carries only a blended 'refmag', unusable for a Ks zeropoint.  VIRAC Ks
     is a dense, obs-independent reference, so a per-obs split field (gc2211_o023) may fall back to
     its base field's cache (gc2211) -- unlike the position refcat, whose footprint IS obs-specific."""
-    for fld in dict.fromkeys([o.field, _base_field(o.field)]):
-        p = f"{BASE}/{fld}/astrometry_diag/refcache/virac2.fits"
-        if os.path.exists(p):
-            return p
-    return None
+    hits = _fglob(o, "astrometry_diag/refcache/virac2.fits")
+    return hits[0] if hits else None
 
 
 _DAO_OBS_RE = re.compile(r"_o(\d{3})_")     # per-exposure token is underscore-bounded: _o023_visit
@@ -673,13 +726,13 @@ def _daophot_glob(o: Observation, filt, det="*"):
       * if a per-obs generation exists but not for this obs -> return [] (don't fall back to a
         different obs or a stale untokened generation);
       * else use the untokened files (single-obs-per-field layout)."""
-    base = f"{BASE}/{o.field}/{filt}/{filt.lower()}_{det}"
-    tok = sorted(glob.glob(f"{base}_o{o.obs}_visit*_*_m3_daophot_basic.fits"))
+    base = f"{filt}/{filt.lower()}_{det}"
+    tok = _fglob(o, f"{base}_o{o.obs}_visit*_*_m3_daophot_basic.fits")
     if tok:
         return tok
-    if glob.glob(f"{base}_o[0-9][0-9][0-9]_visit*_*_m3_daophot_basic.fits"):
+    if _fglob(o, f"{base}_o[0-9][0-9][0-9]_visit*_*_m3_daophot_basic.fits"):
         return []
-    return [c for c in sorted(glob.glob(f"{base}_visit*_*_m3_daophot_basic.fits"))
+    return [c for c in _fglob(o, f"{base}_visit*_*_m3_daophot_basic.fits")
             if not _DAO_OBS_RE.search(os.path.basename(c))]
 
 
@@ -694,8 +747,8 @@ def _virac_with_errors(o: Observation, epoch):
     Prefer ``virac2_full.fits`` (carries per-star e_pmRA/e_pmDE) over ``virac2.fits`` -- several
     fields' virac2.fits lacks the PM-error columns, and using the real per-star PM errors beats
     a constant floor (which collapses the significance to a fixed unit conversion)."""
-    full = f"{BASE}/{o.field}/astrometry_diag/refcache/virac2_full.fits"
-    p = full if os.path.exists(full) else _viraccache_path(o)
+    full = _fglob(o, "astrometry_diag/refcache/virac2_full.fits")
+    p = full[0] if full else _viraccache_path(o)
     if not p:
         return None
     import astropy.units as u
@@ -1731,7 +1784,8 @@ def _catalog_vs_alignment_age(o: Observation, src):
     if not src or "release:" not in src:
         return None, None, None
     name = src.split("release:", 1)[1].split(" [", 1)[0].strip()
-    cpath = os.path.join(BASE, o.field, "catalogs", name)
+    cp = _fglob(o, f"catalogs/{glob.escape(name)}")
+    cpath = cp[0] if cp else os.path.join(BASE, o.field, "catalogs", name)
     # Compare against the OPERATIVE alignment table only -- not the newest of every CSV in the dir,
     # since an older per-filter/VVV table would otherwise set the bar (PR #101 review).
     #
@@ -1748,9 +1802,9 @@ def _catalog_vs_alignment_age(o: Observation, src):
     # Preference, not union: where a locked table exists it is the operative one and a stale
     # consensus table beside it must not set the bar, which is the PR #101 finding.  The consensus
     # table is consulted only when no locked table exists.
-    offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*VIRAC2locked.csv"))
+    offs = _fglob(o, "offsets/Offsets_*VIRAC2locked.csv")
     if not offs:
-        offs = glob.glob(os.path.join(BASE, o.field, "offsets", "Offsets_*_consensus.csv"))
+        offs = _fglob(o, "offsets/Offsets_*_consensus.csv")
     if not (os.path.exists(cpath) and offs):
         return None, None, None
     cm = os.path.getmtime(cpath)
@@ -1908,7 +1962,7 @@ def stage4_offsets(o: Observation, sw):
     # is already declared unreliable the isolated bulk IS the reported value, so no disagreement.
     if ib is not None:
         mdra, mdde, nclean = ib
-        disagree = 0.0 if cell_map_unreliable else float(np.hypot(cc["off_dra"] - mdra, cc["off_dde"] - mdde))
+        disagree = 0.0 if cell_map_unreliable else float(np.hypot(cc["off_dra"] + mdra, cc["off_dde"] + mdde))
         metrics.update(isolated_bulk_off_mas=float(np.hypot(mdra, mdde)),
                        isolated_bulk_n=nclean, bulk_vs_isolated_disagree_mas=disagree,
                        bulk_low_confidence=bool(not cell_map_unreliable and disagree > _BULK_DISAGREE_MAX))
@@ -2162,7 +2216,7 @@ def _cutout_mosaic(o, filt):
     mosaic 'nrcb', not 'merged')."""
     if not filt:
         return None
-    dirs = [f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"]
+    dirs = _field_dirs(o, f"{filt}/pipeline", "images-merged")
     def pick(tag):
         for d in dirs:
             hits = [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
@@ -2187,7 +2241,7 @@ def _mosaic_covering(o, filt, ra, dec):
         return None, 0
     cands = []
     for tag in ("merged", "nrcb", "nrca"):
-        for d in (f"{BASE}/{o.field}/{filt}/pipeline", f"{BASE}/{o.field}/images-merged"):
+        for d in _field_dirs(o, f"{filt}/pipeline", "images-merged"):
             cands += [p for p in glob.glob(f"{d}/{o.obsid}_t001_nircam_clear-{filt.lower()}-{tag}_i2d.fits")
                       if not any(s in p.lower() for s in ("residual", "model", "resbgsub", "bg_i2d"))]
     seen = set(); cands = [c for c in cands if not (c in seen or seen.add(c))]
@@ -3271,9 +3325,8 @@ def _mast_l3_catalog(o, filt, allow_download=None):
     Prefer a local copy; if absent, download it from MAST when it exists there (guarded).  When
     still None, the caller reconstructs the list by detecting on the i2d.  Returns a path or None."""
     for ext in ("ecsv", "fits"):
-        for d in (f"{BASE}/{o.field}/mastDownload", f"{BASE}/{o.field}/mastDownload/**",
-                  f"{BASE}/{o.field}/MAST_FITS", f"{BASE}/{o.field}/{filt}/pipeline",
-                  f"{BASE}/{o.field}/images-merged"):
+        for d in _field_dirs(o, "mastDownload", "mastDownload/**", "MAST_FITS",
+                             f"{filt}/pipeline", "images-merged"):
             hits = [p for p in glob.glob(f"{d}/{o.obsid}_t*_nircam_*{filt.lower()}*_cat.{ext}",
                                          recursive=True)
                     if not any(s in os.path.basename(p).lower() for s in _MAST_CAT_EXCLUDE)]
@@ -4119,10 +4172,19 @@ _PEPPAR_ROOTS = {"brick": "/blue/adamginsburg/adamginsburg/jwst",
 _PEPPAR_DEFAULT_ROOT = "/orange/adamginsburg/jwst"
 
 
+_PEPPAR_EXP_RE = re.compile(r"^jw\d{5}(\d{3})\d{3}_")     # jw<prog5><obs3><visit3>_...
+
+
 def _peppar_cal_for_cat(catpath):
     """The per-frame cal.fits that a peppar ``*_iter1_cat.fits`` was fit on, or None.  Cat lives at
     ``<field>/peppar/<FILT>/<DET>/<exp>_<det>_cal_<field>_iter1_cat.fits``; the cal sits at
-    ``<field>/<FILT>/pipeline/<exp>_<det>_cal.fits``."""
+    ``<field>/<FILT>/pipeline/<exp>_<det>_cal.fits``.
+
+    On a SPLIT field the peppar catalogues stay under ``<field>/peppar`` while the frames move to
+    ``<field>_o<obs>/<FILT>/pipeline`` (gc2211), so the sibling split tree is searched too -- the
+    observation number is read off the exposure name, which carries it (``jw<prog><obs><visit>``).
+    Without this every gc2211 peppar catalogue resolves to no cal image and stage 11 and the
+    peppar half of stage 6 go blank (JWST-GC/data-qa#119)."""
     base = os.path.basename(catpath)
     m = re.match(r"(.+_cal)_.*_iter1_cat\.fits$", base)          # strip the _<field>_iter1_cat tail
     if not m:
@@ -4131,10 +4193,17 @@ def _peppar_cal_for_cat(catpath):
     filt_dir = os.path.dirname(os.path.dirname(os.path.dirname(catpath)))   # .../peppar
     field_dir = os.path.dirname(filt_dir)
     filt = os.path.basename(os.path.dirname(os.path.dirname(catpath)))      # <FILT>
-    for cand in (f"{field_dir}/{filt}/pipeline/{calname}",
-                 f"{field_dir}/images-merged/{calname}"):
-        if os.path.isfile(cand):
-            return cand
+    roots = [field_dir]
+    mo = _PEPPAR_EXP_RE.match(base)
+    if mo:
+        split = f"{field_dir}_o{mo.group(1)}"
+        if os.path.isdir(split):
+            roots.insert(0, split)
+    for root in roots:
+        for cand in (f"{root}/{filt}/pipeline/{calname}",
+                     f"{root}/images-merged/{calname}"):
+            if os.path.isfile(cand):
+                return cand
     return None
 
 
@@ -4822,6 +4891,245 @@ def stage11_effective_psf(o: Observation, sw, lw):
     return _save(fig, f"{o.obsid}_stage11.png"), metrics
 
 
+# --------------------------------------------------------------------------- STAGE 12
+# Photometric linearity: does measured flux scale with true brightness at a CONSTANT ratio across
+# the dynamic range, or does the ratio drift with brightness (a saturation roll-over at the bright
+# end, a PSF-model / crowding bias, or a brighter-fatter response)?  Measured PER FILTER as the
+# aperture-minus-PSF magnitude (aper − PSF) versus PSF magnitude: on a linear detector this is a
+# FLAT line at the aperture correction; a non-zero slope is a brightness-dependent photometric
+# systematic, and a bright-end departure marks where the photometry stops being linear.  Reuses the
+# stage-9 aperture re-measurement machinery (isolated stars, recentroid, local-annulus background,
+# SNR/recentroid quality gate); stage 9 reports the single aperture correction + its scatter, this
+# stage reports the SLOPE of that offset with brightness and the turn-over magnitude.
+
+# Bright-end departure (mag) of the binned aper−PSF median from the faint-baseline aperture
+# correction that marks the onset of non-linearity (saturation roll-over).
+_LIN_TURNOVER_DMAG = 0.05
+# |slope| (mag per mag, over the linear range) above which the filter is flagged as showing a
+# brightness-dependent photometric trend.  Informational: stage 12 is display-only (does not drive
+# an issue-body checkbox); the flag surfaces the number, it does not gate a release.
+_LIN_SLOPE_FLAG = 0.02
+_LIN_BIN_WIDTH = 0.5                     # magnitude bin width for the binned median
+_LIN_MIN_PER_BIN = 8                     # a bin with fewer stars than this is dropped from the fit
+_LIN_MIN_BINS = 4                        # need at least this many linear-range bins to fit a slope
+
+
+def _measure_psf_aper(o: Observation, filt, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px=12.0, maxn=20000):
+    """Re-measure aperture photometry on the ``filt`` mosaic at the catalog PSF-flux positions and
+    return ``(m_psf, dmag, meta)`` for the clean isolated stars, where ``m_psf`` is the PSF
+    instrumental magnitude and ``dmag = m_aper − m_psf``.  Returns ``(None, None, reason)`` (a short
+    string) when the filter cannot be measured.  This is the stage-9 measurement, factored so
+    stage 12 can run it per filter; the gates match stage 9 (isolation, recentroid < 3 px, aperture
+    SNR > ``_APER_SNR_MIN``, no NaN in the aperture)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry, ApertureStats
+    from scipy.spatial import cKDTree
+    sc, psf_flux, src = _psf_flux_positions(o, filt)
+    mpath = _mosaic_path(o, filt)
+    if sc is None:
+        return None, None, "no jicama catalogue with a PSF flux column"
+    if not mpath:
+        return None, None, "no mosaic on disk"
+    try:
+        with fits.open(_used(mpath, f"{filt} mosaic (linearity aperture photometry)")) as h:
+            sci = h["SCI"] if "SCI" in h else h[1]
+            data = sci.data.astype("float32"); w = WCS(sci.header)
+    except (OSError, ValueError, KeyError):
+        return None, None, "mosaic unreadable"
+    x, y = w.world_to_pixel(sc)
+    ny, nx = data.shape
+    inb = (x > r_out + 1) & (x < nx - r_out - 1) & (y > r_out + 1) & (y < ny - r_out - 1)
+    xy = np.c_[x, y]
+    nn = cKDTree(xy).query(xy, k=2)[0][:, 1]
+    keep = inb & (nn > iso_px)
+    if int(keep.sum()) < 50:
+        return None, None, f"only {int(keep.sum())} isolated in-bounds stars"
+    idx = np.where(keep)[0]
+    if idx.size > maxn:
+        idx = idx[np.argsort(psf_flux[idx])[::-1][:maxn]]
+    xr, yr, moved = _recentroid_com(data, x[idx], y[idx], box=11)
+    pos = np.c_[xr, yr]
+    ap = CircularAperture(pos, r=r_ap)
+    ann = CircularAnnulus(pos, r_in=r_in, r_out=r_out)
+    apstats = ApertureStats(data, ann)
+    bkg = apstats.median
+    bkg_std = np.asarray(apstats.std, float)
+    raw = aperture_photometry(np.nan_to_num(data, nan=0.0), ap)["aperture_sum"]
+    aper_flux = np.asarray(raw, float) - np.asarray(bkg, float) * ap.area
+    nanmask = (~np.isfinite(data)).astype("float32")
+    nan_in_ap = np.asarray(aperture_photometry(nanmask, ap)["aperture_sum"], float) > 0.5
+    pf = psf_flux[idx]
+    aper_noise = bkg_std * np.sqrt(float(ap.area))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        snr = aper_flux / aper_noise
+    good = (np.isfinite(aper_flux) & (aper_flux > 0) & np.isfinite(pf) & (pf > 0) & (~nan_in_ap)
+            & np.isfinite(snr) & (snr > _APER_SNR_MIN) & (moved < 3.0))
+    if int(good.sum()) < 50:
+        return None, None, f"only {int(good.sum())} clean stars after quality gate"
+    m_psf = -2.5 * np.log10(pf[good]); m_aper = -2.5 * np.log10(aper_flux[good])
+    dmag = m_aper - m_psf
+    return m_psf, dmag, dict(src=src, n=int(good.sum()), r_ap=r_ap, iso_px=iso_px)
+
+
+def _linearity_fit(m_psf, dmag, turnover_dmag=_LIN_TURNOVER_DMAG):
+    """Bin ``dmag`` (aper − PSF) by magnitude and fit its trend with brightness.  Returns a dict:
+    binned centres/medians/counts, the faint-baseline aperture correction, the bright turn-over
+    magnitude, and the linear-range slope (mag per mag) + its standard error.
+
+    The turn-over is measured as a departure from the fitted LINEAR TREND (a line fit to the faint
+    60% of bins), not from a flat baseline: a filter with a global brightness-dependent slope but no
+    saturation feature then reports NO turn-over (the bins lie on the trend line), and the turn-over
+    marks a genuine roll-over away from linearity.  The slope is refit over the resulting linear
+    range (bins fainter than the turn-over)."""
+    m_psf = np.asarray(m_psf, float); dmag = np.asarray(dmag, float)
+    lo, hi = np.nanpercentile(m_psf, [1, 99])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return None
+    edges = np.arange(lo, hi + _LIN_BIN_WIDTH, _LIN_BIN_WIDTH)
+    if edges.size < 3:
+        return None
+    centres, medians, counts = [], [], []
+    for b in range(1, len(edges)):
+        sel = (m_psf >= edges[b - 1]) & (m_psf < edges[b])
+        c = int(sel.sum())
+        if c < _LIN_MIN_PER_BIN:
+            continue
+        centres.append(0.5 * (edges[b - 1] + edges[b]))
+        medians.append(float(np.median(dmag[sel])))
+        counts.append(c)
+    if len(centres) < _LIN_MIN_BINS:
+        return None
+    centres = np.array(centres); medians = np.array(medians); counts = np.array(counts)
+    # Faint 60% of bins: the clean linear part the bright roll-over does not reach.  The reported
+    # aperture correction is the faint-baseline median; the turn-over reference is a LINE fit there.
+    faint = centres >= np.percentile(centres, 40)
+    baseline = float(np.median(medians[faint])) if faint.any() else float(np.median(medians))
+    if int(faint.sum()) >= 2:
+        ref = np.polyfit(centres[faint], medians[faint], 1, w=np.sqrt(counts[faint]))
+    else:
+        ref = np.array([0.0, baseline])              # too few faint bins: fall back to a flat trend
+    model = np.polyval(ref, centres)
+    # Bright turn-over: brightest→faint, the run of bins whose median departs the trend line by more
+    # than turnover_dmag; the turn-over is the faintest bin of that contiguous bright run (None if
+    # the brightest bin is already on the trend).
+    order = np.argsort(centres)                      # ascending magnitude = bright→faint
+    dev = np.abs(medians - model) > turnover_dmag
+    turnover = None
+    for i in order:
+        if dev[i]:
+            turnover = float(centres[i])
+        else:
+            break
+    # Linear range: bins fainter than the turn-over (or all bins if no turn-over).
+    lin = centres > turnover if turnover is not None else np.ones(centres.shape, bool)
+    slope = slope_err = None
+    lin_coef = None
+    if int(lin.sum()) >= _LIN_MIN_BINS:
+        wts = np.sqrt(counts[lin])
+        coef, cov = np.polyfit(centres[lin], medians[lin], 1, w=wts, cov=True)
+        slope = float(coef[0]); slope_err = float(np.sqrt(cov[0, 0]))
+        lin_coef = (float(coef[0]), float(coef[1]))
+    return dict(centres=centres, medians=medians, counts=counts, baseline=baseline,
+                turnover=turnover, slope=slope, slope_err=slope_err, lin_mask=lin,
+                lin_coef=lin_coef, n_lin_bins=int(lin.sum()))
+
+
+def _stage12_figure_one(o, filt, m_psf, dmag, fit, meta):
+    """One filter's linearity panel: aper−PSF vs PSF magnitude (hexbin), the binned median, the
+    faint-baseline aperture correction, the linear-range slope fit, and the turn-over marker."""
+    import matplotlib.pyplot as plt
+    fig, ax = _fig(1, 1, 6.4, 4.6)
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.88, bottom=0.13)
+    a = ax[0][0]
+    hb = a.hexbin(m_psf, dmag, gridsize=55, bins="log", cmap="viridis", mincnt=1)
+    fig.colorbar(hb, ax=a, label="log N", shrink=0.85)
+    base = fit["baseline"]
+    a.errorbar(fit["centres"], fit["medians"], fmt="o", ms=5, color="white",
+               mec="black", mew=0.7, ecolor="black", zorder=5, label="binned median")
+    a.axhline(base, color="cyan", lw=1.3, zorder=4,
+              label=f"aper. corr. (faint baseline) {base:+.3f}")
+    if fit["slope"] is not None and fit.get("lin_coef"):
+        cl = fit["centres"][fit["lin_mask"]]
+        xx = np.array([cl.min(), cl.max()])
+        yy = np.polyval(fit["lin_coef"], xx)         # the actual linear-range fit
+        a.plot(xx, yy, color="red", lw=1.6, zorder=6,
+               label=f"linear-range slope {fit['slope']:+.3f} ± {fit['slope_err']:.3f} mag/mag")
+    if fit["turnover"] is not None:
+        a.axvline(fit["turnover"], color="orange", lw=1.4, ls="--", zorder=4,
+                  label=f"bright turn-over {fit['turnover']:.1f} mag")
+    dlo, dhi = np.nanpercentile(dmag, [1, 99])
+    pad = 0.15 * (dhi - dlo + 1e-3)
+    a.set_ylim(min(dlo, base - 0.1) - pad, max(dhi, base + 0.1) + pad)
+    a.set_xlabel("PSF instrumental magnitude  (brighter at left)")
+    a.set_ylabel("aperture − PSF  [mag]")
+    a.legend(fontsize=7.5, loc="best", framealpha=0.9)
+    a.set_title(f"{filt}: {meta['n']} isolated stars (>{meta['iso_px']:.0f} px), "
+                f"r_ap={meta['r_ap']:.0f}px", fontsize=9)
+    fig.suptitle(f"{o.target} {o.obsid} — photometric linearity ({filt})", fontsize=11, y=0.97)
+    suffix = f"_{filt}"
+    return _save(fig, f"{o.obsid}_stage12{suffix}.png")
+
+
+def stage12_photometric_linearity(o: Observation, sw, lw=None, r_ap=3.0, iso_px=12.0):
+    """Per-filter photometric-linearity check.  For every filter with a mosaic + PSF-flux catalogue,
+    re-measure aperture photometry on isolated stars and fit the aperture-minus-PSF magnitude as a
+    function of brightness: the slope (mag per mag) is the brightness-dependent photometric trend and
+    the bright turn-over marks where linearity ends.  One figure per filter; the representative SW
+    filter is the primary figure and the rest are returned in ``metrics['extra_figures']`` for the
+    poster to fold into an expandable block."""
+    metrics = dict(stage=12, sw=sw, lw=lw)
+    filts = _available_filters(o) or list(o.filters)
+    # measure every filter; keep the order stable and SW-first so the primary is a short-wave filter
+    per_filter, figures, reasons = {}, [], {}
+    for filt in filts:
+        m_psf, dmag, meta = _measure_psf_aper(o, filt, r_ap=r_ap, iso_px=iso_px)
+        if m_psf is None:
+            reasons[filt] = meta
+            continue
+        fit = _linearity_fit(m_psf, dmag)
+        if fit is None:
+            reasons[filt] = "too few binned points for a linearity fit"
+            continue
+        png = _stage12_figure_one(o, filt, m_psf, dmag, fit, meta)
+        per_filter[filt] = dict(
+            slope=fit["slope"], slope_err=fit["slope_err"], turnover_mag=fit["turnover"],
+            aper_corr=fit["baseline"], n=meta["n"], n_lin_bins=fit["n_lin_bins"],
+            catalog=meta["src"], png=png,
+            flagged=(fit["slope"] is not None and abs(fit["slope"]) > _LIN_SLOPE_FLAG),
+        )
+        figures.append((filt, png))
+    metrics["reasons"] = reasons
+    if not figures:
+        why = "no filter had a mosaic + PSF-flux catalogue with enough clean isolated stars"
+        png = _red_flag_figure(o, "stage12", "LINEARITY UNMEASURABLE",
+                               f"Cannot measure photometric linearity: {why}.")
+        metrics.update(red_flag=True, red_flag_reason=why, passed=False,
+                       filters_measured=[], per_filter={})
+        return png, metrics
+    # primary = representative SW filter if it was measured, else the first measured filter
+    primary = sw if (sw in per_filter) else figures[0][0]
+    metrics["primary_filter"] = primary
+    metrics["filters_measured"] = [f for f, _ in figures]
+    metrics["per_filter"] = {f: {k: v for k, v in d.items() if k != "png"}
+                             for f, d in per_filter.items()}
+    # flat convenience keys for the primary filter (what tests / a quick scan read)
+    pf = per_filter[primary]
+    metrics.update(slope=pf["slope"], slope_err=pf["slope_err"], turnover_mag=pf["turnover_mag"],
+                   aper_corr=pf["aper_corr"], n_isolated=pf["n"],
+                   n_flagged=sum(1 for d in per_filter.values() if d["flagged"]),
+                   passed=not any(d["flagged"] for d in per_filter.values()))
+    # the primary figure is ALSO saved under the canonical stage asset name so the in-place asset
+    # (obsid_stage12.png) is stable across runs even if the SW pick changes
+    import shutil
+    primary_png = os.path.join(OUTDIR, f"{o.obsid}_stage12.png")
+    shutil.copyfile(per_filter[primary]["png"], primary_png)
+    metrics["extra_figures"] = [(f, per_filter[f]["png"]) for f, _ in figures if f != primary]
+    return primary_png, metrics
+
+
 def _dispatch_stage(o, n, sw, lw):
     if n == 1:
         return stage1_mosaics(o, sw, lw)
@@ -4845,6 +5153,8 @@ def _dispatch_stage(o, n, sw, lw):
         return stage10_photometric_consistency(o, sw, lw)
     if n == 11:
         return stage11_effective_psf(o, sw, lw)
+    if n == 12:
+        return stage12_photometric_linearity(o, sw, lw)
     raise ValueError(n)
 
 
@@ -4894,6 +5204,7 @@ _HEADLINE = {
     9: "**Stage 9 — PSF vs aperture photometry.**",
     10: "**Stage 10 — JWST1PASS across-exposure consistency.**",
     11: "**Stage 11 — effective PSF per exposure.**",
+    12: "**Stage 12 — photometric linearity.**",
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
@@ -5033,6 +5344,53 @@ def _caption_stage8(metrics):
     return base + "([how this is made](DOCROOT#stage8))"
 
 
+def _caption_stage12(metrics):
+    """Stage-12 caption: the method, the primary filter's numbers, and a per-filter table so every
+    filter's slope and turn-over appear even though only the primary plot is shown inline (the rest
+    are in the expandable block)."""
+    if metrics.get("red_flag"):
+        return (f"🚩 **Stage 12 — photometric linearity: unmeasurable.** "
+                f"{metrics.get('red_flag_reason', 'no measurable filter')}. "
+                f"([how this is made](DOCROOT#stage12))")
+    prim = metrics.get("primary_filter", metrics.get("sw", "SW"))
+    pf = metrics.get("per_filter", {})
+    base = (f"**Stage 12 — photometric linearity.** For each filter, aperture photometry is "
+            f"[re-measured](DOCROOT#stage9) on the mosaic at the catalogue PSF-flux positions of "
+            f"isolated stars (nearest neighbour > 12 px, [aperture S/N > 30](DOCROOT#glossary-snr), "
+            f"local-annulus background, recentred < 3 px), and the aperture-minus-PSF magnitude is "
+            f"binned against PSF magnitude. A flat line at the aperture correction is a linear "
+            f"response; the fitted **slope (mag per mag)** is the brightness-dependent trend and the "
+            f"**bright turn-over** is the magnitude where the binned median departs the fitted linear "
+            f"trend by more than {_LIN_TURNOVER_DMAG:.2f} mag (a roll-over away from linearity, "
+            f"measured against the trend so a constant slope alone does not trip it). The plot shown "
+            f"is **{prim}**; the other filters are in the expandable block below. ")
+    dprim = pf.get(prim)
+    if dprim and dprim.get("slope") is not None:
+        to = dprim.get("turnover_mag")
+        to_str = f"{to:.1f} mag" if to is not None else "none within range"
+        base += (f"{prim}: slope {dprim['slope']:+.3f} ± {dprim['slope_err']:.3f} mag/mag, "
+                 f"aperture correction {dprim['aper_corr']:+.3f} mag, bright turn-over {to_str}, "
+                 f"{dprim['n']} stars. ")
+    if len(pf) > 1:
+        rows = ["", "| filter | slope (mag/mag) | turn-over (mag) | aper. corr. | N |",
+                "|---|---|---|---|---|"]
+        for f in metrics.get("filters_measured", sorted(pf)):
+            d = pf.get(f) or {}
+            sl = d.get("slope"); se = d.get("slope_err"); to = d.get("turnover_mag")
+            sl_str = f"{sl:+.3f} ± {se:.3f}" if sl is not None else "—"
+            to_str = f"{to:.1f}" if to is not None else "—"
+            flag = " 🚩" if d.get("flagged") else ""
+            ac = d.get("aper_corr")
+            ac_str = f"{ac:+.3f}" if ac is not None else "—"
+            rows.append(f"| {f}{flag} | {sl_str} | {to_str} | {ac_str} | {d.get('n', '—')} |")
+        base += "\n".join(rows) + "\n\n"
+    nfl = metrics.get("n_flagged") or 0
+    if nfl:
+        base += (f"🚩 {nfl} filter(s) show |slope| > {_LIN_SLOPE_FLAG:.2f} mag/mag "
+                 f"(flagged in the table). ")
+    return base + "([how this is made](DOCROOT#stage12))"
+
+
 def _caption_for_impl(n, metrics):
     if n == "6clean":
         exps = ", ".join(metrics.get("excluded_exposures") or [])
@@ -5056,6 +5414,8 @@ def _caption_for_impl(n, metrics):
         return base + "([how this is made](DOCROOT#stage6))"
     if n == 8:
         return _caption_stage8(metrics)
+    if n == 12:
+        return _caption_stage12(metrics)
     # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
     # so the generic "the plot is empty" wording would not fit).
     if metrics.get("red_flag") and n != 7:
@@ -5551,7 +5911,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
-    ap.add_argument("--stage", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    ap.add_argument("--stage", nargs="+", type=int,
+                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
@@ -5615,7 +5976,8 @@ def main(argv=None):
         if args.post:
             try:
                 from .post_diagnostics import post_stage, PostError
-                post_stage(o, n, png, caption_for(n, metrics), args.repo)
+                post_stage(o, n, png, caption_for(n, metrics), args.repo,
+                           extra_images=metrics.get("extra_figures"))
                 # Stage 6 emits a SECOND figure recomputed excluding stage-11-flagged bad-PSF
                 # exposures; post it under its own marker so it sits beside, not over, the main one.
                 if n == 6 and metrics.get("clean_png"):
