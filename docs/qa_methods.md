@@ -613,6 +613,46 @@ peppar catalogues exist for the obs/filter.
 Source: [`data_qa/diagnostics.py` → `stage11_effective_psf`](../data_qa/diagnostics.py)
 (`_exposure_qfit`, `_effective_psf`).
 
+<a id="stage12"></a>
+## Stage 12 — photometric linearity
+
+**What it shows.** Whether measured flux scales with true brightness at a constant ratio across the
+dynamic range, per filter. A brightness-dependent ratio marks a saturation roll-over at the bright
+end, a PSF-model or crowding bias, or a brighter-fatter response.
+
+**How it is measured.** For every filter with a mosaic and a PSF-flux catalogue, stage 12 re-uses
+the [stage-9](#stage9) aperture re-measurement: at the catalogue PSF-flux positions of isolated
+stars (nearest catalogue neighbour more than 12 px away), it re-measures aperture photometry on the
+mosaic (3 px circular aperture, 6–9 px background annulus), recentres each star on the mosaic
+(< 3 px), and keeps stars with aperture [S/N > 30](#glossary-snr) and no NaN in the aperture. The
+aperture-minus-PSF magnitude is then binned against PSF magnitude (0.5 mag bins, ≥ 8 stars per bin).
+
+**The numbers.** On a linear response the binned `aperture − PSF` is a flat line at the aperture
+correction. Stage 12 reports, per filter: the **aperture correction** (the median of the binned
+values over the faint 60% of the range, the linear baseline); the **bright turn-over magnitude**,
+where the binned median departs the **fitted linear trend** by more than `_LIN_TURNOVER_DMAG`
+(0.05 mag) going bright — the onset of non-linearity; and the **slope** (mag per mag, with its
+standard error) of a count-weighted straight-line fit over the linear range (fainter than the
+turn-over). A filter whose `|slope|` exceeds `_LIN_SLOPE_FLAG` (0.02 mag per mag) is flagged in the
+caption table.
+
+The turn-over is measured against the trend line (a line fit to the faint 60% of bins), not against
+a flat baseline. A filter with a genuine global brightness-dependent slope but no saturation feature
+therefore reports no turn-over — its bins lie on the trend — so the turn-over marks a real roll-over
+away from linearity rather than the point where a constant slope has accumulated to 0.05 mag.
+
+**The figure.** One panel per filter: `aperture − PSF` versus PSF magnitude (hexbin, brighter to the
+left), the binned median, the faint-baseline aperture correction, the linear-range slope fit, and
+the turn-over marker. The issue comment shows the representative short-wave filter by default and
+holds the remaining filters in an expandable block; the per-filter slope, turn-over, aperture
+correction and star count for every filter are listed in the caption table. Metrics:
+`primary_filter`, `filters_measured`, `per_filter` (slope, slope_err, turnover_mag, aper_corr, n per
+filter), `slope`/`turnover_mag`/`aper_corr`/`n_isolated` for the primary filter, and `n_flagged`.
+Stage 12 is display-only (it does not drive an issue-body checkbox); the flag surfaces the number.
+
+Source: [`data_qa/diagnostics.py` → `stage12_photometric_linearity`](../data_qa/diagnostics.py)
+(`_measure_psf_aper`, `_linearity_fit`).
+
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 
