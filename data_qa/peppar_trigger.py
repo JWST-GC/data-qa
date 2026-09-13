@@ -26,7 +26,9 @@ in its wider scope brick becomes 1296/1296 (``dolphot/``
 adds 576 flat) and three more fields hold both -- m4 150/150 and ngc6397 120/120 (their cal
 files sit in ``F150W2``/``F322W2``) and w51 64/560 (64 flat in ``dolphot/``) -- for SEVEN
 both-layout fields.  ``field_for`` also sees the flat-only jw02731 760/0, jw02732 1058/0 and
-jwebbinar_prep 6/0, which no filter-dir census lists.
+jwebbinar_prep 6/0, which no filter-dir census lists.  The filter-dir census above predates
+issue #82: m4's and ngc6397's cal files sit in the WIDE-filter dirs ``F150W2``/``F322W2``,
+which ``_FILT_RE`` now accepts, so both fields enumerate 10 (filter, detector) jobs each.
 
 Across the 3060 basename pairs present in both layouts, 1600 (52%, all of m4 / m92 /
 ngc6334 / ngc6397) are HARDLINKS -- one file with two names, where the choice of layout
@@ -82,11 +84,22 @@ RUNNER = os.path.join(_PEPPAR_SCRIPTS, "run_peppar_generic.py")
 # nrcblong.
 _DET_RE = re.compile(r"_(nrc[ab](?:[1-4]|long))_cal\.fits$", re.I)
 
-# A filter-dir name.  This rejects the NIRCam wide filters F150W2 / F322W2 (trailing "2"),
-# which is why m4 and ngc6397 -- whose cal files live in F150W2/ and F322W2/ -- resolve as
-# fields and then enumerate nothing.  Widening it is issue #82, a separate change: it turns
-# two fields that emit no peppar job today into fields that emit one per detector.
-_FILT_RE = re.compile(r"F\d{3,4}[WNM]", re.I)
+# A filter-dir name.  The trailing "2?" admits the NIRCam WIDE filters F150W2 and F322W2
+# (issue #82): m4 and ngc6397 keep every cal file under F150W2/ and F322W2/, so without it
+# both fields resolved in ``field_for`` and then enumerated nothing.  Those products are
+# genuine wide-filter imaging -- the cal headers read FILTER='F150W2'/'F322W2' with
+# PUPIL='CLEAR', so the dir name IS the bandpass.  Reaching them was necessary but not
+# sufficient: both bandpasses ALSO needed two fixes in ``scripts/peppar/run_peppar_generic.py``
+# (the F150W2 PSF grid cannot be built at stpsf's default spectral sampling, and peppar
+# keys the LW detectors NRCA5/NRCB5) before a job emitted here could write a catalog.
+# ``peppar.setup_filter_props()`` carrying both filters says only that the zeropoint/FWHM
+# table has a row -- it does not exercise either of those paths.  Live scope of the widening
+# (census 2026-08-25 over /orange/adamginsburg/jwst): m4 F150W2 120 cal files / 8 SW
+# detectors + F322W2 30 / 2 LW, ngc6397 F150W2 96 / 8 + F322W2 24 / 2, and no other field
+# holds a wide-filter dir -- 20 new (filter, detector) jobs.  All 20 are manual-CLI only:
+# proposal 1979 (m4, ngc6397) is not in ``mast_monitor.PROGRAMS``, so the auto fan-out
+# never reaches them.
+_FILT_RE = re.compile(r"F\d{3,4}[WNM]2?", re.I)
 
 
 def _cal_files(fdir: str, stem: str = "") -> List[str]:
@@ -220,9 +233,10 @@ def enumerate_filt_det(field: str, base: str = BASE) -> Dict[str, List[str]]:
 def nonfilter_cal_dirs(field: str, base: str = BASE) -> List[str]:
     """Subdir names under the field that hold ``*_cal.fits`` (either layout) and are NOT
     filter dirs by ``_FILT_RE``.  These are the reason a field can resolve in ``field_for``
-    -- which matches any subdir -- and then enumerate nothing: ``dolphot/`` (brick, w51) or
-    the wide-filter dirs ``F150W2``/``F322W2`` (m4, ngc6397).  Named in the no-jobs error so
-    it reports the pattern rather than reading as "no data on disk"."""
+    -- which matches any subdir -- and then enumerate nothing: ``dolphot/`` (brick, w51).
+    The wide-filter dirs ``F150W2``/``F322W2`` (m4, ngc6397) used to land here too and now
+    enumerate normally (issue #82).  Named in the no-jobs error so it reports the pattern
+    rather than reading as "no data on disk"."""
     out = []
     for fdir in sorted(glob.glob(f"{base}/{field}/*/")):
         name = os.path.basename(fdir.rstrip("/"))

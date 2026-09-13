@@ -282,21 +282,60 @@ def test_field_with_cal_files_only_outside_filter_dirs_raises(tmp_path):
 
 
 def test_no_jobs_error_names_the_skipped_dirs(tmp_path):
-    """m4 and ngc6397 keep their cal files in F150W2/ and F322W2/; the trailing "2" fails
-    the filter-dir pattern, so they resolve as fields and enumerate nothing.  The error
-    must name those dirs and the pattern -- otherwise it reads as "no data on disk" while
-    the data is there."""
-    make_field(tmp_path, "m4", "F150W2", ["nrca1"], "pipeline")
-    make_field(tmp_path, "m4", "F322W2", ["nrcalong"], "flat")
-    assert ppt.enumerate_filt_det("m4", base=str(tmp_path)) == {}
-    assert ppt.nonfilter_cal_dirs("m4", base=str(tmp_path)) == ["F150W2", "F322W2"]
+    """brick and w51 keep a pile of cal files in dolphot/, which is not a filter dir, so a
+    field holding only those resolves in field_for and enumerates nothing.  The error must
+    name the dir and the pattern -- otherwise it reads as "no data on disk" while the data
+    is there."""
+    make_field(tmp_path, "w51", "dolphot", ["nrca1"], "pipeline")
+    assert ppt.enumerate_filt_det("w51", base=str(tmp_path)) == {}
+    assert ppt.nonfilter_cal_dirs("w51", base=str(tmp_path)) == ["dolphot"]
     with pytest.raises(SystemExit) as ei:
         ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
     msg = str(ei.value)
-    assert "F150W2" in msg and "F322W2" in msg
+    assert "dolphot" in msg
     assert ppt._FILT_RE.pattern in msg
     # it reports only the dirs the pattern rejects: a real filter dir alongside a
     # dolphot/ one leaves just dolphot
     make_field(tmp_path, "brick", "F212N", ["nrca1"], "pipeline")
     make_field(tmp_path, "brick", "dolphot", ["nrca1"], "flat")
     assert ppt.nonfilter_cal_dirs("brick", base=str(tmp_path)) == ["dolphot"]
+
+
+# ------------------------------------------------------- wide filter dirs (issue #82)
+
+@pytest.mark.parametrize("filt,dets", [("F150W2", ["nrca1", "nrcb4"]),
+                                       ("F322W2", ["nrcalong", "nrcblong"])])
+def test_wide_filter_dir_is_a_filter_dir(tmp_path, filt, dets):
+    """F150W2 / F322W2 carry a trailing '2'.  They are filter dirs like any other: they
+    enumerate, they emit jobs, and they are NOT reported as skipped non-filter dirs."""
+    make_field(tmp_path, "m4", filt, dets, "pipeline")
+    assert ppt._FILT_RE.fullmatch(filt)
+    assert ppt.enumerate_filt_det("m4", base=str(tmp_path)) == {
+        filt: sorted(d.upper() for d in dets)}
+    assert ppt.nonfilter_cal_dirs("m4", base=str(tmp_path)) == []
+    jobs = ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    assert {j["det"] for j in jobs} == {d.upper() for d in dets}
+    assert {j["filt"] for j in jobs} == {filt}
+    for job in jobs:
+        assert job["data_dir"] == f"{tmp_path}/m4/{filt}/pipeline"
+        assert job["stf_dir"] == f"{tmp_path}/m4/{filt}/peppar_{job['det'].lower()}"
+
+
+def test_wide_filter_field_emits_the_full_job_set(tmp_path):
+    """The whole point of #82: m4 (and ngc6397) hold ALL their cal files under F150W2/ and
+    F322W2/, so before the widening the field resolved and emitted zero jobs."""
+    make_field(tmp_path, "m4", "F150W2", [f"nrc{m}{n}" for m in "ab"
+                                          for n in "1234"], "pipeline")
+    make_field(tmp_path, "m4", "F322W2", ["nrcalong", "nrcblong"], "pipeline")
+    jobs = ppt.build_jobs(PROGRAM, OBS, base=str(tmp_path))
+    assert len(jobs) == 10
+    assert sorted({j["filt"] for j in jobs}) == ["F150W2", "F322W2"]
+
+
+def test_a_trailing_2_does_not_admit_arbitrary_dirs(tmp_path):
+    """The widening is exactly one optional '2' -- it must not turn other subdirs that
+    hold cal files into filter dirs."""
+    for name in ("dolphot", "F212N2N", "F212", "2F212N", "pipeline2"):
+        assert not ppt._FILT_RE.fullmatch(name), name
+    for name in ("F150W2", "F322W2", "F212N", "F480M", "F2550W"):
+        assert ppt._FILT_RE.fullmatch(name), name
