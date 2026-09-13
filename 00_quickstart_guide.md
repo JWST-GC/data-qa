@@ -5,11 +5,9 @@ This guide is for those getting started with Quality Assessment of the JWST-GC T
 
 ## Important Links
 
-- **QA starting point:**  
-  https://github.com/orgs/JWST-GC/projects/2
+- **QA starting point:**  https://github.com/orgs/JWST-GC/projects/2
 
-- **Detailed explanation of all QA plots and numbers:**  
-  https://github.com/JWST-GC/data-qa/blob/main/docs/qa_methods.md
+- **Detailed explanation of all QA plots and numbers**: https://github.com/JWST-GC/data-qa/blob/main/docs/qa_methods.md
 
 
 ## Brief Description
@@ -25,11 +23,11 @@ Each issue has **stages** for QA review posted as individual comments. The stage
 
 The very basic summary of each stage is:
 
-- Stage 1 Do data exist?
-- Stage 2 Do catalogs exist?
-- Stage 3 How is the absolute photometry?
-- Stage 4 How is the absolute astrometry?
-- Stage 5 Are detectors well-aligned astrometrically?
+- Stage 1: Do data exist?
+- Stage 2: Do catalogs exist?
+- Stage 3: How is the absolute photometry?
+- Stage 4: How is the absolute astrometry?
+- Stage 5: Are detectors well-aligned astrometrically?
 - Stage 6: What is the astrometric precision?
 - Stage 7: How do jicama pipeline products compare to MAST-delivered products?
 - Stage 8: What is the relative spatial distortion between two filters?
@@ -61,7 +59,7 @@ In short, the catalogs are created by iteratively fitting and subtracting PSFs o
 
 
 You can download data and catalogs by selecting the relevant field here:
-https://starformation.astro.ufl.edu/jwst-gc/index.htm.l The downloads are done through Globus, and the products are stored on UF's supercomputer.
+https://starformation.astro.ufl.edu/jwst-gc/index.html. The downloads are done through Globus, and the products are stored on UF's supercomputer.
 
 There are about two dozen issues for data other than the JWST-GC 10678 program. These can generally be ignored, but might be useful as a reference.
 
