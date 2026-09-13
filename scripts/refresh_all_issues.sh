@@ -37,6 +37,18 @@
 #   QA_TREASURY_PROGRAM default 10678 (must match data_qa.mast_monitor.TREASURY_PROGRAM)
 #   QA_TREASURY_PENDING_DAYS default 14 (how long a tile may have NO products on disk
 #                       before "waiting for the delivery" is reported as a failure)
+#
+# Array fan-out (#162) -- the capacity fix for the 2 h wall.  The serial loop covers ~21
+# issues per run, and the campaign is heading for ~139 treasury tiles, so the work is split
+# across SLURM array elements instead:
+#   QA_LIST_ONLY=1      print the work list (one TSV row per issue) to stdout and exit.  A
+#                       submitter materialises it ONCE so every element shares the same
+#                       enumeration and the same row order.
+#   QA_WORK_LIST=<file> read the work list from that file rather than querying GitHub.
+#   QA_WORK_INDEX=<n>   process only row n (0-based) -- one array element's slice.  An index
+#                       past the end is a no-op exit 0, so --array may over-provision.
+# Posting is marker-keyed and idempotent, and assets are replaced by name, so elements never
+# conflict.  scripts/submit_refresh_array.sh drives all three.
 set -uo pipefail
 
 REPO="${QA_REPO:-JWST-GC/data-qa}"
@@ -80,6 +92,13 @@ cd "$REPO_ROOT"
 # non-GC skip list.  The treasury tiles are moved to the END of the list (see ORDER MATTERS
 # above).  created_at is what bounds the treasury PENDING window (see pending_tile below), so
 # it is carried per issue rather than guessed.
+if [ -n "${QA_WORK_LIST:-}" ] && [ "${QA_LIST_ONLY:-0}" = "0" ]; then
+  # An array element re-enumerating for itself would race the board: an issue opened or
+  # closed mid-run shifts every later row, so elements would double-cover one issue and
+  # skip another.  Read the submitter's single snapshot instead.
+  mapfile -t SPECS < "$QA_WORK_LIST"
+  echo "refresh_all_issues: work list read from $QA_WORK_LIST"
+else
 mapfile -t SPECS < <(
   gh api "repos/$REPO/issues?state=open&per_page=100" --paginate \
       -q '.[] | [.title, .created_at] | @tsv' 2>/dev/null \
@@ -128,12 +147,34 @@ if tiles:
     # The partition decides WHO is dropped by the 2 h wall, not how many fit.  Say what this
     # run will actually cover so "the tiles have issues" is never read as "the tiles have QA".
     print(f"NOTE: the serial loop covers ~21 issues within its 2 h wall; {len(tiles)} tile(s) "
-          f"queued after {len(established)} established issue(s) may not be reached this run "
-          f"-- the capacity fix is the --array fan-out (#162)", file=sys.stderr)
+          f"queued after {len(established)} established issue(s) may not be reached in one "
+          f"serial run -- scripts/submit_refresh_array.sh fans the same list out over SLURM "
+          f"array elements, one issue each (#162)", file=sys.stderr)
 for row in established + tiles:
     print(row)'
 )
+fi
+
+# --- array fan-out (#162): emit the work list, or take one element's slice of it ----------
+if [ "${QA_LIST_ONLY:-0}" != "0" ]; then
+    # The count goes to STDERR so stdout carries the rows and nothing else -- the submitter
+    # redirects stdout straight into the work-list file.
+    echo "refresh_all_issues: ${#SPECS[@]} in-scope observation issues in $REPO" >&2
+    [ "${#SPECS[@]}" -gt 0 ] && printf '%s\n' "${SPECS[@]}"
+    exit 0
+fi
 echo "refresh_all_issues: ${#SPECS[@]} in-scope observation issues in $REPO"
+
+if [ -n "${QA_WORK_INDEX:-}" ]; then
+    if [ "$QA_WORK_INDEX" -ge "${#SPECS[@]}" ]; then
+        # An over-provisioned --array (the board shrank between submit and run) is a no-op,
+        # not a failure: a spurious red here would be indistinguishable from a real one.
+        echo "refresh_all_issues: index $QA_WORK_INDEX is past the ${#SPECS[@]}-row work list; nothing to do"
+        exit 0
+    fi
+    SPECS=("${SPECS[$QA_WORK_INDEX]}")
+    echo "refresh_all_issues: array element $QA_WORK_INDEX -> ${SPECS[0]//$'\t'/ }"
+fi
 
 rc_any=0
 # --- classifiers (extracted VERBATIM by tests/test_mast_monitor.py; keep them self-contained)

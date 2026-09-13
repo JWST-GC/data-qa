@@ -13,6 +13,18 @@
 #   #  (fine-grained PAT on JWST-GC/data-qa: Issues=write, Contents=write)
 #
 # --chdir points at the checkout that HAS scripts/ -- the merged main checkout.
+#
+# CAPACITY (#162): the entry below runs the whole board SERIALLY in one 2 h job, which
+# covers ~21 issues -- job 40173146 was cancelled at that wall on 2026-09-13 with 21
+# established issues done and 8 treasury tiles unstarted, and the campaign is heading for
+# ~139 tiles.  To fan the same board out over SLURM array elements, one issue each, swap the
+# command for:
+#
+#   bash scripts/submit_refresh_array.sh
+#
+# That enumerates once, then submits scripts/refresh_all_issues_array.sbatch as
+# --array=0-N%6.  Its own resources come from that file, so the #SCRON lines below then only
+# need to be big enough for the submitter itself (1 cpu, a few minutes).
 
 #SCRON --qos=astronomy-dept-b
 #SCRON --account=astronomy-dept

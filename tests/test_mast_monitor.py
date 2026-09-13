@@ -3288,3 +3288,152 @@ def test_a_gc_program_cannot_be_excused_from_the_monitor():
     assert not overlap, (
         f"program(s) {sorted(overlap)} are on the QA board AND excused from the "
         f"completeness guard; one of the two is wrong")
+
+
+# ------------------- refresh_all_issues.sh array fan-out (#162)
+# The serial loop covers ~21 issues in its 2 h wall and the campaign is heading for ~139
+# treasury tiles, so the board is split one-issue-per-SLURM-array-element.  These run the
+# REAL script with stub `gh` and `python3` on PATH, so what is under test is the shipped
+# shell, not a paraphrase of it.
+
+def _refresh_dir():
+    import pathlib
+    return pathlib.Path(__file__).resolve().parents[1] / "scripts"
+
+
+def _stub_bin(tmp_path):
+    """A PATH dir holding a `gh` that satisfies the auth preflight and a `python3` that
+    records its argv instead of rendering diagnostics."""
+    import os
+    import pathlib
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls.txt"
+    (bin_dir / "gh").write_text(
+        '#!/bin/bash\n'
+        'if [ "$1 $2" = "api user" ]; then echo tester; exit 0; fi\n'
+        'exit 0\n')
+    (bin_dir / "python3").write_text(
+        f'#!/bin/bash\nprintf "%s\\n" "$*" >> {calls}\nexit 0\n')
+    for f in ("gh", "python3"):
+        os.chmod(bin_dir / f, 0o755)
+    return bin_dir, calls
+
+
+def _run_refresh(tmp_path, env):
+    import os
+    import subprocess
+    bin_dir, calls = _stub_bin(tmp_path)
+    e = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}",
+             GITHUB_TOKEN="x", HOME=str(tmp_path))
+    e.update({k: str(v) for k, v in env.items()})
+    p = subprocess.run(["bash", str(_refresh_dir() / "refresh_all_issues.sh")],
+                       capture_output=True, text=True, env=e)
+    recorded = calls.read_text().splitlines() if calls.exists() else []
+    return p, recorded
+
+
+_WORK_ROWS = [
+    "2221\t001\tNIRCam\tBrick\t2024-01-02T03:04:05Z",
+    "10678\t132\tNIRCam\tGC Treasury\t2026-09-12T00:00:00Z",
+    "10678\t132\tMIRI\tGC Treasury\t2026-09-12T00:00:00Z",
+]
+
+
+def _write_list(tmp_path):
+    f = tmp_path / "worklist.tsv"
+    f.write_text("\n".join(_WORK_ROWS) + "\n")
+    return f
+
+
+def test_work_index_refreshes_exactly_its_own_row(tmp_path):
+    """One array element does ONE issue -- that is what bounds the board by the slowest
+    single issue instead of by the sum of all of them."""
+    p, calls = _run_refresh(tmp_path, {"QA_WORK_LIST": _write_list(tmp_path),
+                                       "QA_WORK_INDEX": 1})
+    assert p.returncode == 0, p.stderr
+    diag = [c for c in calls if "data_qa.diagnostics" in c]
+    assert len(diag) == 1, f"expected one diagnostics call, got {diag}"
+    assert "--program 10678 --obs 132" in diag[0]
+    assert "--stage" in diag[0], "row 1 is the NIRCam tile, which takes the staged path"
+
+
+def test_work_index_picks_the_miri_row_by_position(tmp_path):
+    """Rows are addressed by POSITION, so the element -> issue mapping is the submitter's
+    snapshot order and nothing else."""
+    p, calls = _run_refresh(tmp_path, {"QA_WORK_LIST": _write_list(tmp_path),
+                                       "QA_WORK_INDEX": 2})
+    assert p.returncode == 0, p.stderr
+    diag = [c for c in calls if "data_qa.diagnostics" in c]
+    assert len(diag) == 1 and "--miri" in diag[0], diag
+
+
+def test_an_index_past_the_end_is_a_no_op_not_a_failure(tmp_path):
+    """--array may over-provision (an issue closed between submit and run shortens the
+    list).  A red element there would be indistinguishable from a real QA failure."""
+    p, calls = _run_refresh(tmp_path, {"QA_WORK_LIST": _write_list(tmp_path),
+                                       "QA_WORK_INDEX": 9})
+    assert p.returncode == 0, p.stderr
+    assert "nothing to do" in p.stdout
+    assert not [c for c in calls if "data_qa" in c], "no issue should have been touched"
+
+
+def test_list_only_prints_the_rows_on_stdout_and_nothing_else(tmp_path):
+    """The submitter redirects stdout straight into the work-list file, so a progress line
+    leaking onto stdout would become a bogus work-list row."""
+    p, _ = _run_refresh(tmp_path, {"QA_WORK_LIST": _write_list(tmp_path),
+                                   "QA_LIST_ONLY": 1})
+    assert p.returncode == 0, p.stderr
+    # QA_LIST_ONLY re-enumerates (the stub gh returns nothing), so the rows are empty here;
+    # what this pins is that the count line went to stderr.
+    assert "in-scope observation issues" in p.stderr
+    assert "in-scope observation issues" not in p.stdout
+    assert all("\t" in line for line in p.stdout.splitlines() if line)
+
+
+def test_list_only_emits_one_row_per_issue(tmp_path):
+    """End to end: the enumeration a submitter would snapshot."""
+    import os
+    import subprocess
+    bin_dir, _ = _stub_bin(tmp_path)
+    # a `gh` that returns two issue titles, and the REAL python3 for the work-list block
+    (bin_dir / "gh").write_text(
+        '#!/bin/bash\n'
+        'if [ "$1 $2" = "api user" ]; then echo tester; exit 0; fi\n'
+        'printf "%s\\t%s\\n" "GC Treasury — jw10678-o132 (NIRCam)" "2026-09-12T00:00:00Z" \\\n'
+        '                    "Brick — jw02221-o001 (NIRCam)" "2024-01-02T03:04:05Z"\n')
+    os.chmod(bin_dir / "gh", 0o755)
+    (bin_dir / "python3").unlink()
+    e = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", GITHUB_TOKEN="x",
+             QA_LIST_ONLY="1",
+             PYTHONPATH=str(_refresh_dir().parent))
+    p = subprocess.run(["bash", str(_refresh_dir() / "refresh_all_issues.sh")],
+                       capture_output=True, text=True, env=e)
+    assert p.returncode == 0, p.stderr
+    rows = [r.split("\t") for r in p.stdout.splitlines() if r]
+    assert [(r[0], r[1]) for r in rows] == [("2221", "001"), ("10678", "132")], (
+        "established fields first, treasury tiles last")
+
+
+def test_the_array_wrapper_maps_the_slurm_task_id_onto_the_work_index():
+    """Without this the wrapper would be a plain serial job wearing an array's clothes."""
+    src = (_refresh_dir() / "refresh_all_issues_array.sbatch").read_text()
+    assert "QA_WORK_INDEX" in src and "SLURM_ARRAY_TASK_ID" in src
+    assert "--qos=astronomy-dept-b" in src, "burst QOS is the project standing rule"
+
+
+def test_every_array_element_gets_its_own_figure_directory():
+    """Concurrent elements sharing QA_OUTDIR would overwrite each other's PNGs between
+    rendering one and uploading it."""
+    src = (_refresh_dir() / "refresh_all_issues_array.sbatch").read_text()
+    assign = [ln for ln in src.splitlines() if ln.startswith("export QA_OUTDIR=")]
+    assert assign, "the wrapper must set QA_OUTDIR itself"
+    assert "SLURM_ARRAY_TASK_ID" in assign[0], assign[0]
+
+
+def test_the_submitter_sizes_the_array_from_one_shared_snapshot():
+    """Re-enumerating per element races the board: an issue opened or closed mid-run shifts
+    every later row, so one issue is covered twice and another not at all."""
+    src = (_refresh_dir() / "submit_refresh_array.sh").read_text()
+    assert "QA_LIST_ONLY=1" in src
+    assert "QA_WORK_LIST=" in src and "--array=" in src
