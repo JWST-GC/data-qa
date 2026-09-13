@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 
@@ -36,6 +38,7 @@ STAGE_FUNC = {
     8: "stage8_distortion",
     9: "stage9_psf_vs_aper",
     10: "stage10_photometric_consistency", 11: "stage11_effective_psf",
+    12: "stage12_photometric_linearity",
     "6clean": "stage6_astrom_error",          # stage 6 recomputed excluding bad-PSF exposures
     "miri": "miri_overview",
 }
@@ -59,7 +62,7 @@ def _token():
     return tok
 
 
-def _req(method, url, token, data=None, headers=None, raw=False):
+def _req(method, url, token, data=None, headers=None, raw=False, want_headers=False):
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"token {token}")
     req.add_header("Accept", "application/vnd.github+json")
@@ -69,13 +72,15 @@ def _req(method, url, token, data=None, headers=None, raw=False):
     try:
         with urllib.request.urlopen(req) as r:
             body = r.read()
-            return r.status, (body if raw else json.loads(body.decode() or "{}"))
+            payload = body if raw else json.loads(body.decode() or "{}")
+            return (r.status, payload, dict(r.headers)) if want_headers else (r.status, payload)
     except urllib.error.HTTPError as e:
         body = e.read()
         try:
-            return e.code, json.loads(body.decode() or "{}")
+            payload = json.loads(body.decode() or "{}")
         except ValueError:
-            return e.code, {"raw": body}
+            payload = {"raw": body}
+        return (e.code, payload, dict(e.headers)) if want_headers else (e.code, payload)
 
 
 # --------------------------------------------------------------------------- release-asset host
@@ -114,59 +119,125 @@ def upload_asset(repo, token, png_path, asset_name):
 
 
 # --------------------------------------------------------------------------- issue + comment
+# GitHub's list endpoints intermittently return a SPURIOUS EMPTY page even when more items follow
+# -- observed directly: repeated identical calls to the repo issues list gave `page1:100,
+# page2:empty` (dropping issue #1, the oldest, which lives on page 2) and even `page1:empty` on some
+# calls, interleaved with correct results, and the empty can persist across several retries.
+# Treating an empty page as end-of-pagination silently truncates the listing: a real issue reads as
+# "no such issue", and a real marker comment reads as absent -> a DUPLICATE post.  The issues
+# endpoint uses CURSOR pagination (a `Link` header with rel="next" carrying an `after` cursor; no
+# rel="last"), so the end is signalled by the ABSENCE of a rel="next" link, not by an empty page.
+# A page reached via a rel="next" therefore MUST have rows; a spurious empty one is re-fetched.
+_EMPTY_RETRIES = 8
+_EMPTY_BACKOFF_S = 0.4
+_PER_PAGE = 100
+_NEXT_URL_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
+
+
+def _fetch_page(url, token, what, must_have_data):
+    """Fetch one page URL and return (data, next_url_or_None).  Re-fetches a response that cannot be
+    trusted as the true end of the listing: a spurious empty page that ``must_have_data`` (it was
+    reached via a rel="next"), or a FULL page (``_PER_PAGE`` rows) carrying no rel="next" (a
+    truncated/cached Link header would otherwise read as 'listing complete' and drop later pages)."""
+    for _ in range(_EMPTY_RETRIES):
+        st, d, hdrs = _req("GET", url, token, want_headers=True)
+        if st != 200:
+            raise PostError(f"{what} failed ({st}): {d}")
+        nxt = _NEXT_URL_RE.search(hdrs.get("Link", ""))
+        nxt_url = nxt.group(1) if nxt else None
+        empty_bad = not d and must_have_data                 # a page that must exist came back empty
+        truncated_bad = d and nxt_url is None and len(d) >= _PER_PAGE  # full page, no next -> suspect
+        if not empty_bad and not truncated_bad:
+            return d, nxt_url
+        time.sleep(_EMPTY_BACKOFF_S)
+    # exhausted retries: for a full-but-no-next page, return what we have (a real 100-row last page is
+    # possible); for a must-have-data empty, that is a genuine failure.
+    if empty_bad:
+        raise PostError(f"{what}: a page reached via rel=\"next\" kept returning empty")
+    return d, nxt_url
+
+
+def _paged_get(url_tmpl, token, what):
+    """Fetch every item across all pages of a GitHub list endpoint (``url_tmpl`` carries ``{page}``
+    for page 1), following rel="next" cursors to the end and re-fetching a page that cannot be
+    trusted as the end (see _fetch_page).  A non-200 raises -- a transient error must not masquerade
+    as a real negative."""
+    data, nxt = [], None
+    for _ in range(_EMPTY_RETRIES):
+        data, nxt = _fetch_page(url_tmpl.format(page=1), token, what, must_have_data=False)
+        if data:
+            break
+        time.sleep(_EMPTY_BACKOFF_S)
+    if not data:
+        return []
+    items = list(data)
+    while nxt:                                   # follow the cursor to the last page
+        data, nxt = _fetch_page(nxt, token, what, must_have_data=True)
+        items.extend(data)
+    return items
+
+
+# The issues listing can also come back TRUNCATED -- a short page 1 with no rel="next" at all (the
+# Link header itself wrong/cached), which no in-scan check can detect.  Different calls truncate
+# differently, so the scan is run up to _SCAN_ATTEMPTS times and the matches are UNIONed; a title
+# present in the repo surfaces within a few attempts (a full-but-no-next page is already retried in
+# _fetch_page, so only a SHORT truncated page -- indistinguishable in-scan from a real last page --
+# reaches here), and a genuinely-absent title stays absent across all of them.
+_SCAN_ATTEMPTS = 8
+
+
 def _issue_number(repo, token, title):
     """Number of the canonical issue with ``title``.  Titles can be duplicated (a closed
     dup + the live one), so collect ALL matches and prefer an OPEN issue; never post to a
     closed duplicate."""
-    matches, page = [], 1
-    while True:
-        st, data = _req("GET", f"{API}/repos/{repo}/issues?state=all&per_page=100&page={page}", token)
-        if st != 200:
-            # Same "transient error indistinguishable from a real negative" trap as
-            # _find_stage_comment: a 5xx/rate-limit mid-scan must NOT masquerade as "no such
-            # issue" (-> a silent per-issue no-op on a cron run).  Raise instead.
-            raise PostError(f"issue lookup failed ({st}) for {title!r}: {data}")
-        if not data:                       # successful empty page -> end of pagination
+    url = f"{API}/repos/{repo}/issues?state=all&per_page=100&page={{page}}"
+    states = {}                                  # number -> state, unioned across attempts
+    for _ in range(_SCAN_ATTEMPTS):
+        for it in _paged_get(url, token, f"issue lookup for {title!r}"):
+            if "pull_request" not in it and it["title"] == title:
+                states[it["number"]] = it["state"]
+        if states:                               # found it (union only grows) -> done
             break
-        for it in data:
-            if "pull_request" in it:
-                continue
-            if it["title"] == title:
-                matches.append((it["state"], it["number"]))
-        if len(data) < 100:
-            break
-        page += 1
-    if not matches:
+    if not states:
         return None
-    open_ = [n for s, n in matches if s == "open"]
-    return min(open_) if open_ else min(n for _, n in matches)
+    open_ = [n for n, s in states.items() if s == "open"]
+    return min(open_) if open_ else min(states)
 
 
 def _find_stage_comment(repo, token, num, marker):
     """Return the existing marker-keyed comment, or None if it genuinely does not exist.
 
-    CRITICAL: a transient API failure (5xx / rate-limit) must NOT be reported as "not
-    found" -- the caller would then POST a duplicate, spamming the issue on every hiccup.
-    So raise on an API error and only return None when a listing SUCCEEDED without the
-    marker."""
-    page = 1
-    while True:
-        st, data = _req("GET", f"{API}/repos/{repo}/issues/{num}/comments?per_page=100&page={page}", token)
-        if st != 200:
-            raise PostError(f"comment lookup failed ({st}) on #{num}; refusing to risk a "
-                            f"duplicate post: {data}")
-        if not data:                       # successful empty page -> paginated past the end
-            return None
-        for c in data:
-            if marker in (c.get("body") or ""):
-                return c
-        if len(data) < 100:
-            return None
-        page += 1
+    CRITICAL: a transient API failure (5xx / rate-limit) or a spurious empty page must NOT be
+    reported as "not found" -- the caller would then POST a duplicate, spamming the issue on every
+    hiccup.  ``_paged_get`` raises on an API error and confirms an empty page before ending, so a
+    None return here means a COMPLETE listing genuinely lacked the marker."""
+    data = _paged_get(f"{API}/repos/{repo}/issues/{num}/comments?per_page=100&page={{page}}",
+                      token, f"comment lookup on #{num}")
+    for c in data:
+        if marker in (c.get("body") or ""):
+            return c
+    return None
 
 
-def post_stage(o: Observation, stage, png_path, caption, repo, token=None):
-    """Idempotently post/update the stage-N comment on ``o``'s issue with the figure."""
+def _details_block(repo, token, o, stage, extra_images):
+    """Upload each ``(label, png_path)`` and return an expandable ``<details>`` block embedding them,
+    so a multi-figure stage (stage 12: one plot per filter) shows one plot by default and hides the
+    rest.  Each extra asset is named ``{obsid}_stage{stage}_{label}.png`` so it updates in place."""
+    labels = ", ".join(label for label, _ in extra_images)
+    parts = [f"\n\n<details><summary>Other {len(extra_images)} filter(s): {labels}</summary>\n"]
+    for label, path in extra_images:
+        aname = f"{o.obsid}_stage{stage}_{label}.png"
+        url = upload_asset(repo, token, path, aname)
+        parts.append(f"\n**{label}**\n\n![{aname}]({url})\n")
+    parts.append("\n</details>")
+    return "".join(parts)
+
+
+def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra_images=None):
+    """Idempotently post/update the stage-N comment on ``o``'s issue with the figure.
+
+    ``extra_images`` (optional) is a list of ``(label, png_path)`` for a multi-figure stage; they
+    are uploaded and embedded in a collapsed ``<details>`` block after the primary image."""
     token = token or _token()
     num = _issue_number(repo, token, o.issue_title)
     if num is None:
@@ -178,9 +249,11 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None):
     existing = _find_stage_comment(repo, token, num, marker)
     asset_name = f"{o.obsid}_stage{stage}.png"
     img_url = upload_asset(repo, token, png_path, asset_name)
+    extra_block = _details_block(repo, token, o, stage, extra_images) if extra_images else ""
     body = (f"{marker}\n### QA diagnostic — stage {stage}\n\n"
             f"{caption}\n\n"
-            f"![{asset_name}]({img_url})\n\n"
+            f"![{asset_name}]({img_url})\n"
+            f"{extra_block}\n\n"
             f"<sub>{_provenance_footer(repo, stage)}</sub>\n"
             f"<sub>auto-posted by `data_qa.diagnostics`; updates in place as the pipeline advances.</sub>")
     if existing:
