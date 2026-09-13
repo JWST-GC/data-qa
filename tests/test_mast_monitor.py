@@ -1806,9 +1806,31 @@ _REQUIRE_PIPE_REGISTRY = os.environ.get("REQUIRE_PIPE_REGISTRY") == "1"
 _needs_pipeline = pytest.mark.skipif(
     not os.path.exists(_PIPE_FIELDS_PY) and not _REQUIRE_PIPE_REGISTRY,
     reason=f"jwst-gc-pipeline checkout not available at {_PIPE_ROOT}")
-# Globular-cluster programs ride the pipeline for testing only; they are not
-# GC-monitor targets.  Arches/Quintuplet (2045) and Sgr A* (1939) ARE GC fields.
-_GLOBULAR_PROGRAMS = {1334, 1979, 8322, 12587}
+# Programs the pipeline REDUCES that are not GC-monitor targets, so the QA board
+# is not expected to carry them.  Two kinds, kept in one set because the guard
+# asks one question of both -- "is this program's absence from PROGRAMS a
+# decision or an oversight?":
+#
+#   1334, 1979, 8322, 12587  globular clusters, which ride the pipeline as
+#                            calibration/test fields (M92, M4, NGC 6397,
+#                            omega Cen).
+#   9438                     Schlafly's Galactic PLANE pointings -- g007, g028,
+#                            g033, g041, g054, crowded_l3, crowded_l20, at
+#                            l = +3 to +54.  Registered in the pipeline by
+#                            keflavich/jwst-gc-pipeline#621 so its reductions
+#                            get an alignment frame; none of it is in the
+#                            Galactic Centre.
+#
+# Arches/Quintuplet (2045) and Sgr A* (1939) ARE GC fields and stay out of here.
+#
+# Putting a program in this set is a claim about the SCIENCE FOOTPRINT, not a
+# way to quiet the guard: adding a GC program here would hide exactly the
+# oversight the guard exists to catch.  Whether 9438 should instead join the QA
+# board is #149, and moving it there is a one-line change in the other
+# direction.
+_NON_MONITOR_PROGRAMS = {1334, 1979, 8322, 12587, 9438}
+#: Retained under the old name; several tests below still read it.
+_GLOBULAR_PROGRAMS = _NON_MONITOR_PROGRAMS
 # An obsids entry of '*' declares "every observation of this proposal" -- the
 # registry shape for programs whose observation numbers land only as the visits
 # execute (the 10678 treasury: 139 visits over ~1668 planned observations).
@@ -1892,7 +1914,7 @@ def _assert_monitor_covers(mapping):
     goes through ``field_for()`` with concrete probes."""
     for prog_str, obsmap in mapping.items():
         prog = int(prog_str)
-        if prog in _GLOBULAR_PROGRAMS:
+        if prog in _NON_MONITOR_PROGRAMS:
             continue
         assert prog in mm.PROGRAMS, \
             f"pipeline maps program {prog} but mast_monitor.PROGRAMS lacks it"
@@ -2551,3 +2573,20 @@ def test_main_seed_run_keeps_low_disk_notice_and_memo(monkeypatch, tmp_path):
     # the seed commits the baseline even though the disk gate cleared
     # commit_state: the polled observation is now in the state file
     assert "jw10678-o101_t101_nircam" in committed["programs"]["10678"]["obs"]
+
+
+def test_a_gc_program_cannot_be_excused_from_the_monitor():
+    """The exclusion set is a footprint claim, not an escape hatch.
+
+    ``_NON_MONITOR_PROGRAMS`` exists so a program the pipeline reduces but the
+    QA board deliberately does not carry reads as a decision rather than an
+    oversight.  The failure mode it invites is obvious: silence the guard by
+    adding whichever program made it red.  Every GC program the monitor DOES
+    carry is asserted absent from the set, so doing that to one of them fails
+    here instead of removing a field from the board unnoticed.
+    """
+    gc_programs = set(mm.PROGRAMS)
+    overlap = gc_programs & _NON_MONITOR_PROGRAMS
+    assert not overlap, (
+        f"program(s) {sorted(overlap)} are on the QA board AND excused from the "
+        f"completeness guard; one of the two is wrong")
