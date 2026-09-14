@@ -2590,11 +2590,14 @@ def test_act_report_arrival_posts_new_comment(monkeypatch):
         (mm.TREASURY_ISSUE_TITLE, True)]               # planned only: edit
 
 
-def test_act_report_arrival_classified_per_issue(monkeypatch):
-    """Classification is per ISSUE, not batch-global: a treasury tile that
-    landed notifies on the treasury issue while a planned-only brick batch
-    keeps editing in place.  The landed tile also opens its own per-tile QA
-    issue (#161), which notifies for the same reason."""
+def test_act_report_treasury_arrival_edits_in_place(monkeypatch):
+    """Treasury reports edit in place, not notify-per-poll: the treasury is a
+    continuous high-volume stream whose arrivals re-fire every poll (planned
+    masked obs_ids never match the released concrete ones), so a fresh comment
+    per poll on the rolling AND per-tile issues would be spam.  A regular field
+    (brick) is unaffected -- it still edits when planned-only here.  The landed
+    tile still OPENS its own per-tile QA issue (#161); the create notifies on its
+    own, and later polls quietly edit that comment."""
     posted = _patch_post_status(monkeypatch)
     landed = dict(_planned_events()[0], event="NEWLY_RELEASED",
                   released=True, calib_level=3, t_obs_release=59900.0)
@@ -2602,9 +2605,9 @@ def test_act_report_arrival_classified_per_issue(monkeypatch):
                          calib_level=-1, t_obs_release=None)
     mm.act_report([planned_brick, landed], execute=True)
     assert [(title, kw["update_last"]) for title, _, kw in posted] == [
-        ("Brick — jw02221-o001 (NIRCam)", True),       # planned only: edit
-        (mm.TREASURY_ISSUE_TITLE, False),              # arrival: notify
-        ("GC Treasury — jw10678-o101 (NIRCam)", False)]
+        ("Brick — jw02221-o001 (NIRCam)", True),       # regular field: unchanged
+        (mm.TREASURY_ISSUE_TITLE, True),               # treasury: edit-in-place
+        ("GC Treasury — jw10678-o101 (NIRCam)", True)] # per-tile: edit-in-place
 
 
 def test_act_report_fresh_downgrade_notifies_every_issue(monkeypatch, tmp_path):
@@ -2992,7 +2995,9 @@ def test_act_report_treasury_arrival_opens_one_issue_per_observation(monkeypatch
     assert tile[2]["create_labels"] == ["QA", "NIRCam", "program:10678",
                                         "target:GC Treasury"]
     assert "QA checklist" in tile[2]["create_body"]      # the standard template
-    assert tile[2]["update_last"] is False               # arrival: notifies
+    assert tile[2]["update_last"] is True                # treasury: edit-in-place
+                                                         # (the create still opens
+                                                         # + notifies once)
     assert len({id(kw["issue_cache"]) for _, _, kw in posted}) == 1
 
 
