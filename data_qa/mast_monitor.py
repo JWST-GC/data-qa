@@ -1537,10 +1537,22 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
             marker=status_report.MONITOR_MARKER,
             dry_run=not execute, issue_cache=issue_cache)))
     if treasury:
+        # The treasury is a continuous high-volume stream (~1668 tiles releasing
+        # over weeks) whose arrivals RE-FIRE every poll: the planned masked
+        # obs_ids seeded into the state (jw10678NNN001_xxNNN_..._nircam) never
+        # match the released concrete ones (jw10678NNN001_02201_00001_mirimage),
+        # so every tile reads as NEW_OBSERVATION on every poll.  notify-on-arrival
+        # then posts a FRESH comment on the rolling issue AND on every per-tile
+        # issue every hour -- the spam this guards against (#44 had 24, per-tile
+        # issues ~20 each).  Roll the treasury reports into ONE edit-in-place
+        # comment per issue; a fresh downgrade notice still notifies (it rides
+        # every body and must reach a human), and an explicit update_last
+        # override still wins.
+        treasury_edit = override if override is not None else (not fresh_downgrade)
         # single rolling issue (auto-created if absent) instead of per-obs
         # rc=3 "no issue titled ..." failures for every treasury tile
         body = status_report.render_events_comment(treasury, notice=notice)
-        edit = _update_last(treasury)
+        edit = treasury_edit
         posts.append((edit, status_report.post_status(
             TREASURY_ISSUE_TITLE, body, repo=repo, update_last=edit,
             marker=status_report.MONITOR_MARKER, dry_run=not execute,
@@ -1566,9 +1578,11 @@ def act_report(events, execute=False, repo=None, update_last=None, notice=None,
         arrivals = [ev for ev in treasury if event_is_arrival(ev)]
         for (program, obsnum, instr), evs in sorted(_group_by_obs(arrivals).items()):
             o = treasury_observation(program, obsnum, instr, evs)
-            # classified on the TILE's own events, like every other issue: an
-            # arrival posts a notifying comment (update_last False)
-            tile_edit = _update_last(evs)
+            # Edit-in-place like the rolling issue above (treasury tiles re-fire
+            # every poll): the FIRST post still opens the issue and its comment
+            # (a create notifies on its own), and later polls quietly edit that
+            # comment instead of stacking a new one every hour.
+            tile_edit = treasury_edit
             rc = status_report.post_status(
                 o.issue_title,
                 status_report.render_events_comment(evs, notice=notice),
