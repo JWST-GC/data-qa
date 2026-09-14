@@ -1421,6 +1421,62 @@ def test_act_download_proceeds_when_size_fits(monkeypatch):
     assert fetched[0]["dry_run"] is False
 
 
+def test_per_field_routes_the_download_into_the_group_field(monkeypatch):
+    """The flat tree sits one level BELOW every field root, so a staged tile is
+    invisible to the QA read side and had to be copied a second time (#163).
+    Routing on the field the group already carries lands it where
+    diagnostics._field_roots already looks."""
+    fetched = _patch_download(monkeypatch, size=1e12, free_tb=10.0)
+    mm.act_download(_trigger_events("001", field="gc-treasury"), execute=True,
+                    download_dir="/base", min_free_tb=5.0, per_field=True)
+    assert len(fetched) == 1
+    assert fetched[0]["download_dir"] == "/base/gc-treasury"
+
+
+def test_flat_mode_is_still_the_default(monkeypatch):
+    """--per-field is opt-in; the installed cron keeps its flat tree until the
+    scrontab line is changed deliberately."""
+    fetched = _patch_download(monkeypatch, size=1e12, free_tb=10.0)
+    mm.act_download(_trigger_events("001", field="gc-treasury"), execute=True,
+                    download_dir="/base", min_free_tb=5.0)
+    assert fetched[0]["download_dir"] == "/base"
+
+
+def test_per_field_gates_disk_on_the_base_not_the_subdirectory(monkeypatch):
+    """The per-field subdirectories share the base filesystem, and gating on one
+    that does not exist yet would climb back to the same mount regardless -- so
+    the gate reading the base is what keeps the threshold meaningful."""
+    gated = []
+    fetched = _patch_download(monkeypatch, size=1e12, free_tb=10.0)
+    real_gate = mm.disk_gate
+    monkeypatch.setattr(mm, "disk_gate",
+                        lambda d, m: (gated.append(d), (True, 10.0, "gate"))[1])
+    mm.act_download(_trigger_events("001", field="gc-treasury"), execute=True,
+                    download_dir="/base", min_free_tb=5.0, per_field=True)
+    assert gated == ["/base"]
+    assert fetched[0]["download_dir"] == "/base/gc-treasury"
+
+
+def test_per_field_keeps_each_field_in_its_own_tree(monkeypatch):
+    """Two fields in one poll must not share a directory -- that is the whole
+    point of the flag."""
+    fetched = _patch_download(monkeypatch, size=1e12, free_tb=10.0)
+    evs = (_trigger_events("001", field="brick")
+           + _trigger_events("002", field="gc-treasury"))
+    mm.act_download(evs, execute=True, download_dir="/base", min_free_tb=5.0,
+                    per_field=True)
+    assert sorted(f["download_dir"] for f in fetched) == [
+        "/base/brick", "/base/gc-treasury"]
+
+
+def test_the_per_field_flag_reaches_act_download():
+    """A flag main() parses but never forwards would be a silent no-op -- the
+    cron would keep writing flat while its command line said otherwise."""
+    src = inspect.getsource(mm.main)
+    assert "per_field=args.per_field" in src, (
+        "main() parses --per-field but does not forward it to act_download")
+
+
 def test_act_download_unknown_size_skips_by_default(monkeypatch, capsys):
     fetched = _patch_download(monkeypatch, size=None, free_tb=10.0)
     mm.act_download(_trigger_events("001"), execute=True, min_free_tb=5.0)

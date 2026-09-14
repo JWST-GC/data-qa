@@ -1107,13 +1107,24 @@ def disk_gate(download_dir, min_free_tb=DEFAULT_MIN_FREE_TB):
 # ---------------------------------------------------------------------------- actions
 def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
                  min_free_tb=DEFAULT_MIN_FREE_TB, force_unknown_size=False,
-                 state=None, state_path=None):
+                 state=None, state_path=None, per_field=False):
     """Download the products for each actionable (program, obs, instrument) group.
 
     The download tree is a STAGING copy for QA inspection -- the reduction
     downloads its own inputs (see DEFAULT_DOWNLOAD_DIR).  Release-gated
     (event_ready) and deduplicated via the state file's ``downloaded`` map
     (burned only on a successful release-gated download).
+
+    ``per_field`` routes each group into ``<download_dir>/<field>/`` instead of
+    a single flat tree, so astroquery builds
+    ``<download_dir>/<field>/mastDownload/JWST/...`` -- the same shape the QA
+    read side already searches via ``diagnostics._field_roots``.  A flat tree
+    sits one level BELOW every field root, which is why a staged tile needed a
+    separate copy to be visible to QA (#163).  The group's field is already
+    known here (an unmapped one is skipped above), so nothing has to be guessed.
+    ``disk_gate`` keeps watching the BASE directory: the per-field subdirectories
+    all share its filesystem, and gating on a not-yet-created subdirectory would
+    just climb back to the same mount anyway.
 
     Returns ``{group key: SKIP reason}`` for the groups this run REACHED and
     left owed -- low-disk, unknown-size, oversize (issue #84).  Those skips
@@ -1189,11 +1200,13 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
                       f"{min_free_tb:.1f} TB --min-free-tb floor)", file=sys.stderr)
                 owed[(program, obsnum, instr)] = "oversize"
                 continue
+        dest = (os.path.join(download_dir, evs[0]["field"]) if per_field
+                else download_dir)
         print(f"--download: program {program} obs {obsnum} ({instrument}; "
-              f"{len(evs)} event(s); dry_run={not execute})")
+              f"{len(evs)} event(s); dry_run={not execute}) -> {dest}")
         result = retrieve_data.retrieve(
             program, obsnum, product_type=("uncal", "i2d"),
-            instrument=instrument, download_dir=download_dir,
+            instrument=instrument, download_dir=dest,
             dry_run=not execute)
         if execute and state_path and result is not None:
             # burned only on a successful, release-gated download (mirrors the
@@ -1658,6 +1671,13 @@ def main(argv=None):
     ap.add_argument("--download-dir", default=DEFAULT_DOWNLOAD_DIR,
                     help="download destination for --download/--auto "
                          f"(default {DEFAULT_DOWNLOAD_DIR})")
+    ap.add_argument("--per-field", action="store_true",
+                    help="download into <--download-dir>/<field>/ instead of one "
+                         "flat tree, so products land where the QA read side "
+                         "already looks (e.g. --download-dir "
+                         "/orange/adamginsburg/jwst --per-field puts a treasury "
+                         "tile in /orange/adamginsburg/jwst/gc-treasury/"
+                         "mastDownload/JWST/...)")
     ap.add_argument("--pipe-root", default=None,
                     help="jwst-gc-pipeline checkout for --trigger")
     ap.add_argument("--repo", default=None, help="owner/name for --report")
@@ -1893,7 +1913,8 @@ def main(argv=None):
                                 download_dir=args.download_dir,
                                 min_free_tb=args.min_free_tb,
                                 force_unknown_size=args.force_download_unknown_size,
-                                state=state, state_path=args.state) or {}
+                                state=state, state_path=args.state,
+                                per_field=args.per_field) or {}
             if owed:
                 # A group act_download REACHED and did not download (low-disk /
                 # unknown-size / oversize) burned no 'downloaded' key, so the
