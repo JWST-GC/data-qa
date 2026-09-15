@@ -5906,8 +5906,24 @@ def _caption_for_impl(n, metrics):
 
 def _obs_from_disk(program, obs, base=BASE):
     """Fallback registry for on-cluster runs where the release portal is unreachable:
-    find the field dir on disk holding this obs's mosaics and read its NIRCam filters."""
+    find the field dir on disk holding this obs's mosaics and read its NIRCam filters.
+
+    A tile can be DELIVERED to MAST before our pipeline has reduced it (e.g. a treasury tile
+    whose reduce is held on a partial exposure set): its own merged mosaic does not exist yet, so
+    the mosaic pass below finds nothing.  A MAST-only pass then builds the observation from the
+    MAST-delivered NIRCam i2d, so the delivered tile still gets a QA issue driven by MAST products
+    (mirrors ``_miri_obs_from_disk``).  Without it a delivered-but-unreduced tile gets no QA at all
+    (JWST-GC/data-qa#161)."""
     from .observations import CURATED, FIELDS
+    cur = CURATED.get(f"jw{int(program):05d}-o{obs}", {})
+
+    def _made(fld, filts):
+        return Observation(program=str(int(program)), obs=obs,
+                           target=FIELDS.get(fld, fld.title()),   # display name -> matches issue title
+                           release_field=fld, instrument="NIRCam", filters=filts,
+                           visits=cur.get("visits", []), epoch=cur.get("epoch", ""),
+                           notes=cur.get("notes", ""))
+
     for d in sorted(glob.glob(f"{base}/*/")):
         fld = os.path.basename(d.rstrip("/"))
         stem = f"jw{int(program):05d}-o{obs}_t001_nircam_clear-*-merged_i2d.fits"
@@ -5917,12 +5933,19 @@ def _obs_from_disk(program, obs, base=BASE):
             continue
         filts = sorted({m.group(1).upper() for h in hits
                         if (m := re.search(r"clear-(f\d{3}[wnm])-merged", os.path.basename(h).lower()))})
-        cur = CURATED.get(f"jw{int(program):05d}-o{obs}", {})
-        return Observation(program=str(int(program)), obs=obs,
-                           target=FIELDS.get(fld, fld.title()),   # display name -> matches issue title
-                           release_field=fld, instrument="NIRCam", filters=filts,
-                           visits=cur.get("visits", []), epoch=cur.get("epoch", ""),
-                           notes=cur.get("notes", ""))
+        return _made(fld, filts)
+
+    # MAST-only pass: a delivered tile with no merged mosaic of ours yet.  Read the NIRCam filters
+    # from the MAST-delivered i2d under mastDownload, accepting any tile token (_t001_../_t113_..).
+    obsid = f"jw{int(program):05d}-o{obs}"
+    for d in sorted(glob.glob(f"{base}/*/")):
+        fld = os.path.basename(d.rstrip("/"))
+        mhits = glob.glob(f"{base}/{fld}/mastDownload/**/{obsid}_t*_nircam_*_i2d.fits",
+                          recursive=True)
+        filts = sorted({m.group(1).upper() for h in mhits
+                        if (m := re.search(r"clear-(f\d{3}[wnm])", os.path.basename(h).lower()))})
+        if filts:
+            return _made(fld, filts)
     return None
 
 
