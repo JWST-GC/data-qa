@@ -268,3 +268,24 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra
         raise PostError(f"comment {action} failed ({st}): {data}")
     print(f"  stage {stage}: {action} comment on #{num} -> {data.get('html_url')}")
     return data
+
+
+def unpost_stage(o: Observation, stage, repo, token=None):
+    """Remove the stage-``stage`` diagnostic comment on ``o``'s issue, if present.
+
+    Used when a stage's input data are not yet on disk: the stage is excluded from the issue
+    until the data land, so a comment left from an earlier run is deleted.  A no-op when the
+    issue or the comment does not exist."""
+    token = token or _token()
+    num = _issue_number(repo, token, o.issue_title)
+    if num is None:
+        return None
+    marker = DIAG_MARKER.format(n=stage)
+    existing = _find_stage_comment(repo, token, num, marker)
+    if not existing:
+        return None
+    st, data = _req("DELETE", f"{API}/repos/{repo}/issues/comments/{existing['id']}", token)
+    if st >= 300:
+        raise PostError(f"comment delete failed ({st}): {data}")
+    print(f"  stage {stage}: removed (data unavailable) comment on #{num}")
+    return existing["id"]

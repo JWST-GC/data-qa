@@ -943,8 +943,9 @@ def test_make_issues_frame_ok_untficked_when_spatial_unassessed(monkeypatch):
 
 
 def test_make_issues_product_existence_checkboxes(monkeypatch):
-    # jicama / JWST1PASS / peppar presence boxes are auto-set from the diagnostics: a stage
-    # red-flags when its product is absent, so "not red-flagged" ticks the box.
+    # jicama / JWST1PASS / peppar presence boxes are auto-set from the diagnostics: a stage whose
+    # product is absent reports available=False (no red flag), so "not available" leaves the box
+    # unticked.
     from data_qa import make_issues as MI
     monkeypatch.setattr(MI, "_guidestar_json", lambda: {})
     o = Observation(program="2045", obs="001", target="Arches", release_field="arches",
@@ -952,15 +953,15 @@ def test_make_issues_product_existence_checkboxes(monkeypatch):
     monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {
         "stage3": {"passed": True},                       # jicama present (Vega calib ran)
         "stage6": {"peppar_kind": "frame-to-frame σ"},    # peppar present
-        "stage10": {"stage": 10, "red_flag": True},       # JWST1PASS absent
-        "stage11": {"stage": 11, "red_flag": False}})
+        "stage10": {"stage": 10, "available": False},     # JWST1PASS absent
+        "stage11": {"stage": 11, "available": True}})
     lines = {l.split("**Products**: ")[1].split(" present")[0]: l
              for l in MI.render_body(o).splitlines() if "**Products**:" in l}
     assert "[x]" in lines["jicama (merged/release catalogue)"]
-    assert "[ ]" in lines["JWST1PASS products"]           # stage 10 red-flagged -> absent
+    assert "[ ]" in lines["JWST1PASS products"]           # stage 10 unavailable -> absent
     assert "[x]" in lines["peppar products"]
     # nothing present -> all three unticked
-    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {"stage10": {"red_flag": True}})
+    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {"stage10": {"available": False}})
     lines2 = [l for l in MI.render_body(o).splitlines() if "**Products**:" in l]
     assert len(lines2) == 3 and all("[ ]" in l for l in lines2)
 
@@ -2281,8 +2282,8 @@ def test_miri_degenerate_i2d_does_not_pass(tmp_path, monkeypatch):
     assert metrics.get("miri_finite_frac", 1.0) < 0.2
 
 
-def test_miri_overview_red_flag_no_i2d(tmp_path, monkeypatch):
-    """No i2d on disk -> a red-flag figure, passed False."""
+def test_miri_overview_unavailable_no_i2d(tmp_path, monkeypatch):
+    """No i2d on disk -> a pending figure, available False, passed None, no red flag."""
     monkeypatch.setattr(D, "BASE", str(tmp_path))
     monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "out"))
     (tmp_path / "brick" / "mastDownload").mkdir(parents=True)
@@ -2290,7 +2291,8 @@ def test_miri_overview_red_flag_no_i2d(tmp_path, monkeypatch):
                     instrument="MIRI", filters=["F1800W"], visits=[], epoch="", notes="")
     png, metrics = D.miri_overview(o)
     assert os.path.exists(png)
-    assert metrics.get("red_flag") is True and metrics.get("passed") is False
+    assert (metrics.get("available") is False and metrics.get("passed") is None
+            and not metrics.get("red_flag"))
 
 
 # --------------------------------------------------------------------------- input provenance
@@ -2522,14 +2524,14 @@ def test_jwst1pass_matchup_env_override(tmp_path, monkeypatch):
         str(tmp_path / "MATCHUP.XYMEEE")
 
 
-def test_stage10_red_flags_without_product(tmp_path, monkeypatch):
+def test_stage10_unavailable_without_product(tmp_path, monkeypatch):
     monkeypatch.setitem(D._JWST1PASS_ROOTS, "brick", str(tmp_path))
     monkeypatch.delenv("QA_JWST1PASS_DIR", raising=False)
     png, m = D.stage10_photometric_consistency(_obs(field="brick", filt="F182M"), "F182M", None)
-    assert m["red_flag"] and m["passed"] is False
-    assert "MATCHUP" in m["red_flag_reason"] or "no JWST1PASS" in m["red_flag_reason"]
+    assert m.get("available") is False and m.get("passed") is None and not m.get("red_flag")
+    assert "no JWST1PASS" in m["na_reason"]
     cap = D.caption_for(10, m)
-    assert "RED FLAG" in cap and "measurement could not be made" in cap
+    assert "pending" in cap and "not yet on disk" in cap
 
 
 def test_stage10_measures_consistency(tmp_path, monkeypatch):
@@ -2627,12 +2629,12 @@ def test_effective_psf_excludes_saturated_via_dq(tmp_path):
     assert stamp is None and n < 10                                  # saturated cores all dropped
 
 
-def test_stage11_red_flags_without_peppar(tmp_path, monkeypatch):
+def test_stage11_unavailable_without_peppar(tmp_path, monkeypatch):
     monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
     png, m = D.stage11_effective_psf(_obs(field="brick", filt="F212N"), "F212N", None)
-    assert m["red_flag"] and m["passed"] is False
-    assert "no peppar" in m["red_flag_reason"]
-    assert "RED FLAG" in D.caption_for(11, m)
+    assert m.get("available") is False and m.get("passed") is None and not m.get("red_flag")
+    assert "no peppar" in m["na_reason"]
+    assert "pending" in D.caption_for(11, m)
 
 
 def _write_o_frames(det_dir, prog, obs, qfits):
