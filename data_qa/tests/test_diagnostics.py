@@ -3247,6 +3247,36 @@ def test_miri_obs_from_disk_reads_the_monitor_download_tree(tmp_path, monkeypatc
     assert D._miri_obs_from_disk("99999", "001", base=str(tmp_path)) is None
 
 
+def test_obs_from_disk_builds_nircam_from_mast_when_no_mosaic(tmp_path, monkeypatch):
+    """A delivered tile whose reduce is held has no merged mosaic of ours yet, so the mosaic pass
+    finds nothing.  The MAST-only pass then builds the NIRCam observation from the MAST-delivered
+    i2d, so the tile still gets a QA issue (JWST-GC/data-qa#161)."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    for filt in ("f212n", "f480m"):
+        sub = (tmp_path / "gc-treasury" / "mastDownload" / "JWST"
+               / f"jw10678-o113_t113_nircam_clear-{filt}")
+        sub.mkdir(parents=True)
+        _touch(sub, f"jw10678-o113_t113_nircam_clear-{filt}_i2d.fits")
+    o = D._obs_from_disk("10678", "113", base=str(tmp_path))
+    assert o is not None and o.instrument == "NIRCam"
+    assert o.release_field == "gc-treasury"
+    assert o.filters == ["F212N", "F480M"]
+    assert o.issue_title == "GC Treasury — jw10678-o113 (NIRCam)"
+
+
+def test_obs_from_disk_prefers_our_mosaic_over_mast(tmp_path, monkeypatch):
+    """When our own merged mosaic exists the mosaic pass wins, so a reduced tile keeps its previous
+    behaviour and the MAST-only pass never overrides it."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "gc-treasury" / "F212N" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw10678-o137_t001_nircam_clear-f212n-merged_i2d.fits")
+    mast = (tmp_path / "gc-treasury" / "mastDownload" / "JWST"
+            / "jw10678-o137_t137_nircam_clear-f480m"); mast.mkdir(parents=True)
+    _touch(mast, "jw10678-o137_t137_nircam_clear-f480m_i2d.fits")
+    o = D._obs_from_disk("10678", "137", base=str(tmp_path))
+    assert o is not None and o.filters == ["F212N"]      # from the mosaic pass, not the MAST i2d
+
+
 def test_mast_lookups_reach_a_split_field_tree(tmp_path, monkeypatch):
     """`_mast_source_catalog`, `_mast_catalog_positions`, `_mast_i2d` and `_saturation_mask` used
     a literal `{BASE}/{o.field}`, so on a split field (`<field>_o<obs>`, issue #119) they saw only
