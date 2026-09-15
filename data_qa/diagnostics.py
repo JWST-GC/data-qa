@@ -1018,7 +1018,7 @@ def stage2_cmd(o: Observation, sw, lw):
                   f"no release catalogue and no MAST source catalogue for {want} yet")
         png = _red_flag_figure(o, "stage2", "NO CATALOG FOR CMD",
                                f"The CMD is empty: {reason}.")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
     t = Table.read(_used(cat, f"CMD catalogue ({kind})"))
 
@@ -1185,7 +1185,7 @@ def stage3_calibration(o: Observation, sw):
                   f"frame offset" if dao_only else
                   f"no release or MAST source catalogue for {sw} yet")
         png = _red_flag_figure(o, "stage3", "NO PHOTOMETRY TO CALIBRATE", reason + ".")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
     if ref_sc is None or ref_mag is None:
         a.text(0.5, 0.5, "need VIRAC refcat", ha="center", va="center")
@@ -2867,7 +2867,7 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
                   else "no mosaic on disk to measure aperture photometry on")
         png = _red_flag_figure(o, "stage9", "PSF-vs-APER UNMEASURABLE",
                                f"Cannot compare PSF vs aperture photometry: {reason}.")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
     metrics["catalog"] = src
     try:
@@ -3140,7 +3140,7 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
         reason = "no JWST1PASS MATCHUP.XYMEEE product on disk for this obs/filter"
         png = _red_flag_figure(o, "stage10", "JWST1PASS CONSISTENCY UNAVAILABLE",
                                f"Cannot build the across-exposure consistency panels: {reason}.")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
     metrics["filter"] = filt
     d = _read_matchup_xymeee(_jwst1pass_matchup(o, filt))
@@ -3513,7 +3513,7 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
                                f"No MAST-delivered {sw} i2d in mastDownload/ for this obs, so the "
                                f"before/after comparison can't be made. (Not a data defect — the "
                                f"raw MAST product just isn't staged locally.)")
-        metrics.update(red_flag=True, red_flag_reason=f"no MAST {sw} i2d on disk", passed=False)
+        metrics.update(available=False, na_reason=f"no MAST {sw} i2d on disk", passed=None)
         return png, metrics
 
     # MAST source list: prefer the MAST-delivered L3 catalogue (download if it exists on MAST),
@@ -4138,7 +4138,7 @@ def miri_overview(o: Observation, filt=None):
                                f"No MIRI i2d for {o.obsid} in mastDownload/ or in a "
                                f"<FILT>/pipeline/ reduction dir "
                                f"(filters tried: {', '.join(filts)}).")
-        metrics.update(red_flag=True, red_flag_reason="no MIRI i2d on disk", passed=False)
+        metrics.update(available=False, na_reason="no MIRI i2d on disk", passed=None)
         return png, metrics
     # Which image the figure shows, so the panel TITLE and the caption can both name it.
     metrics["i2d_source"] = "mast" if "/mastDownload/" in mpath else "reduced"
@@ -4634,7 +4634,7 @@ def _stage6_figure(o: Observation, sw, lw, exclude=None, png_suffix=""):
         reason = "no per-exposure DAOPHOT catalogs on disk for this obs/filter"
         png = _red_flag_figure(o, "stage6" + png_suffix, "ASTROMETRIC-ERROR CURVE UNAVAILABLE",
                                f"Cannot build the precision-vs-magnitude curve: {reason}.")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
     a.set_yscale("log")
     a.set_ylim(0.03, 300.0)          # 0.03-300 mas: floor through S/N rise incl. faint rms(offset)
@@ -4924,7 +4924,7 @@ def stage11_effective_psf(o: Observation, sw, lw):
         reason = "no peppar per-frame catalogues on disk for this obs/filter"
         png = _red_flag_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE",
                                f"Cannot build the per-exposure effective PSF: {reason}.")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
     metrics["filter"] = filt
     qf = _exposure_qfit(o, filt)          # {exp_token: (median_qfit, n)} pooled over detectors
@@ -4943,7 +4943,7 @@ def stage11_effective_psf(o: Observation, sw, lw):
     if not exps:
         reason = f"no exposures found under peppar {filt}/{det}"
         png = _red_flag_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE", reason + ".")
-        metrics.update(red_flag=True, red_flag_reason=reason, passed=False)
+        metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
 
     # The streak flag lives in ONE place: _streaked_exposures (shared with the stage-6 clean
@@ -5219,7 +5219,7 @@ def stage12_photometric_linearity(o: Observation, sw, lw=None, r_ap=3.0, iso_px=
         why = "no filter had a mosaic + PSF-flux catalogue with enough clean isolated stars"
         png = _red_flag_figure(o, "stage12", "LINEARITY UNMEASURABLE",
                                f"Cannot measure photometric linearity: {why}.")
-        metrics.update(red_flag=True, red_flag_reason=why, passed=False,
+        metrics.update(available=False, na_reason=why, passed=None,
                        filters_measured=[], per_filter={})
         return png, metrics
     # primary = representative SW filter if it was measured, else the first measured filter
@@ -5461,6 +5461,9 @@ def _caption_stage12(metrics):
     """Stage-12 caption: the method, the primary filter's numbers, and a per-filter table so every
     filter's slope and turn-over appear even though only the primary plot is shown inline (the rest
     are in the expandable block)."""
+    if metrics.get("available") is False:
+        return (f"**Stage 12 — pending.** The input data for this stage are not yet on disk "
+                f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
     if metrics.get("red_flag"):
         return (f"🚩 **Stage 12 — photometric linearity: unmeasurable.** "
                 f"{metrics.get('red_flag_reason', 'no measurable filter')}. "
@@ -5531,6 +5534,9 @@ def _caption_for_impl(n, metrics):
         return _caption_stage12(metrics)
     # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
     # so the generic "the plot is empty" wording would not fit).
+    if metrics.get("available") is False:
+        return (f"**Stage {n} — pending.** The input data for this stage are not yet on disk "
+                f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
     if metrics.get("red_flag") and n != 7:
         return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
@@ -6002,6 +6008,10 @@ def _miri_caption(metrics, repo):
                      f"(median {100 * metrics['sat_median']:.2f}%, max {100 * metrics['sat_max']:.2f}% "
                      f"saturated over {metrics['sat_n_frames']} `{metrics['sat_kind']}` frames)")
     body = ", plus ".join(parts) if len(parts) > 1 else parts[0]
+    if metrics.get("available") is False:
+        return (f"**MIRI basics — pending.** The input data for this stage are not yet on disk "
+                f"({metrics.get('na_reason', 'not available')}); it will appear once the data land. "
+                f"([how this is made]({doc}))")
     if metrics.get("red_flag"):
         return (f"🚩 **MIRI basics — {metrics.get('red_flag_reason','no data')}.** "
                 f"([how this is made]({doc}))")
@@ -6038,8 +6048,11 @@ def _run_miri(args):
         json.dump(all_metrics, fh, indent=2, default=_json_default)
     if args.post:
         try:
-            from .post_diagnostics import post_stage, PostError
-            post_stage(o, "miri", png, _miri_caption(metrics, args.repo), args.repo)
+            from .post_diagnostics import post_stage, unpost_stage, PostError
+            if metrics.get("available") is False:
+                unpost_stage(o, "miri", args.repo)
+            else:
+                post_stage(o, "miri", png, _miri_caption(metrics, args.repo), args.repo)
         except (PostError, OSError) as e:
             print(f"  MIRI: post FAILED (figure built OK): {e}", file=sys.stderr)
     return 0
@@ -6113,9 +6126,12 @@ def main(argv=None):
             json.dump(all_metrics, fh, indent=2, default=_json_default)
         if args.post:
             try:
-                from .post_diagnostics import post_stage, PostError
-                post_stage(o, n, png, caption_for(n, metrics), args.repo,
-                           extra_images=metrics.get("extra_figures"))
+                from .post_diagnostics import post_stage, unpost_stage, PostError
+                if metrics.get("available") is False:
+                    unpost_stage(o, n, args.repo)
+                else:
+                    post_stage(o, n, png, caption_for(n, metrics), args.repo,
+                               extra_images=metrics.get("extra_figures"))
                 # Stage 6 emits a SECOND figure recomputed excluding stage-11-flagged bad-PSF
                 # exposures; post it under its own marker so it sits beside, not over, the main one.
                 if n == 6 and metrics.get("clean_png"):

@@ -103,9 +103,10 @@ def render_body(o: Observation) -> str:
                      or str(s4.get("source", "")).startswith("release")
                      or bool(s3.get("passed")))
     #  - JWST1PASS (stage 10): a MATCHUP.XYMEEE / LOG.psfperts product exists.
-    jwst1pass_present = bool(s10) and not s10.get("red_flag")
+    jwst1pass_present = bool(s10) and s10.get("available") is not False and not s10.get("red_flag")
     #  - peppar: stage 6 drew a peppar curve (peppar_kind set) or stage 11 built the ePSF grid.
-    peppar_present = bool(s6.get("peppar_kind")) or (bool(s11) and not s11.get("red_flag"))
+    peppar_present = bool(s6.get("peppar_kind")) or (
+        bool(s11) and s11.get("available") is not False and not s11.get("red_flag"))
 
     filt_rows = "\n".join(f"  - [ ] `{f}` — mosaic reviewed; astrometry + photometry OK"
                           for f in o.filters) or "  - (filters TBD)"
