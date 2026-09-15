@@ -3307,7 +3307,12 @@ def _detect_on_mosaic(path, crop=5000, fwhm_pix=2.5, nsigma=5.0, maxn=500000):
 
 # The STScI L3 source catalogue is delivered as ``_cat.ecsv`` (the default) or ``_cat.fits``; the
 # per-detector, destreak and segmentation products share the ``_cat`` stem and must be excluded.
-_MAST_CAT_EXCLUDE = ("nrca", "nrcb", "destreak", "segm")
+# ``merged`` excludes OUR OWN pipeline product: the MAST catalogue search reaches ``<FILT>/pipeline``
+# and ``images-merged`` (where our reduction writes ``..._t001_...-merged_cat.ecsv``), and a MAST L3
+# NIRCam catalogue is per-i2d (``_tNNN_..._cat``) and never carries ``-merged``.  Without this our
+# merged catalogue is picked as "MAST", which swaps the stage-7 MAST/pipeline series and inverts its
+# conclusion (JWST-GC/data-qa#192).
+_MAST_CAT_EXCLUDE = ("nrca", "nrcb", "destreak", "segm", "merged")
 
 
 def _download_mast_l3_catalog(o, filt):
