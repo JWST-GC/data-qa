@@ -51,8 +51,12 @@ def extract(i2d_path):
 
 def _find_mosaic(program, obs, field):
     prog = f"jw{int(program):05d}"
+    # prefer our reduced mosaic; fall back to the MAST-delivered i2d so a delivered tile that
+    # is not reduced yet still yields its guide star (the keywords are in the MAST L3 header
+    # too).  The MAST layout is a fixed mastDownload/JWST/<product>/ depth -- a bounded glob.
     pats = [f"{BASE}/{field}/*/pipeline/{prog}-o{obs}*_t001_*i2d.fits",
-            f"{BASE}/{field}/images-merged/{prog}-o{obs}*_t001_*i2d.fits"]
+            f"{BASE}/{field}/images-merged/{prog}-o{obs}*_t001_*i2d.fits",
+            f"{BASE}/{field}/mastDownload/JWST/{prog}-o{obs}_t*/{prog}-o{obs}_t*_i2d.fits"]
     for pat in pats:
         hits = sorted(glob.glob(pat))
         # prefer a plain science mosaic over residual/model sidecars
