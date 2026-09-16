@@ -150,3 +150,26 @@ def test_apply_never_writes_the_human_workflow_field(monkeypatch, tmp_path):
 def test_apply_refuses_when_metrics_are_missing(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         _run(monkeypatch, tmp_path, ["--apply", "--max-missing", "0"])
+
+
+def _stub_issue_list(monkeypatch, tmp_path, issues):
+    monkeypatch.setattr(S, "_METRICS_DIR", str(tmp_path))
+    monkeypatch.setattr(S, "_gh", lambda *a, **k: (_json.dumps(issues), 0))
+
+
+def test_rows_skips_non_observation_issues_by_default(monkeypatch, tmp_path):
+    _stub_issue_list(monkeypatch, tmp_path, [
+        {"number": 98, "title": "GC Treasury — jw10678-o098 (NIRCam)", "url": "u98"},
+        {"number": 161, "title": "A delivered tile gets no per-observation QA issue", "url": "u161"},
+    ])
+    assert {r["num"] for r in S._rows("repo")} == {98}          # dev/tracking issue is off the board
+
+
+def test_rows_include_meta_opts_the_escape_hatch_back_in(monkeypatch, tmp_path):
+    _stub_issue_list(monkeypatch, tmp_path, [
+        {"number": 98, "title": "GC Treasury — jw10678-o098 (NIRCam)", "url": "u98"},
+        {"number": 161, "title": "A delivered tile gets no per-observation QA issue", "url": "u161"},
+    ])
+    rows = S._rows("repo", include_meta=True)
+    assert {r["num"] for r in rows} == {98, 161}
+    assert any(r["cat"] == "meta" for r in rows)               # the non-obs issue is a meta card

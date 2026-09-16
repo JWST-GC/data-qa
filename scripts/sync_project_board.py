@@ -154,7 +154,9 @@ def _rows(repo, include_meta=False):
                  "--json", "number,title,url", "--limit", "1000")
     issues = json.loads(out)
     if len(issues) >= 1000:
-        print("WARNING: hit the 300-issue list cap; some open issues may be missing", file=sys.stderr)
+        print("WARNING: hit the 1000-issue list cap; some open issues may be missing "
+              "(raise the --limit) -- cards past the cap would go stale rather than archive",
+              file=sys.stderr)
     rows = []
     for it in issues:
         m = _OBS_RE.search(it["title"])
