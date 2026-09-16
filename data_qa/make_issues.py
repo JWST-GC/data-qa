@@ -92,9 +92,11 @@ _GLOBUS_PROD_EXCLUDE = ("outlier", "_model_", "_residual_", "smoothed_bg",
 # fetch them with a short-lived bearer token; it is the same per issue (only the URL list varies).
 _GLOBUS_DOWNLOAD_HELP = (
     "These are pipeline products on the JWST-GC Globus collection (`" + _GLOBUS_COLLECTION_ID
-    + "`), shared with the Treasury team via a free Globus/ORCID login (not a public release), so "
-    "the URLs redirect to Globus auth.  Fetch them from the command line with a short-lived "
-    "bearer token:\n\n"
+    + "`), not a public release, so the URLs redirect to Globus auth.  Access is granted per "
+    "field: program 10678 (`gc-treasury`) is shared with the Treasury team group today; other "
+    "fields may need a read rule added first, so a 403 after logging in means \"ask for access\" "
+    "rather than a broken link.  Fetch the files from the command line with a short-lived bearer "
+    "token:\n\n"
     "```\n"
     "pip install globus-sdk                 # once\n"
     "python - <<'PY'                        # opens an ORCID/Globus login; prints a ~48 h token\n"
@@ -149,8 +151,9 @@ def _globus_block(o: Observation) -> str:
     for f, kind, url in rows:
         by_filt.setdefault(f, {})[kind] = url
     lines = ["### Data files (Globus)",
-             "Pipeline products for this observation on the JWST-GC Globus collection "
-             "(Treasury-team access via a free Globus login):"]
+             "Pipeline products for this observation on the JWST-GC Globus collection. Access is "
+             "granted per field (10678/`gc-treasury` is shared with the Treasury team; other fields "
+             "may need a read rule added). See the download recipe below."]
     for f in o.filters:
         d = by_filt.get(f)
         if d:
