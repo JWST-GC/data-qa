@@ -85,3 +85,68 @@ def test_gh_token_routing_by_subcommand(monkeypatch):
     assert S._token_for(("api", "repos/x")) == "repo-tok"
     assert S._token_for(("project", "list")) == "proj-tok"
     assert S._token_for(("api", "graphql")) == "proj-tok"
+
+
+# --------------------------------------------------------------- SAFETY properties (docstring)
+import json as _json
+
+_WRITES = ("item-edit", "item-add", "item-archive", "field-create", "field-delete")
+
+
+def _run(monkeypatch, tmp_path, argv):
+    """Drive main() with _gh stubbed (canned project/fields/items/issues, all writes recorded)
+    and _METRICS_DIR pointed at tmp_path.  Returns (rc, list-of-gh-arg-tuples)."""
+    calls = []
+    fields = {
+        "Measured": {"name": "Measured", "id": "F_meas",
+                     "options": [{"name": o, "id": f"m{i}"} for i, o in enumerate(S._MEASURED_OPTIONS)]},
+        "Workflow": {"name": "Workflow", "id": "F_work",
+                     "options": [{"name": o, "id": f"w{i}"} for i, o in enumerate(S._WORKFLOW_OPTIONS)]},
+        "Review status": {"name": "Review status", "id": "F_rev",
+                          "options": [{"name": o, "id": f"r{i}"} for i, o in enumerate(S._REVIEW_OPTIONS)]},
+        "Stages 1-6": {"name": "Stages 1-6", "id": "F_st"},
+        "Red flags": {"name": "Red flags", "id": "F_rf"},
+        "Offset (mas)": {"name": "Offset (mas)", "id": "F_off"},
+    }
+
+    def fake_gh(*args, check=True):
+        calls.append(args)
+        a = list(args)
+        if a[:2] == ["project", "list"]:
+            return _json.dumps({"projects": [{"title": "Data-QA field status",
+                                              "id": "P", "number": 2, "url": "https://x"}]}), 0
+        if a[:2] == ["project", "field-list"]:
+            return _json.dumps({"fields": list(fields.values())}), 0
+        if a[:2] == ["issue", "list"]:
+            return _json.dumps([{"number": 98,
+                                 "title": "GC Treasury — jw10678-o098 (NIRCam)",
+                                 "url": "https://i/98"}]), 0
+        if a[:2] == ["project", "item-list"]:
+            return _json.dumps({"items": []}), 0
+        if a[:2] == ["project", "item-add"]:
+            return _json.dumps({"id": "ITEM1"}), 0
+        return "", 0
+
+    monkeypatch.setattr(S, "_gh", fake_gh)
+    monkeypatch.setattr(S, "_METRICS_DIR", str(tmp_path))
+    monkeypatch.setenv("GH_TOKEN", "x")
+    rc = S.main(argv)
+    return rc, calls
+
+
+def test_dry_run_writes_nothing(monkeypatch, tmp_path):
+    rc, calls = _run(monkeypatch, tmp_path, [])
+    assert not [c for c in calls if any(w in c for w in _WRITES)], calls
+
+
+def test_apply_never_writes_the_human_workflow_field(monkeypatch, tmp_path):
+    (tmp_path / "jw10678-o098.json").write_text(_json.dumps({"stage1": {"passed": True}}))
+    rc, calls = _run(monkeypatch, tmp_path, ["--apply"])
+    edits = [c for c in calls if "item-edit" in c]
+    assert edits, "nothing was written at all; the test is not exercising --apply"
+    assert not [c for c in edits if "F_work" in c]
+
+
+def test_apply_refuses_when_metrics_are_missing(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, tmp_path, ["--apply", "--max-missing", "0"])

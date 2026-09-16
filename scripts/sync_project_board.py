@@ -86,6 +86,9 @@ def _token_for(args):
 
 
 def _gh(*args, check=True):
+    # The token never reaches a log line: it is passed in the child ENV (not argv), and the only
+    # thing echoed on failure is the argv + ``r.stderr`` -- neither carries the secret.  Keep it
+    # that way; do NOT add ``print(args)``-with-token or dump ``env`` here for debugging.
     env = dict(os.environ)
     tok = _token_for(args)
     if tok:
@@ -146,18 +149,20 @@ def _classify(inst, metrics, st):
     return "clean"
 
 
-def _rows(repo):
+def _rows(repo, include_meta=False):
     out, _ = _gh("issue", "list", "--repo", repo, "--state", "open",
-                 "--json", "number,title,url", "--limit", "300")
+                 "--json", "number,title,url", "--limit", "1000")
     issues = json.loads(out)
-    if len(issues) >= 300:
+    if len(issues) >= 1000:
         print("WARNING: hit the 300-issue list cap; some open issues may be missing", file=sys.stderr)
     rows = []
     for it in issues:
         m = _OBS_RE.search(it["title"])
         if not m:
+            if not include_meta:
+                continue                    # non-observation (dev/tracking) issue: off the QA board
             rows.append(dict(num=it["number"], url=it["url"], cat="meta", line="", nrf=0,
-                             offset=None, has_metrics=True))          # meta issue: not expected to
+                             offset=None, has_metrics=True))
             continue
         obsid = f"jw{m.group(1)}-o{m.group(2)}"
         inst = m.group(3)
@@ -233,6 +238,9 @@ def main(argv=None):
     ap.add_argument("--max-missing", type=int, default=3,
                     help="refuse --apply if more than this many NIRCam issues lack metrics")
     ap.add_argument("--allow-missing", action="store_true", help="apply even if metrics are missing")
+    ap.add_argument("--include-meta", action="store_true",
+                    help="also add cards for non-observation (dev/tracking) issues; by default the "
+                         "board carries only per-observation QA issues")
     args = ap.parse_args(argv)
     apply = args.apply
 
@@ -256,7 +264,7 @@ def main(argv=None):
     print(f"metrics dir: {_METRICS_DIR}  (newest: {newest_str})")
     print(f"mode: {'APPLY' if apply else 'DRY-RUN (pass --apply to write)'}")
 
-    rows = _rows(args.repo)
+    rows = _rows(args.repo, include_meta=args.include_meta)
     n_missing = sum(1 for r in rows if not r["has_metrics"])
     if n_missing:
         print(f"WARNING: {n_missing} NIRCam issue(s) have NO metrics file -> 'No metrics'")
@@ -278,7 +286,7 @@ def main(argv=None):
     rev_opt = {o["name"]: o["id"] for o in (frev or {}).get("options", [])}
 
     out, _ = _gh("project", "item-list", str(pnum), "--owner", args.owner, "--format", "json",
-                 "--limit", "300")
+                 "--limit", "1000")
     items = json.loads(out)["items"]
     existing = {c["number"]: it for it in items
                 if (c := it.get("content") or {}).get("number") is not None}
@@ -318,11 +326,12 @@ def main(argv=None):
             _gh("project", "item-edit", "--id", iid, "--project-id", pid,
                 "--field-id", foff["id"], "--number", str(round(float(r["offset"]), 1)))
 
-    # archive cards whose issue is no longer open (closed from the board -> stop inflating counts)
+    # archive cards no longer wanted: a closed issue, or (default) a non-observation issue whose
+    # card predates the QA-only board -- either way it is not in `rows`, so it stops inflating counts.
     open_nums = {r["num"] for r in rows}
     stale = [(n, it) for n, it in existing.items() if n not in open_nums]
     for n, it in stale:
-        print(f"#{n:>3}  issue closed -> archive card")
+        print(f"#{n:>3}  not a tracked QA observation -> archive card")
         if apply:
             _gh("project", "item-archive", str(pnum), "--owner", args.owner, "--id", it["id"])
 
