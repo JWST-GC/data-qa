@@ -1726,6 +1726,28 @@ def test_mast_i2d_and_l3cat_pathing(tmp_path, monkeypatch):
     assert got.endswith("clear-f212n_cat.fits")
 
 
+def test_mast_l3_catalog_never_returns_our_merged_product(tmp_path, monkeypatch):
+    """The MAST catalogue search reaches ``<FILT>/pipeline``/``images-merged`` where OUR reduction
+    writes ``..._t001_...-merged_cat.ecsv``.  That product is ours, not MAST: picking it swaps the
+    stage-7 MAST/pipeline series and inverts the conclusion (JWST-GC/data-qa#192).  The genuine MAST
+    per-i2d catalogue under mastDownload is chosen, and when only our merged product exists the search
+    finds nothing MAST (download disabled)."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "gc-treasury" / "F212N" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw10678-o137_t001_nircam_clear-f212n-merged_cat.ecsv")   # OUR product, not MAST
+    o = Observation(program="10678", obs="137", target="GC Treasury",
+                    release_field="gc-treasury", instrument="NIRCam", filters=["F212N"],
+                    visits=[], epoch="", notes="")
+    assert D._mast_l3_catalog(o, "F212N", allow_download=False) is None   # our merged is not "MAST"
+
+    md = (tmp_path / "gc-treasury" / "mastDownload" / "JWST"
+          / "jw10678-o137_t137_nircam_clear-f212n"); md.mkdir(parents=True)
+    _touch(md, "jw10678-o137_t137_nircam_clear-f212n_cat.ecsv")           # genuine MAST per-i2d
+    got = D._mast_l3_catalog(o, "F212N", allow_download=False)
+    assert got is not None and got.endswith("clear-f212n_cat.ecsv")
+    assert "merged" not in os.path.basename(got)
+
+
 def test_load_mast_catalog_radec_and_mag(tmp_path):
     from astropy.table import Table
     p = str(tmp_path / "cat.fits")
