@@ -22,12 +22,27 @@ def test_render_body_has_checklist_and_marker(obs):
 
 
 def test_render_body_has_no_web_release_references(obs):
-    """The starformation web release is the last, post-QA step: it must never appear
-    in the issue body or QA process (only MAST/archive links belong here)."""
+    """The starformation web release is the last, post-QA step: the release page and its
+    direct downloads must never appear in the issue body.  This guard concerns only those; it
+    does not require the Aladin viewer link (that is asserted separately), and any starformation
+    reference that IS present must be the viewer, which is archive tooling rather than the
+    release page."""
+    import re
     body = mi.render_body(obs)
-    assert "starformation" not in body
     assert "Release page" not in body and "Direct downloads" not in body
     assert "MAST data search" in body            # archive link still present
+    hosts = re.findall(r"starformation\.astro\.ufl\.edu\S*", body)
+    assert all("avm_images/jwst_gc_aladin.html" in h for h in hosts)
+
+
+def test_render_body_links_aladin_viewer(obs):
+    """The overview links the JWST-GC Aladin viewer.  It is a plain link: the viewer centres
+    from its own presets and does not read URL coordinates, so the body claims no per-field
+    centring."""
+    body = mi.render_body(obs)
+    assert mi._ALADIN_PAGE in body
+    assert "centred on this field" not in body
+    assert "?ra=" not in body
 
 
 def test_render_body_asks_destreak_decision(obs):
