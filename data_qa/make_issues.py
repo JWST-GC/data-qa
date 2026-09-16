@@ -73,53 +73,12 @@ def _guidestar_block(o: Observation) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The JWST-GC Aladin viewer (all-survey HiPS overlays).  A plain link: the page centres
+# itself from its own preset buttons and does not read URL coordinates, so the issue links
+# the viewer rather than claiming a per-field centring the page does not do.  Per-field
+# centring is a follow-up that first brings the page under version control (it is a
+# hand-maintained file in the live docroot today).
 _ALADIN_PAGE = "https://starformation.astro.ufl.edu/avm_images/jwst_gc_aladin.html"
-
-
-def _field_center(o: Observation):
-    """``(ra, dec)`` in degrees of the field centre from the on-disk mosaic, or None.
-
-    Reads the WCS centre of the first available i2d (our merged mosaic, else the
-    MAST-delivered i2d), so the Aladin deep-link points at the science field.  The guide
-    star is not used here: the FGS places it arcminutes away, which for a treasury tile is
-    a whole NIRCam field off."""
-    import glob
-    from astropy.io import fits
-    from astropy.wcs import WCS
-    inst = o.instrument.lower()
-    base = "/orange/adamginsburg/jwst"
-    # bounded globs only: the MAST layout is a fixed mastDownload/JWST/<product>/ depth, so
-    # avoid a recursive ``**`` walk of the (large) mastDownload tree.
-    cands = sorted(glob.glob(o.product_glob())) + sorted(glob.glob(
-        f"{base}/{o.field}/mastDownload/JWST/{o.obsid}_t*_{inst}_*/"
-        f"{o.obsid}_t*_{inst}_*_i2d.fits"))
-    for path in cands:
-        try:
-            with fits.open(path) as h:
-                hdr = (h["SCI"] if "SCI" in h else h[1]).header
-            c = WCS(hdr).pixel_to_world(hdr["NAXIS1"] / 2.0, hdr["NAXIS2"] / 2.0)
-            return float(c.ra.deg), float(c.dec.deg)
-        except (OSError, ValueError, KeyError, IndexError):
-            continue
-    return None
-
-
-def _aladin_url(o: Observation) -> str:
-    """Deep-link into the JWST-GC Aladin viewer centred on this field.
-
-    ``?ra=&dec=&fov=`` are read by the viewer to centre the view; the bare page (before it
-    reads those params) still opens at the survey default, so the link is useful either way.
-    The centre is the mosaic WCS centre, and falls back to the guide-star position when no
-    mosaic is on disk yet."""
-    c = _field_center(o)
-    if c is None:
-        gs = _guidestar_json().get(o.obsid) or {}
-        ra, dec = gs.get("gs_ra"), gs.get("gs_dec")
-        if isinstance(ra, (int, float)) and isinstance(dec, (int, float)):
-            c = (ra, dec)
-    if c is None:
-        return _ALADIN_PAGE
-    return f"{_ALADIN_PAGE}?ra={c[0]:.5f}&dec={c[1]:.5f}&fov=0.1"
 
 
 def render_body(o: Observation) -> str:
@@ -167,7 +126,6 @@ def render_body(o: Observation) -> str:
     visits = ", ".join(o.visits) or "—"
     notes = f"\n> **Notes:** {o.notes}\n" if o.notes else ""
     guidestar = _guidestar_block(o)
-    aladin_url = _aladin_url(o)
 
     # combined-tile note: released mosaics carry a merged obsid (jw..-oOOO-TTT), so say so
     merged_note = (f" (mosaic merges obs {o.obs} + {' + '.join(o.merged_obsids)}; "
@@ -189,7 +147,7 @@ def render_body(o: Observation) -> str:
 ### Archive & data
 - APT program (PDF): {o.mast_program_url}
 - MAST data search: {o.mast_search_url}
-- Aladin viewer (centred on this field): {aladin_url}
+- JWST-GC Aladin viewer: {_ALADIN_PAGE}
 - On-disk mosaics: `{o.product_glob()}`
 
 {dropped_note}{guidestar}{notes}
