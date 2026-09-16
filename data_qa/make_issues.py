@@ -79,9 +79,39 @@ def _guidestar_block(o: Observation) -> str:
 # scripts/release/stage_release.py in jwst-gc-pipeline.
 _GLOBUS_HTTPS_BASE = "https://g-92a536.55ba.08cc.data.globus.org"
 _GLOBUS_ROOT = "/orange/adamginsburg/jwst"
+_GLOBUS_COLLECTION_ID = "d9873d5e-0fbd-4980-aedf-4ca56f65a045"      # "JWST root" guest collection
+# Globus tutorial native client, used only to mint a short-lived HTTPS token; the same recipe
+# ships in jwst-gc-pipeline scripts/release/make_webpage.py for the public release.
+_GLOBUS_NATIVE_CLIENT = "3b1925c0-a87b-452b-a492-2c9921d3bd14"
 # per-detector and intermediate products that are not the released mosaic + its catalogue
 _GLOBUS_PROD_EXCLUDE = ("outlier", "_model_", "_residual_", "smoothed_bg",
                         "destreak", "_crf", "_cr_", "segm", "nrca", "nrcb")
+
+# These files are shared with the Treasury team over Globus (a free Globus/ORCID login), NOT a
+# public release, so the HTTPS URLs redirect to Globus auth.  This is the command-line recipe to
+# fetch them with a short-lived bearer token; it is the same per issue (only the URL list varies).
+_GLOBUS_DOWNLOAD_HELP = (
+    "These are pipeline products on the JWST-GC Globus collection (`" + _GLOBUS_COLLECTION_ID
+    + "`), shared with the Treasury team via a free Globus/ORCID login (not a public release), so "
+    "the URLs redirect to Globus auth.  Fetch them from the command line with a short-lived "
+    "bearer token:\n\n"
+    "```\n"
+    "pip install globus-sdk                 # once\n"
+    "python - <<'PY'                        # opens an ORCID/Globus login; prints a ~48 h token\n"
+    "import globus_sdk\n"
+    'C = "' + _GLOBUS_COLLECTION_ID + '"\n'
+    'cl = globus_sdk.NativeAppAuthClient("' + _GLOBUS_NATIVE_CLIENT + '")\n'
+    'cl.oauth2_start_flow(requested_scopes=f"https://auth.globus.org/scopes/{C}/https")\n'
+    'print("Log in here:", cl.oauth2_get_authorize_url())\n'
+    'tok = cl.oauth2_exchange_code_for_tokens(input("code: ").strip())\n'
+    'print("TOKEN:", tok.by_resource_server[C]["access_token"])\n'
+    "PY\n"
+    "TOKEN=<paste the printed token>\n"
+    'wget --header="Authorization: Bearer $TOKEN" -i urls.txt      # urls.txt = the list below\n'
+    "```\n\n"
+    "Or transfer with the Globus CLI: `globus login`, then `globus transfer "
+    + _GLOBUS_COLLECTION_ID + ":<path> <your-endpoint>:<dest>`."
+)
 
 
 def _globus_products(o: Observation):
@@ -108,8 +138,9 @@ def _globus_products(o: Observation):
 
 
 def _globus_block(o: Observation) -> str:
-    """Markdown block: per-filter i2d + catalogue download links, and a plain URL list (in a
-    code block) that ``wget -i`` or ``xargs curl`` can consume directly."""
+    """Markdown block: per-filter i2d + catalogue links on the Globus collection, plus a
+    collapsed command-line recipe (bearer-token ``wget``) and the plain URL list it consumes.
+    The files need a Globus login, so a bare URL is not fetchable without the token."""
     rows = _globus_products(o)
     if not rows:
         return ("### Data files (Globus)\n_No pipeline `i2d`/catalogue on disk yet; this "
@@ -118,15 +149,17 @@ def _globus_block(o: Observation) -> str:
     for f, kind, url in rows:
         by_filt.setdefault(f, {})[kind] = url
     lines = ["### Data files (Globus)",
-             "Direct-download URLs for the pipeline products on the JWST-GC Globus collection:"]
+             "Pipeline products for this observation on the JWST-GC Globus collection "
+             "(Treasury-team access via a free Globus login):"]
     for f in o.filters:
         d = by_filt.get(f)
         if d:
             parts = [f"[{k}]({d[k]})" for k in ("i2d", "catalog") if k in d]
             lines.append(f"- `{f}` — " + " · ".join(parts))
     urls = "\n".join(url for _, _, url in rows)
-    lines.append("\n<details><summary>URL list (for <code>wget -i</code> / "
-                 "<code>xargs -n1 curl -O</code>)</summary>\n\n```\n" + urls + "\n```\n</details>\n")
+    lines.append("\n<details><summary>Download from the command line</summary>\n\n"
+                 + _GLOBUS_DOWNLOAD_HELP
+                 + "\n\n**`urls.txt`:**\n```\n" + urls + "\n```\n</details>\n")
     return "\n".join(lines) + "\n\n"
 
 

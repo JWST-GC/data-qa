@@ -129,7 +129,9 @@ def test_globus_block_lists_i2d_and_catalog(tmp_path, monkeypatch, obs):
     assert "_data_i2d" not in block and "-nrca_" not in block and "_model_" not in block
     assert "clear-f212n-merged_cat.ecsv" in block
     assert f"{mi._GLOBUS_HTTPS_BASE}/brick/F212N/pipeline/" in block
-    assert "wget -i" in block                                   # scriptable URL list present
+    # command-line download recipe: bearer-token wget + the scriptable URL list
+    assert "Authorization: Bearer" in block and "globus-sdk" in block
+    assert mi._GLOBUS_COLLECTION_ID in block and "urls.txt" in block
 
 
 def test_globus_block_empty_when_unreduced(tmp_path, monkeypatch, obs):
