@@ -22,12 +22,35 @@ def test_render_body_has_checklist_and_marker(obs):
 
 
 def test_render_body_has_no_web_release_references(obs):
-    """The starformation web release is the last, post-QA step: it must never appear
-    in the issue body or QA process (only MAST/archive links belong here)."""
+    """The starformation web release is the last, post-QA step: the release page and its
+    direct downloads must never appear in the issue body.  The Aladin viewer is hosted on
+    the same domain but is an archive visualisation tool, not the release, so it is allowed;
+    the only starformation reference permitted is that viewer link."""
+    import re
     body = mi.render_body(obs)
-    assert "starformation" not in body
     assert "Release page" not in body and "Direct downloads" not in body
     assert "MAST data search" in body            # archive link still present
+    hosts = re.findall(r"starformation\.astro\.ufl\.edu\S*", body)
+    assert hosts and all("avm_images/jwst_gc_aladin.html" in h for h in hosts)
+
+
+def test_render_body_links_aladin_viewer_centred(obs, monkeypatch):
+    """The overview links the Aladin viewer with the field centre as ?ra=&dec=&fov=."""
+    monkeypatch.setattr(mi, "_field_center", lambda o: (266.53550, -28.71280))
+    body = mi.render_body(obs)
+    assert ("https://starformation.astro.ufl.edu/avm_images/jwst_gc_aladin.html"
+            "?ra=266.53550&dec=-28.71280&fov=0.1") in body
+
+
+def test_aladin_url_falls_back_to_guidestar_then_bare(obs, monkeypatch):
+    """With no mosaic on disk the centre comes from the guide star; with neither, the bare
+    viewer page is linked (still useful, just not pre-centred)."""
+    monkeypatch.setattr(mi, "_field_center", lambda o: None)
+    monkeypatch.setattr(mi, "_guidestar_json",
+                        lambda: {obs.obsid: {"gs_ra": 266.40000, "gs_dec": -28.90000}})
+    assert mi._aladin_url(obs).endswith("?ra=266.40000&dec=-28.90000&fov=0.1")
+    monkeypatch.setattr(mi, "_guidestar_json", lambda: {})
+    assert mi._aladin_url(obs) == mi._ALADIN_PAGE
 
 
 def test_render_body_asks_destreak_decision(obs):
