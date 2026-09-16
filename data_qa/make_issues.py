@@ -73,6 +73,14 @@ def _guidestar_block(o: Observation) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The JWST-GC Aladin viewer (all-survey HiPS overlays).  A plain link: the page centres
+# itself from its own preset buttons and does not read URL coordinates, so the issue links
+# the viewer rather than claiming a per-field centring the page does not do.  Per-field
+# centring is a follow-up that first brings the page under version control (it is a
+# hand-maintained file in the live docroot today).
+_ALADIN_PAGE = "https://starformation.astro.ufl.edu/avm_images/jwst_gc_aladin.html"
+
+
 def render_body(o: Observation) -> str:
     M = _qa_metrics(o)
     s1, s2, s3, s4, s5 = (M.get(f"stage{n}", {}) for n in (1, 2, 3, 4, 5))
@@ -139,6 +147,7 @@ def render_body(o: Observation) -> str:
 ### Archive & data
 - APT program (PDF): {o.mast_program_url}
 - MAST data search: {o.mast_search_url}
+- JWST-GC Aladin viewer: {_ALADIN_PAGE}
 - On-disk mosaics: `{o.product_glob()}`
 
 {dropped_note}{guidestar}{notes}
