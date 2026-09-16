@@ -73,6 +73,63 @@ def _guidestar_block(o: Observation) -> str:
     return "\n".join(lines) + "\n"
 
 
+# JWST-GC Globus guest collection (rooted at /orange/adamginsburg/jwst): its HTTPS data
+# plane serves collection-relative paths, so a released product's download URL is
+# ``_GLOBUS_HTTPS_BASE + <path relative to _GLOBUS_ROOT>``.  Kept in step with
+# scripts/release/stage_release.py in jwst-gc-pipeline.
+_GLOBUS_HTTPS_BASE = "https://g-92a536.55ba.08cc.data.globus.org"
+_GLOBUS_ROOT = "/orange/adamginsburg/jwst"
+# per-detector and intermediate products that are not the released mosaic + its catalogue
+_GLOBUS_PROD_EXCLUDE = ("outlier", "_model_", "_residual_", "smoothed_bg",
+                        "destreak", "_crf", "_cr_", "segm", "nrca", "nrcb")
+
+
+def _globus_products(o: Observation):
+    """``(filter, kind, url)`` for this obs's pipeline i2d + catalogue files, as Globus HTTPS
+    download URLs, from the on-disk pipeline dir.  ``kind`` is ``i2d`` or ``catalog``; one of
+    each per filter, preferring the merged mosaic + merged catalogue and skipping per-detector
+    and intermediate products."""
+    import glob
+    inst = o.instrument.lower()
+    rows = []
+    for f in o.filters:
+        pdir = f"{_GLOBUS_ROOT}/{o.field}/{f}/pipeline"
+        for kind, suffix in (("i2d", "i2d.fits"), ("catalog", "cat.ecsv")):
+            hits = [p for p in glob.glob(f"{pdir}/{o.obsid}*_t001_{inst}_*_{suffix}")
+                    if not any(t in os.path.basename(p).lower() for t in _GLOBUS_PROD_EXCLUDE)]
+            # prefer the merged mosaic, and the plain science i2d over the cataloging
+            # ``_data_i2d`` resample, then shortest name.
+            hits.sort(key=lambda p: ("merged" not in (b := os.path.basename(p).lower()),
+                                     "_data_i2d" in b, len(b), b))
+            if hits:
+                rel = os.path.relpath(hits[0], _GLOBUS_ROOT)
+                rows.append((f, kind, f"{_GLOBUS_HTTPS_BASE}/{rel}"))
+    return rows
+
+
+def _globus_block(o: Observation) -> str:
+    """Markdown block: per-filter i2d + catalogue download links, and a plain URL list (in a
+    code block) that ``wget -i`` or ``xargs curl`` can consume directly."""
+    rows = _globus_products(o)
+    if not rows:
+        return ("### Data files (Globus)\n_No pipeline `i2d`/catalogue on disk yet; this "
+                "section fills in once the observation is reduced._\n\n")
+    by_filt = {}
+    for f, kind, url in rows:
+        by_filt.setdefault(f, {})[kind] = url
+    lines = ["### Data files (Globus)",
+             "Direct-download URLs for the pipeline products on the JWST-GC Globus collection:"]
+    for f in o.filters:
+        d = by_filt.get(f)
+        if d:
+            parts = [f"[{k}]({d[k]})" for k in ("i2d", "catalog") if k in d]
+            lines.append(f"- `{f}` — " + " · ".join(parts))
+    urls = "\n".join(url for _, _, url in rows)
+    lines.append("\n<details><summary>URL list (for <code>wget -i</code> / "
+                 "<code>xargs -n1 curl -O</code>)</summary>\n\n```\n" + urls + "\n```\n</details>\n")
+    return "\n".join(lines) + "\n\n"
+
+
 def render_body(o: Observation) -> str:
     M = _qa_metrics(o)
     s1, s2, s3, s4, s5 = (M.get(f"stage{n}", {}) for n in (1, 2, 3, 4, 5))
@@ -118,6 +175,7 @@ def render_body(o: Observation) -> str:
     visits = ", ".join(o.visits) or "—"
     notes = f"\n> **Notes:** {o.notes}\n" if o.notes else ""
     guidestar = _guidestar_block(o)
+    globus = _globus_block(o)
 
     # combined-tile note: released mosaics carry a merged obsid (jw..-oOOO-TTT), so say so
     merged_note = (f" (mosaic merges obs {o.obs} + {' + '.join(o.merged_obsids)}; "
@@ -141,7 +199,7 @@ def render_body(o: Observation) -> str:
 - MAST data search: {o.mast_search_url}
 - On-disk mosaics: `{o.product_glob()}`
 
-{dropped_note}{guidestar}{notes}
+{globus}{dropped_note}{guidestar}{notes}
 ### QA checklist
 <sub>boxes with a ✓ are auto-set from the diagnostic replies below (`data_qa.diagnostics`); the rest are manual.</sub>
 - [{_ck(delivered)}] Observation delivered / retrieved
