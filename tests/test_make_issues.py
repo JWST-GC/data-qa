@@ -121,3 +121,36 @@ def test_sync_observation_preserves_human_checkbox_via_github_plumbing(
     (method, url, data), = calls
     assert method == "PATCH" and url.endswith("/issues/7")
     assert "- [x] Background / stripes / artifacts acceptable" in data["body"]
+
+
+def test_globus_block_lists_i2d_and_catalog(tmp_path, monkeypatch, obs):
+    """The Globus section links one i2d + one catalogue per filter and a scriptable URL
+    list, preferring the plain merged science i2d over the _data_i2d resample and skipping
+    per-detector and model/residual products."""
+    monkeypatch.setattr(mi, "_GLOBUS_ROOT", str(tmp_path))
+    pdir = tmp_path / "brick" / "F212N" / "pipeline"
+    pdir.mkdir(parents=True)
+    for name in (
+        "jw02221-o001_t001_nircam_clear-f212n-merged_i2d.fits",           # preferred
+        "jw02221-o001_t001_nircam_clear-f212n-merged_data_i2d.fits",      # resample, not preferred
+        "jw02221-o001_t001_nircam_clear-f212n-nrca_i2d.fits",            # per-detector, excluded
+        "jw02221-o001_t001_nircam_clear-f212n-merged_cat.ecsv",
+        "jw02221-o001_t001_nircam_clear-f212n-merged_m2_daophot_basic_mergedcat_model_i2d.fits",
+    ):
+        (pdir / name).write_text("")
+    block = mi._globus_block(obs)
+    assert "### Data files (Globus)" in block
+    assert "clear-f212n-merged_i2d.fits" in block
+    assert "_data_i2d" not in block and "-nrca_" not in block and "_model_" not in block
+    assert "clear-f212n-merged_cat.ecsv" in block
+    assert f"{mi._GLOBUS_HTTPS_BASE}/brick/F212N/pipeline/" in block
+    # command-line download recipe: bearer-token wget + the scriptable URL list
+    assert "Authorization: Bearer" in block and "globus-sdk" in block
+    assert mi._GLOBUS_COLLECTION_ID in block and "urls.txt" in block
+
+
+def test_globus_block_empty_when_unreduced(tmp_path, monkeypatch, obs):
+    """With no pipeline products on disk the section states that it fills in after reduction."""
+    monkeypatch.setattr(mi, "_GLOBUS_ROOT", str(tmp_path))
+    (tmp_path / "brick").mkdir()
+    assert "fills in once the observation is reduced" in mi._globus_block(obs)
