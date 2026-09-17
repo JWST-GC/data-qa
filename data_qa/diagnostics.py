@@ -2177,6 +2177,21 @@ def _catalog_vs_alignment_age(o: Observation, src):
     return iso(cm), iso(am), name
 
 
+def _offset_panel_title(off_med, bulk_source, ss, cell_off_med, cc, spread, gate_note):
+    """Title for the offset-cloud panel.  Leads with the same-star tie (the unbiased estimator,
+    carried in ``off_med``/``bulk_source``) and demotes the per-cell histogram median to a second
+    line: the histogram peak against a dense reference is biased several mas (its RA term can flip
+    sign per filter), so it belongs on the map, not in the headline.  Extracted so the choice of
+    authoritative estimator is pinned by a unit test -- a later simplification back to the histogram
+    would misstate the measurement while the metrics stayed correct."""
+    sp = f", cells scatter by {spread:.0f} mas" if spread is not None else ""
+    hist = f"per-cell histogram median {cell_off_med:.0f} mas over {cc['n_cells']} cells{sp}"
+    lead = (f"offset from VIRAC {off_med:.1f} mas [{bulk_source}]"
+            + (f" ({ss['npairs']} same-star pairs)" if ss else ""))
+    return (f"{lead}\n{hist}\n(colour = sky quadrant; point size ∝ sources; dashed circle = "
+            f"cell-to-cell spread; {gate_note}; marginals = per-cell histogram)")
+
+
 def stage4_offsets(o: Observation, sw):
     """How far the JWST catalog positions sit from the same stars' VIRAC positions, measured
     separately in each of up to 16 spatial cells by the ``xcorr`` histogram peak, plus the
@@ -2505,15 +2520,7 @@ def stage4_offsets(o: Observation, sw):
     # goes on the top marginal so it clears the inset histograms.
     a1t, _a1r = _add_marginals(a1, cdra, cdde, color="#4477aa", bins=12,
                                weights=np.array([c["n"] for c in cells], float))
-    sp_str = f", cells scatter by {spread:.0f} mas" if spread is not None else ""
-    # This panel shows the per-CELL histogram peaks, so its headline is the median over cells.  The
-    # same-star measurement of the same quantity is reported beside it.
-    ss_str = (f"\nsame stars, matched one to one: {ss['off']:.1f} mas (n={ss['npairs']})" if ss else
-              "\nsame-star measurement unavailable; the histogram value is the one reported")
-    a1t.set_title(f"JWST−VIRAC offset {cell_off_med:.0f} mas over {cc['n_cells']} cells"
-                  f"{sp_str}{ss_str}\n"
-                  f"(colour = sky quadrant; point size ∝ sources; dashed circle = cell-to-cell "
-                  f"spread; {gate_note}; marginals weighted by source count)",
+    a1t.set_title(_offset_panel_title(off_med, bulk_source, ss, cell_off_med, cc, spread, gate_note),
                   fontsize=7)
     if im:
         # The inter-module offset is two numbers; print them.
