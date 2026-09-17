@@ -214,12 +214,23 @@ def test_caption_linkifies_docroot():
         assert "qa_methods.md#" in cap
 
 
-def test_caption_stage3_drops_false_claim_and_labels_line():
-    cap = D.caption_for(3, dict(stage=3, sw="F212N", n_matched=2603, slope=1.0, scatter=0.28))
-    # the untrue "a tight locus means the right stars were matched" claim is gone
-    assert "right stars were matched" not in cap
-    # positive labelling: the cyan line is named "1:1 line" (no "not a fit")
-    assert "1:1 line" in cap and "NOT a fit" not in cap
+def test_caption_stage3_grades_on_our_catalog_and_names_mast():
+    cap = D.caption_for(3, dict(stage=3, sw="F212N", source="jicama-m8", n_matched=2603,
+                                slope=1.0, scatter=0.28, our_slope=1.0,
+                                mast_slope=0.99, mast_scatter=0.30))
+    assert "right stars were matched" not in cap and "NOT a fit" not in cap
+    # the graded panel is named (our catalogue) and MAST is called out as shown alongside
+    assert "jicama-m8" in cap and "MAST" in cap
+    assert "slope" in cap and "scatter" in cap
+
+
+def test_caption_stage3_informational_when_mast_only():
+    # no pipeline catalogue yet -> MAST shown for information, stage not graded (not a red flag)
+    cap = D.caption_for(3, dict(stage=3, sw="F212N", passed=None,
+                                primary_source="MAST catalogue", mast_slope=0.02, mast_scatter=1.2,
+                                na_reason="pipeline catalogue not yet available"))
+    assert "information" in cap and "not graded" in cap
+    assert "MAST" in cap
 
 
 def test_caption_stage2_spells_out_lf_and_drops_meaningless_clause():
@@ -3630,3 +3641,62 @@ def test_load_reference_prefers_ksmag_over_refmag(tmp_path):
            "refmag": np.array([99.0, 99.0, 99.0, 99.0])}).write(p)
     _, mag = aa.load_reference(str(p), 2026.7)
     np.testing.assert_allclose(np.sort(mag), [11.0, 13.0, 15.0, 17.0])
+
+
+def test_stage3_reference_selects_virac2_over_gaia(tmp_path, monkeypatch):
+    """The gaia_virac2 refcat mixes VIRAC2 Ks and Gaia G in one refmag column; stage 3 must take the
+    VIRAC2 (NIR) rows only, else optical G wrecks the slope."""
+    from astropy.table import Table
+    from data_qa.observations import Observation
+    p = tmp_path / "gaia_virac2_refcat_epoch2026.70_o100.fits"
+    Table({"RA": np.linspace(266.40, 266.60, 6), "DEC": np.linspace(-28.95, -28.85, 6),
+           "source": np.array(["VIRAC2", "VIRAC2", "VIRAC2", "GaiaDR3", "GaiaDR3", "VIRAC2"]),
+           "refmag": np.array([14.0, 15.0, 16.0, 20.0, 21.0, np.nan])}).write(p)
+    o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    monkeypatch.setattr(D, "_viraccache_path", lambda o: None)
+    monkeypatch.setattr(D, "_refcat_path", lambda o: str(p))
+    sc, mag = D._stage3_reference(o, 2026.70)
+    np.testing.assert_allclose(np.sort(mag), [14.0, 15.0, 16.0])   # 3 finite VIRAC2 rows only
+    assert len(sc) == 3
+
+
+def _stage3_synth(monkeypatch, our=True):
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa.observations import Observation
+    rng = np.random.default_rng(0)
+    n = 200
+    ra = 266.4 + rng.uniform(0, 0.02, n); dec = -28.9 + rng.uniform(0, 0.02, n)
+    ks = rng.uniform(13.5, 16.5, n)                 # inside the [13,17] fit window
+    ref_sc = SkyCoord(ra * u.deg, dec * u.deg)
+    o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: None)
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2026.70)
+    monkeypatch.setattr(D, "_stage3_reference", lambda o, ep: (ref_sc, ks))
+    monkeypatch.setattr(D, "_mast_calibration_sources",
+                        lambda o, sw: (ref_sc, ks + 3.0 + rng.normal(0, 0.05, n)))
+    our_val = ((ref_sc, ks + 3.0 + rng.normal(0, 0.05, n), "jicama-m2") if our
+               else (None, None, None))
+    monkeypatch.setattr(D, "_stage3_our_catalog", lambda o, sw: our_val)
+    return o
+
+
+def test_stage3_mast_primary_our_graded(monkeypatch):
+    o = _stage3_synth(monkeypatch, our=True)
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["primary_source"] == "MAST catalogue"     # MAST is the always-shown primary image
+    assert m["source"] == "jicama-m2"                  # verdict comes from OUR catalogue
+    assert m["passed"] is True                          # slope ~1, tight scatter -> pass
+    assert m.get("extra_figures")                       # our catalogue posted as a 2nd image
+    assert m["mast_slope"] is not None                  # MAST panel numbers recorded too
+
+
+def test_stage3_mast_only_informational(monkeypatch):
+    o = _stage3_synth(monkeypatch, our=False)
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["available"] is True                       # MAST shown -> stage posts
+    assert m["passed"] is None                          # ungraded, NOT red-flagged
+    assert m["primary_source"] == "MAST catalogue"
+    assert not m.get("extra_figures")                   # nothing graded to add
