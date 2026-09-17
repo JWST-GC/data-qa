@@ -799,12 +799,13 @@ def _stage4_seams(monkeypatch, cells, dropped, grid_used):
     monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/ref")
     monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2024.0)
     monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (jsc, None))
+    # stage 4 now sources positions from the MAST L3 catalogue; feed the synthetic jsc there.
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, f: (jsc, None))
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
     monkeypatch.setattr(D, "_cell_offsets", lambda j, r: (cells, dropped, grid_used))
     monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: None)   # -> off_med = cell_off_med
     monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
-    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, f: None)
     monkeypatch.setattr(D, "_save", lambda fig, name: name)
 
 
@@ -1542,10 +1543,11 @@ def _stage4_injection(monkeypatch, shift_mas):
     monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/refcat.fits")
     monkeypatch.setattr(D, "_obs_epoch", lambda o, path: 2022.5)
     monkeypatch.setattr(aa, "load_reference", lambda ref, ep: (ref_sc, None))
+    # stage 4 sources positions from the MAST L3 catalogue; feed the shifted synthetic field there.
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: (jsc, None))
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
     monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
-    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: None)
     _png, metrics = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
     return metrics
 
@@ -1564,6 +1566,92 @@ def test_stage4_fails_on_90mas_misregistration(monkeypatch):
     m = _stage4_injection(monkeypatch, 90.0)
     assert m["passed"] is False
     assert m["cell_off_med"] > 75 and m["gate_off_mas"] > 75
+
+
+def test_stage4_unavailable_when_no_mast_catalogue(monkeypatch):
+    # No MAST L3 catalogue on disk is a not-yet-delivered state, not a defect: available=False,
+    # passed=None, and NO red flag (the stage is left blank, not flagged).
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, sw: "/dev/null/m_i2d.fits")
+    monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/ref.fits")
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2022.5)
+    monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (object(), None))   # ref present
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: None)           # no MAST cat
+    monkeypatch.setattr(D, "_save", lambda fig, name: name)
+    _png, m = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
+    assert m.get("available") is False and m.get("passed") is None and not m.get("red_flag")
+    assert m.get("source") == "MAST L3 catalogue"
+
+
+def test_source_label_from_path_tokens():
+    f = D._source_label_from_path
+    assert f("/x/mastDownload/JWST/jw10678-o1_t1_nircam_clear-f212n/..._cat.ecsv") == "MAST L3"
+    assert f("/x/mastDownload/JWST/..._i2d.fits") == "MAST i2d"
+    assert f("jw10678-o1_t001_nircam_clear-f212n_m1_daophot_cat.fits") == "jicama-m1"
+    assert f("jw10678-o1_t001_nircam_clear-f212n_m3_daophot_basic_mergedcat.fits") == "jicama-m3"
+    assert f("jw10678-o1_t001_nircam_clear-f212n-merged_cat.ecsv") == "jicama-m3"
+    assert f("gaia_virac2_refcat_epoch2026.7_o1.fits") == "VIRAC/Gaia ref"
+    assert f("jw10678-o1_LOG.MATCHUP.XYMEEE") == "JWST1PASS"
+    assert f("something_miri_f770w_i2d.fits") == "MIRI i2d"
+    # a MIRI CATALOGUE is one of our products: keep the m-level with a MIRI tag, do not collapse
+    # to a bare "MIRI" (which could not be told from a MAST/unknown-origin MIRI catalogue).
+    assert f("jw10678-o40_t001_miri_f770w_m2_daophot_cat.ecsv") == "jicama-m2 MIRI"
+    assert f("jw10678-o40_t001_miri_clear-f770w-merged_cat.ecsv") == "jicama-m3 MIRI"
+    assert f("jw10678-o40_t001_miri_f770w_cat.ecsv") == "jicama MIRI"
+    assert f("/x/mastDownload/JWST/jw10678-o40_t1_miri_f770w/..._cat.ecsv") == "MAST L3"
+
+
+def test_save_annotates_data_source(tmp_path, monkeypatch):
+    """`_save` leaves a 'Data source' footer built from the files the stage recorded via _used."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path))
+    monkeypatch.setattr(D, "_INPUTS",
+                        [("cat", "jw10678-o1_t001_nircam_clear-f212n-merged_cat.ecsv"),
+                         ("ref", "gaia_virac2_refcat_epoch2026.7_o1.fits")])
+    fig = plt.figure()
+    D._save(fig, "src_footer_test.png")
+    foot = [t.get_text() for t in fig.texts if "Data source" in t.get_text()]
+    assert len(foot) == 1
+    assert "jicama-m3" in foot[0] and "VIRAC/Gaia ref" in foot[0]
+    plt.close(fig)
+
+
+def test_save_does_not_overwrite_a_stage_own_source_footer(tmp_path, monkeypatch):
+    """A stage that already wrote its own, more specific 'Data source' footer keeps it -- the
+    central annotation must not stack a second one (a duplicated footer is ugly, a replaced one
+    is wrong)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path))
+    monkeypatch.setattr(D, "_INPUTS",
+                        [("cat", "jw10678-o1_t001_nircam_clear-f212n-merged_cat.ecsv")])
+    fig = plt.figure()
+    fig.text(0.5, 0.005, "Data source: MAST L3", ha="center")   # the stage's own, specific footer
+    D._save(fig, "src_footer_keep_test.png")
+    foots = [t.get_text() for t in fig.texts if "Data source" in t.get_text()]
+    assert foots == ["Data source: MAST L3"]                    # untouched, not stacked
+    plt.close(fig)
+
+
+def test_offset_summary_figure_measures_or_blank(monkeypatch):
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    jsc = SkyCoord(np.full(50, 266.4) * u.deg, np.full(50, -28.9) * u.deg)
+    ref = jsc
+    cells = [{"i": k % 4, "j": k // 4, "ra": 266.4, "dec": -28.9, "dra": 1.0, "dde": 0.0,
+              "off": 1.0, "n": 40} for k in range(16)]
+    monkeypatch.setattr(D, "_cell_offsets", lambda j, r: (cells, [], 4))
+    monkeypatch.setattr(D, "_cell_consistency", lambda c, d: {"cells": c, "off_med": 1.0,
+                        "spread": 0.5, "n_cells": len(c), "coverage": 1.0})
+    monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: {"off": 1.2, "npairs": 40, "scatter": 0.3})
+    monkeypatch.setattr(D, "_offset_cloud", lambda j, r: (np.array([1.0, 2.0]), np.array([0.0, 0.0]), 1.0))
+    monkeypatch.setattr(D, "_save", lambda fig, name: name)
+    png, sub = D._offset_summary_figure(_obs(), "F212N", jsc, ref, "release:x_m3_cat.ecsv", "out.png")
+    assert png == "out.png" and sub["offset_med_mas"] is not None
+    # no catalogue -> blank (no figure, no metrics), never a red flag
+    assert D._offset_summary_figure(_obs(), "F212N", None, ref, "x", "o.png") == (None, {})
 
 
 # --------------------------------------------------------------------------- stage 7 (MAST vs pipeline)
