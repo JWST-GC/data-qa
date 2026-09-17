@@ -1592,6 +1592,47 @@ def test_source_label_from_path_tokens():
     assert f("gaia_virac2_refcat_epoch2026.7_o1.fits") == "VIRAC/Gaia ref"
     assert f("jw10678-o1_LOG.MATCHUP.XYMEEE") == "JWST1PASS"
     assert f("something_miri_f770w_i2d.fits") == "MIRI i2d"
+    # a MIRI CATALOGUE is one of our products: keep the m-level with a MIRI tag, do not collapse
+    # to a bare "MIRI" (which could not be told from a MAST/unknown-origin MIRI catalogue).
+    assert f("jw10678-o40_t001_miri_f770w_m2_daophot_cat.ecsv") == "jicama-m2 MIRI"
+    assert f("jw10678-o40_t001_miri_clear-f770w-merged_cat.ecsv") == "jicama-m3 MIRI"
+    assert f("jw10678-o40_t001_miri_f770w_cat.ecsv") == "jicama MIRI"
+    assert f("/x/mastDownload/JWST/jw10678-o40_t1_miri_f770w/..._cat.ecsv") == "MAST L3"
+
+
+def test_save_annotates_data_source(tmp_path, monkeypatch):
+    """`_save` leaves a 'Data source' footer built from the files the stage recorded via _used."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path))
+    monkeypatch.setattr(D, "_INPUTS",
+                        [("cat", "jw10678-o1_t001_nircam_clear-f212n-merged_cat.ecsv"),
+                         ("ref", "gaia_virac2_refcat_epoch2026.7_o1.fits")])
+    fig = plt.figure()
+    D._save(fig, "src_footer_test.png")
+    foot = [t.get_text() for t in fig.texts if "Data source" in t.get_text()]
+    assert len(foot) == 1
+    assert "jicama-m3" in foot[0] and "VIRAC/Gaia ref" in foot[0]
+    plt.close(fig)
+
+
+def test_save_does_not_overwrite_a_stage_own_source_footer(tmp_path, monkeypatch):
+    """A stage that already wrote its own, more specific 'Data source' footer keeps it -- the
+    central annotation must not stack a second one (a duplicated footer is ugly, a replaced one
+    is wrong)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path))
+    monkeypatch.setattr(D, "_INPUTS",
+                        [("cat", "jw10678-o1_t001_nircam_clear-f212n-merged_cat.ecsv")])
+    fig = plt.figure()
+    fig.text(0.5, 0.005, "Data source: MAST L3", ha="center")   # the stage's own, specific footer
+    D._save(fig, "src_footer_keep_test.png")
+    foots = [t.get_text() for t in fig.texts if "Data source" in t.get_text()]
+    assert foots == ["Data source: MAST L3"]                    # untouched, not stacked
+    plt.close(fig)
 
 
 def test_offset_summary_figure_measures_or_blank(monkeypatch):

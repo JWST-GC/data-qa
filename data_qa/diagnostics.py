@@ -1695,18 +1695,25 @@ def _source_label_from_path(path):
         return "peppar"
     if "mastdownload" in str(path).lower() or "mast_fits" in str(path).lower():
         return "MAST i2d" if b.endswith("_i2d.fits") else "MAST L3"
-    if "miri" in b:
-        return "MIRI i2d" if b.endswith("_i2d.fits") else "MIRI"
     if "virac" in b or "refcat" in b or "gaia" in b:
         return "VIRAC/Gaia ref"
+    # a MIRI i2d carries no catalogue m-level; a MIRI CATALOGUE is one of our jicama products, so
+    # it keeps the m-level (checked below) with a MIRI tag rather than collapsing to a bare "MIRI"
+    # that could not be told from a MAST or unknown-origin MIRI catalogue.
+    if "miri" in b and b.endswith("_i2d.fits"):
+        return "MIRI i2d"
     m = re.search(r"_m(\d+)_", b)
     if m:
-        return f"jicama-m{m.group(1)}"
-    if "mergedcat" in b or "-merged_cat" in b:
-        return "jicama-m3"
-    if "-merged" in b:
-        return "jicama-merged"
-    return "pipeline"
+        level = f"jicama-m{m.group(1)}"
+    elif "mergedcat" in b or "-merged_cat" in b:
+        level = "jicama-m3"
+    elif "-merged" in b:
+        level = "jicama-merged"
+    elif "miri" in b:
+        level = "jicama"                       # a MIRI catalogue with no m-level token
+    else:
+        return "pipeline"
+    return f"{level} MIRI" if "miri" in b else level
 
 
 def _offset_summary_figure(o: Observation, sw, jsc, ref_sc, src_label, out_name):
