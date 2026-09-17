@@ -3814,13 +3814,13 @@ def _stage7_astrom_title(mast_off, jic_off):
     5 mas band, not a contradiction."""
     both = mast_off is not None and jic_off is not None
     if both:
-        head = (f"offset from VIRAC — jicama {jic_off[2]:.0f} mas vs MAST "
+        head = (f"same-star tie to VIRAC — jicama {jic_off[2]:.0f} mas vs MAST "
                 f"{mast_off[2]:.0f} mas")
         return head + (" (pipeline tighter)" if jic_off[2] < mast_off[2] else "")
     if jic_off is not None:
-        return f"offset from VIRAC — jicama {jic_off[2]:.0f} mas (MAST offset not measured)"
+        return f"same-star tie to VIRAC — jicama {jic_off[2]:.0f} mas (MAST offset not measured)"
     if mast_off is not None:
-        return f"offset from VIRAC — MAST {mast_off[2]:.0f} mas (pipeline offset not measured)"
+        return f"same-star tie to VIRAC — MAST {mast_off[2]:.0f} mas (pipeline offset not measured)"
     return "astrometry vs VIRAC (bulk offset)"
 
 
@@ -4036,9 +4036,9 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     axh.set_title("source counts in the common window — MAST vs pipeline", fontsize=9)
 
     # bottom-right (MAIN): each catalogue's offset from VIRAC, as a 2-D (ΔRA, ΔDec) cloud with
-    # marginals.  VIRAC's own ~1.2" source spacing swamps a nearest-neighbour distance, so this
-    # coarse-aligns by the xcorr histogram peak first; the cloud CENTRE is then the field offset
-    # (MAST far from 0, jicama near 0).
+    # marginals.  The cloud is the per-star mutual-nearest pairs (same-star tie); its CENTRE is the
+    # field offset.  The xcorr histogram peak is NOT the headline here -- it is biased high for a
+    # DEEP catalogue against dense VIRAC and made jicama read worse than MAST (see _stage7_offset).
     axo = fig.add_subplot(gs[1, 1])
     # Wording is DERIVED from the sign of (jicama offset − MAST offset): claim the pipeline
     # "tightens" only when BOTH are measured AND jicama is the smaller.  When jicama is wider or
@@ -6182,10 +6182,22 @@ def _caption_for_impl(n, metrics):
             base += ("(NOTE: no merged/release jicama catalogue exists yet for this obs, so the "
                      "pipeline side falls back to the per-i2d MAST catalogue — both sides of this "
                      "comparison are MAST.) ")
-        base += ("The BOTTOM-RIGHT panel (the main result) is each catalogue's "
-                 "[offset from VIRAC](DOCROOT#glossary-bulk), found by coarse-aligning on the "
-                 "[xcorr histogram peak](DOCROOT#glossary-xcorr) and taking the centre of the "
-                 "per-star cloud")
+        method = (metrics.get("jicama_offset_method") or metrics.get("mast_offset_method")
+                  or "same-star")
+        if method == "same-star":
+            base += ("The BOTTOM-RIGHT panel (the main result) is each catalogue's "
+                     "[offset from VIRAC](DOCROOT#glossary-bulk), measured star by star from the "
+                     "mutual-nearest pairs (the same star in both catalogues) — the unbiased tie. "
+                     "The [xcorr histogram peak](DOCROOT#glossary-xcorr) is NOT used for the "
+                     "headline here: against dense VIRAC it is biased high for a DEEP catalogue, "
+                     "which would make the deep pipeline catalogue read spuriously worse than the "
+                     "shallow MAST one")
+        else:
+            base += ("The BOTTOM-RIGHT panel (the main result) is each catalogue's "
+                     "[offset from VIRAC](DOCROOT#glossary-bulk); the same-star tie was unavailable "
+                     "(no small unambiguous tie — possible gross mis-registration), so this falls "
+                     "back to the [xcorr histogram peak](DOCROOT#glossary-xcorr) cloud centre, read "
+                     "as a large-offset flag rather than a clean tie")
         # Improvement clause is CONDITIONAL: assert tightening only when both offsets are measured
         # AND jicama is the smaller.  Otherwise report the numbers, or state that the comparison is
         # unavailable, and claim no improvement.
