@@ -3764,6 +3764,36 @@ def _offset_cloud(jsc, ref_sc):
     return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
 
 
+def _stage7_offset(sc, ref_sc, metrics=None, key=None):
+    """(ΔRA_pairs, ΔDec_pairs, bulk_mas) of catalogue ``sc`` from VIRAC (JWST − VIRAC), or None.
+
+    PREFERS the same-star tie (mutual-nearest pairs).  The ``xcorr`` histogram peak used by
+    ``_offset_cloud`` is biased HIGH for a DEEP catalogue against dense VIRAC -- it stacks wrong
+    pairs into a spurious far peak, then the 0.1″ cloud self-selects around it: jw10678 o132 jicama
+    reads 62 mas by that route but 13.5 mas star-by-star, while the shallow MAST catalogue (no such
+    pile-up) reads ~14 mas either way.  Reporting the biased cloud made a well-tied deep pipeline
+    catalogue look WORSE than raw MAST, which is a measurement artefact, not a real mis-registration.
+
+    ``same_star_tie`` self-guards: it refuses (returns None) unless a small, unambiguous global tie
+    already exists, so it cannot fabricate agreement for a grossly mis-registered frame.  In that
+    case fall back to the xcorr-aligned cloud (which still detects the gross offset), flagged as the
+    lower-confidence method."""
+    if sc is None or ref_sc is None:
+        return None
+    ss = aa.same_star_tie(sc, ref_sc)
+    if ss is not None and ss.get("dra_pairs") is not None:
+        if metrics is not None and key:
+            metrics[f"{key}_offset_method"] = "same-star"
+            metrics[f"{key}_offset_npairs"] = ss["npairs"]
+        # same_star_tie returns (VIRAC − JWST); negate to the (JWST − VIRAC) convention the panel
+        # axes and _offset_cloud use.
+        return -np.asarray(ss["dra_pairs"]), -np.asarray(ss["dde_pairs"]), ss["off"]
+    oc = _offset_cloud(sc, ref_sc)
+    if oc is not None and metrics is not None and key:
+        metrics[f"{key}_offset_method"] = "xcorr-cloud"
+    return oc
+
+
 def _stage7_astrom_title(mast_off, jic_off):
     """Astrometry sub-panel title, worded from the SIGN of (jicama offset − MAST offset).  It calls
     the pipeline 'tighter' only when both offsets are measured AND jicama is STRICTLY smaller; in
@@ -3930,8 +3960,10 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     ep = aa.epoch_of(mast_path) if mast_path else None
     ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
                  if (ref and ep) else (None, None))
-    mast_off = _offset_cloud(mast_sc, ref_sc) if mast_sc is not None else None
-    jic_off = _offset_cloud(jsc, ref_sc) if jsc is not None else None
+    # Offset from VIRAC via the same-star tie (unbiased); the xcorr-histogram cloud is biased high
+    # for a deep catalogue and made jicama read WORSE than MAST -- see _stage7_offset.
+    mast_off = _stage7_offset(mast_sc, ref_sc, metrics, "mast")
+    jic_off = _stage7_offset(jsc, ref_sc, metrics, "jicama")
     if mast_off is not None:
         metrics["mast_offset_med_mas"] = mast_off[2]
     if jic_off is not None:
