@@ -845,9 +845,27 @@ def _grayscale(ax, path, title, role="mosaic (displayed)"):
     return frac
 
 
+def _annotate_sources(fig):
+    """Footer naming the distinct data source(s) the figure was built from, mapped from the files
+    the stage recorded via ``_used`` -- so every plot says whether it is MAST, jicama-mN, peppar,
+    JWST1PASS, MIRI, or the VIRAC/Gaia reference.  A stage that has already written its own, more
+    specific 'Data source' footer keeps it (this fills in the rest)."""
+    if any("Data source" in t.get_text() for t in fig.texts):
+        return
+    labels = []
+    for _role, path in _INPUTS:
+        lab = _source_label_from_path(path)
+        if lab not in labels:
+            labels.append(lab)
+    if labels:
+        fig.text(0.5, 0.002, "Data source: " + ", ".join(labels),
+                 ha="center", fontsize=7.5, color="0.4")
+
+
 def _save(fig, name):
     os.makedirs(OUTDIR, exist_ok=True)
     out = os.path.join(OUTDIR, name)
+    _annotate_sources(fig)               # name the data source(s) on every stage figure
     fig.savefig(out, dpi=110, bbox_inches="tight")
     import matplotlib.pyplot as plt
     plt.close(fig)
@@ -1664,6 +1682,96 @@ def _dataset_label(metrics):
     return "jicama catalogue"
 
 
+def _source_label_from_path(path):
+    """Short data-source token for a product PATH, so every stage figure can name what it was built
+    from: MAST products, our jicama catalogue (with its pipeline m-level), peppar / JWST1PASS /
+    MIRI.  Returns e.g. 'MAST L3', 'jicama-m3', 'peppar', 'JWST1PASS', 'MIRI i2d', or 'pipeline'."""
+    b = os.path.basename(str(path or "")).lower()
+    if not b:
+        return "unknown"
+    if "matchup" in b or "jwst1pass" in b:
+        return "JWST1PASS"
+    if "peppar" in b:
+        return "peppar"
+    if "mastdownload" in str(path).lower() or "mast_fits" in str(path).lower():
+        return "MAST i2d" if b.endswith("_i2d.fits") else "MAST L3"
+    if "miri" in b:
+        return "MIRI i2d" if b.endswith("_i2d.fits") else "MIRI"
+    if "virac" in b or "refcat" in b or "gaia" in b:
+        return "VIRAC/Gaia ref"
+    m = re.search(r"_m(\d+)_", b)
+    if m:
+        return f"jicama-m{m.group(1)}"
+    if "mergedcat" in b or "-merged_cat" in b:
+        return "jicama-m3"
+    if "-merged" in b:
+        return "jicama-merged"
+    return "pipeline"
+
+
+def _offset_summary_figure(o: Observation, sw, jsc, ref_sc, src_label, out_name):
+    """A compact per-cell offset of a JWST catalogue against VIRAC, shared by stage 7's jicama view
+    (stage 4 runs the fuller version for MAST).  Reuses the same offset primitives -- ``_cell_offsets``
+    / ``_cell_consistency`` / ``aa.same_star_tie`` / ``_offset_cloud`` -- so the two stay in step.
+    Returns ``(png_path, submetrics)`` or ``(None, {})`` when it cannot be measured (no red flag)."""
+    from matplotlib.patches import Circle
+    import matplotlib as mpl
+    if jsc is None or ref_sc is None:
+        return None, {}
+    cells, dropped, grid_used = _cell_offsets(jsc, ref_sc)
+    if not cells:
+        return None, {}
+    cc = _cell_consistency(cells, dropped)
+    cells = cc["cells"]
+    ss = aa.same_star_tie(jsc, ref_sc)
+    cloud = _offset_cloud(jsc, ref_sc)
+    off_med = float(ss["off"]) if ss else float(cc["off_med"])
+    sub = dict(offset_med_mas=off_med, offset_scatter_mas=cc["spread"], n_cells=cc["n_cells"],
+               cell_coverage=cc["coverage"], same_star_off=(ss["off"] if ss else None),
+               source=src_label)
+    fig, ax = _fig(1, 2, 6.4, 5.4)
+    fig.subplots_adjust(wspace=0.5, top=0.84, bottom=0.14)
+    a0 = ax[0][0]
+    NCELL = grid_used or 4
+    ra_all = jsc.ra.deg
+    dec_all = jsc.dec.deg
+    if float(np.nanmax(ra_all) - np.nanmin(ra_all)) > 180.0:      # RA-wrap guard
+        NCELL = 1
+    re_ = np.linspace(np.nanmin(ra_all), np.nanmax(ra_all), NCELL + 1)
+    de_ = np.linspace(np.nanmin(dec_all), np.nanmax(dec_all), NCELL + 1)
+    grid = np.full((NCELL, NCELL), np.nan)
+    for c in cells:
+        grid[c["i"], c["j"]] = c["off"]
+    cmap = mpl.colormaps["inferno"].copy()
+    cmap.set_bad("white")
+    gmax = float(np.nanmax(grid)) if np.isfinite(grid).any() else 0.0
+    vmax = min(3.0 * aa.THRESH["absolute"], max(10.0, 1.1 * gmax))
+    im0 = a0.imshow(grid.T, origin="lower", extent=[re_[0], re_[-1], de_[0], de_[-1]],
+                    aspect="auto", cmap=cmap, vmin=0, vmax=vmax)
+    fig.colorbar(im0, ax=a0, label="offset in cell [mas]", shrink=0.85)
+    a0.set_xlabel("RA [deg]")
+    a0.set_ylabel("Dec [deg]")
+    a0.invert_xaxis()
+    a0.set_title(f"per-cell offset: {cc['n_cells']} cells, field {cc['off_med']:.0f} mas", fontsize=8)
+    a1 = ax[0][1]
+    if cloud is not None:
+        dra, dde, _bulk = cloud
+        a1.scatter(dra, dde, s=4, alpha=0.3, color="#4477aa")
+        a1.plot(float(np.median(dra)), float(np.median(dde)), "k+", ms=14, mew=2)
+    if aa.THRESH["absolute"] > 0:
+        a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
+    a1.axhline(0, color="k", lw=0.4)
+    a1.axvline(0, color="k", lw=0.4)
+    a1.set_aspect("equal")
+    a1.set_xlabel("ΔRA [mas]")
+    a1.set_ylabel("ΔDec [mas]")
+    a1.set_title(f"offset from VIRAC {off_med:.1f} mas"
+                 + (f" (same stars, n={ss['npairs']})" if ss else ""), fontsize=8)
+    fig.suptitle(f"{o.target} {o.obsid} — {sw} jicama − VIRAC offset", fontsize=11)
+    fig.text(0.5, 0.005, f"Data source: {_dataset_label(sub)}", ha="center", fontsize=8, color="0.4")
+    return _save(fig, out_name), sub
+
+
 def _add_marginals(ax, x, y, color="#4477aa", bins=40, weights=None):
     """Attach top (x) and right (y) marginal histograms to ``ax`` as inset axes locked to its
     data limits, so the 1-D ΔRA / ΔDec distributions are shown alongside the 2-D scatter/hexbin
@@ -1874,11 +1982,20 @@ def stage4_offsets(o: Observation, sw):
     ep = _obs_epoch(o, path)
     ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
                  if (ref and ep) else (None, None))
-    # Positions come from the catalog (release -> MAST -> per-filter DAO).  Stage 4 needs only
-    # positions, so an obs that has been detected but not yet merged (gc2211 o046) falls back to
-    # its per-filter DAO catalog and is still measurable.
-    jsc, src = _jwst_positions(o, sw)
+    # Stage 4 measures the MAST-delivered L3 catalogue against VIRAC -- the pipeline-independent
+    # tie (the jicama-vs-VIRAC view is stage 7).  A missing MAST catalogue is a not-yet-delivered
+    # state, not a defect, so report it unavailable and leave the stage blank rather than red-flag it.
+    mp = _mast_catalog_positions(o, sw)
+    jsc = mp[0] if mp else None
+    src = "MAST L3 catalogue"
     metrics["source"] = src
+    if jsc is None or ref_sc is None:
+        why = ("no MAST L3 catalogue on disk for this filter" if jsc is None
+               else "no VIRAC2/Gaia reference catalogue on disk")
+        png = _red_flag_figure(o, "stage4", "MAST↔VIRAC OFFSET UNAVAILABLE",
+                               f"The positional-offset plot is empty: {why}.")
+        metrics.update(available=False, na_reason=why, passed=None, n_cells=0)
+        return png, metrics
 
     # NRCA-minus-NRCB offset, from the per-detector daophot catalogs (module-split).  Measured by
     # the xcorr histogram peak, which recovers offsets out to the 1.5" search radius.  A 0.1"
@@ -2016,16 +2133,11 @@ def stage4_offsets(o: Observation, sw):
         metrics.update(catalog_stale=True, catalog_date=cdate,
                        alignment_date=adate, stale_catalog_name=cname)
 
-    # Whole-field crossmatch offset from BOTH catalogues, via the pipeline's validated histogram-
-    # stacking (sweep + contrast + edge-alias rejection): the jicama product AND the pipeline-
-    # independent raw MAST L3 catalogue.  Shown side by side so a jicama-reduction offset the raw
-    # MAST does not share is visible, and each carries its own confidence (contrast/ok).
-    jic_x = _crossmatch_offset(jsc, ref_sc)
-    if jic_x is not None:
-        metrics.update(jicama_xoff_mas=jic_x["off"], jicama_xoff_contrast=jic_x["contrast"],
-                       jicama_xoff_ok=jic_x["ok"])
-    mastpos = _mast_catalog_positions(o, sw)
-    mast_x = _crossmatch_offset(mastpos[0], ref_sc, restrict_footprint=True) if mastpos else None
+    # Whole-field crossmatch offset via the pipeline's validated histogram-stacking (sweep +
+    # contrast + edge-alias rejection).  Stage 4 is the MAST-vs-VIRAC tie, so only the MAST marker
+    # is drawn here; the jicama-vs-VIRAC crossmatch is stage 7.
+    jic_x = None
+    mast_x = _crossmatch_offset(jsc, ref_sc, restrict_footprint=True)
     if mast_x is not None:
         metrics.update(mast_xoff_mas=mast_x["off"], mast_xoff_dra=mast_x["dra"],
                        mast_xoff_dde=mast_x["dde"], mast_xoff_contrast=mast_x["contrast"],
@@ -2208,8 +2320,10 @@ def stage4_offsets(o: Observation, sw):
         a2.text(0.5, 0.14, f"({'≤' if ok else '>'} {aa.THRESH['intermodule']:.0f} mas gate)",
                 ha="center", va="center", fontsize=9,
                 color=("#2a7" if ok else "#c33"), transform=a2.transAxes)
-    fig.suptitle(f"{o.target} {o.obsid} — positional offsets (JWST catalog − VIRAC)",
+    fig.suptitle(f"{o.target} {o.obsid} — positional offsets (MAST catalogue − VIRAC)",
                  fontsize=11, y=0.99)
+    fig.text(0.5, 0.005, f"Data source: {_dataset_label(metrics)}",
+             ha="center", fontsize=8, color="0.4")
     return _save(fig, f"{o.obsid}_stage4.png"), metrics
 
 
@@ -3744,7 +3858,22 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
         metrics["red_flag"] = True
         metrics["red_flag_reason"] = red_flag_reason
     fig.suptitle(f"{o.target} {o.obsid} — MAST vs pipeline ({sw})", fontsize=12, y=0.98)
-    return _save(fig, f"{o.obsid}_stage7.png"), metrics
+    fig.text(0.5, 0.005, f"Data source: MAST i2d + pipeline i2d; offsets from "
+             f"{mast_kind or 'MAST L3'} and {jic_label}", ha="center", fontsize=8, color="0.4")
+    main_png = _save(fig, f"{o.obsid}_stage7.png")
+
+    # Second figure: the jicama-vs-VIRAC per-cell offset -- the stage-4 analysis run on OUR
+    # catalogue (stage 4 itself now measures the MAST catalogue).  Omitted, not red-flagged, when
+    # no jicama catalogue is on disk yet.
+    jpos, jsrc = _jwst_positions(o, sw)
+    if jpos is not None and ref_sc is not None:
+        jp, jsub = _offset_summary_figure(o, sw, jpos, ref_sc, jsrc,
+                                          f"{o.obsid}_stage7_jicama_offset.png")
+        if jp is not None:
+            metrics.setdefault("extra_figures", []).append(
+                ("jicama vs VIRAC (per-cell offset)", jp))
+            metrics["jicama_offset_med_mas"] = jsub.get("offset_med_mas")
+    return main_png, metrics
 
 
 # --------------------------------------------------------------------------- STAGE 8 (distortion)
