@@ -3602,3 +3602,17 @@ def test_issue_number_absent_title_returns_none(monkeypatch):
     monkeypatch.setattr(P, "_paged_get",
                         lambda url, token, what: [{"number": 9, "state": "open", "title": "x"}])
     assert P._issue_number("JWST-GC/data-qa", "tok", "NOPE") is None
+
+
+def test_offset_panel_title_headlines_same_star_not_histogram():
+    """The offset panel must lead with the same-star tie (the authoritative estimator) and demote
+    the per-cell histogram median -- if someone simplifies it back to the histogram the figure would
+    misstate the measurement while the metrics stay correct, and this catches that."""
+    cc = {"n_cells": 12}
+    t = D._offset_panel_title(1.2, "same-star", {"off": 1.2, "npairs": 40}, 14.0, cc, 6.0, "gate 75")
+    lead, second = t.split("\n")[:2]
+    assert "1.2 mas [same-star]" in lead and "same-star pairs" in lead
+    assert "histogram median 14 mas" in second and "histogram median" not in lead
+    # with no same-star tie, the reported (headline) value is the histogram one, labelled as such
+    t2 = D._offset_panel_title(14.0, "histogram", None, 14.0, cc, 6.0, "gate 75")
+    assert "14.0 mas [histogram]" in t2.split("\n")[0]
