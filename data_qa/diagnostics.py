@@ -2302,14 +2302,18 @@ def stage4_offsets(o: Observation, sw):
     a1t, _a1r = _add_marginals(a1, cdra, cdde, color="#4477aa", bins=12,
                                weights=np.array([c["n"] for c in cells], float))
     sp_str = f", cells scatter by {spread:.0f} mas" if spread is not None else ""
-    # This panel shows the per-CELL histogram peaks, so its headline is the median over cells.  The
-    # same-star measurement of the same quantity is reported beside it.
-    ss_str = (f"\nsame stars, matched one to one: {ss['off']:.1f} mas (n={ss['npairs']})" if ss else
-              "\nsame-star measurement unavailable; the histogram value is the one reported")
-    a1t.set_title(f"JWST−VIRAC offset {cell_off_med:.0f} mas over {cc['n_cells']} cells"
-                  f"{sp_str}{ss_str}\n"
+    # HEADLINE the same-star tie (the offset measured from stars matched one to one), which is the
+    # unbiased number: the per-cell histogram peak against a dense reference carries a several-mas
+    # correlated-background bias (its RA term can even flip sign per filter), so it is demoted to the
+    # spatial-map / detector role it is good for.  When no same-star tie is available the histogram
+    # median is the reported value, and the headline says so.  ``off_med``/``bulk_source`` already
+    # encode this choice (off_med = same-star when present); the map + marginals stay the histogram.
+    hist_str = f"per-cell histogram median {cell_off_med:.0f} mas over {cc['n_cells']} cells{sp_str}"
+    lead = (f"offset from VIRAC {off_med:.1f} mas [{bulk_source}]"
+            + (f" ({ss['npairs']} same-star pairs)" if ss else ""))
+    a1t.set_title(f"{lead}\n{hist_str}\n"
                   f"(colour = sky quadrant; point size ∝ sources; dashed circle = cell-to-cell "
-                  f"spread; {gate_note}; marginals weighted by source count)",
+                  f"spread; {gate_note}; marginals = per-cell histogram)",
                   fontsize=7)
     if im:
         # The inter-module offset is two numbers; print them.
