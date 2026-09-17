@@ -3602,3 +3602,31 @@ def test_issue_number_absent_title_returns_none(monkeypatch):
     monkeypatch.setattr(P, "_paged_get",
                         lambda url, token, what: [{"number": 9, "state": "open", "title": "x"}])
     assert P._issue_number("JWST-GC/data-qa", "tok", "NOPE") is None
+
+
+def test_load_reference_reads_refmag(tmp_path):
+    """The Step-0 gaia_virac2 reference catalogue carries its magnitude in `refmag`, not
+    `Ksmag`.  gc-treasury tiles have only this catalogue (no raw VIRAC2 Ksmag cache), so stage 3
+    photometric calibration goes blank ("need VIRAC refcat") unless load_reference reads refmag."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "gaia_virac2_refcat_epoch2026.70_o100.fits"
+    Table({"RA": np.linspace(266.4, 266.6, 5), "DEC": np.linspace(-28.95, -28.85, 5),
+           "refmag": np.array([12.0, 14.0, 16.0, 18.0, 20.0])}).write(p)
+    sc, mag = aa.load_reference(str(p), 2026.7)
+    assert sc is not None
+    assert mag is not None and np.isfinite(mag).all()
+    np.testing.assert_allclose(np.sort(mag), [12.0, 14.0, 16.0, 18.0, 20.0])
+
+
+def test_load_reference_prefers_ksmag_over_refmag(tmp_path):
+    """A raw VIRAC2 cache (reduction fields) carries both a real Ksmag and no refmag; where both a
+    Ksmag and a refmag exist, Ksmag wins so the calibration uses native VIRAC2 Ks."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "virac2.fits"
+    Table({"RAJ2000": np.linspace(266.4, 266.6, 4), "DEJ2000": np.linspace(-28.95, -28.85, 4),
+           "Ksmag": np.array([11.0, 13.0, 15.0, 17.0]),
+           "refmag": np.array([99.0, 99.0, 99.0, 99.0])}).write(p)
+    _, mag = aa.load_reference(str(p), 2026.7)
+    np.testing.assert_allclose(np.sort(mag), [11.0, 13.0, 15.0, 17.0])
