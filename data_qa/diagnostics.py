@@ -4701,9 +4701,21 @@ def _peppar_cal_for_cat(catpath):
     if not m:
         return None
     calname = m.group(1) + ".fits"
-    filt_dir = os.path.dirname(os.path.dirname(os.path.dirname(catpath)))   # .../peppar
-    field_dir = os.path.dirname(filt_dir)
-    filt = os.path.basename(os.path.dirname(os.path.dirname(catpath)))      # <FILT>
+    # Walk up to the "peppar" directory so this works for BOTH layouts: flat
+    # (<field>/peppar/<FILT>/<DET>/cat) and per-observation (<field>/peppar/o<obs>/<FILT>/<DET>/cat,
+    # gc-treasury's disjoint tiles).  The field dir is peppar's parent either way; the extra o<obs>
+    # level would otherwise make dirname-counting resolve field_dir to '.../peppar' and filt to the
+    # obs token, so the cal lookup finds nothing and stage 11 / stage 6's peppar half go blank.
+    peppar_dir = os.path.dirname(catpath)
+    while peppar_dir and os.path.basename(peppar_dir) != "peppar":
+        parent = os.path.dirname(peppar_dir)
+        if parent == peppar_dir:        # reached the filesystem root with no "peppar" ancestor
+            return None
+        peppar_dir = parent
+    if not peppar_dir:
+        return None
+    field_dir = os.path.dirname(peppar_dir)
+    filt = os.path.basename(os.path.dirname(os.path.dirname(catpath)))      # <FILT> (2 dirs up)
     roots = [field_dir]
     mo = _PEPPAR_EXP_RE.match(base)
     if mo:
@@ -4857,6 +4869,25 @@ def _exclude_frames(cats, exclude):
     return [c for c in cats if _tok(c) not in exclude]
 
 
+def _peppar_dir(o: Observation, filt):
+    """The peppar directory for this obs+filter, or None.  Two layouts are supported:
+      * per-observation  ``<field>/peppar/o<obs>/<FILT>/``  -- the pipeline writes gc-treasury's
+        disjoint tiles here so each obs keeps its own frames (no shared combo across unrelated sky);
+      * flat             ``<field>/peppar/<FILT>/``         -- a shared filter dir holding several
+        observations' frames (gc2211 o023 beside o046; cloud E/F o002 beside o005).
+    The per-observation path is checked first, the flat path is the fallback.  Everything BELOW the
+    returned dir (per-detector subdirs, combo_starlist, ``*_iter1_cat.fits``) is identical in both,
+    so callers glob unchanged; the flat layout still needs the by-filename obs scoping it always had."""
+    if not filt:
+        return None
+    root = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar"
+    perobs = f"{root}/o{o.obs}/{filt}"
+    if os.path.isdir(perobs):
+        return perobs
+    flat = f"{root}/{filt}"
+    return flat if os.path.isdir(flat) else None
+
+
 def _peppar_precision(o: Observation, filt, max_frames=48, exclude=None):
     """Independent peppar astrometric-precision series vs instrumental magnitude, as a dict with the
     two quantities peppar carries (either key may be absent, whichever products exist):
@@ -4870,8 +4901,8 @@ def _peppar_precision(o: Observation, filt, max_frames=48, exclude=None):
     from astropy.table import Table
     if not filt:
         return None
-    pdir = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar/{filt}"
-    if not os.path.isdir(pdir):
+    pdir = _peppar_dir(o, filt)
+    if pdir is None:
         return None
     pixscale = 63.0 if filt.upper() in _LW_PREF else 31.0        # NIRCam LW / SW mas per pixel
 
@@ -5182,8 +5213,8 @@ def _exposure_qfit(o: Observation, filt):
     so its qfit spikes above the run's baseline.  Returns {exposure_token: (median_qfit, n_bright)}
     or {} if no peppar catalogues."""
     from astropy.table import Table
-    pdir = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar/{filt}"
-    if not os.path.isdir(pdir):
+    pdir = _peppar_dir(o, filt)
+    if pdir is None:
         return {}
     # SCOPE to this observation: a peppar filter dir can hold the frames of several observations
     # (gc2211 o023 sits beside o046/o049; cloudef o002 beside o005), so filter the exposure token to
@@ -5315,9 +5346,7 @@ def stage11_effective_psf(o: Observation, sw, lw):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     metrics = dict(stage=11, sw=sw, lw=lw)
-    filt = next((f for f in (sw, lw)
-                 if f and os.path.isdir(f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}"
-                                        f"/{o.field}/peppar/{f}")), None)
+    filt = next((f for f in (sw, lw) if f and _peppar_dir(o, f)), None)
     if filt is None:
         reason = "no peppar per-frame catalogues on disk for this obs/filter"
         png = _red_flag_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE",
@@ -5327,7 +5356,7 @@ def stage11_effective_psf(o: Observation, sw, lw):
     metrics["filter"] = filt
     qf = _exposure_qfit(o, filt)          # {exp_token: (median_qfit, n)} pooled over detectors
     # a representative detector to show the ePSF stamps for (NRCA1 if present, else the first)
-    pdir = f"{_PEPPAR_ROOTS.get(o.field, _PEPPAR_DEFAULT_ROOT)}/{o.field}/peppar/{filt}"
+    pdir = _peppar_dir(o, filt)
     dets = sorted(os.path.basename(d) for d in glob.glob(f"{pdir}/NRC*"))
     det = "NRCA1" if "NRCA1" in dets else (dets[0] if dets else None)
     pref = f"jw{int(o.program):05d}{o.obs}"          # scope to THIS obs (see _exposure_qfit)

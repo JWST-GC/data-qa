@@ -1224,6 +1224,44 @@ def test_peppar_precision_none_without_products(tmp_path, monkeypatch):
     assert D._peppar_precision(o, "F212N") is None
 
 
+def test_peppar_dir_prefers_per_obs_then_flat(tmp_path, monkeypatch):
+    """gc-treasury's disjoint tiles moved to peppar/o<obs>/<FILT>/ (per-obs); the flat
+    peppar/<FILT>/ layout (gc2211, cloud E/F) is the fallback.  Per-obs must win when both exist,
+    and a missing directory returns None."""
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "gc-treasury", str(tmp_path))
+    o = Observation(program="10678", obs="132", target="GC Treasury", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    root = tmp_path / "gc-treasury" / "peppar"
+    assert D._peppar_dir(o, "F212N") is None                     # neither layout on disk
+    (root / "F212N").mkdir(parents=True)
+    assert D._peppar_dir(o, "F212N") == str(root / "F212N")      # flat fallback
+    (root / "o132" / "F212N").mkdir(parents=True)
+    assert D._peppar_dir(o, "F212N") == str(root / "o132" / "F212N")   # per-obs wins
+
+
+def test_peppar_cal_for_cat_resolves_under_per_obs_layout(tmp_path):
+    """A per-obs cat (peppar/o<obs>/<FILT>/<DET>/) must still resolve its cal in
+    <field>/<FILT>/pipeline/ — the extra o<obs> level would otherwise send dirname-counting to the
+    wrong field_dir/filt and blank stage 11 + stage 6's peppar half."""
+    field = tmp_path / "gc-treasury"
+    catdir = field / "peppar" / "o132" / "F212N" / "NRCA1"
+    catdir.mkdir(parents=True)
+    cat = catdir / "jw10678132001_02101_00001_nrca1_cal_gc-treasury_iter1_cat.fits"
+    cat.write_text("")
+    caldir = field / "F212N" / "pipeline"
+    caldir.mkdir(parents=True)
+    cal = caldir / "jw10678132001_02101_00001_nrca1_cal.fits"
+    cal.write_text("")
+    assert D._peppar_cal_for_cat(str(cat)) == str(cal)
+
+
+def test_peppar_cal_for_cat_no_peppar_ancestor_returns_none():
+    """A valid cat name whose path has NO 'peppar' ancestor must return None, not spin forever at
+    the filesystem root (os.path.dirname('/') == '/')."""
+    assert D._peppar_cal_for_cat(
+        "/tmp/nope/jw10678132001_02101_00001_nrca1_cal_gc-treasury_iter1_cat.fits") is None
+
+
 def test_pick_filters_prefers_mosaic_backed_over_higher_ranked():
     # cloudef jw02092-o005: all four available, but only F162M/F360M have a reduced mosaic.
     # F210M/F480M rank HIGHER in the preference lists, so the naive pick chose the unreduced pair
