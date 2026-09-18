@@ -3722,6 +3722,31 @@ def test_stage3_mast_only_informational(monkeypatch):
     assert not m.get("extra_figures")                   # nothing graded to add
 
 
+def test_stage7_offset_recovers_true_offset_not_collapsed():
+    """A DEEP catalogue genuinely 60 mas off VIRAC must report ~60, NOT the ~13 a bare same-star
+    tie collapses to at its 0.05" radius.  Builds a dense reference, a JWST copy shifted by 60 mas,
+    plus many spurious deep sources (the pile-up that drives the collapse), and checks the recovered
+    bulk.  This pins the NUMBER (the reviewer's point: monkeypatching same_star_tie only pinned
+    routing)."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.default_rng(3)
+    n = 4000
+    ra = 266.40 + rng.uniform(0, 0.03, n)
+    dec = -28.90 + rng.uniform(0, 0.03, n)
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.90))
+    jra = ra + 60.0 / 3.6e6 / cosd + rng.normal(0, 0.003 / 3600, n)   # true 60 mas RA offset
+    jdec = dec + rng.normal(0, 0.003 / 3600, n)
+    era = 266.40 + rng.uniform(0, 0.03, 8000)                          # spurious deep sources
+    ede = -28.90 + rng.uniform(0, 0.03, 8000)
+    jsc = SkyCoord(np.concatenate([jra, era]) * u.deg,
+                   np.concatenate([jdec, ede]) * u.deg)
+    out = D._bulk_offset(jsc, ref)
+    assert out is not None
+    assert 50.0 < out[2] < 70.0            # ~60, not the collapsed ~13
+
+
 def test_offset_panel_title_headlines_same_star_not_histogram():
     """The offset panel must lead with the same-star tie (the authoritative estimator) and demote
     the per-cell histogram median -- if someone simplifies it back to the histogram the figure would
