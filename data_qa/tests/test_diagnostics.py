@@ -1255,6 +1255,13 @@ def test_peppar_cal_for_cat_resolves_under_per_obs_layout(tmp_path):
     assert D._peppar_cal_for_cat(str(cat)) == str(cal)
 
 
+def test_peppar_cal_for_cat_no_peppar_ancestor_returns_none():
+    """A valid cat name whose path has NO 'peppar' ancestor must return None, not spin forever at
+    the filesystem root (os.path.dirname('/') == '/')."""
+    assert D._peppar_cal_for_cat(
+        "/tmp/nope/jw10678132001_02101_00001_nrca1_cal_gc-treasury_iter1_cat.fits") is None
+
+
 def test_pick_filters_prefers_mosaic_backed_over_higher_ranked():
     # cloudef jw02092-o005: all four available, but only F162M/F360M have a reduced mosaic.
     # F210M/F480M rank HIGHER in the preference lists, so the naive pick chose the unreduced pair

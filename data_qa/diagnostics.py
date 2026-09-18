@@ -4708,7 +4708,10 @@ def _peppar_cal_for_cat(catpath):
     # obs token, so the cal lookup finds nothing and stage 11 / stage 6's peppar half go blank.
     peppar_dir = os.path.dirname(catpath)
     while peppar_dir and os.path.basename(peppar_dir) != "peppar":
-        peppar_dir = os.path.dirname(peppar_dir)
+        parent = os.path.dirname(peppar_dir)
+        if parent == peppar_dir:        # reached the filesystem root with no "peppar" ancestor
+            return None
+        peppar_dir = parent
     if not peppar_dir:
         return None
     field_dir = os.path.dirname(peppar_dir)
