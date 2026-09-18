@@ -191,6 +191,10 @@ PROGRAMS: Dict[int, Dict[str, str]] = {
     3958: {"001": "sickle", "002": "sickle", "007": "sickle"},
     2092: {"002": "cloudef", "005": "cloudef_controlfield"},   # o005 = the control/offset pointing
     1939: {"001": "sgra"},
+    # gc9257 (PI Do): NIRCam + NIRISS imaging of the nuclear star cluster, target NSC_CENTRAL,
+    # registered in the pipeline by jwst-gc-pipeline#916.  QA monitors only the NIRCam obs (o001);
+    # the field key mirrors the pipeline registry (jwst_gc_pipeline/fields.yaml: gc9257).
+    9257: {"001": "gc9257"},
     1905: {"001": "wd1", "003": "wd1"},
     3523: {"003": "wd2", "005": "wd2"},
     6778: {"001": "ngc6334"},
@@ -203,7 +207,7 @@ PROGRAMS: Dict[int, Dict[str, str]] = {
 # per FIELD (the cataloging TARGET), derived from these programs' PROGRAMS rows.
 # 1182 is left out on purpose: it maps BOTH brick (GC -- already covered via
 # 2221) and w51 (non-GC), so deriving fields from it would wrongly sweep w51 in.
-GC_PROGRAMS = (TREASURY_PROGRAM, 2221, 2211, 4147, 5365, 2045, 3958, 2092, 1939)
+GC_PROGRAMS = (TREASURY_PROGRAM, 2221, 2211, 4147, 5365, 2045, 3958, 2092, 1939, 9257)
 
 GC_FIELDS = frozenset(
     field for prog in GC_PROGRAMS for field in PROGRAMS[prog].values()
