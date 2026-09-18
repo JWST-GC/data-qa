@@ -1414,8 +1414,7 @@ def stage3_calibration(o: Observation, sw):
         nonlocal primary_png
         out = f"{o.obsid}_stage3.png" if primary_png is None else f"{o.obsid}_stage3_{kind}.png"
         png, sub = _calibration_figure(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out)
-        if png is None:                            # too few matched stars for this catalogue
-            metrics.setdefault("skipped_catalogues", []).append([lbl, sub.get("na_reason")])
+        if png is None:                            # too few matched stars for this catalogue -> skip
             return
         for k, v in sub.items():
             metrics[f"{kind}_{k}"] = v

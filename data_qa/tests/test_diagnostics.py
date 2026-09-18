@@ -3643,6 +3643,19 @@ def test_load_reference_prefers_ksmag_over_refmag(tmp_path):
     np.testing.assert_allclose(np.sort(mag), [11.0, 13.0, 15.0, 17.0])
 
 
+def test_load_reference_prefers_refmag_over_gaia_g(tmp_path):
+    """The physics half of the ranking: with both a NIR `refmag` and Gaia optical `phot_g_mean_mag`
+    present, refmag must win — choosing G for an F212N zeropoint is the failure the ranking prevents."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "ref.fits"
+    Table({"RA": np.linspace(266.4, 266.6, 4), "DEC": np.linspace(-28.95, -28.85, 4),
+           "refmag": np.array([14.0, 15.0, 16.0, 17.0]),
+           "phot_g_mean_mag": np.array([90.0, 91.0, 92.0, 93.0])}).write(p)
+    _, mag = aa.load_reference(str(p), 2026.7)
+    np.testing.assert_allclose(np.sort(mag), [14.0, 15.0, 16.0, 17.0])
+
+
 def test_stage3_reference_selects_virac2_over_gaia(tmp_path, monkeypatch):
     """The gaia_virac2 refcat mixes VIRAC2 Ks and Gaia G in one refmag column; stage 3 must take the
     VIRAC2 (NIR) rows only, else optical G wrecks the slope."""
@@ -3662,21 +3675,27 @@ def test_stage3_reference_selects_virac2_over_gaia(tmp_path, monkeypatch):
 
 
 def _stage3_synth(monkeypatch, our=True):
+    """Synthetic stage-3 inputs.  The reference spans 11-19 mag (STRADDLING the [13,17] fit window,
+    so windowing is actually exercised), and MAST vs our photometry DIFFER (MAST noisy + a slope
+    error, ours clean unit-slope) so the grade-source and windowing assertions can't pass by accident
+    on identical fixtures."""
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     from data_qa.observations import Observation
     rng = np.random.default_rng(0)
-    n = 200
+    n = 400
     ra = 266.4 + rng.uniform(0, 0.02, n); dec = -28.9 + rng.uniform(0, 0.02, n)
-    ks = rng.uniform(13.5, 16.5, n)                 # inside the [13,17] fit window
+    ks = rng.uniform(11.0, 19.0, n)                 # straddles the [13,17] window
     ref_sc = SkyCoord(ra * u.deg, dec * u.deg)
     o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
                     instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
     monkeypatch.setattr(D, "_mosaic_path", lambda o, f: None)
     monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2026.70)
     monkeypatch.setattr(D, "_stage3_reference", lambda o, ep: (ref_sc, ks))
+    # MAST: a wrong slope (0.7) + large scatter -> would FAIL if it were graded
     monkeypatch.setattr(D, "_mast_calibration_sources",
-                        lambda o, sw: (ref_sc, ks + 3.0 + rng.normal(0, 0.05, n)))
+                        lambda o, sw: (ref_sc, 0.7 * ks + 5.0 + rng.normal(0, 0.4, n)))
+    # ours: clean unit slope, tight scatter -> passes
     our_val = ((ref_sc, ks + 3.0 + rng.normal(0, 0.05, n), "jicama-m2") if our
                else (None, None, None))
     monkeypatch.setattr(D, "_stage3_our_catalog", lambda o, sw: our_val)
@@ -3688,9 +3707,10 @@ def test_stage3_mast_primary_our_graded(monkeypatch):
     _, m = D.stage3_calibration(o, "F212N")
     assert m["primary_source"] == "MAST catalogue"     # MAST is the always-shown primary image
     assert m["source"] == "jicama-m2"                  # verdict comes from OUR catalogue
-    assert m["passed"] is True                          # slope ~1, tight scatter -> pass
+    assert m["passed"] is True                          # graded on OURS (unit slope): pass ...
+    assert not (0.8 < m["mast_slope"] < 1.2)            # ... NOT on MAST (slope 0.7) -> grade-source pinned
     assert m.get("extra_figures")                       # our catalogue posted as a 2nd image
-    assert m["mast_slope"] is not None                  # MAST panel numbers recorded too
+    assert m["our_fit_windowed"] is True and m["our_n_fit"] < m["our_n_matched"]  # window applied
 
 
 def test_stage3_mast_only_informational(monkeypatch):
