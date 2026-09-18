@@ -1262,6 +1262,14 @@ def test_peppar_cal_for_cat_no_peppar_ancestor_returns_none():
         "/tmp/nope/jw10678132001_02101_00001_nrca1_cal_gc-treasury_iter1_cat.fits") is None
 
 
+def test_apply_vega_zp_adds_when_present_else_unchanged():
+    """Pins the depth-histogram calibration arithmetic: with a ZP the mag is shifted by exactly it;
+    with None it is unchanged.  Guards against the +ZP being dropped while the 'Vega' label stays."""
+    m = np.array([-7.0, -5.0, -3.0])
+    np.testing.assert_allclose(D._apply_vega_zp(m, 26.0), m + 26.0)
+    np.testing.assert_array_equal(D._apply_vega_zp(m, None), m)
+
+
 def test_stage7_caption_flags_real_misregistration_when_jicama_far_worse():
     """When jicama is materially farther from VIRAC than raw MAST, the caption must call it a real
     mis-registration (re-tie), not the neutral 'MAST as close as pipeline' — o132 is jicama 70 vs
@@ -1273,6 +1281,13 @@ def test_stage7_caption_flags_real_misregistration_when_jicama_far_worse():
     cap2 = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=13.0,
                                  mast_offset_med_mas=11.0, n_jicama_window=75000, n_mast_window=5000))
     assert "farther from VIRAC" not in cap2
+    # pin the margin: just below -> neutral, just above -> mis-registration
+    mo = 14.0; margin = D._STAGE7_MISREG_MARGIN_MAS
+    lo = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=mo + margin - 2,
+                               mast_offset_med_mas=mo, n_jicama_window=1, n_mast_window=1))
+    hi = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=mo + margin + 2,
+                               mast_offset_med_mas=mo, n_jicama_window=1, n_mast_window=1))
+    assert "farther from VIRAC" not in lo and "farther from VIRAC" in hi
 
 
 def test_pick_filters_prefers_mosaic_backed_over_higher_ranked():

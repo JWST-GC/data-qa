@@ -492,6 +492,14 @@ def _vega_zeropoint(o: Observation, filt, sc, instr):
     return float(np.median(zz[bright])) if bright.sum() >= 20 else float(np.median(zz))
 
 
+def _apply_vega_zp(instr_mag, zp):
+    """Add the instrumental->Vega zeropoint to an instrumental magnitude array (``vega = instr + ZP``,
+    per ``_vega_zeropoint``); return it unchanged when ``zp`` is None (no Vega catalogue).  Factored
+    out so the stage-7 depth-histogram calibration is unit-testable -- without it the histogram would
+    silently fall back to raw instrumental mags (tens of mag negative) under a 'Vega' axis label."""
+    return instr_mag + zp if zp is not None else instr_mag
+
+
 def _mast_source_catalog(o: Observation, filt):
     """MAST-delivered L3 source catalog for one filter (single-band), or None.  Two homes, in
     priority order:
@@ -3814,6 +3822,13 @@ def _bulk_offset(sc, ref_sc, metrics=None, key=None):
     return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
 
 
+# How much farther from VIRAC jicama must sit than raw MAST before the caption calls it a real
+# mis-registration (rather than the neutral "about as close").  The per-star tie noise floor is a
+# few mas (o132: MAST same-star residual 0.09, jicama 4.67, from the #260 estimator work), so 25 mas
+# is comfortably above the floor while well below the ~50-80 mas #871 refused-tie cluster it flags.
+_STAGE7_MISREG_MARGIN_MAS = 25.0
+
+
 def _stage7_astrom_title(mast_off, jic_off):
     """Astrometry sub-panel title, worded from the SIGN of (jicama offset − MAST offset).  It calls
     the pipeline 'tighter' only when both offsets are measured AND jicama is STRICTLY smaller; in
@@ -3935,10 +3950,11 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
         # Add the instrumental->Vega zeropoint from the merged catalogue so the depth reads real
         # magnitudes and is comparable to MAST; fall back to instrumental (labelled) if no Vega cat.
         jzp = _vega_zeropoint(o, sw, jsc, jmag)
+        jmag = _apply_vega_zp(jmag, jzp)
         if jzp is not None:
-            jmag = jmag + jzp
             jic_mag_calibrated = True
             metrics["jicama_instr_to_vega_zp"] = float(jzp)
+            metrics["jicama_mag_median"] = float(np.nanmedian(jmag))
         jsrc = f"release:{jname}"; jic_is_release = True
     else:
         jsc, jmag, jsrc = _jwst_sources(o, sw)
@@ -6252,7 +6268,7 @@ def _caption_for_impl(n, metrics):
             base += f" — {jo:.0f} mas (jicama) vs {mo:.0f} mas (MAST)"
             if jo < mo:
                 base += ", so the pipeline sits closer to VIRAC. "
-            elif jo > mo + 25:
+            elif jo > mo + _STAGE7_MISREG_MARGIN_MAS:
                 # jicama materially FARTHER from VIRAC than raw MAST -> a real mis-registration of
                 # the pipeline catalogue, not an estimator quirk (MAST is tied independently of our
                 # offsets table).  On gc-treasury this is the m2 refused-tie population.
