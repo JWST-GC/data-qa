@@ -187,7 +187,10 @@ def load_reference(path, epoch):
         return None, None
     pmra = col("pmRA", "pmra")
     pmdec = col("pmDE", "pmdec")
-    mag = col("Ksmag", "phot_g_mean_mag", "Gmag", "mag")
+    # Ksmag: raw VIRAC2 cache (reduction fields).  refmag: the Step-0 gaia_virac2 reference
+    # catalogue (NIR-tied VIRAC2 fill + Gaia, per its meta) that gc-treasury tiles carry INSTEAD
+    # of a Ksmag cache -- prefer it over Gaia optical G for a NIR (F212N) zeropoint.
+    mag = col("Ksmag", "refmag", "phot_g_mean_mag", "Gmag", "mag")
     ref_ep = 2014.0 if ("RAJ2000".lower() in cols) else 2016.0   # VIRAC2 vs Gaia
     dt = epoch - ref_ep
     if pmra is not None and pmdec is not None:

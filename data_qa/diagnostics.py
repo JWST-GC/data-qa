@@ -899,6 +899,26 @@ def _red_flag_figure(o, stage_name, title, reason):
     return _save(fig, f"{o.obsid}_{stage_name}.png")
 
 
+def _note_figure(o, stage_name, title, reason):
+    """A NEUTRAL (grey) note panel for an ungraded, not-a-defect state -- the counterpart to
+    ``_red_flag_figure``.  A red panel would read as 'something is wrong'; use this when the stage
+    simply cannot be graded yet (e.g. no pipeline catalogue), so it does not alarm."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(7.6, 3.4))
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_axis_off()
+    ax.add_patch(plt.Rectangle((0, 0), 1, 1, color="#404040"))
+    ax.text(0.5, 0.70, "ⓘ NOT YET GRADED", color="white", fontsize=24, fontweight="bold",
+            ha="center", va="center")
+    ax.text(0.5, 0.44, title, color="white", fontsize=14, fontweight="bold",
+            ha="center", va="center")
+    ax.text(0.5, 0.21, reason, color="#dddddd", fontsize=10, ha="center", va="center", wrap=True)
+    ax.text(0.5, 0.05, f"{o.target} {o.obsid}", color="#cccccc", fontsize=8,
+            ha="center", va="center")
+    return _save(fig, f"{o.obsid}_{stage_name}.png")
+
+
 # --------------------------------------------------------------------------- STAGE 1
 def stage1_mosaics(o: Observation, sw, lw):
     """One full-width grayscale panel PER FILTER, stacked vertically.  NIRCam mosaics are
@@ -1175,77 +1195,260 @@ def _clipped_locus_fit(x, y, k=3.0, maxiter=5):
     return float(slope), float(zp), scat, int(len(xf)), n_unclipped, clip_exit
 
 
-def stage3_calibration(o: Observation, sw):
-    """JWST (SW ~ F212N) catalogue mag vs VIRAC Ks for matched stars.  The cyan 1:1 line is the
-    ideal unit-slope relation (not a fit); the measured free slope and the scatter about the
-    locus gate whether the photometric zeropoint is sane."""
+# The JWST-vs-VIRAC photometric locus is linear only over a clean magnitude range: brighter than
+# this the JWST NIRCam narrow band SATURATES (measured too faint -> the locus flattens), fainter than
+# this the VIRAC reference photometry is noisy and the JWST catalogue is crowding-incomplete.  In GC
+# Ks, saturation sets in ~13 and VIRAC stays reliable to ~17.  Fitting the whole range instead drags
+# a well-calibrated tile's slope down to ~0.5 (measured on jw10678 o129/o132/o135).  The zeropoint
+# offset is still read from the full matched set (it is robust); only the SLOPE/SCATTER fit is windowed.
+_STAGE3_FIT_MAG_MIN = 13.0
+_STAGE3_FIT_MAG_MAX = 17.0
+
+
+def _stage3_reference(o: Observation, ep):
+    """(SkyCoord, mag) for the stage-3 photometric reference, restricted to a clean NIR band, or
+    (None, None).  The Step-0 ``gaia_virac2_refcat`` mixes VIRAC2 Ks (NIR) and Gaia DR3 G (optical)
+    in one ``refmag`` column (``source`` says which); only the VIRAC2 rows track a JWST NIR band, so
+    a Gaia-G contaminated reference gives a garbage slope.  Select the VIRAC2 rows; their RA/DEC are
+    already PM-propagated to the catalogue epoch, so no further propagation is applied.  A raw VIRAC2
+    cache (reduction fields) has a native ``Ksmag`` and no ``source`` column -> defer to
+    ``load_reference`` (which also PM-propagates from 2014)."""
+    ref = _viraccache_path(o) or _refcat_path(o)
+    if not ref or not ep:
+        return None, None
+    from astropy.table import Table
+    t = Table.read(_used(ref, "VIRAC2/Gaia reference catalogue"))
+    cols = {c.lower(): c for c in t.colnames}
+    if "source" in cols and "refmag" in cols:
+        import astropy.units as u
+        from astropy.coordinates import SkyCoord
+        src = np.array([str(s).upper() for s in np.asarray(t[cols["source"]])])
+        rmag = np.asarray(t[cols["refmag"]], float)
+        keep = np.char.find(src, "VIRAC") >= 0
+        keep &= np.isfinite(rmag)
+        if keep.sum() == 0:
+            return aa.load_reference(ref, ep)      # no VIRAC rows -> fall back to whatever loads
+        ra = np.asarray(t[cols["ra"]], float)[keep]
+        dec = np.asarray(t[cols["dec"]], float)[keep]
+        return SkyCoord(ra * u.deg, dec * u.deg), rmag[keep]
+    return aa.load_reference(ref, ep)
+
+
+def _mast_calibration_sources(o: Observation, sw):
+    """(SkyCoord, mag) from the MAST-delivered per-i2d source catalogue for the calibration check,
+    or (None, None).  MAST is the always-shown baseline; its aperture photometry is crowding-limited
+    in the GC, so stage 3 grades on OUR catalogue, not this one."""
     import astropy.units as u
-    from astropy.coordinates import search_around_sky
-    fig, ax = _fig(1, 1, 5.5, 5.5)
-    metrics = dict(stage=3, sw=sw)
-    path = _mosaic_path(o, sw)
-    ref = _viraccache_path(o) or _refcat_path(o)   # cache has real Ksmag
-    ep = _obs_epoch(o, path)
-    ref_sc, ref_mag = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
-                       if (ref and ep) else (None, None))
-    # Read the JWST catalog (release -> MAST) -- do NOT re-detect on the mosaic.
-    jsc, jmag, src = _jwst_sources(o, sw)
-    metrics["source"] = src
-    a = ax[0][0]
-    if jsc is None:
-        import matplotlib.pyplot as plt
-        plt.close(fig)          # close the empty fig before the red-flag builds its own
-        # Calibration needs magnitudes; a positions-only DAO catalogue can't be calibrated.  Say
-        # so, and point at stage 4 (which CAN measure the frame offset from those positions).
-        dao_only = bool(_dao_position_catalog(o, sw))
-        reason = (f"per-filter DAO catalogue exists for {sw} but carries positions only (no "
-                  f"calibrated photometry) — calibration needs magnitudes; see stage 4 for the "
-                  f"frame offset" if dao_only else
-                  f"no release or MAST source catalogue for {sw} yet")
-        png = _red_flag_figure(o, "stage3", "NO PHOTOMETRY TO CALIBRATE", reason + ".")
-        metrics.update(available=False, na_reason=reason, passed=None)
-        return png, metrics
-    if ref_sc is None or ref_mag is None:
-        a.text(0.5, 0.5, "need VIRAC refcat", ha="center", va="center")
-        metrics["passed"] = False
-        return _save(fig, f"{o.obsid}_stage3.png"), metrics
-    # Anchor on VIRAC (sparse, Ks-bright) -> nearest JWST catalog source.  The release catalog
-    # goes far deeper than VIRAC, so an all-pairs match would pair faint JWST sources with the
-    # wrong VIRAC star and blow up the scatter; nearest-from-VIRAC keeps the locus clean.
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    mp = _mast_source_catalog(o, sw)
+    if not mp:
+        return None, None
+    m = Table.read(_used(mp, f"JWST catalogue, MAST per-i2d ({sw})"))
+    magc = next((c for c in ("aper_total_abmag", "aper50_abmag", "aper70_abmag",
+                             "aper30_abmag") if c in m.colnames), None)
+    if not magc:
+        return None, None
+    if "sky_centroid" in m.colnames:
+        sc = m["sky_centroid"]; ra = np.asarray(sc.ra.deg, float); dec = np.asarray(sc.dec.deg, float)
+    else:
+        low = {c.lower(): c for c in m.colnames}
+        if "sky_centroid.ra" not in low or "sky_centroid.dec" not in low:
+            return None, None
+        ra = np.asarray(m[low["sky_centroid.ra"]], float)
+        dec = np.asarray(m[low["sky_centroid.dec"]], float)
+    mag = np.asarray(m[magc], float)
+    g = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(mag)
+    if g.sum() < 30:
+        return None, None
+    return SkyCoord(ra[g] * u.deg, dec[g] * u.deg), mag[g]
+
+
+def _perfilter_psf_photometry(o: Observation, filt):
+    """Highest-m-level per-filter jicama PSF catalogue carrying FLUX (not yet Vega-calibrated), or
+    None.  These ``f<filt>_<module>_o<obs>_indivexp_merged_m<N>_dao_basic.fits`` tables exist long
+    before the cross-band merged release catalogue (many treasury tiles have per-filter PSF
+    photometry while only a few have the merged catalogue), so stage 3 can grade OUR photometry from
+    them via an instrumental-mag slope check (the zeropoint is absorbed in the locus fit).  The
+    ``_vetted`` sibling is positions-only, so it is excluded here."""
+    pats = [p for p in _fglob(o, f"catalogs/{filt.lower()}_*_o{o.obs}_*dao_basic*.fits")
+            if all(t not in os.path.basename(p).lower() for t in ("carta", "seed", "vetted"))]
+    if not pats:
+        return None
+
+    def rank(p):
+        m = re.search(r"_m(\d+)_", os.path.basename(p))
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            mt = 0.0
+        return (int(m.group(1)) if m else 0, mt)
+    return max(pats, key=rank)
+
+
+def _stage3_our_catalog(o: Observation, sw):
+    """(SkyCoord, mag, source_label) for OUR pipeline catalogue used to GRADE the calibration, or
+    (None, None, None).  Prefers the cross-band merged release catalogue (``mag_vega_<sw>``); falls
+    back to the per-filter PSF catalogue's instrumental mag (``-2.5 log10 flux``) so tiles that have
+    reached only per-filter photometry still grade.  This is the 'jicama when available' half of the
+    MAST-always / ours-when-available pattern."""
+    from astropy.table import Table
+    # 1) cross-band merged release catalogue with a Vega magnitude
+    cat, magcol, sccol = _catalog_with_vega(o, sw)
+    if cat:
+        m = Table.read(_used(cat, f"JWST catalogue, pipeline merged Vega ({sw})"))
+        if sccol in m.colnames and magcol in m.colnames:
+            sc = m[sccol]; mag = np.asarray(m[magcol], float)
+            g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(mag)
+            if g.sum() >= 30:
+                return sc[g], mag[g], _source_label_from_path(cat)
+    # 2) per-filter PSF catalogue: instrumental mag from flux
+    p = _perfilter_psf_photometry(o, sw)
+    if p:
+        m = Table.read(_used(p, f"JWST catalogue, pipeline per-filter PSF ({sw})"))
+        low = {c.lower(): c for c in m.colnames}
+        if "skycoord" in m.colnames and "flux" in low:
+            sc = m["skycoord"]; flux = np.asarray(m[low["flux"]], float)
+            pos = (np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)
+                   & np.isfinite(flux) & (flux > 0))
+            if pos.sum() >= 30:
+                return sc[pos], -2.5 * np.log10(flux[pos]), _source_label_from_path(p)
+    return None, None, None
+
+
+def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_mag, out_name):
+    """VIRAC reference mag vs one JWST catalogue's mag: hexbin locus + 1:1 line + sigma-clipped fit.
+    Returns (png, submetrics); submetrics carries slope/scatter/passed, or (None, {na_reason}) when
+    too few stars match to fit a locus.  The cyan 1:1 line is the ideal unit-slope relation; the
+    free slope and locus scatter gate the zeropoint."""
+    import astropy.units as u
+    # Anchor on VIRAC (sparse, bright) -> nearest JWST source.  A JWST catalogue goes far deeper, so
+    # an all-pairs match would pair faint JWST sources with the wrong VIRAC star; nearest-from-VIRAC
+    # keeps the locus clean.
     idx, sep, _ = ref_sc.match_to_catalog_sky(jsc)
     keep = sep < 0.1 * u.arcsec
     if keep.sum() < 30:
-        a.text(0.5, 0.5, f"only {int(keep.sum())} matches", ha="center", va="center")
-        metrics["passed"] = False
-        return _save(fig, f"{o.obsid}_stage3.png"), metrics
+        return None, dict(source=src_label, na_reason=f"only {int(keep.sum())} matched stars")
     x = ref_mag[keep]; y = jmag[idx[keep]]
     g = np.isfinite(x) & np.isfinite(y)
     x, y = x[g], y[g]
-    # robust sigma-clipped linear fit to the stellar locus (see _clipped_locus_fit)
-    slope, zp, scat, n_locus, n_unclipped, clip_exit = _clipped_locus_fit(x, y)
+    # Fit the SLOPE/SCATTER only over the clean magnitude window (saturation + faint-noise cut);
+    # the offset (locus zeropoint) is read from the whole matched set, which is robust.
+    win = (x >= _STAGE3_FIT_MAG_MIN) & (x <= _STAGE3_FIT_MAG_MAX)
+    windowed = bool(win.sum() >= 30)
+    xf, yf = (x[win], y[win]) if windowed else (x, y)
+    slope, zp, scat, n_locus, n_unclipped, clip_exit = _clipped_locus_fit(xf, yf)
+    fig, ax = _fig(1, 1, 5.5, 5.5); a = ax[0][0]
     hb = a.hexbin(x, y, gridsize=80, bins="log", cmap="magma", mincnt=1)
     fig.colorbar(hb, ax=a, label="log N stars", shrink=0.85)
-
     dy = y - x
     hcnt, hedge = np.histogram(dy, bins=60)
     zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus offset
     xs = np.array([np.nanmin(x), np.nanmax(x)])
     a.plot(xs, xs, "c-", lw=1.4, label="1:1 reference line")
     a.plot(xs, slope * xs + zp, "g--", lw=1.4, label="fitted locus")
-    a.set_xlabel("VIRAC Ks [mag]"); a.set_ylabel(f"JWST {sw} catalog mag")
+    if windowed:                                   # mark the magnitude range the fit used
+        a.axvspan(_STAGE3_FIT_MAG_MIN, _STAGE3_FIT_MAG_MAX, color="0.7", alpha=0.15, zorder=0)
+    a.set_xlabel("VIRAC reference mag"); a.set_ylabel(f"JWST {sw} mag ({src_label})")
     a.legend(fontsize=8, loc="upper left")
-    # Say which exit the clip took: n_locus == n_matched reads the same whether the clip converged
-    # with nothing to reject or was refused for want of survivors, and those are different numbers.
+    # Say which exit the clip took: n_locus == n_fit reads the same whether the clip converged with
+    # nothing to reject or was refused for want of survivors, and those are different numbers.
     locus_note = " unclipped" if clip_exit == "floor-unclipped" else ""
-    a.set_title(f"{o.obsid} calibration  n={int(g.sum())} (locus {n_locus}{locus_note})  "
-                f"slope={slope:.2f}  scatter={scat:.2f}  locus offset={zp1:.2f}", fontsize=9)
-    # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen
-    # only the SCATTER for the real narrow-vs-broad (F212N vs Ks) colour/extinction spread.
-    metrics.update(n_matched=int(g.sum()), n_locus=n_locus, n_locus_unclipped=n_unclipped,
-                   clip_exit=clip_exit, slope=float(slope),
-                   zeropoint_fit=float(zp), scatter=scat, locus_offset=float(zp1),
-                   passed=(0.8 < slope < 1.2 and scat < 0.8))
-    return _save(fig, f"{o.obsid}_stage3.png"), metrics
+    win_note = (f"  fit {_STAGE3_FIT_MAG_MIN:.0f}-{_STAGE3_FIT_MAG_MAX:.0f}" if windowed
+                else "  fit full")
+    a.set_title(f"{o.obsid} {src_label}  n={int(g.sum())} (locus {n_locus}{locus_note}{win_note})  "
+                f"slope={slope:.2f}  scatter={scat:.2f}  offset={zp1:.2f}", fontsize=8.5)
+    fig.text(0.5, 0.005, f"Data source: {src_label} vs VIRAC/Gaia reference", ha="center",
+             fontsize=7.5, color="0.4")
+    # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen only
+    # the SCATTER for the real narrow-vs-broad colour/extinction spread.
+    sub = dict(source=src_label, n_matched=int(g.sum()), n_fit=int(xf.size), fit_windowed=windowed,
+               n_locus=n_locus, n_locus_unclipped=n_unclipped, clip_exit=clip_exit,
+               slope=float(slope), zeropoint_fit=float(zp), scatter=scat, locus_offset=float(zp1),
+               passed=bool(0.8 < slope < 1.2 and scat < 0.8))
+    return _save(fig, out_name), sub
+
+
+def stage3_calibration(o: Observation, sw):
+    """Photometric zeropoint check: JWST catalogue mag vs VIRAC reference mag for matched stars.
+    The MAST-delivered catalogue is ALWAYS shown (primary panel) as the archive baseline; OUR
+    pipeline catalogue (merged release, else per-filter PSF) is added as a second panel WHEN
+    AVAILABLE and carries the stage verdict.  With no pipeline catalogue yet, MAST is shown for
+    information and the stage stays ungraded rather than red-flagging the archive's crowding-limited
+    aperture photometry."""
+    metrics = dict(stage=3, sw=sw)
+    path = _mosaic_path(o, sw)
+    ep = _obs_epoch(o, path)
+    ref_sc, ref_mag = _stage3_reference(o, ep)     # VIRAC2 Ks (clean NIR band), PM-propagated
+
+    mast_sc, mast_mag = _mast_calibration_sources(o, sw)
+    our_sc, our_mag, our_lbl = _stage3_our_catalog(o, sw)
+
+    if mast_sc is None and our_sc is None:
+        # Nothing to calibrate: no MAST and no pipeline source catalogue yet -> the stage has not
+        # run.  Excluded (available=False), not red-flagged.
+        dao_only = bool(_dao_position_catalog(o, sw))
+        reason = (f"per-filter DAO catalogue exists for {sw} but carries positions only (no "
+                  f"calibrated photometry) — calibration needs magnitudes; see stage 4 for the "
+                  f"frame offset" if dao_only else
+                  f"no MAST or pipeline source catalogue for {sw} yet")
+        png = _red_flag_figure(o, "stage3", "NO PHOTOMETRY TO CALIBRATE", reason + ".")
+        metrics.update(available=False, na_reason=reason, passed=None)
+        return png, metrics
+
+    if ref_sc is None or ref_mag is None:
+        # A source catalogue exists but no VIRAC/Gaia reference WITH magnitudes resolved.  Every
+        # field carries a Step-0 refcat, so this is unexpected; stay ungraded rather than red-flag.
+        png = _note_figure(o, "stage3", "NO VIRAC REFERENCE MAGNITUDES",
+                           "found a source catalogue but no VIRAC/Gaia reference with magnitudes "
+                           "to calibrate against.")
+        metrics.update(available=True, passed=None,
+                       na_reason="no VIRAC/Gaia reference magnitudes resolved")
+        return png, metrics
+
+    # MAST panel first -> the always-shown primary image; ours (when present) is the graded panel.
+    primary_png = None
+    extra = []
+
+    def _emit(jsc, jmag, lbl, kind, is_our):
+        nonlocal primary_png
+        out = f"{o.obsid}_stage3.png" if primary_png is None else f"{o.obsid}_stage3_{kind}.png"
+        png, sub = _calibration_figure(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out)
+        if png is None:                            # too few matched stars for this catalogue -> skip
+            return
+        for k, v in sub.items():
+            metrics[f"{kind}_{k}"] = v
+        if primary_png is None:
+            primary_png = png
+            metrics["primary_source"] = lbl
+        else:
+            extra.append((f"{lbl} vs VIRAC (calibration)", png))
+        if is_our:
+            metrics.update(passed=sub["passed"], source=lbl, slope=sub["slope"],
+                           scatter=sub["scatter"], n_matched=sub["n_matched"],
+                           locus_offset=sub["locus_offset"], zeropoint_fit=sub["zeropoint_fit"])
+
+    if mast_sc is not None:
+        _emit(mast_sc, mast_mag, "MAST catalogue", "mast", is_our=False)
+    if our_sc is not None:
+        _emit(our_sc, our_mag, our_lbl, "our", is_our=True)
+
+    if primary_png is None:
+        # Every catalogue present but too few stars matched the reference to fit a locus.
+        png = _note_figure(o, "stage3", "TOO FEW MATCHED STARS",
+                           "source catalogue(s) present but too few stars matched the VIRAC "
+                           "reference to fit a photometric locus.")
+        metrics.update(available=True, passed=None, na_reason="too few matched stars")
+        return png, metrics
+
+    if our_sc is None:
+        # Only MAST was shown -> informational, ungraded (do NOT red-flag archive photometry).
+        metrics.update(available=True, passed=None, source=metrics.get("primary_source"),
+                       na_reason="MAST catalogue shown for information; pipeline catalogue not yet "
+                                 "available for a graded calibration")
+    if extra:
+        metrics["extra_figures"] = extra
+    return primary_png, metrics
 
 
 # --------------------------------------------------------------------------- STAGE 4
@@ -1730,12 +1933,14 @@ def _offset_summary_figure(o: Observation, sw, jsc, ref_sc, src_label, out_name)
         return None, {}
     cc = _cell_consistency(cells, dropped)
     cells = cc["cells"]
-    ss = aa.same_star_tie(jsc, ref_sc)
-    cloud = _offset_cloud(jsc, ref_sc)
-    off_med = float(ss["off"]) if ss else float(cc["off_med"])
+    # Field offset from the xcorr peak refined by a same-star tie on the RESIDUAL (_bulk_offset).
+    # A bare same_star_tie here collapses toward 0 for a DEEP catalogue whose real offset is a
+    # sizeable fraction of its 0.05" radius (jw10678 o132 jicama: bare tie 13.5 mas, true ~66) and
+    # would understate a real mis-registration; _bulk_offset does not.
+    cloud = _bulk_offset(jsc, ref_sc)
+    off_med = float(cloud[2]) if cloud is not None else float(cc["off_med"])
     sub = dict(offset_med_mas=off_med, offset_scatter_mas=cc["spread"], n_cells=cc["n_cells"],
-               cell_coverage=cc["coverage"], same_star_off=(ss["off"] if ss else None),
-               source=src_label)
+               cell_coverage=cc["coverage"], source=src_label)
     fig, ax = _fig(1, 2, 6.4, 5.4)
     fig.subplots_adjust(wspace=0.5, top=0.84, bottom=0.14)
     a0 = ax[0][0]
@@ -1772,8 +1977,7 @@ def _offset_summary_figure(o: Observation, sw, jsc, ref_sc, src_label, out_name)
     a1.set_aspect("equal")
     a1.set_xlabel("ΔRA [mas]")
     a1.set_ylabel("ΔDec [mas]")
-    a1.set_title(f"offset from VIRAC {off_med:.1f} mas"
-                 + (f" (same stars, n={ss['npairs']})" if ss else ""), fontsize=8)
+    a1.set_title(f"offset from VIRAC {off_med:.1f} mas (xcorr + same-star residual)", fontsize=8)
     fig.suptitle(f"{o.target} {o.obsid} — {sw} jicama − VIRAC offset", fontsize=11)
     fig.text(0.5, 0.005, f"Data source: {_dataset_label(sub)}", ha="center", fontsize=8, color="0.4")
     return _save(fig, out_name), sub
@@ -3567,6 +3771,49 @@ def _offset_cloud(jsc, ref_sc):
     return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
 
 
+def _bulk_offset(sc, ref_sc, metrics=None, key=None):
+    """(ΔRA_pairs, ΔDec_pairs, bulk_mas) of catalogue ``sc`` from VIRAC (JWST − VIRAC), or None.
+
+    Coarse-align by the ``xcorr`` histogram peak (finds the bulk out to 1.5″, so a gross offset is
+    not missed), THEN refine with a same-star tie on the RESIDUAL — the mutual-nearest pairs of the
+    SHIFTED catalogue, where the tie is unbiased because the two frames are already ~aligned.  Report
+    ``xcorr + residual``.
+
+    A bare ``same_star_tie`` on the UNSHIFTED catalogue is wrong here: at a fixed 0.05″ mutual radius
+    it truncation-collapses toward 0 for any real offset that is a sizeable fraction of the radius,
+    and it bites hardest on a DEEP catalogue (more spurious near-neighbours).  Measured on jw10678
+    o132 jicama vs VIRAC: bare tie reads 13.5 mas at r=0.05″ but climbs to 60 mas as the radius opens
+    and agrees with the xcorr peak (66 mas); shifting by the xcorr vector then leaves only 0.7 mas of
+    residual — so 66 mas is the true offset and 13.5 was the collapse.  ``_offset_cloud`` (xcorr peak
+    + 0.1″ cloud median) already gets this right (62 mas); this is the same idea with a tighter
+    residual tie."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord, search_around_sky
+    if sc is None or ref_sc is None or len(sc) < 50:
+        return None
+    xc = aa.xcorr(sc, ref_sc, maxsep=1.5 * u.arcsec)
+    if not (xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= 100):
+        return None
+    cosd = float(np.cos(np.radians(np.median(sc.dec.deg))))
+    # shift sc onto VIRAC by the coarse peak, then keep pairs that fall within 0.1″ (the real matches)
+    j_al = SkyCoord((sc.ra.deg + xc["dra"] / 3.6e6 / cosd) * u.deg,
+                    (sc.dec.deg + xc["ddec"] / 3.6e6) * u.deg)
+    ia, ib, sep, _ = search_around_sky(j_al, ref_sc, 0.1 * u.arcsec)
+    if len(ia) < 20:
+        return None
+    # per-pair residual of the ALIGNED catalogue (aligned JWST − VIRAC); the total offset from VIRAC
+    # is the coarse peak plus that residual, per pair (so the plotted cloud sits at the true offset).
+    rdra = (j_al[ia].ra - ref_sc[ib].ra).to(u.mas).value * cosd
+    rdde = (j_al[ia].dec - ref_sc[ib].dec).to(u.mas).value
+    dra = xc["dra"] + rdra
+    dde = xc["ddec"] + rdde
+    if metrics is not None and key:
+        metrics[f"{key}_offset_method"] = "xcorr+residual"
+        metrics[f"{key}_offset_npairs"] = int(len(ia))
+        metrics[f"{key}_offset_residual_mas"] = float(np.hypot(np.median(rdra), np.median(rdde)))
+    return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
+
+
 def _stage7_astrom_title(mast_off, jic_off):
     """Astrometry sub-panel title, worded from the SIGN of (jicama offset − MAST offset).  It calls
     the pipeline 'tighter' only when both offsets are measured AND jicama is STRICTLY smaller; in
@@ -3733,8 +3980,10 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     ep = aa.epoch_of(mast_path) if mast_path else None
     ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
                  if (ref and ep) else (None, None))
-    mast_off = _offset_cloud(mast_sc, ref_sc) if mast_sc is not None else None
-    jic_off = _offset_cloud(jsc, ref_sc) if jsc is not None else None
+    # Offset from VIRAC via the same-star tie (unbiased); the xcorr-histogram cloud is biased high
+    # for a deep catalogue and made jicama read WORSE than MAST -- see _bulk_offset.
+    mast_off = _bulk_offset(mast_sc, ref_sc, metrics, "mast")
+    jic_off = _bulk_offset(jsc, ref_sc, metrics, "jicama")
     if mast_off is not None:
         metrics["mast_offset_med_mas"] = mast_off[2]
     if jic_off is not None:
@@ -3800,9 +4049,10 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     axh.set_title("source counts in the common window — MAST vs pipeline", fontsize=9)
 
     # bottom-right (MAIN): each catalogue's offset from VIRAC, as a 2-D (ΔRA, ΔDec) cloud with
-    # marginals.  VIRAC's own ~1.2" source spacing swamps a nearest-neighbour distance, so this
-    # coarse-aligns by the xcorr histogram peak first; the cloud CENTRE is then the field offset
-    # (MAST far from 0, jicama near 0).
+    # marginals.  The offset is the xcorr histogram peak refined by a same-star tie on the residual
+    # (see _bulk_offset); the cloud CENTRE is the field offset.  A deep pipeline catalogue CAN sit
+    # genuinely farther from VIRAC than shallow MAST here -- that is a real mis-registration to fix,
+    # not an estimator artefact.
     axo = fig.add_subplot(gs[1, 1])
     # Wording is DERIVED from the sign of (jicama offset − MAST offset): claim the pipeline
     # "tightens" only when BOTH are measured AND jicama is the smaller.  When jicama is wider or
@@ -5469,17 +5719,11 @@ _HEADLINE = {
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
-# stages whose caption is NOT built in code live here (1, 3).  Stages 2/4/5/6/7 build their caption
-# in code (variant- or availability-dependent), so no template exists for them -- avoids a dead
-# duplicate that drifts.
+# stage 1's caption is NOT built in code.  Stages 2/3/4/5/6/7 build their caption in code (variant-
+# or availability-dependent), so no template exists for them -- avoids a dead duplicate that drifts.
 CAPTIONS = {
     1: "**Stage 1 — first mosaics.** Grayscale {sw} (SW) and {lw} (LW) `i2d`. "
        "([how this is made](DOCROOT#stage1))",
-    3: "**Stage 3 — photometric calibration (zeropoint).** 2-D histogram of "
-       "JWST {sw} catalogue magnitude vs [VIRAC Ks](DOCROOT#glossary-virac) for {n_matched} "
-       "[cross-matched](DOCROOT#glossary-crossmatch) stars. The 1:1 line is anchored on the densest "
-       "stellar ridge. Slope {slope:.2f}, scatter about the locus {scatter:.2f} mag. "
-       "([how this is made](DOCROOT#stage3))",
 }
 
 
@@ -5953,9 +6197,11 @@ def _caption_for_impl(n, metrics):
                      "pipeline side falls back to the per-i2d MAST catalogue — both sides of this "
                      "comparison are MAST.) ")
         base += ("The BOTTOM-RIGHT panel (the main result) is each catalogue's "
-                 "[offset from VIRAC](DOCROOT#glossary-bulk), found by coarse-aligning on the "
-                 "[xcorr histogram peak](DOCROOT#glossary-xcorr) and taking the centre of the "
-                 "per-star cloud")
+                 "[offset from VIRAC](DOCROOT#glossary-bulk), the "
+                 "[xcorr histogram peak](DOCROOT#glossary-xcorr) refined by a same-star tie on the "
+                 "residual (the peak locates the bulk out to 1.5″, the residual tie is unbiased once "
+                 "the frames are aligned — a bare same-star tie on the unshifted catalogue collapses "
+                 "toward 0 at its 0.05″ radius and would understate a real offset)")
         # Improvement clause is CONDITIONAL: assert tightening only when both offsets are measured
         # AND jicama is the smaller.  Otherwise report the numbers, or state that the comparison is
         # unavailable, and claim no improvement.
@@ -6051,6 +6297,33 @@ def _caption_for_impl(n, metrics):
                      f"{_EPSF_QFIT_STREAK_FACTOR:.0f}× the run median"
                      + (f" ({qb:.1f})" if qb is not None else "") + ". ")
         return base + "([how this is made](DOCROOT#stage11))"
+    if n == 3:
+        # MAST is always shown for information; the pipeline ("our") catalogue, when present, carries
+        # the graded verdict.  Built in code so the informational (MAST-only) and graded cases each
+        # read correctly and a missing slope/scatter never drops the caption to a bare fragment.
+        virac = "[VIRAC reference](DOCROOT#glossary-virac)"
+        xm = "[cross-matched](DOCROOT#glossary-crossmatch)"
+        if metrics.get("our_slope") is None:            # nothing graded -> informational
+            src = metrics.get("primary_source") or metrics.get("source") or "MAST catalogue"
+            base = (f"**Stage 3 — photometric calibration (zeropoint).** JWST catalogue magnitude "
+                    f"vs {virac} for {xm} stars. The **{src}** panel is shown for information "
+                    f"({metrics.get('na_reason', 'not yet gradable')}). ")
+            if metrics.get("mast_slope") is not None:
+                base += (f"Its slope is {metrics['mast_slope']:.2f} with "
+                         f"{metrics['mast_scatter']:.2f} mag scatter; MAST aperture photometry is "
+                         f"crowding-limited in the GC, so it is not graded. ")
+            return base + "([how this is made](DOCROOT#stage3))"
+        src = metrics.get("source", "pipeline catalogue")
+        base = (f"**Stage 3 — photometric calibration (zeropoint).** 2-D histogram of JWST "
+                f"{metrics.get('sw', 'SW')} catalogue magnitude vs {virac} for "
+                f"{metrics.get('n_matched', '?')} {xm} stars. The graded panel is the **{src}** "
+                f"catalogue: slope {metrics.get('slope', float('nan')):.2f}, scatter about the "
+                f"locus {metrics.get('scatter', float('nan')):.2f} mag. ")
+        if metrics.get("mast_slope") is not None:
+            base += (f"The **MAST catalogue** is shown alongside (slope "
+                     f"{metrics['mast_slope']:.2f}, scatter {metrics['mast_scatter']:.2f}); its "
+                     f"aperture photometry is crowding-limited, so it is not graded. ")
+        return base + "([how this is made](DOCROOT#stage3))"
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})

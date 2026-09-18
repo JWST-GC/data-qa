@@ -214,12 +214,23 @@ def test_caption_linkifies_docroot():
         assert "qa_methods.md#" in cap
 
 
-def test_caption_stage3_drops_false_claim_and_labels_line():
-    cap = D.caption_for(3, dict(stage=3, sw="F212N", n_matched=2603, slope=1.0, scatter=0.28))
-    # the untrue "a tight locus means the right stars were matched" claim is gone
-    assert "right stars were matched" not in cap
-    # positive labelling: the cyan line is named "1:1 line" (no "not a fit")
-    assert "1:1 line" in cap and "NOT a fit" not in cap
+def test_caption_stage3_grades_on_our_catalog_and_names_mast():
+    cap = D.caption_for(3, dict(stage=3, sw="F212N", source="jicama-m8", n_matched=2603,
+                                slope=1.0, scatter=0.28, our_slope=1.0,
+                                mast_slope=0.99, mast_scatter=0.30))
+    assert "right stars were matched" not in cap and "NOT a fit" not in cap
+    # the graded panel is named (our catalogue) and MAST is called out as shown alongside
+    assert "jicama-m8" in cap and "MAST" in cap
+    assert "slope" in cap and "scatter" in cap
+
+
+def test_caption_stage3_informational_when_mast_only():
+    # no pipeline catalogue yet -> MAST shown for information, stage not graded (not a red flag)
+    cap = D.caption_for(3, dict(stage=3, sw="F212N", passed=None,
+                                primary_source="MAST catalogue", mast_slope=0.02, mast_scatter=1.2,
+                                na_reason="pipeline catalogue not yet available"))
+    assert "information" in cap and "not graded" in cap
+    assert "MAST" in cap
 
 
 def test_caption_stage2_spells_out_lf_and_drops_meaningless_clause():
@@ -3602,6 +3613,138 @@ def test_issue_number_absent_title_returns_none(monkeypatch):
     monkeypatch.setattr(P, "_paged_get",
                         lambda url, token, what: [{"number": 9, "state": "open", "title": "x"}])
     assert P._issue_number("JWST-GC/data-qa", "tok", "NOPE") is None
+
+
+def test_load_reference_reads_refmag(tmp_path):
+    """The Step-0 gaia_virac2 reference catalogue carries its magnitude in `refmag`, not
+    `Ksmag`.  gc-treasury tiles have only this catalogue (no raw VIRAC2 Ksmag cache), so stage 3
+    photometric calibration goes blank ("need VIRAC refcat") unless load_reference reads refmag."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "gaia_virac2_refcat_epoch2026.70_o100.fits"
+    Table({"RA": np.linspace(266.4, 266.6, 5), "DEC": np.linspace(-28.95, -28.85, 5),
+           "refmag": np.array([12.0, 14.0, 16.0, 18.0, 20.0])}).write(p)
+    sc, mag = aa.load_reference(str(p), 2026.7)
+    assert sc is not None
+    assert mag is not None and np.isfinite(mag).all()
+    np.testing.assert_allclose(np.sort(mag), [12.0, 14.0, 16.0, 18.0, 20.0])
+
+
+def test_load_reference_prefers_ksmag_over_refmag(tmp_path):
+    """A raw VIRAC2 cache (reduction fields) carries both a real Ksmag and no refmag; where both a
+    Ksmag and a refmag exist, Ksmag wins so the calibration uses native VIRAC2 Ks."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "virac2.fits"
+    Table({"RAJ2000": np.linspace(266.4, 266.6, 4), "DEJ2000": np.linspace(-28.95, -28.85, 4),
+           "Ksmag": np.array([11.0, 13.0, 15.0, 17.0]),
+           "refmag": np.array([99.0, 99.0, 99.0, 99.0])}).write(p)
+    _, mag = aa.load_reference(str(p), 2026.7)
+    np.testing.assert_allclose(np.sort(mag), [11.0, 13.0, 15.0, 17.0])
+
+
+def test_load_reference_prefers_refmag_over_gaia_g(tmp_path):
+    """The physics half of the ranking: with both a NIR `refmag` and Gaia optical `phot_g_mean_mag`
+    present, refmag must win — choosing G for an F212N zeropoint is the failure the ranking prevents."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "ref.fits"
+    Table({"RA": np.linspace(266.4, 266.6, 4), "DEC": np.linspace(-28.95, -28.85, 4),
+           "refmag": np.array([14.0, 15.0, 16.0, 17.0]),
+           "phot_g_mean_mag": np.array([90.0, 91.0, 92.0, 93.0])}).write(p)
+    _, mag = aa.load_reference(str(p), 2026.7)
+    np.testing.assert_allclose(np.sort(mag), [14.0, 15.0, 16.0, 17.0])
+
+
+def test_stage3_reference_selects_virac2_over_gaia(tmp_path, monkeypatch):
+    """The gaia_virac2 refcat mixes VIRAC2 Ks and Gaia G in one refmag column; stage 3 must take the
+    VIRAC2 (NIR) rows only, else optical G wrecks the slope."""
+    from astropy.table import Table
+    from data_qa.observations import Observation
+    p = tmp_path / "gaia_virac2_refcat_epoch2026.70_o100.fits"
+    Table({"RA": np.linspace(266.40, 266.60, 6), "DEC": np.linspace(-28.95, -28.85, 6),
+           "source": np.array(["VIRAC2", "VIRAC2", "VIRAC2", "GaiaDR3", "GaiaDR3", "VIRAC2"]),
+           "refmag": np.array([14.0, 15.0, 16.0, 20.0, 21.0, np.nan])}).write(p)
+    o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    monkeypatch.setattr(D, "_viraccache_path", lambda o: None)
+    monkeypatch.setattr(D, "_refcat_path", lambda o: str(p))
+    sc, mag = D._stage3_reference(o, 2026.70)
+    np.testing.assert_allclose(np.sort(mag), [14.0, 15.0, 16.0])   # 3 finite VIRAC2 rows only
+    assert len(sc) == 3
+
+
+def _stage3_synth(monkeypatch, our=True):
+    """Synthetic stage-3 inputs.  The reference spans 11-19 mag (STRADDLING the [13,17] fit window,
+    so windowing is actually exercised), and MAST vs our photometry DIFFER (MAST noisy + a slope
+    error, ours clean unit-slope) so the grade-source and windowing assertions can't pass by accident
+    on identical fixtures."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa.observations import Observation
+    rng = np.random.default_rng(0)
+    n = 400
+    ra = 266.4 + rng.uniform(0, 0.02, n); dec = -28.9 + rng.uniform(0, 0.02, n)
+    ks = rng.uniform(11.0, 19.0, n)                 # straddles the [13,17] window
+    ref_sc = SkyCoord(ra * u.deg, dec * u.deg)
+    o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: None)
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2026.70)
+    monkeypatch.setattr(D, "_stage3_reference", lambda o, ep: (ref_sc, ks))
+    # MAST: a wrong slope (0.7) + large scatter -> would FAIL if it were graded
+    monkeypatch.setattr(D, "_mast_calibration_sources",
+                        lambda o, sw: (ref_sc, 0.7 * ks + 5.0 + rng.normal(0, 0.4, n)))
+    # ours: clean unit slope, tight scatter -> passes
+    our_val = ((ref_sc, ks + 3.0 + rng.normal(0, 0.05, n), "jicama-m2") if our
+               else (None, None, None))
+    monkeypatch.setattr(D, "_stage3_our_catalog", lambda o, sw: our_val)
+    return o
+
+
+def test_stage3_mast_primary_our_graded(monkeypatch):
+    o = _stage3_synth(monkeypatch, our=True)
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["primary_source"] == "MAST catalogue"     # MAST is the always-shown primary image
+    assert m["source"] == "jicama-m2"                  # verdict comes from OUR catalogue
+    assert m["passed"] is True                          # graded on OURS (unit slope): pass ...
+    assert not (0.8 < m["mast_slope"] < 1.2)            # ... NOT on MAST (slope 0.7) -> grade-source pinned
+    assert m.get("extra_figures")                       # our catalogue posted as a 2nd image
+    assert m["our_fit_windowed"] is True and m["our_n_fit"] < m["our_n_matched"]  # window applied
+
+
+def test_stage3_mast_only_informational(monkeypatch):
+    o = _stage3_synth(monkeypatch, our=False)
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["available"] is True                       # MAST shown -> stage posts
+    assert m["passed"] is None                          # ungraded, NOT red-flagged
+    assert m["primary_source"] == "MAST catalogue"
+    assert not m.get("extra_figures")                   # nothing graded to add
+
+
+def test_stage7_offset_recovers_true_offset_not_collapsed():
+    """A DEEP catalogue genuinely 60 mas off VIRAC must report ~60, NOT the ~13 a bare same-star
+    tie collapses to at its 0.05" radius.  Builds a dense reference, a JWST copy shifted by 60 mas,
+    plus many spurious deep sources (the pile-up that drives the collapse), and checks the recovered
+    bulk.  This pins the NUMBER (the reviewer's point: monkeypatching same_star_tie only pinned
+    routing)."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.default_rng(3)
+    n = 4000
+    ra = 266.40 + rng.uniform(0, 0.03, n)
+    dec = -28.90 + rng.uniform(0, 0.03, n)
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.90))
+    jra = ra + 60.0 / 3.6e6 / cosd + rng.normal(0, 0.003 / 3600, n)   # true 60 mas RA offset
+    jdec = dec + rng.normal(0, 0.003 / 3600, n)
+    era = 266.40 + rng.uniform(0, 0.03, 8000)                          # spurious deep sources
+    ede = -28.90 + rng.uniform(0, 0.03, 8000)
+    jsc = SkyCoord(np.concatenate([jra, era]) * u.deg,
+                   np.concatenate([jdec, ede]) * u.deg)
+    out = D._bulk_offset(jsc, ref)
+    assert out is not None
+    assert 50.0 < out[2] < 70.0            # ~60, not the collapsed ~13
 
 
 def test_offset_panel_title_headlines_same_star_not_histogram():
