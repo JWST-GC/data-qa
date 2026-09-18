@@ -222,11 +222,14 @@ def _find_stage_comment(repo, token, num, marker):
 def _details_block(repo, token, o, stage, extra_images):
     """Upload each ``(label, png_path)`` and return an expandable ``<details>`` block embedding them,
     so a multi-figure stage (stage 12: one plot per filter) shows one plot by default and hides the
-    rest.  Each extra asset is named ``{obsid}_stage{stage}_{label}.png`` so it updates in place."""
+    rest.  The asset name is the figure's own basename (already a stable, URL-safe
+    ``{obsid}_stage{stage}_{tag}.png``) so it updates in place -- deriving it from the free-text
+    ``label`` instead put spaces/parens in the release-asset URL (e.g. 'jicama-m8 vs VIRAC
+    (calibration)'), which the GitHub API rejects as control characters in the path."""
     labels = ", ".join(label for label, _ in extra_images)
-    parts = [f"\n\n<details><summary>Other {len(extra_images)} filter(s): {labels}</summary>\n"]
+    parts = [f"\n\n<details><summary>Other {len(extra_images)} figure(s): {labels}</summary>\n"]
     for label, path in extra_images:
-        aname = f"{o.obsid}_stage{stage}_{label}.png"
+        aname = os.path.basename(path)
         url = upload_asset(repo, token, path, aname)
         parts.append(f"\n**{label}**\n\n![{aname}]({url})\n")
     parts.append("\n</details>")
