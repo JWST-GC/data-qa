@@ -3547,11 +3547,29 @@ def test_details_block_embeds_extra(monkeypatch):
     o = Observation(program="1182", obs="004", target="Brick", release_field="brick",
                     instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
     block = P._details_block("JWST-GC/data-qa", "tok", o, 12,
-                             [("F405N", "/tmp/a.png"), ("F444W", "/tmp/b.png")])
+                             [("F405N", f"/tmp/{o.obsid}_stage12_F405N.png"),
+                              ("F444W", f"/tmp/{o.obsid}_stage12_F444W.png")])
     assert "<details>" in block and "</details>" in block
-    assert "Other 2 filter(s): F405N, F444W" in block
+    assert "Other 2 figure(s): F405N, F444W" in block
     assert "**F405N**" in block and "**F444W**" in block
-    assert f"{o.obsid}_stage12_F405N.png" in block
+    assert f"{o.obsid}_stage12_F405N.png" in block          # asset name = the png basename
+
+
+def test_details_block_asset_name_is_url_safe_with_spaced_label(monkeypatch):
+    """The asset name (release-asset URL path) must not carry spaces/parens from a free-text label
+    — GitHub rejects control characters in the path (stage 3's 'jicama-m8 vs VIRAC (calibration)')."""
+    from data_qa import post_diagnostics as P
+    seen = []
+    monkeypatch.setattr(P, "upload_asset",
+                        lambda repo, token, path, name: seen.append(name) or f"https://cdn/{name}")
+    o = Observation(program="10678", obs="132", target="GC Treasury", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    block = P._details_block("JWST-GC/data-qa", "tok", o, 3,
+                             [("jicama-m8 vs VIRAC (calibration)",
+                               f"/tmp/{o.obsid}_stage3_our.png")])
+    assert seen == [f"{o.obsid}_stage3_our.png"]           # basename, not the label
+    assert " " not in seen[0] and "(" not in seen[0]
+    assert "**jicama-m8 vs VIRAC (calibration)**" in block  # label still the visible caption
 
 
 # --------------------------------------------------------------------------- pagination robustness
