@@ -3702,35 +3702,29 @@ def test_stage3_mast_only_informational(monkeypatch):
     assert not m.get("extra_figures")                   # nothing graded to add
 
 
-def test_stage7_offset_prefers_same_star(monkeypatch):
-    """The stage-7 offset must come from the same-star tie, not the xcorr cloud (which is biased
-    high for a deep catalogue vs dense VIRAC and made jicama read worse than MAST)."""
+def test_stage7_offset_recovers_true_offset_not_collapsed():
+    """A DEEP catalogue genuinely 60 mas off VIRAC must report ~60, NOT the ~13 a bare same-star
+    tie collapses to at its 0.05" radius.  Builds a dense reference, a JWST copy shifted by 60 mas,
+    plus many spurious deep sources (the pile-up that drives the collapse), and checks the recovered
+    bulk.  This pins the NUMBER (the reviewer's point: monkeypatching same_star_tie only pinned
+    routing)."""
     import astropy.units as u
     from astropy.coordinates import SkyCoord
-    sc = SkyCoord(np.linspace(266.4, 266.5, 50) * u.deg,
-                  np.linspace(-28.90, -28.85, 50) * u.deg)
-    monkeypatch.setattr(D.aa, "same_star_tie", lambda a, b: dict(
-        off=13.5, npairs=100, dra_pairs=np.full(100, -13.5), dde_pairs=np.zeros(100)))
-    # if the cloud were used instead this would raise (it is monkeypatched to blow up)
-    monkeypatch.setattr(D, "_offset_cloud", lambda a, b: (_ for _ in ()).throw(AssertionError("cloud used")))
-    dra, dde, bulk = D._stage7_offset(sc, sc)
-    assert abs(bulk - 13.5) < 1e-6
-    assert np.allclose(dra, 13.5)         # same_star (VIRAC−JWST) negated to (JWST−VIRAC)
-
-
-def test_stage7_offset_falls_back_to_cloud_when_same_star_refuses(monkeypatch):
-    """When same_star_tie refuses (gross offset, no small unambiguous tie) the xcorr cloud is the
-    fallback so a grossly mis-registered frame is still detected, not silently tied to ~0."""
-    import astropy.units as u
-    from astropy.coordinates import SkyCoord
-    sc = SkyCoord(np.linspace(266.4, 266.5, 30) * u.deg,
-                  np.linspace(-28.90, -28.85, 30) * u.deg)
-    monkeypatch.setattr(D.aa, "same_star_tie", lambda a, b: None)
-    monkeypatch.setattr(D, "_offset_cloud",
-                        lambda a, b: (np.zeros(30), np.zeros(30), 620.0))
-    metrics = {}
-    out = D._stage7_offset(sc, sc, metrics, "jicama")
-    assert out[2] == 620.0 and metrics["jicama_offset_method"] == "xcorr-cloud"
+    rng = np.random.default_rng(3)
+    n = 4000
+    ra = 266.40 + rng.uniform(0, 0.03, n)
+    dec = -28.90 + rng.uniform(0, 0.03, n)
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.90))
+    jra = ra + 60.0 / 3.6e6 / cosd + rng.normal(0, 0.003 / 3600, n)   # true 60 mas RA offset
+    jdec = dec + rng.normal(0, 0.003 / 3600, n)
+    era = 266.40 + rng.uniform(0, 0.03, 8000)                          # spurious deep sources
+    ede = -28.90 + rng.uniform(0, 0.03, 8000)
+    jsc = SkyCoord(np.concatenate([jra, era]) * u.deg,
+                   np.concatenate([jdec, ede]) * u.deg)
+    out = D._bulk_offset(jsc, ref)
+    assert out is not None
+    assert 50.0 < out[2] < 70.0            # ~60, not the collapsed ~13
 
 
 def test_offset_panel_title_headlines_same_star_not_histogram():

@@ -1934,12 +1934,14 @@ def _offset_summary_figure(o: Observation, sw, jsc, ref_sc, src_label, out_name)
         return None, {}
     cc = _cell_consistency(cells, dropped)
     cells = cc["cells"]
-    ss = aa.same_star_tie(jsc, ref_sc)
-    cloud = _offset_cloud(jsc, ref_sc)
-    off_med = float(ss["off"]) if ss else float(cc["off_med"])
+    # Field offset from the xcorr peak refined by a same-star tie on the RESIDUAL (_bulk_offset).
+    # A bare same_star_tie here collapses toward 0 for a DEEP catalogue whose real offset is a
+    # sizeable fraction of its 0.05" radius (jw10678 o132 jicama: bare tie 13.5 mas, true ~66) and
+    # would understate a real mis-registration; _bulk_offset does not.
+    cloud = _bulk_offset(jsc, ref_sc)
+    off_med = float(cloud[2]) if cloud is not None else float(cc["off_med"])
     sub = dict(offset_med_mas=off_med, offset_scatter_mas=cc["spread"], n_cells=cc["n_cells"],
-               cell_coverage=cc["coverage"], same_star_off=(ss["off"] if ss else None),
-               source=src_label)
+               cell_coverage=cc["coverage"], source=src_label)
     fig, ax = _fig(1, 2, 6.4, 5.4)
     fig.subplots_adjust(wspace=0.5, top=0.84, bottom=0.14)
     a0 = ax[0][0]
@@ -1976,8 +1978,7 @@ def _offset_summary_figure(o: Observation, sw, jsc, ref_sc, src_label, out_name)
     a1.set_aspect("equal")
     a1.set_xlabel("ΔRA [mas]")
     a1.set_ylabel("ΔDec [mas]")
-    a1.set_title(f"offset from VIRAC {off_med:.1f} mas"
-                 + (f" (same stars, n={ss['npairs']})" if ss else ""), fontsize=8)
+    a1.set_title(f"offset from VIRAC {off_med:.1f} mas (xcorr + same-star residual)", fontsize=8)
     fig.suptitle(f"{o.target} {o.obsid} — {sw} jicama − VIRAC offset", fontsize=11)
     fig.text(0.5, 0.005, f"Data source: {_dataset_label(sub)}", ha="center", fontsize=8, color="0.4")
     return _save(fig, out_name), sub
@@ -3771,34 +3772,47 @@ def _offset_cloud(jsc, ref_sc):
     return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
 
 
-def _stage7_offset(sc, ref_sc, metrics=None, key=None):
+def _bulk_offset(sc, ref_sc, metrics=None, key=None):
     """(ΔRA_pairs, ΔDec_pairs, bulk_mas) of catalogue ``sc`` from VIRAC (JWST − VIRAC), or None.
 
-    PREFERS the same-star tie (mutual-nearest pairs).  The ``xcorr`` histogram peak used by
-    ``_offset_cloud`` is biased HIGH for a DEEP catalogue against dense VIRAC -- it stacks wrong
-    pairs into a spurious far peak, then the 0.1″ cloud self-selects around it: jw10678 o132 jicama
-    reads 62 mas by that route but 13.5 mas star-by-star, while the shallow MAST catalogue (no such
-    pile-up) reads ~14 mas either way.  Reporting the biased cloud made a well-tied deep pipeline
-    catalogue look WORSE than raw MAST, which is a measurement artefact, not a real mis-registration.
+    Coarse-align by the ``xcorr`` histogram peak (finds the bulk out to 1.5″, so a gross offset is
+    not missed), THEN refine with a same-star tie on the RESIDUAL — the mutual-nearest pairs of the
+    SHIFTED catalogue, where the tie is unbiased because the two frames are already ~aligned.  Report
+    ``xcorr + residual``.
 
-    ``same_star_tie`` self-guards: it refuses (returns None) unless a small, unambiguous global tie
-    already exists, so it cannot fabricate agreement for a grossly mis-registered frame.  In that
-    case fall back to the xcorr-aligned cloud (which still detects the gross offset), flagged as the
-    lower-confidence method."""
-    if sc is None or ref_sc is None:
+    A bare ``same_star_tie`` on the UNSHIFTED catalogue is wrong here: at a fixed 0.05″ mutual radius
+    it truncation-collapses toward 0 for any real offset that is a sizeable fraction of the radius,
+    and it bites hardest on a DEEP catalogue (more spurious near-neighbours).  Measured on jw10678
+    o132 jicama vs VIRAC: bare tie reads 13.5 mas at r=0.05″ but climbs to 60 mas as the radius opens
+    and agrees with the xcorr peak (66 mas); shifting by the xcorr vector then leaves only 0.7 mas of
+    residual — so 66 mas is the true offset and 13.5 was the collapse.  ``_offset_cloud`` (xcorr peak
+    + 0.1″ cloud median) already gets this right (62 mas); this is the same idea with a tighter
+    residual tie."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord, search_around_sky
+    if sc is None or ref_sc is None or len(sc) < 50:
         return None
-    ss = aa.same_star_tie(sc, ref_sc)
-    if ss is not None and ss.get("dra_pairs") is not None:
-        if metrics is not None and key:
-            metrics[f"{key}_offset_method"] = "same-star"
-            metrics[f"{key}_offset_npairs"] = ss["npairs"]
-        # same_star_tie returns (VIRAC − JWST); negate to the (JWST − VIRAC) convention the panel
-        # axes and _offset_cloud use.
-        return -np.asarray(ss["dra_pairs"]), -np.asarray(ss["dde_pairs"]), ss["off"]
-    oc = _offset_cloud(sc, ref_sc)
-    if oc is not None and metrics is not None and key:
-        metrics[f"{key}_offset_method"] = "xcorr-cloud"
-    return oc
+    xc = aa.xcorr(sc, ref_sc, maxsep=1.5 * u.arcsec)
+    if not (xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= 100):
+        return None
+    cosd = float(np.cos(np.radians(np.median(sc.dec.deg))))
+    # shift sc onto VIRAC by the coarse peak, then keep pairs that fall within 0.1″ (the real matches)
+    j_al = SkyCoord((sc.ra.deg + xc["dra"] / 3.6e6 / cosd) * u.deg,
+                    (sc.dec.deg + xc["ddec"] / 3.6e6) * u.deg)
+    ia, ib, sep, _ = search_around_sky(j_al, ref_sc, 0.1 * u.arcsec)
+    if len(ia) < 20:
+        return None
+    # per-pair residual of the ALIGNED catalogue (aligned JWST − VIRAC); the total offset from VIRAC
+    # is the coarse peak plus that residual, per pair (so the plotted cloud sits at the true offset).
+    rdra = (j_al[ia].ra - ref_sc[ib].ra).to(u.mas).value * cosd
+    rdde = (j_al[ia].dec - ref_sc[ib].dec).to(u.mas).value
+    dra = xc["dra"] + rdra
+    dde = xc["ddec"] + rdde
+    if metrics is not None and key:
+        metrics[f"{key}_offset_method"] = "xcorr+residual"
+        metrics[f"{key}_offset_npairs"] = int(len(ia))
+        metrics[f"{key}_offset_residual_mas"] = float(np.hypot(np.median(rdra), np.median(rdde)))
+    return dra, dde, float(np.hypot(np.median(dra), np.median(dde)))
 
 
 def _stage7_astrom_title(mast_off, jic_off):
@@ -3814,13 +3828,13 @@ def _stage7_astrom_title(mast_off, jic_off):
     5 mas band, not a contradiction."""
     both = mast_off is not None and jic_off is not None
     if both:
-        head = (f"same-star tie to VIRAC — jicama {jic_off[2]:.0f} mas vs MAST "
+        head = (f"offset from VIRAC — jicama {jic_off[2]:.0f} mas vs MAST "
                 f"{mast_off[2]:.0f} mas")
         return head + (" (pipeline tighter)" if jic_off[2] < mast_off[2] else "")
     if jic_off is not None:
-        return f"same-star tie to VIRAC — jicama {jic_off[2]:.0f} mas (MAST offset not measured)"
+        return f"offset from VIRAC — jicama {jic_off[2]:.0f} mas (MAST offset not measured)"
     if mast_off is not None:
-        return f"same-star tie to VIRAC — MAST {mast_off[2]:.0f} mas (pipeline offset not measured)"
+        return f"offset from VIRAC — MAST {mast_off[2]:.0f} mas (pipeline offset not measured)"
     return "astrometry vs VIRAC (bulk offset)"
 
 
@@ -3968,9 +3982,9 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
                  if (ref and ep) else (None, None))
     # Offset from VIRAC via the same-star tie (unbiased); the xcorr-histogram cloud is biased high
-    # for a deep catalogue and made jicama read WORSE than MAST -- see _stage7_offset.
-    mast_off = _stage7_offset(mast_sc, ref_sc, metrics, "mast")
-    jic_off = _stage7_offset(jsc, ref_sc, metrics, "jicama")
+    # for a deep catalogue and made jicama read WORSE than MAST -- see _bulk_offset.
+    mast_off = _bulk_offset(mast_sc, ref_sc, metrics, "mast")
+    jic_off = _bulk_offset(jsc, ref_sc, metrics, "jicama")
     if mast_off is not None:
         metrics["mast_offset_med_mas"] = mast_off[2]
     if jic_off is not None:
@@ -4036,9 +4050,10 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     axh.set_title("source counts in the common window — MAST vs pipeline", fontsize=9)
 
     # bottom-right (MAIN): each catalogue's offset from VIRAC, as a 2-D (ΔRA, ΔDec) cloud with
-    # marginals.  The cloud is the per-star mutual-nearest pairs (same-star tie); its CENTRE is the
-    # field offset.  The xcorr histogram peak is NOT the headline here -- it is biased high for a
-    # DEEP catalogue against dense VIRAC and made jicama read worse than MAST (see _stage7_offset).
+    # marginals.  The offset is the xcorr histogram peak refined by a same-star tie on the residual
+    # (see _bulk_offset); the cloud CENTRE is the field offset.  A deep pipeline catalogue CAN sit
+    # genuinely farther from VIRAC than shallow MAST here -- that is a real mis-registration to fix,
+    # not an estimator artefact.
     axo = fig.add_subplot(gs[1, 1])
     # Wording is DERIVED from the sign of (jicama offset − MAST offset): claim the pipeline
     # "tightens" only when BOTH are measured AND jicama is the smaller.  When jicama is wider or
@@ -6182,22 +6197,12 @@ def _caption_for_impl(n, metrics):
             base += ("(NOTE: no merged/release jicama catalogue exists yet for this obs, so the "
                      "pipeline side falls back to the per-i2d MAST catalogue — both sides of this "
                      "comparison are MAST.) ")
-        method = (metrics.get("jicama_offset_method") or metrics.get("mast_offset_method")
-                  or "same-star")
-        if method == "same-star":
-            base += ("The BOTTOM-RIGHT panel (the main result) is each catalogue's "
-                     "[offset from VIRAC](DOCROOT#glossary-bulk), measured star by star from the "
-                     "mutual-nearest pairs (the same star in both catalogues) — the unbiased tie. "
-                     "The [xcorr histogram peak](DOCROOT#glossary-xcorr) is NOT used for the "
-                     "headline here: against dense VIRAC it is biased high for a DEEP catalogue, "
-                     "which would make the deep pipeline catalogue read spuriously worse than the "
-                     "shallow MAST one")
-        else:
-            base += ("The BOTTOM-RIGHT panel (the main result) is each catalogue's "
-                     "[offset from VIRAC](DOCROOT#glossary-bulk); the same-star tie was unavailable "
-                     "(no small unambiguous tie — possible gross mis-registration), so this falls "
-                     "back to the [xcorr histogram peak](DOCROOT#glossary-xcorr) cloud centre, read "
-                     "as a large-offset flag rather than a clean tie")
+        base += ("The BOTTOM-RIGHT panel (the main result) is each catalogue's "
+                 "[offset from VIRAC](DOCROOT#glossary-bulk), the "
+                 "[xcorr histogram peak](DOCROOT#glossary-xcorr) refined by a same-star tie on the "
+                 "residual (the peak locates the bulk out to 1.5″, the residual tie is unbiased once "
+                 "the frames are aligned — a bare same-star tie on the unshifted catalogue collapses "
+                 "toward 0 at its 0.05″ radius and would understate a real offset)")
         # Improvement clause is CONDITIONAL: assert tightening only when both offsets are measured
         # AND jicama is the smaller.  Otherwise report the numbers, or state that the comparison is
         # unavailable, and claim no improvement.

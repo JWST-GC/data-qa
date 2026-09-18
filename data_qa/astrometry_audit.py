@@ -150,8 +150,7 @@ def same_star_tie(a: SkyCoord, b: SkyCoord, bulk=None, radius=0.05 * u.arcsec, m
     mdra, mddec = float(np.median(dra)), float(np.median(ddec))
     return dict(dra=mdra, ddec=mddec, off=float(np.hypot(mdra, mddec)),
                 npairs=int(mutual.sum()),
-                scatter=float(np.hypot(mad_std(dra), mad_std(ddec))),
-                dra_pairs=dra, dde_pairs=ddec)     # per-pair (b-a) vectors, for plotting the cloud
+                scatter=float(np.hypot(mad_std(dra), mad_std(ddec))))
 
 
 def direct_intermodule(sc_a: SkyCoord, sc_b: SkyCoord, radius=0.1 * u.arcsec):
