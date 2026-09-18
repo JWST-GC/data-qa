@@ -30,7 +30,7 @@
 #   QA_REPO             default JWST-GC/data-qa
 #   QA_BASE             default /orange/adamginsburg/jwst   (on-disk products)
 #   QA_OUTDIR           scratch dir for the rendered PNGs   (default: mktemp)
-#   REFRESH_STAGES      default "1 2 3 4 5 6 7 8 9 10 11"
+#   REFRESH_STAGES      default "1 2 3 4 5 6 7 8 9 10 11 12"
 #   QA_EXCLUDE_FIELDS   default "w51 wd1 wd2 ngc6334"       (field keys to skip)
 #   QA_EXCLUDE_RE       default "westerlund|ngc ?6334|globular|w51"  (display-name skip regex)
 #   QA_TREASURY_LAST    default 1  (order program-10678 tiles after every other issue)
@@ -52,7 +52,7 @@
 set -uo pipefail
 
 REPO="${QA_REPO:-JWST-GC/data-qa}"
-STAGES="${REFRESH_STAGES:-1 2 3 4 5 6 7 8 9 10 11}"
+STAGES="${REFRESH_STAGES:-1 2 3 4 5 6 7 8 9 10 11 12}"
 # Kept in step with data_qa.mast_monitor.TREASURY_PROGRAM by
 # tests/test_mast_monitor.py::test_refresh_script_treasury_program_matches_the_module.
 TREASURY_PROGRAM="${QA_TREASURY_PROGRAM:-10678}"
