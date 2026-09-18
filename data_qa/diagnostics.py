@@ -3924,15 +3924,26 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     # made the pipeline product look orders of magnitude shallower than it is (issue #38).  Fall back
     # to _jwst_sources only when no flux catalogue exists (then it is the MAST per-i2d cat, labelled).
     jsc, jflux, jname = _psf_flux_positions(o, sw)
+    jic_mag_calibrated = False
     if jsc is not None:
         with np.errstate(divide="ignore", invalid="ignore"):
             jmag = -2.5 * np.log10(jflux)
         fin = np.isfinite(jmag)
         jsc, jmag = jsc[fin], jmag[fin]
+        # jmag here is INSTRUMENTAL (-2.5 log10 flux, flux uncalibrated) -> tens of mag negative,
+        # which put the depth histogram on a nonsense axis (jw10678 o132: -21..-3 vs MAST's ~14-24).
+        # Add the instrumental->Vega zeropoint from the merged catalogue so the depth reads real
+        # magnitudes and is comparable to MAST; fall back to instrumental (labelled) if no Vega cat.
+        jzp = _vega_zeropoint(o, sw, jsc, jmag)
+        if jzp is not None:
+            jmag = jmag + jzp
+            jic_mag_calibrated = True
+            metrics["jicama_instr_to_vega_zp"] = float(jzp)
         jsrc = f"release:{jname}"; jic_is_release = True
     else:
         jsc, jmag, jsrc = _jwst_sources(o, sw)
         jic_is_release = str(jsrc).startswith("release")
+        jic_mag_calibrated = True                      # _jwst_sources returns calibrated mags
     metrics["jicama_source"] = jsrc
     metrics["jicama_is_release"] = bool(jic_is_release)
     jic_label = "jicama catalogue" if jic_is_release else "pipeline (no merged catalogue yet)"
@@ -4043,8 +4054,11 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     if n_jic_win is not None:
         metrics["n_jicama_window"] = n_jic_win
     axh.set_yscale("log")
-    axh.set_xlabel("magnitude" + (" (jicama zeropoint)" if mast_zp is not None
-                                  else " (each in its own zeropoint)"))
+    if jic_mag_calibrated:
+        axh.set_xlabel("magnitude (jicama Vega"
+                       + ("; MAST shifted to match)" if mast_zp is not None else ")"))
+    else:
+        axh.set_xlabel("instrumental magnitude (no zeropoint available)")
     axh.set_ylabel("N sources"); axh.legend(fontsize=7.5, loc="upper left")
     axh.set_title("source counts in the common window — MAST vs pipeline", fontsize=9)
 
@@ -6238,8 +6252,15 @@ def _caption_for_impl(n, metrics):
             base += f" — {jo:.0f} mas (jicama) vs {mo:.0f} mas (MAST)"
             if jo < mo:
                 base += ", so the pipeline sits closer to VIRAC. "
+            elif jo > mo + 25:
+                # jicama materially FARTHER from VIRAC than raw MAST -> a real mis-registration of
+                # the pipeline catalogue, not an estimator quirk (MAST is tied independently of our
+                # offsets table).  On gc-treasury this is the m2 refused-tie population.
+                base += (f", so the pipeline catalogue is **{jo - mo:.0f} mas farther from VIRAC "
+                         f"than raw MAST** — a real astrometric mis-registration to fix (re-tie), "
+                         f"not a MAST-quality issue. ")
             else:
-                base += " (MAST is as close to VIRAC as the pipeline here). "
+                base += " (MAST is about as close to VIRAC as the pipeline here). "
         elif jo is not None:
             base += (f" — {jo:.0f} mas (jicama); the MAST comparison is unavailable "
                      f"(the MAST offset is unmeasurable, possibly MAST mis-registration). ")

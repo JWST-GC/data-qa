@@ -1262,6 +1262,19 @@ def test_peppar_cal_for_cat_no_peppar_ancestor_returns_none():
         "/tmp/nope/jw10678132001_02101_00001_nrca1_cal_gc-treasury_iter1_cat.fits") is None
 
 
+def test_stage7_caption_flags_real_misregistration_when_jicama_far_worse():
+    """When jicama is materially farther from VIRAC than raw MAST, the caption must call it a real
+    mis-registration (re-tie), not the neutral 'MAST as close as pipeline' — o132 is jicama 70 vs
+    MAST 14."""
+    cap = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=70.0,
+                                mast_offset_med_mas=14.0, n_jicama_window=75000, n_mast_window=0))
+    assert "farther from VIRAC than raw MAST" in cap and "re-tie" in cap
+    # comparable offsets -> neutral wording, no false alarm
+    cap2 = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=13.0,
+                                 mast_offset_med_mas=11.0, n_jicama_window=75000, n_mast_window=5000))
+    assert "farther from VIRAC" not in cap2
+
+
 def test_pick_filters_prefers_mosaic_backed_over_higher_ranked():
     # cloudef jw02092-o005: all four available, but only F162M/F360M have a reduced mosaic.
     # F210M/F480M rank HIGHER in the preference lists, so the naive pick chose the unreduced pair
@@ -1763,7 +1776,8 @@ def test_caption_stage7_neutral_when_jicama_not_tighter():
     cap = D.caption_for(7, dict(stage=7, jicama_offset_med_mas=19.56, mast_offset_med_mas=17.62))
     assert "20 mas (jicama)" in cap and "18 mas (MAST)" in cap
     assert "so the pipeline sits closer to VIRAC" not in cap
-    assert "MAST is as close to VIRAC as the pipeline here" in cap
+    assert "farther from VIRAC" not in cap                  # small diff -> no mis-registration alarm
+    assert "MAST is about as close to VIRAC as the pipeline here" in cap
 
 
 def test_caption_stage7_drops_clause_when_mast_unavailable():
