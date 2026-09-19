@@ -2188,6 +2188,25 @@ def test_stage8_recovers_gradient_null_significance_and_amp90(tmp_path, monkeypa
     assert m["passed"] is True and not m.get("red_flag")               # a real ~mas term is no defect
 
 
+def test_stage8_metrics_use_full_population_not_map_clip(tmp_path, monkeypatch):
+    # The map clip drops wild-coordinate strays so the grid is not stretched, but the PUBLISHED
+    # metrics (n_stars, frac_gt_20mas) must be computed on the FULL population BEFORE that clip:
+    # the strays are exactly the nearest-neighbour-ambiguous tail frac_gt_20mas is defined to count,
+    # so clipping first would silently divide that QA number by ~5.
+    ra, dec = _grid_radec(3000, 71)
+    rng = np.random.RandomState(71)
+    dra = rng.normal(0, 1.0, 3000); dde = rng.normal(0, 1.0, 3000)
+    k = 60                                     # strays ~1° off, each carrying a >20 mas residual
+    sra = np.concatenate([ra, ra[:k] + 1.0]); sdec = np.concatenate([dec, dec[:k] + 1.0])
+    sdra = np.concatenate([dra, np.full(k, 60.0)]); sdde = np.concatenate([dde, np.full(k, 60.0)])
+    m = _run_stage8(tmp_path, monkeypatch, sra, sdec, sdra, sdde)
+    assert m["n_stars"] == 3000 + k                     # metrics on the FULL population
+    assert m["n_stars_mapped"] == 3000                  # strays dropped from the MAP only
+    assert m["n_stars_offfield_clipped"] == k
+    assert m["frac_gt_20mas"] > 0.015                   # the stray tail is counted (~0.0196), not ~0
+    assert m["passed"] is True
+
+
 def test_stage8_pure_noise_significance_near_one_and_does_not_flip_pass(tmp_path, monkeypatch):
     # pure Gaussian position noise, NO coherent term: significance ~1, and passed stays True
     # (the gate is measurement-success, not amplitude, so noise cannot flip fail->pass).

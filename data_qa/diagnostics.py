@@ -4304,23 +4304,26 @@ def _interfilter_residuals(o, f1):
     return sc1.ra.deg, sc1.dec.deg, dra, dde, f2.upper(), os.path.basename(p)
 
 
-def _clip_to_core(ra, dec, pct=1.0, stretch=2.0):
-    """Boolean mask dropping only wild-coordinate rows that STRETCH the field's extent.
+def _clip_to_core(ra, dec, nmad=15.0):
+    """Boolean mask dropping wild-coordinate strays: points more than ``nmad`` robust MADs from the
+    median in RA or Dec.
 
-    When the [pct, 100−pct] percentile box is at least ``stretch``× tighter than the full range in
-    RA or Dec -- i.e. a handful of strays (mismatched cross-band pairs land ~1° off the ~0.1° mosaic)
-    are inflating the range -- keep only the points inside that box, so a binning grid is not spread
-    across empty sky and the map does not go mostly blank.  A field with no strays (full range ≈ core
-    range) is returned untouched (all-True), so a clean, uniformly-sampled field keeps its edge
-    stars.  Factored out for testing."""
+    MAD-based rather than a fixed percentile, so it is insensitive to the stray FRACTION: a handful
+    of mismatched cross-band pairs land ~1° off the ~0.1° mosaic (~100 MADs out) and are dropped
+    whether they are 0.1% or 3% of the rows, while a clean, uniformly-sampled field lies within ~4
+    MADs of its median and is returned entirely (so edge stars are not trimmed).  Dropping these
+    keeps a binning grid from being stretched across empty sky and the map from going mostly blank.
+    Factored out for testing."""
     ra = np.asarray(ra, float); dec = np.asarray(dec, float)
-    xlo, xhi = np.nanpercentile(ra, [pct, 100.0 - pct])
-    ylo, yhi = np.nanpercentile(dec, [pct, 100.0 - pct])
-    ra_span = float(np.nanmax(ra) - np.nanmin(ra)); dec_span = float(np.nanmax(dec) - np.nanmin(dec))
-    if (xhi > xlo and ra_span > stretch * (xhi - xlo)) or \
-       (yhi > ylo and dec_span > stretch * (yhi - ylo)):
-        return (ra >= xlo) & (ra <= xhi) & (dec >= ylo) & (dec <= yhi)
-    return np.ones(ra.shape, bool)
+
+    def _keep(x):
+        med = np.nanmedian(x)
+        mad = 1.4826 * np.nanmedian(np.abs(x - med))
+        if not np.isfinite(mad) or mad <= 0:
+            return np.ones(x.shape, bool)
+        return np.abs(x - med) <= nmad * mad
+
+    return _keep(ra) & _keep(dec)
 
 
 def _binned_median_2d(x, y, vals, nb, minn=3, cosd=1.0):
@@ -4399,21 +4402,27 @@ def stage8_distortion(o: Observation, sw):
                        na_reason="no second-filter positions for an inter-filter distortion map")
         return png, metrics
     ra, dec, dra, dde, f2, catname = res
-    # Clip to the footprint core BEFORE binning.  A handful of wild-coordinate rows (mismatched
-    # cross-band pairs land the position ~1° off the ~0.1° mosaic) otherwise stretch the bin grid
-    # across mostly-empty sky, cramming the whole field into one corner and leaving the map a sea of
-    # blank cells (the reported symptom).  Robust 1–99 percentiles keep the real strip and drop the
-    # strays; only genuine off-strip corners stay blank after this.
-    n_raw = int(len(ra))
-    core = _clip_to_core(ra, dec)
-    if int(core.sum()) >= 200:
-        ra, dec, dra, dde = ra[core], dec[core], dra[core], dde[core]
     cosd = float(np.cos(np.radians(np.median(dec))))
     rad = np.hypot(dra, dde)                                # bulk already removed upstream
+    # Published metrics describe the FULL cross-band residual population and are computed BEFORE any
+    # clip: frac_gt_20mas is DEFINED as the nearest-neighbour-ambiguous tail (see
+    # _interfilter_residuals), and the strays clipped below are exactly that tail, so clipping first
+    # would silently divide this QA number by ~5.  n_stars is likewise the measurement count.
     metrics.update(f2=f2, catalog=catname, n_stars=int(len(ra)),
-                   n_stars_offfield_clipped=n_raw - int(len(ra)),
                    resid_rms_mas=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
                    frac_gt_20mas=float(np.mean(rad > 20.0)))
+    # For the MAP ONLY, clip the wild-coordinate strays (mismatched cross-band pairs land ~1° off the
+    # ~0.1° mosaic) that would otherwise stretch the bin grid across empty sky and leave the map a sea
+    # of blank cells (the reported symptom).  _clip_to_core acts only when the strays actually stretch
+    # the extent, so a clean field is untouched.  Binning/null/quiver below run on this mapped subset;
+    # the metrics above are unaffected.
+    core = _clip_to_core(ra, dec)
+    if int(core.sum()) >= 200:
+        metrics["n_stars_offfield_clipped"] = int(len(ra)) - int(core.sum())
+        ra, dec, dra, dde, rad = ra[core], dec[core], dra[core], dde[core], rad[core]
+    else:
+        metrics["n_stars_offfield_clipped"] = 0
+    metrics["n_stars_mapped"] = int(len(ra))
 
     nb = 12; minn = 3
     fig, ax = _fig(1, 3, 5.6, 5.2)
