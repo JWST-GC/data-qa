@@ -3426,6 +3426,40 @@ def _jwst1pass_psfperts(o: Observation, filt):
     return out
 
 
+def _psfperts_vlim(pp):
+    """Shared diverging half-range (frac. flux) for the perturbation-PSF rows, scaled to the DATA.
+
+    Jay's montage clips to ±0.1, but the real perturbation is often ~0.002–0.02, which renders as a
+    flat near-white panel on a fixed ±0.1 scale (the reported "shows nothing").  Use a robust
+    percentile of the interior |flux| pooled across ALL detectors, so the rows share one scale, then
+    floor it so an essentially-flat chip still gets a usable ramp and cap it at Jay's 0.1 so the
+    display never exceeds the montage range.  Returns _PSFPERTS_VLIM if nothing is readable."""
+    from astropy.io import fits
+    vals = []
+    for det, path in pp:
+        try:
+            img = np.asarray(fits.getdata(path), float)
+        except (OSError, ValueError, KeyError):
+            continue
+        c = np.abs(img) < _PSFPERTS_CLIP
+        if c.any():
+            vals.append(np.abs(img[c]))
+    if not vals:
+        return _PSFPERTS_VLIM
+    return _psfperts_scale(np.concatenate(vals))
+
+
+def _psfperts_scale(absvals):
+    """Data-scaled diverging half-range from interior |flux|: the 99th percentile, floored at 0.01
+    and capped at Jay's ±0.1.  Factored out for testing.  The floor keeps an essentially-flat chip
+    on a usable ramp; the cap keeps the display within Jay's montage range; the percentile is what
+    makes a ~0.002 perturbation visible instead of flat-white on a fixed ±0.1 scale."""
+    a = np.asarray(absvals, float)
+    if a.size == 0 or not np.isfinite(a).any():
+        return _PSFPERTS_VLIM
+    return float(min(_PSFPERTS_VLIM, max(0.01, float(np.nanpercentile(a, 99)))))
+
+
 def _draw_psfperts_row(a, path, det, filt, vlim=_PSFPERTS_VLIM):
     """Draw one detector's perturbation-PSF residual image (``LOG.psfperts.fits``) into axis ``a`` as
     a full-width panel, on the diverging +/-0.1 scale jwst1pass clips to.  Returns (mappable, rms) --
@@ -3542,9 +3576,13 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
     # mismatch for that chip).
     if pp:
         rms_by_det = {}
+        # One shared, data-scaled colour range across the detector rows (the fixed ±0.1 clip renders
+        # a ~0.002 perturbation as a flat white panel); recorded so the caption can state it.
+        pvlim = _psfperts_vlim(pp)
+        metrics["psfperts_vlim"] = pvlim
         for k, (det, path) in enumerate(pp):
             a = fig.add_subplot(gs[2 + k, :])
-            im, rms = _draw_psfperts_row(a, path, det, filt)
+            im, rms = _draw_psfperts_row(a, path, det, filt, vlim=pvlim)
             if im is not None:
                 fig.colorbar(im, ax=a, fraction=0.012, pad=0.01, label="frac. flux")
                 rms_by_det[det] = rms
@@ -3874,6 +3912,21 @@ def _stage7_verdict(our_path, mast_off, jic_off, jic_unmeas):
     return passed, False, None
 
 
+def _mast_depth_zp(jmag_matched, mast_mag_matched):
+    """Median (jicama − MAST) magnitude offset that puts MAST on jicama's scale, or None.
+
+    nanmedian + a finite check, factored out so it is unit-testable: a single NaN among the matched
+    jicama mags makes a plain median NaN, and because NaN is truthy the caller's ``mast_zp or 0.0``
+    would KEEP it and add NaN to every MAST mag -- which silently dropped the entire MAST series from
+    the depth histogram (the reported "missing MAST data").  Returns None (caller falls back to
+    MAST's own scale) when the offset is not finite or there are too few pairs."""
+    d = np.asarray(jmag_matched, float) - np.asarray(mast_mag_matched, float)
+    if d.size < 30:
+        return None
+    z = float(np.nanmedian(d))
+    return z if np.isfinite(z) else None
+
+
 def _depth_hist(ax, mags, label, color):
     """Draw one step magnitude-histogram of the FINITE entries of ``mags`` and return that count.
     Guards the two ways ``np.histogram`` raises "autodetected range of [nan, nan] is not finite":
@@ -4057,10 +4110,12 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
         idx, sep, _ = mast_sc.match_to_catalog_sky(jsc)
         mm2 = sep < 0.2 * u.arcsec
         if int(mm2.sum()) >= 30:
-            mast_zp = float(np.median(jmag[idx[mm2]] - mast_mag[mm2]))
-            metrics["mast_to_jicama_zp"] = mast_zp
+            z = _mast_depth_zp(jmag[idx[mm2]], mast_mag[mm2])
+            if z is not None:
+                mast_zp = z
+                metrics["mast_to_jicama_zp"] = mast_zp
     if mast_sc is not None and mast_mag is not None:
-        mm = mast_mag[_inbox(mast_sc)] + (mast_zp or 0.0)      # on jicama ZP when calibrated
+        mm = mast_mag[_inbox(mast_sc)] + (mast_zp if mast_zp is not None else 0.0)  # jicama ZP when calibrated
         zlab = "" if mast_zp is not None else " (own ZP)"
         n_mast_win = _depth_hist(axh, mm, f"{mast_kind}{zlab}", "#ee6677")
     if jsc is not None and jmag is not None:
@@ -4249,6 +4304,28 @@ def _interfilter_residuals(o, f1):
     return sc1.ra.deg, sc1.dec.deg, dra, dde, f2.upper(), os.path.basename(p)
 
 
+def _clip_to_core(ra, dec, nmad=15.0):
+    """Boolean mask dropping wild-coordinate strays: points more than ``nmad`` robust MADs from the
+    median in RA or Dec.
+
+    MAD-based rather than a fixed percentile, so it is insensitive to the stray FRACTION: a handful
+    of mismatched cross-band pairs land ~1° off the ~0.1° mosaic (~100 MADs out) and are dropped
+    whether they are 0.1% or 3% of the rows, while a clean, uniformly-sampled field lies within ~4
+    MADs of its median and is returned entirely (so edge stars are not trimmed).  Dropping these
+    keeps a binning grid from being stretched across empty sky and the map from going mostly blank.
+    Factored out for testing."""
+    ra = np.asarray(ra, float); dec = np.asarray(dec, float)
+
+    def _keep(x):
+        med = np.nanmedian(x)
+        mad = 1.4826 * np.nanmedian(np.abs(x - med))
+        if not np.isfinite(mad) or mad <= 0:
+            return np.ones(x.shape, bool)
+        return np.abs(x - med) <= nmad * mad
+
+    return _keep(ra) & _keep(dec)
+
+
 def _binned_median_2d(x, y, vals, nb, minn=3, cosd=1.0):
     """Median of ``vals`` on an ``nb`` x ``nb`` grid over (x, y), plus the per-cell count.
     Numpy-only (avoids a scipy dependency that the CI env lacks).  Returns (med, xe, ye, cnt)
@@ -4327,9 +4404,26 @@ def stage8_distortion(o: Observation, sw):
     ra, dec, dra, dde, f2, catname = res
     cosd = float(np.cos(np.radians(np.median(dec))))
     rad = np.hypot(dra, dde)                                # bulk already removed upstream
+    # Published metrics describe the FULL cross-band residual population and are computed BEFORE any
+    # clip: frac_gt_20mas is DEFINED as the nearest-neighbour-ambiguous tail (see
+    # _interfilter_residuals), and the strays clipped below are exactly that tail, so clipping first
+    # would silently divide this QA number by ~5.  n_stars is likewise the measurement count.
     metrics.update(f2=f2, catalog=catname, n_stars=int(len(ra)),
                    resid_rms_mas=float(np.hypot(aa.mad_std(dra), aa.mad_std(dde))),
                    frac_gt_20mas=float(np.mean(rad > 20.0)))
+    # For the MAP ONLY, clip the wild-coordinate strays (mismatched cross-band pairs land ~1° off the
+    # ~0.1° mosaic) that would otherwise stretch the bin grid across empty sky and leave the map a sea
+    # of blank cells (the reported symptom).  _clip_to_core drops points >15 robust MADs from the
+    # median in RA or Dec; real field shapes (square, thin strip, split tiles) sit within ~1.4 MADs so
+    # none is trimmed.  Binning/null/quiver below run on this mapped subset; the metrics above are
+    # unaffected.
+    core = _clip_to_core(ra, dec)
+    if int(core.sum()) >= 200:
+        metrics["n_stars_offfield_clipped"] = int(len(ra)) - int(core.sum())
+        ra, dec, dra, dde, rad = ra[core], dec[core], dra[core], dde[core], rad[core]
+    else:
+        metrics["n_stars_offfield_clipped"] = 0
+    metrics["n_stars_mapped"] = int(len(ra))
 
     nb = 12; minn = 3
     fig, ax = _fig(1, 3, 5.6, 5.2)
@@ -6341,10 +6435,13 @@ def _caption_for_impl(n, metrics):
                      f"{metrics['saturation_turnover_mag']:.1f} mag (blue dashed — saturation onset). ")
         dets = metrics.get("psfperts_dets") or []
         if dets:
+            pv = metrics.get("psfperts_vlim")
+            scale = (f"a ±{pv:.3f} fractional-flux scale (data-scaled to the perturbation, capped at "
+                     f"Jay's ±0.1)" if pv is not None else "a ±0.1 fractional-flux scale")
             base += (f"\n\nBelow, one full-width row per detector ({', '.join(dets)}) shows that "
                      f"chip's **perturbation-PSF residual** (`LOG.psfperts.fits`): the correction "
                      f"jwst1pass fit from the bright-star fit residuals and added to the library "
-                     f"STDPSF, on a ±0.1 fractional-flux scale, titled with its interior rms. ")
+                     f"STDPSF, on {scale}, titled with its interior rms. ")
         return base + "([how this is made](DOCROOT#stage10))"
     if n == 11:
         # Built in code so the streak-flag sentence is only stated when an exposure is actually
