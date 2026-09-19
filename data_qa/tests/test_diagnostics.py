@@ -1270,6 +1270,44 @@ def test_apply_vega_zp_adds_when_present_else_unchanged():
     np.testing.assert_array_equal(D._apply_vega_zp(m, None), m)
 
 
+def test_mast_depth_zp_nan_tolerant():
+    """The stage-7 depth histogram lost its whole MAST series when the MAST→jicama zeropoint came
+    out NaN (one NaN among matched jicama mags -> plain median NaN -> `zp or 0.0` keeps NaN, since
+    NaN is truthy -> every MAST mag becomes NaN).  The zeropoint must survive a stray NaN and be
+    None (not NaN) when it cannot be measured."""
+    j = np.arange(40, dtype=float)            # jicama mags
+    mm = j - 1.8                              # MAST mags, constant 1.8 offset
+    assert D._mast_depth_zp(j, mm) == pytest.approx(1.8)
+    j2 = j.copy(); j2[5] = np.nan            # one stray NaN must not poison the median
+    assert D._mast_depth_zp(j2, mm) == pytest.approx(1.8)
+    assert D._mast_depth_zp(np.full(40, np.nan), mm) is None   # unmeasurable -> None, never NaN
+    assert D._mast_depth_zp(j[:10], mm[:10]) is None           # too few pairs -> None
+
+
+def test_clip_to_core_drops_far_outliers():
+    """Stage 8 blanked most of its map because a few wild-coordinate rows (~1° off the ~0.1° mosaic)
+    stretched the bin grid.  The core clip keeps the dense field and drops the strays."""
+    ra = np.concatenate([266.60 + 0.02 * np.random.default_rng(0).random(500), [265.8, 267.9]])
+    dec = np.concatenate([-28.50 + 0.02 * np.random.default_rng(1).random(500), [-29.9, -27.1]])
+    keep = D._clip_to_core(ra, dec)
+    assert not keep[-1] and not keep[-2]      # the two far strays are dropped
+    assert keep[:500].mean() > 0.9            # nearly all of the core survives
+    # a clean field with NO strays is returned untouched, so edge stars are not trimmed
+    clean_ra = 266.60 + 0.02 * np.random.default_rng(2).random(500)
+    clean_dec = -28.50 + 0.02 * np.random.default_rng(3).random(500)
+    assert D._clip_to_core(clean_ra, clean_dec).all()
+
+
+def test_psfperts_scale_floor_cap_and_percentile():
+    """Stage-10 perturbation panels were flat-white because a ~0.002 residual was drawn on a fixed
+    ±0.1 scale.  The scale is the 99th percentile of |flux|, floored at 0.01 and capped at 0.1."""
+    assert D._psfperts_scale(np.full(1000, 0.001)) == pytest.approx(0.01)   # tiny -> floor
+    assert D._psfperts_scale(np.full(1000, 0.5)) == pytest.approx(0.1)      # huge -> Jay's cap
+    mid = D._psfperts_scale(np.full(1000, 0.03))
+    assert mid == pytest.approx(0.03)                                       # in-range -> percentile
+    assert D._psfperts_scale(np.array([])) == pytest.approx(D._PSFPERTS_VLIM)
+
+
 def test_stage7_caption_flags_real_misregistration_when_jicama_far_worse():
     """When jicama is materially farther from VIRAC than raw MAST, the caption must call it a real
     mis-registration (re-tie), not the neutral 'MAST as close as pipeline' — o132 is jicama 70 vs
