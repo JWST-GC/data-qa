@@ -4413,9 +4413,10 @@ def stage8_distortion(o: Observation, sw):
                    frac_gt_20mas=float(np.mean(rad > 20.0)))
     # For the MAP ONLY, clip the wild-coordinate strays (mismatched cross-band pairs land ~1° off the
     # ~0.1° mosaic) that would otherwise stretch the bin grid across empty sky and leave the map a sea
-    # of blank cells (the reported symptom).  _clip_to_core acts only when the strays actually stretch
-    # the extent, so a clean field is untouched.  Binning/null/quiver below run on this mapped subset;
-    # the metrics above are unaffected.
+    # of blank cells (the reported symptom).  _clip_to_core drops points >15 robust MADs from the
+    # median in RA or Dec; real field shapes (square, thin strip, split tiles) sit within ~1.4 MADs so
+    # none is trimmed.  Binning/null/quiver below run on this mapped subset; the metrics above are
+    # unaffected.
     core = _clip_to_core(ra, dec)
     if int(core.sum()) >= 200:
         metrics["n_stars_offfield_clipped"] = int(len(ra)) - int(core.sum())
