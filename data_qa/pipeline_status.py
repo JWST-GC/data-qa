@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -41,6 +42,42 @@ def _newest(pats):
     if not files:
         return None, 0
     return max(os.path.getmtime(f) for f in files), len(files)
+
+
+_OBSID_TOKEN = re.compile(r"_o\d{3,}(?!\d)")
+
+
+def _newest_for_obs(pats, obs):
+    """(mtime, count, caveat) for a glob set, narrowed to ONE observation.
+
+    The cataloging products live in a per-FIELD directory that several observations
+    write into, and their filenames carry the obsid (``..._o041_..._m3_...``).  A glob
+    that omits the obsid therefore returns the whole field, and the newest match is
+    usually some other tile's -- which made every obsid's issue report the field-wide
+    high-water mark for each m-stage and flagged real, monotone tiles as STALE.
+
+    Three cases, in order:
+
+    * some matches carry this obsid -> report only those.
+    * matches carry obsid tokens but none is this one -> nothing has run for this
+      observation yet: (None, 0), i.e. pending.
+    * no match carries any obsid token (older fields, pre-obsid naming) -> fall back
+      to the whole set and say so in the caveat, rather than reporting pending for
+      products that are plainly there.
+    """
+    files = []
+    for pat in pats:
+        files += glob.glob(pat)
+    if not files:
+        return None, 0, ""
+    mine_re = re.compile(rf"_o{int(obs):03d}(?!\d)")
+    mine = [f for f in files if mine_re.search(os.path.basename(f))]
+    if mine:
+        return max(os.path.getmtime(f) for f in mine), len(mine), ""
+    if any(_OBSID_TOKEN.search(os.path.basename(f)) for f in files):
+        return None, 0, ""
+    return (max(os.path.getmtime(f) for f in files), len(files),
+            " · field-pooled, filenames carry no obsid")
 
 
 def _ts(mtime):
@@ -85,12 +122,12 @@ def stage_rows(o, offset_mas=None, offset_thresh=75.0):
     n_programs = len({os.path.basename(p)[2:7]
                       for p in glob.glob(f"{P}/*/pipeline/jw?????*-o*_crf.fits")})
     shared = " · field-shared, may include sibling obs" if n_programs > 1 else ""
-    sf_t, sf_n = _newest([f"{P}/*/*visit*_daophot_basic.fits"])
+    sf_t, sf_n, sf_c = _newest_for_obs([f"{P}/*/*visit*_daophot_basic.fits"], o.obs)
     add("single-frame cataloging", sf_t, sf_n,
-        detail=(f"{sf_n} per-exposure catalogs" + shared) if sf_n else "")
-    m7_t, m7_n = _newest([f"{P}/catalogs/*m7*.fits"])
+        detail=(f"{sf_n} per-exposure catalogs" + shared + sf_c) if sf_n else "")
+    m7_t, m7_n, m7_c = _newest_for_obs([f"{P}/catalogs/*m7*.fits"], o.obs)
     add("cross-frame catalog merge (m7)", m7_t, m7_n,
-        detail=("merged multi-band" + shared) if m7_t else "")
+        detail=("merged multi-band" + shared + m7_c) if m7_t else "")
 
     # refcat comparison + JWST reference-frame creation
     off_txt = ""
@@ -118,21 +155,25 @@ def stage_rows(o, offset_mas=None, offset_thresh=75.0):
     else:
         add("re-alignment of frames", None, 0, status=PEND)
 
-    # cataloging m1..m8 (field-shared: see caveat above).  These must be monotonically
-    # non-decreasing in time (m8 is derived from m7, ...).  A later stage whose newest file
-    # is OLDER than an earlier stage means it was NOT regenerated after that earlier stage
-    # changed -> it is STALE (🛑), not done: the pipeline must re-run it.
+    # cataloging m1..m8, scoped to THIS observation (see _newest_for_obs).  These must be
+    # monotonically non-decreasing in time (m8 is derived from m7, ...).  A later stage whose
+    # newest file is OLDER than an earlier stage means it was NOT regenerated after that
+    # earlier stage changed -> it is STALE (🛑), not done: the pipeline must re-run it.
+    # The comparison is only meaningful within one observation: pooled over a field, a
+    # sibling tile finishing its m2 makes every later stage of every OTHER tile read stale.
     newest_earlier = None
     for k in range(1, 9):
-        mt, mn = _newest([f"{P}/catalogs/*_m{k}_*.fits", f"{P}/catalogs/*_m{k}.fits"])
+        mt, mn, cav = _newest_for_obs(
+            [f"{P}/catalogs/*_m{k}_*.fits", f"{P}/catalogs/*_m{k}.fits"], o.obs)
+        note = (shared + cav) if cav else ""
         if not mt:
             st, det = PEND, ""
         elif newest_earlier is not None and mt < newest_earlier - 1.0:
             st = STALE
-            det = f"{mn} catalogs · STALE (older than an earlier m-stage; re-run)" + shared
+            det = f"{mn} catalogs · STALE (older than an earlier m-stage; re-run)" + note
         else:
             st = DONE
-            det = f"{mn} catalogs" + shared
+            det = f"{mn} catalogs" + note
         add(f"cataloging m{k}", mt, mn, status=st, detail=det)
         if mt:
             newest_earlier = mt if newest_earlier is None else max(newest_earlier, mt)
