@@ -489,21 +489,33 @@ within the match radius) inflate the sampling noise of a cell median beyond scat
 null-based figure is the one to trust. This complements [stage 4](#stage4), which measures the
 field offset and the cell-to-cell consistency, by exposing *spatially-structured* residuals.
 
+**Provisional per-filter fallback.** When no cross-band merged catalog exists yet, but two
+*per-filter* jicama DAO merges of the obs do (`<filt>_merged_o<obs>_indivexp_merged_m<N>_dao_basic.fits`,
+generic `skycoord` + instrumental `flux`), the map is built from those two catalogs cross-matched
+directly (mutual nearest neighbour at 0.1″, S/N > 10 in both) rather than reusing an upstream pairing.
+This is a **provisional** measurement: the two filters are not yet registered to a common frame
+(refcat comparison / offsets table / re-alignment still pending), so any bulk or gradient offset here
+is pipeline-progress state, not a per-filter WCS defect. It is reported (`provisional: True`,
+`provisional_reason`) and its measurement is graded for success, but it is **never red-flagged**, and
+it becomes a graded distortion measurement once the cross-band merge lands. This keeps a not-yet-merged
+two-band obs from reading as *no data* when position data does exist (JWST-GC/data-qa#247).
+
 **Pass/fail semantics.** A real ~1 mas inter-filter distortion term is an *expected measurement*,
 so `passed` reflects only whether the measurement **succeeded** (enough populated cells). It is
 free of any gate on the amplitude against a self-derived noise level, which is what keeps injected
-noise from flipping it. A single-filter or not-yet-merged obs has no second band to difference and
+noise from flipping it. A single-filter or not-yet-reduced obs has no second band to difference and
 lands in a distinct *not-applicable* state (no `passed`, no red flag). A **red flag** is raised on
-a **gross** absolute inter-filter offset alone (fixed `binned_amp90_mas` > 15 mas), the size that
-indicates a genuine per-filter WCS break on top of the normal distortion.
+a **gross** absolute inter-filter offset alone (fixed `binned_amp90_mas` > 15 mas) on the
+cross-band merged path, the size that indicates a genuine per-filter WCS break on top of the normal
+distortion; the provisional per-filter path never red-flags.
 
 Metrics: `n_stars`, `resid_rms_mas` (per-star), `binned_amp90_mas` (90th-percentile cell
 amplitude), `null_amp90_mas` and `amp90_significance` (observed ÷ null; also `amp90_p_value`),
 `per_cell_sem_mas` (reported, ~2× optimistic), `frac_gt_20mas`, `stars_per_cell`,
-`cells_used`/`cells_total`.
+`cells_used`/`cells_total`, and on the fallback `provisional` / `provisional_reason`.
 
 **Source:** [`data_qa/diagnostics.py` → `stage8_distortion`](../data_qa/diagnostics.py)
-(`_interfilter_residuals`, `_binned_median_2d`).
+(`_interfilter_residuals`, `_perfilter_interfilter_residuals`, `_binned_median_2d`).
 
 <a id="stage9"></a>
 ## Stage 9 — PSF vs aperture photometry

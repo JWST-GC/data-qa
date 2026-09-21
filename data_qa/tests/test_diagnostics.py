@@ -2052,6 +2052,15 @@ def test_caption_stage8_gross_offset_flags_but_describes_map():
     assert "plot is empty" not in cap.lower()
 
 
+def test_caption_stage8_provisional_describes_perfilter_and_not_flagged():
+    cap = D.caption_for(8, dict(stage=8, sw="F212N", f2="F480M", n_stars=110000,
+                                resid_rms_mas=14.3, binned_amp90_mas=34.0, amp90_significance=12.0,
+                                provisional=True, passed=True))
+    assert "provisional" in cap.lower() and "per-filter" in cap.lower()
+    assert "not a data defect" in cap.lower()
+    assert "🚩" not in cap                                  # a provisional offset is never flagged
+
+
 def test_interfilter_residuals_bulk_removed_and_gradient(tmp_path, monkeypatch):
     from astropy.table import Table
     from astropy.coordinates import SkyCoord
@@ -2156,6 +2165,55 @@ def test_interfilter_residuals_requires_min_stars(tmp_path, monkeypatch):
     p = str(tmp_path / "few.fits"); _two_filter_cat(p, ra, dec, 0.0, 0.0)
     monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
     assert D._interfilter_residuals(object(), "F212N") is None
+
+
+def _sc_deg(ra, dec):
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    return SkyCoord(np.asarray(ra, float) * u.deg, np.asarray(dec, float) * u.deg)
+
+
+def test_perfilter_interfilter_residuals_crossmatch_bulk_removed_and_partner(tmp_path, monkeypatch):
+    # #247: two SEPARATE per-filter jicama catalogues (generic skycoord + flux, no cross-band merge)
+    # are cross-matched, the nearest-wavelength partner is chosen, the bulk offset is removed and a
+    # position-dependent gradient survives.
+    rng = np.random.RandomState(9)
+    ra = 266.40 + rng.uniform(0, 0.03, 800); dec = -28.90 + rng.uniform(0, 0.03, 800)
+    cosd = np.cos(np.radians(-28.9))
+    grad = (ra - ra.mean()) * 2000.0                       # RA-dependent ΔRA (distortion-like)
+    sc_f212 = _sc_deg(ra + (60.0 + grad) / 3.6e6 / cosd, dec)   # bulk 60 + gradient
+    base = _sc_deg(ra, dec)
+    sn = np.full(800, 100.0)
+    pos = {"F212N": (sc_f212, sn), "F187N": (base, sn), "F480M": (base, sn)}
+    monkeypatch.setattr(D, "_jicama_perfilter_catalog", lambda o, f: f"/fake/{f}.fits")
+    monkeypatch.setattr(D, "_jicama_perfilter_filters", lambda o: ["F187N", "F212N", "F480M"])
+    monkeypatch.setattr(D, "_jicama_positions", lambda o, f: pos[f])
+    out = D._perfilter_interfilter_residuals(_obs(filt="F212N"), "F212N")
+    assert out is not None
+    rr, dd, dra, dde, f2, name = out
+    assert f2 == "F187N"                                   # nearest-wavelength partner (25 nm, not 268)
+    assert abs(np.median(dra)) < 2 and abs(np.median(dde)) < 2      # bulk removed
+    assert np.corrcoef(rr, dra)[0, 1] > 0.8               # gradient recovered
+    assert " + " in name                                  # two-catalogue provenance label
+
+
+def test_stage8_perfilter_path_is_provisional_and_not_red_flagged(tmp_path, monkeypatch):
+    # #247: with only per-filter jicama catalogues (no cross-band merge), stage 8 measures a
+    # PROVISIONAL map from them and must NOT red-flag a gross offset -- the filters are not yet
+    # cross-tied, so a large inter-filter offset there is pipeline-progress state, not a WCS defect.
+    ra, dec = _grid_radec(3000, 47)
+    ran = (ra - ra.mean()) / (0.5 * (ra.max() - ra.min()))
+    dra = 40.0 * ran; dde = np.zeros(ra.size)             # ~40 mas gradient -> gross by the merged gate
+    monkeypatch.setattr(D, "_interfilter_residuals", lambda o, f: None)
+    monkeypatch.setattr(D, "_perfilter_interfilter_residuals",
+                        lambda o, f: (ra, dec, dra, dde, "F480M", "a.fits + b.fits"))
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "figs"))
+    png, m = D.stage8_distortion(_obs(filt="F212N"), "F212N")
+    assert os.path.exists(png)
+    assert m.get("provisional") is True and "provisional_reason" in m
+    assert m["binned_amp90_mas"] > 15.0                   # amplitude IS gross...
+    assert not m.get("red_flag")                          # ...but is NOT flagged on the provisional path
+    assert m["passed"] is True                            # the measurement still succeeded
 
 
 def _run_stage8(tmp_path, monkeypatch, ra, dec, dra, dde, sn=100.0):
@@ -2267,6 +2325,7 @@ def test_stage8_not_applicable_state_is_not_a_red_flag(tmp_path, monkeypatch):
            "flux_f212n": np.full(ra.size, 1e4),
            "flux_err_f212n": np.full(ra.size, 1e2)}).write(p, overwrite=True)
     monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
+    monkeypatch.setattr(D, "_perfilter_interfilter_residuals", lambda o, f: None)  # no jicama fallback
     monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "figs"))
     png, m = D.stage8_distortion(_obs(filt="F212N"), "F212N")
     assert os.path.exists(png)
