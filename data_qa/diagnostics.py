@@ -1443,7 +1443,7 @@ def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_ma
     a.plot(xs, slope * xs + zp, "g--", lw=1.4, label="fitted locus")
     if windowed:                                   # mark the magnitude range the fit used
         a.axvspan(_STAGE3_FIT_MAG_MIN, _STAGE3_FIT_MAG_MAX, color="0.7", alpha=0.15, zorder=0)
-    a.set_xlabel("VIRAC reference mag"); a.set_ylabel(f"JWST {sw} mag ({src_label})")
+    a.set_xlabel("VIRAC2 reference mag (VVV/VISTA Ks)"); a.set_ylabel(f"JWST {sw} mag ({src_label})")
     a.legend(fontsize=8, loc="upper left")
     # Say which exit the clip took: n_locus == n_fit reads the same whether the clip converged with
     # nothing to reject or was refused for want of survivors, and those are different numbers.
@@ -2536,6 +2536,14 @@ def stage4_offsets(o: Observation, sw):
             a0.add_patch(Rectangle((re_[c["i"]], de_[c["j"]]),
                                    re_[c["i"] + 1] - re_[c["i"]], de_[c["j"] + 1] - de_[c["j"]],
                                    fill=False, ec="#e41a1c", lw=2.0, zorder=3))
+    # Annotate each measured cell with the source count it used (Matt, #177): a thin cell can
+    # read well-registered on n=8 and be noise, so the per-cell weight belongs on the map itself.
+    import matplotlib.patheffects as _pe
+    for c in cells:
+        xc = 0.5 * (re_[c["i"]] + re_[c["i"] + 1]); yc = 0.5 * (de_[c["j"]] + de_[c["j"] + 1])
+        a0.text(xc, yc, f"{int(c['n'])}", ha="center", va="center", fontsize=6.5,
+                color="white", zorder=4,
+                path_effects=[_pe.withStroke(linewidth=1.4, foreground="black")])
     a0.set_xlabel("RA [deg]"); a0.set_ylabel("Dec [deg]"); a0.invert_xaxis()
     _nsp = cc.get("n_spurious", 0)
     _dropnote = f"{cc['n_dropped']} unmeasured" + (f" ({_nsp} spurious)" if _nsp else "")
@@ -3677,7 +3685,39 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
     fig.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency ({filt}, "
                  f"n={metrics['n_stars']}, {metrics['n_exposures']} exp)", fontsize=11, y=0.995)
     metrics["passed"] = True
-    return _save(fig, f"{o.obsid}_stage10.png"), metrics
+    primary_png = _save(fig, f"{o.obsid}_stage10.png")
+
+    # Log-y companion of the four consistency panels (Matt, #177): the linear panels above compress
+    # the informative bright-end floor into the bottom sliver; a log-y copy makes the X/Y/mag RMS
+    # values legible.  Same data, same x-window; posted as an extra image alongside the linear one.
+    fig2 = plt.figure(figsize=(W, 8.4))
+    gs2 = fig2.add_gridspec(2, 2, hspace=0.32, wspace=0.24)
+    lpanels = [
+        (fig2.add_subplot(gs2[0, 0]), exm, "X RMS (mas)"),
+        (fig2.add_subplot(gs2[0, 1]), eym, "Y RMS (mas)"),
+        (fig2.add_subplot(gs2[1, 0]), d["em"], "magnitude RMS (mag)"),
+        (fig2.add_subplot(gs2[1, 1]), d["q"], "quality of fit"),
+    ]
+    for a, y, ylab in lpanels:
+        yp = np.asarray(y, float)
+        a.plot(m, yp, ".", ms=1.4, color="#666666", alpha=0.35, rasterized=True)
+        med, lo, hi, ctr = _binned_stat(m, yp)
+        if med is not None:
+            a.plot(ctr, med, "-", color="#cc3311", lw=1.8)
+            a.fill_between(ctr, np.clip(lo, 1e-6, None), hi, color="#cc3311", alpha=0.20)
+        a.set_yscale("log")
+        a.set_xlim(-16, -3)
+        a.set_xlabel("instrumental magnitude")
+        a.set_ylabel(ylab)
+        a.grid(alpha=0.25, which="both")
+    if metrics.get("saturation_turnover_mag") is not None:
+        lpanels[2][0].axvline(metrics["saturation_turnover_mag"], color="#3366cc", ls="--", lw=1.0)
+    fig2.suptitle(f"{o.target} {o.obsid} — JWST1PASS across-exposure consistency, LOG y-scale "
+                  f"({filt})", fontsize=11, y=0.995)
+    metrics.setdefault("extra_figures", []).append(
+        ("stage 10 — across-exposure consistency (log y-scale)",
+         _save(fig2, f"{o.obsid}_stage10_logy.png")))
+    return primary_png, metrics
 
 
 STAGES = {1: stage1_mosaics, 2: stage2_cmd, 3: stage3_calibration, 4: stage4_offsets,
@@ -5277,12 +5317,15 @@ def _stage6_figure(o: Observation, sw, lw, exclude=None, png_suffix=""):
             continue
         any_data = True
         lbl = f"{filt}  (n={int(ok.sum())}" + ("" if zp is not None else ", instr") + ")"
-        a.plot(ctr, med, "-", color=color, lw=1.7,
+        # Linestyle convention matched across the jicama and peppar panels (Matt, #177): DASHED =
+        # formal σ_fit (jicama here, peppar per-frame formal), SOLID = achieved repeatability
+        # (jicama rms(jwst) internal, peppar frame-to-frame σ), DOTTED = jicama rms(offset−VIRAC).
+        a.plot(ctr, med, "--", color=color, lw=1.7,
                label=lbl + r"  formal $\sigma_{\rm fit}$")
         a.fill_between(ctr, lo, hi, color=color, alpha=0.20)
-        # This solid curve is the fitter's FORMAL 1-sigma position error, per detection -- it has no
+        # This dashed curve is the fitter's FORMAL 1-sigma position error, per detection -- it has no
         # systematic in it by construction, so it is NOT the achieved astrometric precision (that is
-        # the empirical rms(jwst) dotted curve below, ~20x larger).  Record it under an explicit key
+        # the empirical rms(jwst) solid curve below, ~20x larger).  Record it under an explicit key
         # and make the headline `floor_mas` the EMPIRICAL floor (set in the rms(jwst) block), so a
         # reader of the metric gets the achieved precision (issue #1 review).  The fit error is
         # kept separately as `formal_sigma_floor_mas_<filt>`.
@@ -5291,9 +5334,9 @@ def _stage6_figure(o: Observation, sw, lw, exclude=None, png_suffix=""):
         metrics[f"floor_is_empirical_{filt.lower()}"] = False
         metrics[f"nstars_{filt.lower()}"] = int(ok.sum())
         hist_series.append((mag[ok], color, filt))    # same sample as the curve, for the count panel
-        # rms(offset): the EXTERNAL scatter vs VIRAC (includes the VIRAC error floor), dashed, same
+        # rms(offset): the EXTERNAL scatter vs VIRAC (includes the VIRAC error floor), dotted, same
         # colour -- shown alongside sigma_pos so "how precisely measured" vs "how well it agrees
-        # with the external frame" are both visible.
+        # with the external frame" are both visible.  (jicama-only; no peppar analogue.)
         import astropy.units as u
         ref = _viraccache_path(o) or _refcat_path(o)
         ep = _obs_epoch(o, _mosaic_path(o, filt))
@@ -5312,7 +5355,7 @@ def _stage6_figure(o: Observation, sw, lw, exclude=None, png_suffix=""):
                 resid = np.hypot(dra - np.median(dra), dde - np.median(dde)) / np.sqrt(2.0)
                 rms, rctr = _binned_rms(mag[idx[keep]], resid)
                 if rms is not None:
-                    a.plot(rctr, rms, "--", color=color, lw=1.5, alpha=0.9,
+                    a.plot(rctr, rms, ":", color=color, lw=1.5, alpha=0.9,
                            label=f"{filt}  rms(offset−VIRAC)")
                     metrics[f"rms_offset_floor_mas_{filt.lower()}"] = float(np.nanmin(rms))
         # rms(jwst): the INTERNAL per-star position scatter across exposures (merged-catalog
@@ -5326,7 +5369,7 @@ def _stage6_figure(o: Observation, sw, lw, exclude=None, png_suffix=""):
             jmag_v, jrms = jr
             med_j, _, _, ctr_j = _binned_stat(jmag_v, jrms)
             if med_j is not None:
-                a.plot(ctr_j, med_j, ":", color=color, lw=2.2, alpha=0.95,
+                a.plot(ctr_j, med_j, "-", color=color, lw=2.2, alpha=0.95,
                        label=f"{filt}  rms(jwst) internal — achieved repeatability")
                 metrics[f"rms_jwst_floor_mas_{filt.lower()}"] = float(np.nanmin(med_j))
                 # the ACHIEVED precision: promote the empirical floor to the headline metric.
@@ -5480,6 +5523,10 @@ _EPSF_THRESH_SIGMA = 30.0            # DAOStarFinder detection threshold for the
 _EPSF_ISO_PX = 25                    # isolation radius (px): drop a star with any neighbour within
 _EPSF_QFIT_STREAK_FACTOR = 2.0       # exposure qfit > this x the median-of-exposures = streak flag
 _EPSF_LOG_VMIN = 0.003               # log-stretch floor (fraction of the peak) for the ePSF stamps
+_EPSF_DET_MAXEXP = 4                  # exposures stacked per detector for the per-detector ePSF overview
+# NIRCam detector display order for the per-detector ePSF overview (SW module A, SW module B, LW).
+_NRC_DET_ORDER = ["NRCA1", "NRCA2", "NRCA3", "NRCA4", "NRCB1", "NRCB2", "NRCB3", "NRCB4",
+                  "NRCALONG", "NRCBLONG"]
 
 
 def _exposure_qfit(o: Observation, filt):
@@ -5611,6 +5658,34 @@ def _epsf_rms_radius(stamp):
     return float(np.sqrt((((xx - cx) ** 2 + (yy - cy) ** 2) * s).sum() / tot))
 
 
+def _detector_epsf(o: Observation, filt, det, max_exp=_EPSF_DET_MAXEXP):
+    """Effective PSF of one DETECTOR: the mean of that chip's per-exposure ePSFs (each itself the mean
+    of the exposure's bright, isolated, unsaturated stars) over up to ``max_exp`` of its exposures.  A
+    per-detector version of the per-exposure stamp, so an ePSF defect confined to one chip is visible
+    even when the representative detector looks fine.  Returns (stamp, n_exposures_used, n_stars) or
+    (None, 0, 0)."""
+    pdir = _peppar_dir(o, filt)
+    if pdir is None:
+        return None, 0, 0
+    pref = f"jw{int(o.program):05d}{o.obs}"          # scope to THIS obs (see _exposure_qfit)
+    exps = []
+    for c in sorted(glob.glob(f"{pdir}/{det}/*_iter1_cat.fits")):
+        if not os.path.basename(c).startswith(pref):
+            continue
+        mo = re.search(r"(jw\d+_\d+_\d+)_nrc", os.path.basename(c))
+        if mo and mo.group(1) not in exps:
+            exps.append(mo.group(1))
+    stamps = []; nst = 0
+    for exp in exps[:max_exp]:
+        cal = _peppar_cal_for_cat(f"{pdir}/{det}/{exp}_{det.lower()}_cal_{o.field}_iter1_cat.fits")
+        e, ns = (_effective_psf(cal) if cal else (None, 0))
+        if e is not None:
+            stamps.append(e); nst += int(ns)
+    if not stamps:
+        return None, 0, 0
+    return np.mean(stamps, axis=0), len(stamps), nst
+
+
 def stage11_effective_psf(o: Observation, sw, lw):
     """Effective PSF per exposure, to catch a streaked/broadened PSF (e.g. a momentary tracking
     failure).  For each exposure of a representative detector the empirical PSF is built by stacking
@@ -5703,7 +5778,41 @@ def stage11_effective_psf(o: Observation, sw, lw):
     if streaked:
         ttl += f"  —  {len(streaked)} flagged exposure(s) (high qfit / broadened PSF)"
     fig.suptitle(ttl, fontsize=10, y=0.995)
-    return _save(fig, f"{o.obsid}_stage11.png"), metrics
+    primary_png = _save(fig, f"{o.obsid}_stage11.png")
+
+    # Per-DETECTOR ePSF overview (keflavich, #177): each NIRCam chip is analysed independently, so an
+    # ePSF defect can appear on one detector and not another.  The primary figure shows per-exposure
+    # stamps for one representative detector; this companion stacks one ePSF per detector (SW A1-4,
+    # SW B1-4, LW), so a chip-specific problem stands out.
+    order = ([d for d in _NRC_DET_ORDER if d in dets]
+             + [d for d in dets if d not in _NRC_DET_ORDER])
+    if len(order) > 1:
+        ncol2 = min(5, len(order)); nrow2 = int(np.ceil(len(order) / ncol2))
+        fig2, ax2 = plt.subplots(nrow2, ncol2, figsize=(2.35 * ncol2, 2.9 * nrow2), squeeze=False)
+        for a in ax2.flat:
+            a.set_xticks([]); a.set_yticks([]); a.set_axis_off()
+        det_rms = {}
+        for k, dd in enumerate(order):
+            a = ax2.flat[k]; a.set_axis_on(); a.set_xticks([]); a.set_yticks([])
+            e, nexp, ns = _detector_epsf(o, filt, dd)
+            rr = _epsf_rms_radius(e) if e is not None else None
+            det_rms[dd] = rr
+            if e is not None:
+                a.imshow(np.clip(e, 0, None), origin="lower", cmap="inferno", norm=norm)
+                rtxt = f"  r={rr:.1f}px" if rr is not None else ""
+                a.set_title(f"{dd}\n{nexp} exp, {ns} stars{rtxt}", fontsize=8.5)
+            else:
+                a.text(0.5, 0.5, "no ePSF", ha="center", va="center", fontsize=8,
+                       style="italic", transform=a.transAxes)
+                a.set_title(dd, fontsize=8.5)
+        metrics["epsf_rms_radius_by_detector"] = {d: det_rms[d] for d in order
+                                                  if det_rms.get(d) is not None}
+        fig2.suptitle(f"{o.target} {o.obsid} — effective PSF per detector ({filt}); each stamp stacks "
+                      f"bright isolated unsaturated stars over up to {_EPSF_DET_MAXEXP} of that chip's "
+                      f"exposures (log stretch)", fontsize=10, y=0.998)
+        metrics.setdefault("extra_figures", []).append(
+            ("stage 11 — effective PSF per detector", _save(fig2, f"{o.obsid}_stage11_perdet.png")))
+    return primary_png, metrics
 
 
 # --------------------------------------------------------------------------- STAGE 12
@@ -6328,7 +6437,11 @@ def _caption_for_impl(n, metrics):
                 f" The [offset between the JWST-mean and the VIRAC position](DOCROOT#glossary-bulk) is measured separately in each spatial cell."
                 f" The measurement is the 'mode' (i.e., the peak of the histogram) of [all JWST−VIRAC pair "
                 f"separations](DOCROOT#glossary-xcorr) in that cell.\n\n"
-                f"LEFT maps that offset across the mosaic{dev_or_unmeas}.\n\n"
+                f"Positions are the **{metrics.get('sw', 'SW')}** short-wavelength catalogue "
+                f"({metrics.get('source', 'MAST')}); the coarser-pixel long-wavelength band "
+                f"(e.g. F480M) is not used here.\n\n"
+                f"LEFT maps that offset across the mosaic{dev_or_unmeas}, with each measured cell "
+                f"annotated by the number of sources it used.\n\n"
                 f"{scatter_pos} plots the **per-cell** offsets as (ΔRA, ΔDec) points sized by source "
                 f"count, with the field value in the title, a circle at the 75 mas gate, and "
                 f"ΔRA/ΔDec marginal histograms.\n\n"
@@ -6556,12 +6669,14 @@ def _caption_for_impl(n, metrics):
         # the metric -- the exact formal-sold-as-achieved conflation this stage was fixed to avoid.
         sw, lw = metrics.get("sw"), metrics.get("lw")
         emp = any(metrics.get(f"floor_is_empirical_{f.lower()}") for f in (sw, lw) if f)
-        base = ("**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel.\n\n"
-                "**formal σ_fit** (solid) is the PSF fitter's formal per-detection position error. "
-                "**rms(offset)** (dashed) is the RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) "
+        base = ("**Stage 6 — astrometric precision.** Error curves vs Vega magnitude per channel. "
+                "Linestyles match across the jicama (LEFT) and peppar (RIGHT) panels: **dashed** = "
+                "formal σ_fit, **solid** = achieved repeatability.\n\n"
+                "**formal σ_fit** (dashed) is the PSF fitter's formal per-detection position error. "
+                "**rms(offset)** (dotted) is the RMS of the per-star JWST−[VIRAC](DOCROOT#glossary-virac) "
                 "offset (external scatter, incl. the VIRAC floor). ")
         if emp:
-            base += ("**rms(jwst)** (dotted) is the empirical scatter of a star across exposures — "
+            base += ("**rms(jwst)** (solid) is the empirical scatter of a star across exposures — "
                      "the **achieved internal repeatability** (sub-mas, well above the formal σ_fit), "
                      "and the number the headline `floor_mas` reports (`floor_is_empirical` true). ")
         else:
@@ -6608,6 +6723,9 @@ def _caption_for_impl(n, metrics):
                      f"chip's **perturbation-PSF residual** (`LOG.psfperts.fits`): the correction "
                      f"jwst1pass fit from the bright-star fit residuals and added to the library "
                      f"STDPSF, on {scale}, titled with its interior rms. ")
+        if metrics.get("extra_figures"):
+            base += ("\n\nA companion figure repeats the four consistency panels with a **log** "
+                     "y-scale so the bright-end floor and its rise are easier to read. ")
         return base + "([how this is made](DOCROOT#stage10))"
     if n == 11:
         # Built in code so the streak-flag sentence is only stated when an exposure is actually
@@ -6625,6 +6743,11 @@ def _caption_for_impl(n, metrics):
             base += (f"⚠️ **{ns} exposure(s) flagged:** {exps} — peppar `qfit` above "
                      f"{_EPSF_QFIT_STREAK_FACTOR:.0f}× the run median"
                      + (f" ({qb:.1f})" if qb is not None else "") + ". ")
+        if metrics.get("epsf_rms_radius_by_detector"):
+            nd = len(metrics["epsf_rms_radius_by_detector"])
+            base += (f"\n\nA companion figure shows one stacked ePSF per detector ({nd} chips) so a "
+                     "chip-specific ePSF defect stands out, since each detector is analysed "
+                     "independently. ")
         return base + "([how this is made](DOCROOT#stage11))"
     if n == 3:
         # MAST is always shown for information; the pipeline ("our") catalogue, when present, carries
@@ -6632,6 +6755,10 @@ def _caption_for_impl(n, metrics):
         # read correctly and a missing slope/scatter never drops the caption to a bare fragment.
         virac = "[VIRAC reference](DOCROOT#glossary-virac)"
         xm = "[cross-matched](DOCROOT#glossary-crossmatch)"
+        # The graded reference band is the VIRAC2 NIR magnitude, which is VVV/VISTA Ks
+        # (the refcat keeps only VIRAC-sourced rows for the fit); name it + link the profile.
+        refband = ("The reference magnitude is VVV/VISTA **Ks** ([SVO filter profile]"
+                   "(http://svo2.cab.inta-csic.es/theory/fps/index.php?id=Paranal/VISTA.Ks)). ")
         if metrics.get("our_slope") is None:            # nothing graded -> informational
             src = metrics.get("primary_source") or metrics.get("source") or "MAST catalogue"
             base = (f"**Stage 3 — photometric calibration (zeropoint).** JWST catalogue magnitude "
@@ -6641,7 +6768,7 @@ def _caption_for_impl(n, metrics):
                 base += (f"Its slope is {metrics['mast_slope']:.2f} with "
                          f"{metrics['mast_scatter']:.2f} mag scatter; MAST aperture photometry is "
                          f"crowding-limited in the GC, so it is not graded. ")
-            return base + "([how this is made](DOCROOT#stage3))"
+            return base + refband + "([how this is made](DOCROOT#stage3))"
         src = metrics.get("source", "pipeline catalogue")
         base = (f"**Stage 3 — photometric calibration (zeropoint).** 2-D histogram of JWST "
                 f"{metrics.get('sw', 'SW')} catalogue magnitude vs {virac} for "
@@ -6652,7 +6779,7 @@ def _caption_for_impl(n, metrics):
             base += (f"The **MAST catalogue** is shown alongside (slope "
                      f"{metrics['mast_slope']:.2f}, scatter {metrics['mast_scatter']:.2f}); its "
                      f"aperture photometry is crowding-limited, so it is not graded. ")
-        return base + "([how this is made](DOCROOT#stage3))"
+        return base + refband + "([how this is made](DOCROOT#stage3))"
     try:
         return CAPTIONS[n].format(**{k: (v if v is not None else float("nan"))
                                      for k, v in metrics.items()})
