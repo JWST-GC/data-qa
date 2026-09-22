@@ -610,6 +610,92 @@ def _dao_position_catalog(o: Observation, filt):
     return max(pats, key=lambda p: (_catalog_priority(os.path.basename(p))[0], _mtime(p)))
 
 
+# Treasury per-filter DAO merges (jicama), written BEFORE the cross-band merge / photometric
+# calibration: ``<filt>_merged_o<obs>_indivexp_merged_m<N>_dao_basic.fits``.  They carry a generic
+# ``skycoord`` + instrumental ``flux`` (no ``skycoord_<filt>`` / ``mag_vega_<filt>`` column), so the
+# merged-catalogue resolvers (_catalog_for / _catalog_with_vega / _interfilter_residuals) skip them.
+# Stage 8 needs POSITIONS only, and two such per-filter catalogues of the same obs share the frames,
+# offsets table, DVA correction and VIRAC registration -- exactly the inter-filter distortion
+# reference -- so cross-matching them measures the residual without waiting on the cross-band merge.
+_JICAMA_PERFILTER_RE = re.compile(r"^(f\d{3}[wnm])_merged_", re.I)
+# The shared _OBS_TOK_RE ("_o(\d{3})\b") does NOT match the treasury token "_o041_indivexp": \b
+# needs a word/non-word transition, and both "1" and "_" are word characters, so it fires only when
+# the token precedes a "." or "-".  Use an explicit non-digit lookahead here so the per-filter merges
+# are obs-scoped correctly.  (The shared regex has the same blind spot for treasury names; scoping it
+# there today falls back to the split-tree location test, so this is a local fix, not that one's.)
+_OBS_TOK_JICAMA_RE = re.compile(r"_o(\d{3})(?!\d)")
+
+
+def _jicama_obs_scoped(low, p, o):
+    """True when catalogue ``p`` (basename ``low``) belongs to THIS observation: located in the obs
+    split tree, or carrying this obs's ``_o<obs>`` token."""
+    if os.path.dirname(os.path.dirname(p)).endswith(f"_o{o.obs}"):
+        return True
+    m = _OBS_TOK_JICAMA_RE.search(low)
+    return bool(m and m.group(1) == o.obs)
+
+
+def _jicama_perfilter_catalog(o: Observation, filt):
+    """Highest-priority per-filter jicama DAO merge for ``filt`` of THIS obs (positions + instrumental
+    flux, no calibrated magnitude), or None.  Prefers the both-module ``merged`` product at the highest
+    m-stage, newest within a tier; excludes per-module (nrca/nrcb) and the ``_vetted`` / ``_i2dseed`` /
+    ``_consensus`` sidecars."""
+    fl = filt.lower()
+    cand = []
+    for p in _fglob(o, f"catalogs/{fl}_merged_*indivexp_merged_m*_dao_basic.fits"):
+        low = os.path.basename(p).lower()
+        if any(s in low for s in ("_vetted", "_i2dseed", "_consensus", "nrca", "nrcb")):
+            continue
+        if not _jicama_obs_scoped(low, p, o):
+            continue                              # a different obs's catalogue -> never use it here
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            mtime = 0.0
+        cand.append((p, _catalog_priority(low)[0], mtime))
+    if not cand:
+        return None
+    return max(cand, key=lambda c: (c[1], c[2]))[0]
+
+
+def _jicama_perfilter_filters(o: Observation):
+    """Filters (upper-case) of THIS obs that have a per-filter jicama DAO merge on disk."""
+    out = set()
+    for p in _fglob(o, "catalogs/f*_merged_*indivexp_merged_m*_dao_basic.fits"):
+        low = os.path.basename(p).lower()
+        if any(s in low for s in ("_vetted", "_i2dseed", "_consensus", "nrca", "nrcb")):
+            continue
+        if not _jicama_obs_scoped(low, p, o):
+            continue
+        fm = _JICAMA_PERFILTER_RE.match(low)
+        if fm:
+            out.add(fm.group(1).upper())
+    return sorted(out)
+
+
+def _jicama_positions(o: Observation, filt):
+    """(SkyCoord, S/N) from the per-filter jicama DAO merge for one filter -- finite positions only,
+    S/N = ``flux`` / ``flux_err`` where both columns exist (else None).  Returns (None, None) when the
+    catalogue is absent or under 200 usable rows."""
+    from astropy.table import Table
+    p = _jicama_perfilter_catalog(o, filt)
+    if not p:
+        return None, None
+    t = Table.read(_used(p, f"per-filter jicama catalogue ({filt})"))
+    if "skycoord" not in t.colnames:
+        return None, None
+    sc = t["skycoord"]
+    g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)
+    if int(g.sum()) < 200:
+        return None, None
+    sn = None
+    if "flux" in t.colnames and "flux_err" in t.colnames:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            sn = np.asarray(t["flux"], float) / np.asarray(t["flux_err"], float)
+        sn = sn[g]
+    return sc[g], sn
+
+
 # A merged catalog's ``skycoord_<filt>`` is only that ROW's own position when the cross-filter
 # match was tight.  jicama's merge accepts anything inside max_offset=0.10", which at GC density
 # (JWST NN spacing ~0.1-0.2") also admits the NEIGHBOUR of an undetected star, so the row carries
@@ -4233,6 +4319,53 @@ _SKYCOORD_COL_RE = re.compile(r"^skycoord_(f\d{3}[wnm])\.ra$")
 _STAGE8_GROSS_OFFSET_MAS = 15.0
 
 
+def _perfilter_interfilter_residuals(o, f1):
+    """Inter-filter position residual for a not-yet-cross-band-merged obs, from two SEPARATE per-filter
+    jicama DAO merges (``_jicama_positions``).  Cross-matches ``f1`` against the nearest-in-wavelength
+    partner filter that also has a per-filter catalogue, mutual-NN at 0.1", keeps S/N > 10 in both
+    bands, bulk-removes, and returns the same tuple as ``_interfilter_residuals`` (ra, dec, dra_mas,
+    dde_mas, f2, catname) or None.
+
+    The pairing is a FRESH cross-match (the merged-catalogue path reuses upstream pairing at ~100 mas),
+    so the nearest-neighbour-ambiguous tail is larger here; stage 8's shuffled-position null carries
+    that tail, so the significance floor accounts for it.  Two filters of one obs share the frames, the
+    offsets table, the DVA correction and the VIRAC registration, so the differenced position is a
+    per-filter WCS (distortion) term with no external catalogue in it (see #247)."""
+    import astropy.units as u
+    if not _jicama_perfilter_catalog(o, f1):
+        return None
+
+    def _wl(name):
+        m = re.search(r"f(\d{3})", name.lower()); return int(m.group(1)) if m else 9999
+    partners = [f for f in _jicama_perfilter_filters(o) if f.lower() != f1.lower()]
+    if not partners:
+        return None
+    f2 = min(partners, key=lambda c: abs(_wl(c) - _wl(f1)))
+    sc1, sn1 = _jicama_positions(o, f1)
+    sc2, sn2 = _jicama_positions(o, f2)
+    if sc1 is None or sc2 is None:
+        return None
+    i12, sep, _ = sc1.match_to_catalog_sky(sc2)
+    i21, _, _ = sc2.match_to_catalog_sky(sc1)
+    mutual = (sep < 0.1 * u.arcsec) & (i21[i12] == np.arange(len(sc1)))
+    j = i12[mutual]
+    keep = np.ones(int(mutual.sum()), bool)
+    if sn1 is not None:
+        keep &= np.isfinite(sn1[mutual]) & (sn1[mutual] > 10)
+    if sn2 is not None:
+        keep &= np.isfinite(sn2[j]) & (sn2[j] > 10)
+    if int(keep.sum()) < 200:
+        return None
+    a1 = sc1[mutual][keep]; a2 = sc2[j][keep]
+    cosd = float(np.cos(np.radians(np.median(a1.dec.deg))))
+    dra = (a1.ra - a2.ra).to(u.mas).value * cosd
+    dde = (a1.dec - a2.dec).to(u.mas).value
+    dra -= np.median(dra); dde -= np.median(dde)           # bulk-removed -> residual = distortion
+    c1 = os.path.basename(_jicama_perfilter_catalog(o, f1))
+    c2 = os.path.basename(_jicama_perfilter_catalog(o, f2))
+    return a1.ra.deg, a1.dec.deg, dra, dde, f2.upper(), f"{c1} + {c2}"
+
+
 def _interfilter_residuals(o, f1):
     """Per-star (RA, Dec, ΔRA, ΔDec) position difference between filter ``f1`` and a second JWST
     filter of the SAME field, from the merged catalogue's per-band positions of the SAME source
@@ -4388,20 +4521,34 @@ def stage8_distortion(o: Observation, sw):
     import matplotlib
     matplotlib.use("Agg")
     metrics = dict(stage=8, sw=sw)
+    # Prefer the cross-band MERGED catalogue (both filters registered onto a common frame, so the
+    # residual is a per-filter WCS/distortion term).  When none exists yet, fall back to the two
+    # per-filter jicama DAO merges: a PROVISIONAL measurement that still carries the not-yet-cross-tied
+    # inter-filter frame difference, so it is reported but NOT graded as a defect (see #247).
     res = _interfilter_residuals(o, sw)
+    provisional = False
     if res is None:
-        # NOT APPLICABLE, not a defect: a single-filter or not-yet-merged obs simply has no second
+        res = _perfilter_interfilter_residuals(o, sw)
+        provisional = res is not None
+    if res is None:
+        # NOT APPLICABLE, not a defect: a single-filter or not-yet-reduced obs simply has no second
         # band to difference.  Use a distinct "measurement unavailable" state -- do NOT red_flag it
         # and do NOT mark it failed (either would post a non-defect as a defect).
         png = _red_flag_figure(o, "stage8", "DISTORTION MAP NOT APPLICABLE",
-                               f"No inter-filter distortion map for {sw}: need a merged catalogue "
-                               f"carrying {sw} positions plus a second filter's positions for the "
-                               f"same sources. (Not a defect — a single-filter or not-yet-merged "
-                               f"obs simply has no second band to difference.)")
+                               f"No inter-filter distortion map for {sw}: need either a merged "
+                               f"catalogue carrying {sw} positions plus a second filter's, or a "
+                               f"per-filter catalogue for {sw} and a second filter of this obs. "
+                               f"(Not a defect — a single-filter or not-yet-reduced obs simply has "
+                               f"no second band to difference.)")
         metrics.update(measurable=False, passed=None,
                        na_reason="no second-filter positions for an inter-filter distortion map")
         return png, metrics
     ra, dec, dra, dde, f2, catname = res
+    if provisional:
+        metrics.update(provisional=True, provisional_reason=(
+            "measured from two per-filter jicama catalogues (no cross-band merge yet); the filters "
+            "are not yet registered to a common frame, so any bulk/gradient inter-filter offset here "
+            "is pipeline-progress state, not a data defect — reported, not graded"))
     cosd = float(np.cos(np.radians(np.median(dec))))
     rad = np.hypot(dra, dde)                                # bulk already removed upstream
     # Published metrics describe the FULL cross-band residual population and are computed BEFORE any
@@ -4479,14 +4626,18 @@ def stage8_distortion(o: Observation, sw):
     # (noise leaves the cells populated).  Amplitude + null significance are reported for reading.
     metrics["passed"] = bool(cells_used >= minn)
     # red_flag ONLY on a GROSS absolute inter-filter offset -- a fixed threshold a normal ~1 mas
-    # distortion residual never reaches, so it fires only on a genuine per-filter WCS break.
-    if amp > _STAGE8_GROSS_OFFSET_MAS:
+    # distortion residual never reaches, so it fires only on a genuine per-filter WCS break.  Skip it
+    # on the PROVISIONAL per-filter path: those two filters are not yet registered to a common frame,
+    # so a large offset there is expected pipeline-progress state, not a per-filter WCS defect (#247).
+    if amp > _STAGE8_GROSS_OFFSET_MAS and not provisional:
         metrics.update(red_flag=True,
                        red_flag_reason=(f"gross inter-filter offset: amp90 {amp:.1f} mas "
                                         f"(> {_STAGE8_GROSS_OFFSET_MAS:.0f} mas) between {sw} and "
                                         f"{f2} — likely a per-filter WCS break"))
-    fig.suptitle(f"{o.target} {o.obsid} — inter-filter distortion residual ({sw} − {f2})",
-                 fontsize=11, y=0.98)
+    suptitle = f"{o.target} {o.obsid} — inter-filter distortion residual ({sw} − {f2})"
+    if provisional:
+        suptitle += "\nprovisional: per-filter catalogues, not yet cross-tied to a common frame"
+    fig.suptitle(suptitle, fontsize=11, y=0.98)
     return _save(fig, f"{o.obsid}_stage8.png"), metrics
 
 
@@ -5969,10 +6120,25 @@ def _caption_stage8(metrics):
     sw = metrics.get("sw", "SW")
     if metrics.get("measurable") is False:
         return ("**Stage 8 — inter-filter distortion residual: not applicable.** No second-filter "
-                f"positions for {sw} in a merged catalogue, so there is no band to difference (a "
-                "single-filter or not-yet-merged obs). No pass/fail is set. "
+                f"positions for {sw} in a merged or per-filter catalogue, so there is no band to "
+                "difference (a single-filter or not-yet-reduced obs). No pass/fail is set. "
                 "([how this is made](DOCROOT#stage8))")
     f2 = metrics.get("f2", "a 2nd filter")
+    if metrics.get("provisional"):
+        nS = metrics.get("n_stars"); rms = metrics.get("resid_rms_mas")
+        amp = metrics.get("binned_amp90_mas"); signif = metrics.get("amp90_significance")
+        head = (f"**Stage 8 — inter-filter distortion residual ({sw} − {f2}): provisional.** "
+                f"No cross-band merged catalogue exists for this obs yet, so this map cross-matches "
+                f"the two per-filter jicama catalogues directly. The filters are not yet registered "
+                f"to a common frame (refcat comparison / offsets table / re-alignment still pending), "
+                f"so any bulk or gradient offset here is pipeline-progress state, **not a data "
+                f"defect** — it is reported, not graded, and never red-flagged. ")
+        if nS is not None and rms is not None:
+            head += f"Here: {nS} stars, {rms:.2f} mas per-star"
+            if amp is not None and signif is not None:
+                head += f"; 90th-percentile cell amplitude {amp:.1f} mas ({signif:.1f}× a shuffled null)"
+            head += ". It becomes a graded distortion measurement once the cross-band merge lands. "
+        return head + "([how this is made](DOCROOT#stage8))"
     nS = metrics.get("n_stars"); rms = metrics.get("resid_rms_mas")
     amp = metrics.get("binned_amp90_mas"); null = metrics.get("null_amp90_mas")
     signif = metrics.get("amp90_significance"); frac = metrics.get("frac_gt_20mas")
