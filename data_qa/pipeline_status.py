@@ -48,22 +48,29 @@ _OBSID_TOKEN = re.compile(r"_o\d{3,}(?!\d)")
 
 
 def _newest_for_obs(pats, obs):
-    """(mtime, count, caveat) for a glob set, narrowed to ONE observation.
+    """(mtime, count, caveat) for a glob set, attributed to ONE observation.
 
     The cataloging products live in a per-FIELD directory that several observations
-    write into, and their filenames carry the obsid (``..._o041_..._m3_...``).  A glob
-    that omits the obsid therefore returns the whole field, and the newest match is
-    usually some other tile's -- which made every obsid's issue report the field-wide
-    high-water mark for each m-stage and flagged real, monotone tiles as STALE.
+    write into.  Where the filenames carry the obsid (``..._o041_..._m3_...``) they can
+    be attributed; where they do not, they can only be pooled.  A glob that omits the
+    obsid pools unconditionally, so every observation's issue reported the field-wide
+    newest file for each stage and the monotonicity check compared tiles against each
+    other -- the defect this helper exists to remove.
 
-    Three cases, in order:
+    A field's catalogs may be fully tagged (gc-treasury), not tagged at all, or PART
+    tagged (w51, cloudc, sgrb2 -- a few dozen tagged files beside a thousand that are
+    not).  Each needs different handling, and the partial case needs saying out loud:
 
-    * some matches carry this obsid -> report only those.
-    * matches carry obsid tokens but none is this one -> nothing has run for this
-      observation yet: (None, 0), i.e. pending.
-    * no match carries any obsid token (older fields, pre-obsid naming) -> fall back
-      to the whole set and say so in the caveat, rather than reporting pending for
-      products that are plainly there.
+    * no matches -> pending.
+    * every match tagged -> report this observation's, or pending if it has none.
+    * no match tagged -> pool the lot and say so; these fields predate obsid naming
+      and reporting pending for products that are plainly there would be worse.
+    * SOME matches tagged -> report this observation's tagged matches TOGETHER WITH
+      every untagged one, and say how many could not be attributed.  Dropping the
+      untagged files silently would date the row from a small tagged subset (w51 m2
+      fell three months, m5/m6 went blank on 148 and 115 files), and it would leave
+      one table comparing an obsid-scoped stage against a pooled one -- the same
+      cross-population comparison, moved from the tile seam to the tagging seam.
     """
     files = []
     for pat in pats:
@@ -71,13 +78,20 @@ def _newest_for_obs(pats, obs):
     if not files:
         return None, 0, ""
     mine_re = re.compile(rf"_o{int(obs):03d}(?!\d)")
-    mine = [f for f in files if mine_re.search(os.path.basename(f))]
-    if mine:
+    tagged, untagged = [], []
+    for f in files:
+        (tagged if _OBSID_TOKEN.search(os.path.basename(f)) else untagged).append(f)
+    mine = [f for f in tagged if mine_re.search(os.path.basename(f))]
+    if not tagged:
+        return (max(os.path.getmtime(f) for f in files), len(files),
+                " · field-pooled, filenames carry no obsid")
+    if not untagged:
+        if not mine:
+            return None, 0, ""
         return max(os.path.getmtime(f) for f in mine), len(mine), ""
-    if any(_OBSID_TOKEN.search(os.path.basename(f)) for f in files):
-        return None, 0, ""
-    return (max(os.path.getmtime(f) for f in files), len(files),
-            " · field-pooled, filenames carry no obsid")
+    sel = mine + untagged
+    return (max(os.path.getmtime(f) for f in sel), len(sel),
+            f" · {len(untagged)} untagged not attributed")
 
 
 def _ts(mtime):

@@ -106,3 +106,67 @@ def test_single_frame_row_is_scoped_too(field):
     assert rows["single-frame cataloging"][0] == PS.PEND
     rows = _by_label(PS.stage_rows(_O("041")))
     assert rows["single-frame cataloging"][0] == PS.DONE
+
+
+@pytest.fixture()
+def partly_tagged(tmp_path, monkeypatch):
+    """w51-shaped field: a few obsid-tagged catalogs beside many that carry no obsid.
+
+    Real proportions (2026-09-21): w51 73 tagged of 1068, cloudc 18 of 589, sgrb2 36 of
+    878.  The tagged ones are also the OLDER ones, which is what makes dropping the
+    untagged majority move a row's date backwards instead of merely narrowing it.
+    """
+    P = tmp_path / "w51"
+    old = time.time() - 86400 * 90          # tagged, June-era
+    new = time.time() - 86400               # untagged, current
+    for k in (2, 3, 4):
+        _touch(str(P / "catalogs" / f"f405n_merged_o001_indivexp_merged_m{k}_dao_basic.fits"), old)
+        _touch(str(P / "catalogs" / f"f405n_merged_o002_indivexp_merged_m{k}_dao_basic.fits"), old)
+    for k in (5, 6):    # tagged, but only a SIBLING's -- the case that went blank
+        _touch(str(P / "catalogs" / f"f405n_merged_o002_indivexp_merged_m{k}_dao_basic.fits"), old)
+    for k in (2, 3, 4, 5, 6):
+        for det in ("nrca", "nrcb"):
+            _touch(str(P / "catalogs" / f"f405n_{det}_indivexp_merged_m{k}_dao_basic.fits"), new)
+    monkeypatch.setattr(PS, "BASE", str(tmp_path))
+
+    class _W(_O):
+        program = "1182"
+        field = "w51"
+
+    return _W
+
+
+def test_partial_tagging_keeps_the_untagged_products(partly_tagged):
+    """The untagged majority must stay in the row, not be dropped for a tagged subset."""
+    rows = _by_label(PS.stage_rows(partly_tagged("001")))
+    when = {label: w for label, _st, w, _d in PS.stage_rows(partly_tagged("001"))}
+    assert rows["cataloging m2"][0] == PS.DONE
+    assert "3 catalogs" in rows["cataloging m2"][1]        # 1 tagged mine + 2 untagged
+    # dated from the current untagged files, not the three-month-old tagged pair
+    assert when["cataloging m2"] > when["cataloging m2"][:4] + "-01-01 00:00"
+    assert rows["cataloging m2"][1].endswith("2 untagged not attributed")
+
+
+def test_partial_tagging_does_not_blank_a_stage_the_field_has(partly_tagged):
+    """m5/m6 have no tagged file of THIS obs, only a sibling's plus untagged ones.
+
+    Scoping alone reported pending here, on a field holding 148 and 115 of them.
+    """
+    rows = _by_label(PS.stage_rows(partly_tagged("001")))
+    for k in (5, 6):
+        assert rows[f"cataloging m{k}"][0] == PS.DONE
+        assert "2 untagged not attributed" in rows[f"cataloging m{k}"][1]
+
+
+def test_partial_tagging_says_how_many_were_not_attributed(partly_tagged):
+    """The caveat is the point: a silently-narrowed row reads as pipeline state."""
+    for label, _st, _w, detail in PS.stage_rows(partly_tagged("001")):
+        if label.startswith("cataloging m") and detail:
+            assert "untagged not attributed" in detail
+
+
+def test_partial_tagging_compares_one_population(partly_tagged):
+    """Every m-row draws from the same set, so no row goes stale against another's."""
+    rows = _by_label(PS.stage_rows(partly_tagged("001")))
+    assert not any(st == PS.STALE for label, (st, _d) in rows.items()
+                   if label.startswith("cataloging m"))
