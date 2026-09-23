@@ -169,9 +169,6 @@ def upload_asset(repo, token, png_path, asset_name):
     tag = _asset_shard_tag(asset_name)
     rel = _ensure_release(repo, token, tag)
     _delete_asset(repo, token, tag, rel, asset_name)
-    legacy = _ensure_release(repo, token, ASSET_RELEASE_TAG, create=False)
-    if legacy is not None:
-        _delete_asset(repo, token, ASSET_RELEASE_TAG, legacy, asset_name)
     with open(png_path, "rb") as fh:
         blob = fh.read()
     ctype = mimetypes.guess_type(png_path)[0] or "image/png"
@@ -180,6 +177,11 @@ def upload_asset(repo, token, png_path, asset_name):
     if st >= 300:
         raise PostError(f"asset upload failed ({st}): {data}")
     _asset_index(repo, token, tag, rel)[asset_name] = data.get("id")
+    # free the legacy copy only once the shard copy exists, so a failed upload leaves the old
+    # comment's image resolvable
+    legacy = _ensure_release(repo, token, ASSET_RELEASE_TAG, create=False)
+    if legacy is not None:
+        _delete_asset(repo, token, ASSET_RELEASE_TAG, legacy, asset_name)
     return data["browser_download_url"]
 
 

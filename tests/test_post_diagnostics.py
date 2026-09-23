@@ -1,3 +1,4 @@
+import pytest
 """Tests for data_qa.post_diagnostics.unpost_stage.
 
 The suite is offline: ``_req``, ``_issue_number`` and ``_find_stage_comment`` are stubbed so the
@@ -119,3 +120,32 @@ def test_asset_shard_tag_is_stable_and_spread():
     from collections import Counter
     assert max(Counter(tags).values()) < 1000                        # every shard under the cap
     assert len(set(tags)) == P.ASSET_SHARDS
+
+
+def test_upload_failure_keeps_legacy_copy(tmp_path, monkeypatch):
+    from data_qa import post_diagnostics as P
+    png = tmp_path / "x.png"; png.write_bytes(b"png")
+    name = "jw10678-o132_stage3.png"
+    tag = P._asset_shard_tag(name)
+    state = {"qa-assets": {name: 7}, tag: {f"f{i}.png": 100 + i for i in range(1000)}}  # shard full
+    monkeypatch.setattr(P, "_req", _fake_github(state))
+    monkeypatch.setattr(P, "_RELEASES", {}); monkeypatch.setattr(P, "_ASSET_INDEX", {})
+    with pytest.raises(P.PostError):
+        P.upload_asset("o/r", "tok", str(png), name)
+    assert state["qa-assets"] == {name: 7}                          # old comment image still live
+
+
+def test_ensure_release_rereads_after_concurrent_create(monkeypatch):
+    from data_qa import post_diagnostics as P
+    seen = {"gets": 0}
+
+    def fake(method, url, token, data=None, headers=None, raw=False, want_headers=False):
+        if method == "GET":
+            seen["gets"] += 1
+            # first GET: missing; after our POST loses the race, the re-read finds it
+            return (404, {}) if seen["gets"] == 1 else (200, {"id": 9, "tag_name": "qa-assets-03"})
+        return (422, {"errors": [{"code": "already_exists"}]})
+    monkeypatch.setattr(P, "_req", fake)
+    monkeypatch.setattr(P, "_RELEASES", {})
+    assert P._ensure_release("o/r", "tok", "qa-assets-03")["id"] == 9
+    assert seen["gets"] == 2
