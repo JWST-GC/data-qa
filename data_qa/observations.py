@@ -47,6 +47,10 @@ FIELDS: Dict[str, str] = {
     "arches": "Arches",
     "quintuplet": "Quintuplet",
     "sgra": "Sgr A*",
+    # gc9257 (PI Do, program 9257): NIRCam+NIRISS imaging of the Milky Way nuclear star cluster
+    # (target NSC_CENTRAL), registered by jwst-gc-pipeline#916.  The display name is the issue-title
+    # idempotency key, so it is fixed here before any issue exists; kept distinct from "Sgr A*".
+    "gc9257": "Nuclear Star Cluster",
     "sgrb2": "Sgr B2",
     "sgrc": "Sgr C",
     "sickle": "Sickle",

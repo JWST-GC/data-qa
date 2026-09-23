@@ -5,6 +5,7 @@ Covers the pure numeric helpers (`_binned_stat`), the caption fallback that once
 per-exposure daophot glob (`_daophot_glob`) that keeps one observation's cats out of another's
 QA on multi-obs fields.  No I/O beyond touching empty files under a temporary QA_BASE.
 """
+import glob
 import os
 
 import numpy as np
@@ -213,12 +214,23 @@ def test_caption_linkifies_docroot():
         assert "qa_methods.md#" in cap
 
 
-def test_caption_stage3_drops_false_claim_and_labels_line():
-    cap = D.caption_for(3, dict(stage=3, sw="F212N", n_matched=2603, slope=1.0, scatter=0.28))
-    # the untrue "a tight locus means the right stars were matched" claim is gone
-    assert "right stars were matched" not in cap
-    # positive labelling: the cyan line is named "1:1 line" (no "not a fit")
-    assert "1:1 line" in cap and "NOT a fit" not in cap
+def test_caption_stage3_grades_on_our_catalog_and_names_mast():
+    cap = D.caption_for(3, dict(stage=3, sw="F212N", source="jicama-m8", n_matched=2603,
+                                slope=1.0, scatter=0.28, our_slope=1.0,
+                                mast_slope=0.99, mast_scatter=0.30))
+    assert "right stars were matched" not in cap and "NOT a fit" not in cap
+    # the graded panel is named (our catalogue) and MAST is called out as shown alongside
+    assert "jicama-m8" in cap and "MAST" in cap
+    assert "slope" in cap and "scatter" in cap
+
+
+def test_caption_stage3_informational_when_mast_only():
+    # no pipeline catalogue yet -> MAST shown for information, stage not graded (not a red flag)
+    cap = D.caption_for(3, dict(stage=3, sw="F212N", passed=None,
+                                primary_source="MAST catalogue", mast_slope=0.02, mast_scatter=1.2,
+                                na_reason="pipeline catalogue not yet available"))
+    assert "information" in cap and "not graded" in cap
+    assert "MAST" in cap
 
 
 def test_caption_stage2_spells_out_lf_and_drops_meaningless_clause():
@@ -252,6 +264,10 @@ def test_caption_anchors_exist_in_docs():
                 n_overlap=100, n_overlap_hi=50, intermodule_rms_hi=4.0),
         6: dict(red_flag=True, red_flag_reason="x"),
         9: dict(stage=9, n_isolated=19812, aper_corr_med=0.45, aper_psf_scatter=0.07),
+        12: dict(stage=12, sw="F212N", primary_filter="F212N", filters_measured=["F212N"],
+                 per_filter={"F212N": dict(slope=0.006, slope_err=0.004, turnover_mag=None,
+                                           aper_corr=0.42, n=1800, flagged=False)},
+                 slope=0.006, slope_err=0.004, turnover_mag=None, aper_corr=0.42, n_flagged=0),
     }
     for n, m in samples.items():
         cap = D.caption_for(n, m)
@@ -794,12 +810,13 @@ def _stage4_seams(monkeypatch, cells, dropped, grid_used):
     monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/ref")
     monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2024.0)
     monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (jsc, None))
+    # stage 4 now sources positions from the MAST L3 catalogue; feed the synthetic jsc there.
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, f: (jsc, None))
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
     monkeypatch.setattr(D, "_cell_offsets", lambda j, r: (cells, dropped, grid_used))
     monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: None)   # -> off_med = cell_off_med
     monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
-    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, f: None)
     monkeypatch.setattr(D, "_save", lambda fig, name: name)
 
 
@@ -938,8 +955,9 @@ def test_make_issues_frame_ok_untficked_when_spatial_unassessed(monkeypatch):
 
 
 def test_make_issues_product_existence_checkboxes(monkeypatch):
-    # jicama / JWST1PASS / peppar presence boxes are auto-set from the diagnostics: a stage
-    # red-flags when its product is absent, so "not red-flagged" ticks the box.
+    # jicama / JWST1PASS / peppar presence boxes are auto-set from the diagnostics: a stage whose
+    # product is absent reports available=False (no red flag), so "not available" leaves the box
+    # unticked.
     from data_qa import make_issues as MI
     monkeypatch.setattr(MI, "_guidestar_json", lambda: {})
     o = Observation(program="2045", obs="001", target="Arches", release_field="arches",
@@ -947,15 +965,15 @@ def test_make_issues_product_existence_checkboxes(monkeypatch):
     monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {
         "stage3": {"passed": True},                       # jicama present (Vega calib ran)
         "stage6": {"peppar_kind": "frame-to-frame σ"},    # peppar present
-        "stage10": {"stage": 10, "red_flag": True},       # JWST1PASS absent
-        "stage11": {"stage": 11, "red_flag": False}})
+        "stage10": {"stage": 10, "available": False},     # JWST1PASS absent
+        "stage11": {"stage": 11, "available": True}})
     lines = {l.split("**Products**: ")[1].split(" present")[0]: l
              for l in MI.render_body(o).splitlines() if "**Products**:" in l}
     assert "[x]" in lines["jicama (merged/release catalogue)"]
-    assert "[ ]" in lines["JWST1PASS products"]           # stage 10 red-flagged -> absent
+    assert "[ ]" in lines["JWST1PASS products"]           # stage 10 unavailable -> absent
     assert "[x]" in lines["peppar products"]
     # nothing present -> all three unticked
-    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {"stage10": {"red_flag": True}})
+    monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {"stage10": {"available": False}})
     lines2 = [l for l in MI.render_body(o).splitlines() if "**Products**:" in l]
     assert len(lines2) == 3 and all("[ ]" in l for l in lines2)
 
@@ -1204,6 +1222,110 @@ def test_peppar_precision_none_without_products(tmp_path, monkeypatch):
     o = Observation(program="2221", obs="001", target="Brick", release_field="brick",
                     instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
     assert D._peppar_precision(o, "F212N") is None
+
+
+def test_peppar_dir_prefers_per_obs_then_flat(tmp_path, monkeypatch):
+    """gc-treasury's disjoint tiles moved to peppar/o<obs>/<FILT>/ (per-obs); the flat
+    peppar/<FILT>/ layout (gc2211, cloud E/F) is the fallback.  Per-obs must win when both exist,
+    and a missing directory returns None."""
+    monkeypatch.setitem(D._PEPPAR_ROOTS, "gc-treasury", str(tmp_path))
+    o = Observation(program="10678", obs="132", target="GC Treasury", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    root = tmp_path / "gc-treasury" / "peppar"
+    assert D._peppar_dir(o, "F212N") is None                     # neither layout on disk
+    (root / "F212N").mkdir(parents=True)
+    assert D._peppar_dir(o, "F212N") == str(root / "F212N")      # flat fallback
+    (root / "o132" / "F212N").mkdir(parents=True)
+    assert D._peppar_dir(o, "F212N") == str(root / "o132" / "F212N")   # per-obs wins
+
+
+def test_peppar_cal_for_cat_resolves_under_per_obs_layout(tmp_path):
+    """A per-obs cat (peppar/o<obs>/<FILT>/<DET>/) must still resolve its cal in
+    <field>/<FILT>/pipeline/ — the extra o<obs> level would otherwise send dirname-counting to the
+    wrong field_dir/filt and blank stage 11 + stage 6's peppar half."""
+    field = tmp_path / "gc-treasury"
+    catdir = field / "peppar" / "o132" / "F212N" / "NRCA1"
+    catdir.mkdir(parents=True)
+    cat = catdir / "jw10678132001_02101_00001_nrca1_cal_gc-treasury_iter1_cat.fits"
+    cat.write_text("")
+    caldir = field / "F212N" / "pipeline"
+    caldir.mkdir(parents=True)
+    cal = caldir / "jw10678132001_02101_00001_nrca1_cal.fits"
+    cal.write_text("")
+    assert D._peppar_cal_for_cat(str(cat)) == str(cal)
+
+
+def test_peppar_cal_for_cat_no_peppar_ancestor_returns_none():
+    """A valid cat name whose path has NO 'peppar' ancestor must return None, not spin forever at
+    the filesystem root (os.path.dirname('/') == '/')."""
+    assert D._peppar_cal_for_cat(
+        "/tmp/nope/jw10678132001_02101_00001_nrca1_cal_gc-treasury_iter1_cat.fits") is None
+
+
+def test_apply_vega_zp_adds_when_present_else_unchanged():
+    """Pins the depth-histogram calibration arithmetic: with a ZP the mag is shifted by exactly it;
+    with None it is unchanged.  Guards against the +ZP being dropped while the 'Vega' label stays."""
+    m = np.array([-7.0, -5.0, -3.0])
+    np.testing.assert_allclose(D._apply_vega_zp(m, 26.0), m + 26.0)
+    np.testing.assert_array_equal(D._apply_vega_zp(m, None), m)
+
+
+def test_mast_depth_zp_nan_tolerant():
+    """The stage-7 depth histogram lost its whole MAST series when the MAST→jicama zeropoint came
+    out NaN (one NaN among matched jicama mags -> plain median NaN -> `zp or 0.0` keeps NaN, since
+    NaN is truthy -> every MAST mag becomes NaN).  The zeropoint must survive a stray NaN and be
+    None (not NaN) when it cannot be measured."""
+    j = np.arange(40, dtype=float)            # jicama mags
+    mm = j - 1.8                              # MAST mags, constant 1.8 offset
+    assert D._mast_depth_zp(j, mm) == pytest.approx(1.8)
+    j2 = j.copy(); j2[5] = np.nan            # one stray NaN must not poison the median
+    assert D._mast_depth_zp(j2, mm) == pytest.approx(1.8)
+    assert D._mast_depth_zp(np.full(40, np.nan), mm) is None   # unmeasurable -> None, never NaN
+    assert D._mast_depth_zp(j[:10], mm[:10]) is None           # too few pairs -> None
+
+
+def test_clip_to_core_drops_far_outliers():
+    """Stage 8 blanked most of its map because a few wild-coordinate rows (~1° off the ~0.1° mosaic)
+    stretched the bin grid.  The core clip keeps the dense field and drops the strays."""
+    ra = np.concatenate([266.60 + 0.02 * np.random.default_rng(0).random(500), [265.8, 267.9]])
+    dec = np.concatenate([-28.50 + 0.02 * np.random.default_rng(1).random(500), [-29.9, -27.1]])
+    keep = D._clip_to_core(ra, dec)
+    assert not keep[-1] and not keep[-2]      # the two far strays are dropped
+    assert keep[:500].mean() > 0.9            # nearly all of the core survives
+    # a clean field with NO strays is returned untouched, so edge stars are not trimmed
+    clean_ra = 266.60 + 0.02 * np.random.default_rng(2).random(500)
+    clean_dec = -28.50 + 0.02 * np.random.default_rng(3).random(500)
+    assert D._clip_to_core(clean_ra, clean_dec).all()
+
+
+def test_psfperts_scale_floor_cap_and_percentile():
+    """Stage-10 perturbation panels were flat-white because a ~0.002 residual was drawn on a fixed
+    ±0.1 scale.  The scale is the 99th percentile of |flux|, floored at 0.01 and capped at 0.1."""
+    assert D._psfperts_scale(np.full(1000, 0.001)) == pytest.approx(0.01)   # tiny -> floor
+    assert D._psfperts_scale(np.full(1000, 0.5)) == pytest.approx(0.1)      # huge -> Jay's cap
+    mid = D._psfperts_scale(np.full(1000, 0.03))
+    assert mid == pytest.approx(0.03)                                       # in-range -> percentile
+    assert D._psfperts_scale(np.array([])) == pytest.approx(D._PSFPERTS_VLIM)
+
+
+def test_stage7_caption_flags_real_misregistration_when_jicama_far_worse():
+    """When jicama is materially farther from VIRAC than raw MAST, the caption must call it a real
+    mis-registration (re-tie), not the neutral 'MAST as close as pipeline' — o132 is jicama 70 vs
+    MAST 14."""
+    cap = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=70.0,
+                                mast_offset_med_mas=14.0, n_jicama_window=75000, n_mast_window=0))
+    assert "farther from VIRAC than raw MAST" in cap and "re-tie" in cap
+    # comparable offsets -> neutral wording, no false alarm
+    cap2 = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=13.0,
+                                 mast_offset_med_mas=11.0, n_jicama_window=75000, n_mast_window=5000))
+    assert "farther from VIRAC" not in cap2
+    # pin the margin: just below -> neutral, just above -> mis-registration
+    mo = 14.0; margin = D._STAGE7_MISREG_MARGIN_MAS
+    lo = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=mo + margin - 2,
+                               mast_offset_med_mas=mo, n_jicama_window=1, n_mast_window=1))
+    hi = D.caption_for(7, dict(stage=7, sw="F212N", jicama_offset_med_mas=mo + margin + 2,
+                               mast_offset_med_mas=mo, n_jicama_window=1, n_mast_window=1))
+    assert "farther from VIRAC" not in lo and "farther from VIRAC" in hi
 
 
 def test_pick_filters_prefers_mosaic_backed_over_higher_ranked():
@@ -1536,10 +1658,11 @@ def _stage4_injection(monkeypatch, shift_mas):
     monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/refcat.fits")
     monkeypatch.setattr(D, "_obs_epoch", lambda o, path: 2022.5)
     monkeypatch.setattr(aa, "load_reference", lambda ref, ep: (ref_sc, None))
+    # stage 4 sources positions from the MAST L3 catalogue; feed the shifted synthetic field there.
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: (jsc, None))
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
     monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
-    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: None)
     _png, metrics = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
     return metrics
 
@@ -1558,6 +1681,92 @@ def test_stage4_fails_on_90mas_misregistration(monkeypatch):
     m = _stage4_injection(monkeypatch, 90.0)
     assert m["passed"] is False
     assert m["cell_off_med"] > 75 and m["gate_off_mas"] > 75
+
+
+def test_stage4_unavailable_when_no_mast_catalogue(monkeypatch):
+    # No MAST L3 catalogue on disk is a not-yet-delivered state, not a defect: available=False,
+    # passed=None, and NO red flag (the stage is left blank, not flagged).
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, sw: "/dev/null/m_i2d.fits")
+    monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/ref.fits")
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2022.5)
+    monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (object(), None))   # ref present
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: None)           # no MAST cat
+    monkeypatch.setattr(D, "_save", lambda fig, name: name)
+    _png, m = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
+    assert m.get("available") is False and m.get("passed") is None and not m.get("red_flag")
+    assert m.get("source") == "MAST L3 catalogue"
+
+
+def test_source_label_from_path_tokens():
+    f = D._source_label_from_path
+    assert f("/x/mastDownload/JWST/jw10678-o1_t1_nircam_clear-f212n/..._cat.ecsv") == "MAST L3"
+    assert f("/x/mastDownload/JWST/..._i2d.fits") == "MAST i2d"
+    assert f("jw10678-o1_t001_nircam_clear-f212n_m1_daophot_cat.fits") == "jicama-m1"
+    assert f("jw10678-o1_t001_nircam_clear-f212n_m3_daophot_basic_mergedcat.fits") == "jicama-m3"
+    assert f("jw10678-o1_t001_nircam_clear-f212n-merged_cat.ecsv") == "jicama-m3"
+    assert f("gaia_virac2_refcat_epoch2026.7_o1.fits") == "VIRAC/Gaia ref"
+    assert f("jw10678-o1_LOG.MATCHUP.XYMEEE") == "JWST1PASS"
+    assert f("something_miri_f770w_i2d.fits") == "MIRI i2d"
+    # a MIRI CATALOGUE is one of our products: keep the m-level with a MIRI tag, do not collapse
+    # to a bare "MIRI" (which could not be told from a MAST/unknown-origin MIRI catalogue).
+    assert f("jw10678-o40_t001_miri_f770w_m2_daophot_cat.ecsv") == "jicama-m2 MIRI"
+    assert f("jw10678-o40_t001_miri_clear-f770w-merged_cat.ecsv") == "jicama-m3 MIRI"
+    assert f("jw10678-o40_t001_miri_f770w_cat.ecsv") == "jicama MIRI"
+    assert f("/x/mastDownload/JWST/jw10678-o40_t1_miri_f770w/..._cat.ecsv") == "MAST L3"
+
+
+def test_save_annotates_data_source(tmp_path, monkeypatch):
+    """`_save` leaves a 'Data source' footer built from the files the stage recorded via _used."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path))
+    monkeypatch.setattr(D, "_INPUTS",
+                        [("cat", "jw10678-o1_t001_nircam_clear-f212n-merged_cat.ecsv"),
+                         ("ref", "gaia_virac2_refcat_epoch2026.7_o1.fits")])
+    fig = plt.figure()
+    D._save(fig, "src_footer_test.png")
+    foot = [t.get_text() for t in fig.texts if "Data source" in t.get_text()]
+    assert len(foot) == 1
+    assert "jicama-m3" in foot[0] and "VIRAC/Gaia ref" in foot[0]
+    plt.close(fig)
+
+
+def test_save_does_not_overwrite_a_stage_own_source_footer(tmp_path, monkeypatch):
+    """A stage that already wrote its own, more specific 'Data source' footer keeps it -- the
+    central annotation must not stack a second one (a duplicated footer is ugly, a replaced one
+    is wrong)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path))
+    monkeypatch.setattr(D, "_INPUTS",
+                        [("cat", "jw10678-o1_t001_nircam_clear-f212n-merged_cat.ecsv")])
+    fig = plt.figure()
+    fig.text(0.5, 0.005, "Data source: MAST L3", ha="center")   # the stage's own, specific footer
+    D._save(fig, "src_footer_keep_test.png")
+    foots = [t.get_text() for t in fig.texts if "Data source" in t.get_text()]
+    assert foots == ["Data source: MAST L3"]                    # untouched, not stacked
+    plt.close(fig)
+
+
+def test_offset_summary_figure_measures_or_blank(monkeypatch):
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    jsc = SkyCoord(np.full(50, 266.4) * u.deg, np.full(50, -28.9) * u.deg)
+    ref = jsc
+    cells = [{"i": k % 4, "j": k // 4, "ra": 266.4, "dec": -28.9, "dra": 1.0, "dde": 0.0,
+              "off": 1.0, "n": 40} for k in range(16)]
+    monkeypatch.setattr(D, "_cell_offsets", lambda j, r: (cells, [], 4))
+    monkeypatch.setattr(D, "_cell_consistency", lambda c, d: {"cells": c, "off_med": 1.0,
+                        "spread": 0.5, "n_cells": len(c), "coverage": 1.0})
+    monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: {"off": 1.2, "npairs": 40, "scatter": 0.3})
+    monkeypatch.setattr(D, "_offset_cloud", lambda j, r: (np.array([1.0, 2.0]), np.array([0.0, 0.0]), 1.0))
+    monkeypatch.setattr(D, "_save", lambda fig, name: name)
+    png, sub = D._offset_summary_figure(_obs(), "F212N", jsc, ref, "release:x_m3_cat.ecsv", "out.png")
+    assert png == "out.png" and sub["offset_med_mas"] is not None
+    # no catalogue -> blank (no figure, no metrics), never a red flag
+    assert D._offset_summary_figure(_obs(), "F212N", None, ref, "x", "o.png") == (None, {})
 
 
 # --------------------------------------------------------------------------- stage 7 (MAST vs pipeline)
@@ -1620,7 +1829,8 @@ def test_caption_stage7_neutral_when_jicama_not_tighter():
     cap = D.caption_for(7, dict(stage=7, jicama_offset_med_mas=19.56, mast_offset_med_mas=17.62))
     assert "20 mas (jicama)" in cap and "18 mas (MAST)" in cap
     assert "so the pipeline sits closer to VIRAC" not in cap
-    assert "MAST is as close to VIRAC as the pipeline here" in cap
+    assert "farther from VIRAC" not in cap                  # small diff -> no mis-registration alarm
+    assert "MAST is about as close to VIRAC as the pipeline here" in cap
 
 
 def test_caption_stage7_drops_clause_when_mast_unavailable():
@@ -1718,6 +1928,28 @@ def test_mast_i2d_and_l3cat_pathing(tmp_path, monkeypatch):
     # local L3 cat is found (download not attempted); the per-detector destreak cat is excluded
     got = D._mast_l3_catalog(o, "F212N", allow_download=False)
     assert got.endswith("clear-f212n_cat.fits")
+
+
+def test_mast_l3_catalog_never_returns_our_merged_product(tmp_path, monkeypatch):
+    """The MAST catalogue search reaches ``<FILT>/pipeline``/``images-merged`` where OUR reduction
+    writes ``..._t001_...-merged_cat.ecsv``.  That product is ours, not MAST: picking it swaps the
+    stage-7 MAST/pipeline series and inverts the conclusion (JWST-GC/data-qa#192).  The genuine MAST
+    per-i2d catalogue under mastDownload is chosen, and when only our merged product exists the search
+    finds nothing MAST (download disabled)."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "gc-treasury" / "F212N" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw10678-o137_t001_nircam_clear-f212n-merged_cat.ecsv")   # OUR product, not MAST
+    o = Observation(program="10678", obs="137", target="GC Treasury",
+                    release_field="gc-treasury", instrument="NIRCam", filters=["F212N"],
+                    visits=[], epoch="", notes="")
+    assert D._mast_l3_catalog(o, "F212N", allow_download=False) is None   # our merged is not "MAST"
+
+    md = (tmp_path / "gc-treasury" / "mastDownload" / "JWST"
+          / "jw10678-o137_t137_nircam_clear-f212n"); md.mkdir(parents=True)
+    _touch(md, "jw10678-o137_t137_nircam_clear-f212n_cat.ecsv")           # genuine MAST per-i2d
+    got = D._mast_l3_catalog(o, "F212N", allow_download=False)
+    assert got is not None and got.endswith("clear-f212n_cat.ecsv")
+    assert "merged" not in os.path.basename(got)
 
 
 def test_load_mast_catalog_radec_and_mag(tmp_path):
@@ -1818,6 +2050,15 @@ def test_caption_stage8_gross_offset_flags_but_describes_map():
     assert "🚩" in cap and "gross" in cap.lower()
     # even red-flagged, it describes the rendered map -- not the generic empty-plot caption
     assert "plot is empty" not in cap.lower()
+
+
+def test_caption_stage8_provisional_describes_perfilter_and_not_flagged():
+    cap = D.caption_for(8, dict(stage=8, sw="F212N", f2="F480M", n_stars=110000,
+                                resid_rms_mas=14.3, binned_amp90_mas=34.0, amp90_significance=12.0,
+                                provisional=True, passed=True))
+    assert "provisional" in cap.lower() and "per-filter" in cap.lower()
+    assert "not a data defect" in cap.lower()
+    assert "🚩" not in cap                                  # a provisional offset is never flagged
 
 
 def test_interfilter_residuals_bulk_removed_and_gradient(tmp_path, monkeypatch):
@@ -1926,6 +2167,55 @@ def test_interfilter_residuals_requires_min_stars(tmp_path, monkeypatch):
     assert D._interfilter_residuals(object(), "F212N") is None
 
 
+def _sc_deg(ra, dec):
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    return SkyCoord(np.asarray(ra, float) * u.deg, np.asarray(dec, float) * u.deg)
+
+
+def test_perfilter_interfilter_residuals_crossmatch_bulk_removed_and_partner(tmp_path, monkeypatch):
+    # #247: two SEPARATE per-filter jicama catalogues (generic skycoord + flux, no cross-band merge)
+    # are cross-matched, the nearest-wavelength partner is chosen, the bulk offset is removed and a
+    # position-dependent gradient survives.
+    rng = np.random.RandomState(9)
+    ra = 266.40 + rng.uniform(0, 0.03, 800); dec = -28.90 + rng.uniform(0, 0.03, 800)
+    cosd = np.cos(np.radians(-28.9))
+    grad = (ra - ra.mean()) * 2000.0                       # RA-dependent ΔRA (distortion-like)
+    sc_f212 = _sc_deg(ra + (60.0 + grad) / 3.6e6 / cosd, dec)   # bulk 60 + gradient
+    base = _sc_deg(ra, dec)
+    sn = np.full(800, 100.0)
+    pos = {"F212N": (sc_f212, sn), "F187N": (base, sn), "F480M": (base, sn)}
+    monkeypatch.setattr(D, "_jicama_perfilter_catalog", lambda o, f: f"/fake/{f}.fits")
+    monkeypatch.setattr(D, "_jicama_perfilter_filters", lambda o: ["F187N", "F212N", "F480M"])
+    monkeypatch.setattr(D, "_jicama_positions", lambda o, f: pos[f])
+    out = D._perfilter_interfilter_residuals(_obs(filt="F212N"), "F212N")
+    assert out is not None
+    rr, dd, dra, dde, f2, name = out
+    assert f2 == "F187N"                                   # nearest-wavelength partner (25 nm, not 268)
+    assert abs(np.median(dra)) < 2 and abs(np.median(dde)) < 2      # bulk removed
+    assert np.corrcoef(rr, dra)[0, 1] > 0.8               # gradient recovered
+    assert " + " in name                                  # two-catalogue provenance label
+
+
+def test_stage8_perfilter_path_is_provisional_and_not_red_flagged(tmp_path, monkeypatch):
+    # #247: with only per-filter jicama catalogues (no cross-band merge), stage 8 measures a
+    # PROVISIONAL map from them and must NOT red-flag a gross offset -- the filters are not yet
+    # cross-tied, so a large inter-filter offset there is pipeline-progress state, not a WCS defect.
+    ra, dec = _grid_radec(3000, 47)
+    ran = (ra - ra.mean()) / (0.5 * (ra.max() - ra.min()))
+    dra = 40.0 * ran; dde = np.zeros(ra.size)             # ~40 mas gradient -> gross by the merged gate
+    monkeypatch.setattr(D, "_interfilter_residuals", lambda o, f: None)
+    monkeypatch.setattr(D, "_perfilter_interfilter_residuals",
+                        lambda o, f: (ra, dec, dra, dde, "F480M", "a.fits + b.fits"))
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "figs"))
+    png, m = D.stage8_distortion(_obs(filt="F212N"), "F212N")
+    assert os.path.exists(png)
+    assert m.get("provisional") is True and "provisional_reason" in m
+    assert m["binned_amp90_mas"] > 15.0                   # amplitude IS gross...
+    assert not m.get("red_flag")                          # ...but is NOT flagged on the provisional path
+    assert m["passed"] is True                            # the measurement still succeeded
+
+
 def _run_stage8(tmp_path, monkeypatch, ra, dec, dra, dde, sn=100.0):
     p = str(tmp_path / "cat.fits"); _two_filter_cat(p, ra, dec, dra, dde, sn=sn)
     monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
@@ -1954,6 +2244,25 @@ def test_stage8_recovers_gradient_null_significance_and_amp90(tmp_path, monkeypa
     assert m["amp90_significance"] > 3.0 and m["amp90_p_value"] < 0.1
     assert m["cells_total"] == 144 and m["cells_used"] > 0
     assert m["passed"] is True and not m.get("red_flag")               # a real ~mas term is no defect
+
+
+def test_stage8_metrics_use_full_population_not_map_clip(tmp_path, monkeypatch):
+    # The map clip drops wild-coordinate strays so the grid is not stretched, but the PUBLISHED
+    # metrics (n_stars, frac_gt_20mas) must be computed on the FULL population BEFORE that clip:
+    # the strays are exactly the nearest-neighbour-ambiguous tail frac_gt_20mas is defined to count,
+    # so clipping first would silently divide that QA number by ~5.
+    ra, dec = _grid_radec(3000, 71)
+    rng = np.random.RandomState(71)
+    dra = rng.normal(0, 1.0, 3000); dde = rng.normal(0, 1.0, 3000)
+    k = 60                                     # strays ~1° off, each carrying a >20 mas residual
+    sra = np.concatenate([ra, ra[:k] + 1.0]); sdec = np.concatenate([dec, dec[:k] + 1.0])
+    sdra = np.concatenate([dra, np.full(k, 60.0)]); sdde = np.concatenate([dde, np.full(k, 60.0)])
+    m = _run_stage8(tmp_path, monkeypatch, sra, sdec, sdra, sdde)
+    assert m["n_stars"] == 3000 + k                     # metrics on the FULL population
+    assert m["n_stars_mapped"] == 3000                  # strays dropped from the MAP only
+    assert m["n_stars_offfield_clipped"] == k
+    assert m["frac_gt_20mas"] > 0.015                   # the stray tail is counted (~0.0196), not ~0
+    assert m["passed"] is True
 
 
 def test_stage8_pure_noise_significance_near_one_and_does_not_flip_pass(tmp_path, monkeypatch):
@@ -2016,6 +2325,7 @@ def test_stage8_not_applicable_state_is_not_a_red_flag(tmp_path, monkeypatch):
            "flux_f212n": np.full(ra.size, 1e4),
            "flux_err_f212n": np.full(ra.size, 1e2)}).write(p, overwrite=True)
     monkeypatch.setattr(D, "_catalog_candidates", lambda o: [(p, "m8", 8, 1.0)])
+    monkeypatch.setattr(D, "_perfilter_interfilter_residuals", lambda o, f: None)  # no jicama fallback
     monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "figs"))
     png, m = D.stage8_distortion(_obs(filt="F212N"), "F212N")
     assert os.path.exists(png)
@@ -2049,6 +2359,11 @@ def test_miri_caption_variants():
     rf = D._miri_caption(dict(filt="F770W", red_flag=True, red_flag_reason="no MIRI i2d on disk"),
                          "JWST-GC/data-qa")
     assert rf.startswith("🚩") and "no MIRI i2d" in rf
+    # the caption names the image it actually shows: a reduced mosaic is not labelled MAST (#163)
+    assert "MAST i2d image" in D._miri_caption(dict(filt="F770W", i2d_source="mast"),
+                                               "JWST-GC/data-qa")
+    assert "Reduced i2d image" in D._miri_caption(dict(filt="F770W", i2d_source="reduced"),
+                                                  "JWST-GC/data-qa")
 
 
 def test_miri_i2d_pathing(tmp_path, monkeypatch):
@@ -2271,8 +2586,8 @@ def test_miri_degenerate_i2d_does_not_pass(tmp_path, monkeypatch):
     assert metrics.get("miri_finite_frac", 1.0) < 0.2
 
 
-def test_miri_overview_red_flag_no_i2d(tmp_path, monkeypatch):
-    """No i2d on disk -> a red-flag figure, passed False."""
+def test_miri_overview_unavailable_no_i2d(tmp_path, monkeypatch):
+    """No i2d on disk -> a pending figure, available False, passed None, no red flag."""
     monkeypatch.setattr(D, "BASE", str(tmp_path))
     monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "out"))
     (tmp_path / "brick" / "mastDownload").mkdir(parents=True)
@@ -2280,7 +2595,8 @@ def test_miri_overview_red_flag_no_i2d(tmp_path, monkeypatch):
                     instrument="MIRI", filters=["F1800W"], visits=[], epoch="", notes="")
     png, metrics = D.miri_overview(o)
     assert os.path.exists(png)
-    assert metrics.get("red_flag") is True and metrics.get("passed") is False
+    assert (metrics.get("available") is False and metrics.get("passed") is None
+            and not metrics.get("red_flag"))
 
 
 # --------------------------------------------------------------------------- input provenance
@@ -2512,14 +2828,14 @@ def test_jwst1pass_matchup_env_override(tmp_path, monkeypatch):
         str(tmp_path / "MATCHUP.XYMEEE")
 
 
-def test_stage10_red_flags_without_product(tmp_path, monkeypatch):
+def test_stage10_unavailable_without_product(tmp_path, monkeypatch):
     monkeypatch.setitem(D._JWST1PASS_ROOTS, "brick", str(tmp_path))
     monkeypatch.delenv("QA_JWST1PASS_DIR", raising=False)
     png, m = D.stage10_photometric_consistency(_obs(field="brick", filt="F182M"), "F182M", None)
-    assert m["red_flag"] and m["passed"] is False
-    assert "MATCHUP" in m["red_flag_reason"] or "no JWST1PASS" in m["red_flag_reason"]
+    assert m.get("available") is False and m.get("passed") is None and not m.get("red_flag")
+    assert "no JWST1PASS" in m["na_reason"]
     cap = D.caption_for(10, m)
-    assert "RED FLAG" in cap and "measurement could not be made" in cap
+    assert "pending" in cap and "not yet on disk" in cap
 
 
 def test_stage10_measures_consistency(tmp_path, monkeypatch):
@@ -2617,12 +2933,12 @@ def test_effective_psf_excludes_saturated_via_dq(tmp_path):
     assert stamp is None and n < 10                                  # saturated cores all dropped
 
 
-def test_stage11_red_flags_without_peppar(tmp_path, monkeypatch):
+def test_stage11_unavailable_without_peppar(tmp_path, monkeypatch):
     monkeypatch.setitem(D._PEPPAR_ROOTS, "brick", str(tmp_path))
     png, m = D.stage11_effective_psf(_obs(field="brick", filt="F212N"), "F212N", None)
-    assert m["red_flag"] and m["passed"] is False
-    assert "no peppar" in m["red_flag_reason"]
-    assert "RED FLAG" in D.caption_for(11, m)
+    assert m.get("available") is False and m.get("passed") is None and not m.get("red_flag")
+    assert "no peppar" in m["na_reason"]
+    assert "pending" in D.caption_for(11, m)
 
 
 def _write_o_frames(det_dir, prog, obs, qfits):
@@ -2824,6 +3140,83 @@ def test_clipped_locus_fit_refuses_a_clip_that_strips_its_own_support(monkeypatc
     assert n_locus == n_unclipped == 34                  # nothing was thrown away
 
 
+# ------------------------------------------------------- split per-observation reduction trees
+def _split_field_tree(tmp_path):
+    """A field whose observations were split into per-observation reduction trees, HALF migrated:
+    the frames and the per-obs catalogues moved to ``gc2211_o023``, the mosaic and the pooled
+    five-pointing catalogue stayed under ``gc2211`` (the real gc2211 layout)."""
+    base = tmp_path / "gc2211"
+    (base / "catalogs").mkdir(parents=True)
+    (base / "images-merged").mkdir(parents=True)
+    (base / "offsets").mkdir(parents=True)
+    _touch(base / "catalogs", "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7.fits")
+    _touch(base / "images-merged", "jw02211-o023_t001_nircam_clear-f200w-merged_i2d.fits")
+    _touch(base / "offsets", "Offsets_JWST_gc2211_VIRAC2locked.csv")
+
+    split = tmp_path / "gc2211_o023"
+    (split / "catalogs").mkdir(parents=True)
+    (split / "F200W").mkdir(parents=True)
+    _touch(split / "catalogs",
+           "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7_o023.fits")
+    _touch(split / "catalogs", "gaia_virac2_refcat_epoch2023.71.fits")
+    for det in ("nrca1", "nrcb1"):
+        _touch(split / "F200W", f"f200w_{det}_o023_visit001_exp1_m3_daophot_basic.fits")
+    return base, split
+
+
+def test_split_field_reads_the_per_observation_tree_and_the_base_field(tmp_path, monkeypatch):
+    """A half-migrated field must resolve products from BOTH trees.
+
+    Before this, the field name alone was the path: the five gc2211 observations found the pooled
+    catalogue and zero per-exposure catalogues, and all reported the same stage 2/3/4 numbers
+    (#94, #119).
+    """
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    base, split = _split_field_tree(tmp_path)
+    o = _obs(field="gc2211", obs="023")
+
+    assert D._field_roots(o) == [str(split), str(base)]
+    # the per-exposure catalogues live ONLY in the split tree
+    got = D._daophot_glob(o, "F200W")
+    assert len(got) == 2 and all(str(split) in g for g in got)
+    # the mosaic lives ONLY in the base field
+    assert D._mosaic_path(o, "F200W") == str(base / "images-merged" /
+                                             "jw02211-o023_t001_nircam_clear-f200w-merged_i2d.fits")
+    # this observation's own catalogue wins over the pooled multi-pointing one
+    cands = [os.path.basename(p) for p, _k, _t, _m in D._catalog_candidates(o)]
+    assert "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7_o023.fits" in cands
+    # the POOLED five-pointing catalogue is out: it is not this observation's
+    assert "basic_merged_indivexp_photometry_tables_merged_resbgsub_m7.fits" not in cands
+    # the split tree's untokened refcat is this obs's by location
+    assert D._refcat_path(o) == str(split / "catalogs" / "gaia_virac2_refcat_epoch2023.71.fits")
+
+
+def test_split_field_peppar_cal_resolves_into_the_sibling_tree(tmp_path, monkeypatch):
+    """peppar catalogues stay in the base field while their cal frames move; stage 11 and the
+    peppar half of stage 6 go blank unless the sibling split tree is searched."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    base, split = _split_field_tree(tmp_path)
+    pdir = base / "peppar" / "F200W" / "NRCA1"
+    pdir.mkdir(parents=True)
+    cat = pdir / "jw02211023001_02101_00001_nrca1_cal_gc2211_iter1_cat.fits"
+    _touch(pdir, cat.name)
+    (split / "F200W" / "pipeline").mkdir(parents=True)
+    _touch(split / "F200W" / "pipeline", "jw02211023001_02101_00001_nrca1_cal.fits")
+
+    assert D._peppar_cal_for_cat(str(cat)) == str(
+        split / "F200W" / "pipeline" / "jw02211023001_02101_00001_nrca1_cal.fits")
+
+
+def test_field_without_a_split_tree_is_unchanged(tmp_path, monkeypatch):
+    """One root, the old behaviour: no field without a ``<field>_o<obs>`` directory moves."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    d = tmp_path / "brick" / "F212N"; d.mkdir(parents=True)
+    _touch(d, "f212n_nrca1_visit001_exp1_m3_daophot_basic.fits")
+    o = _obs(field="brick", obs="001", filt="F212N")
+    assert D._field_roots(o) == [str(tmp_path / "brick")]
+    assert len(D._daophot_glob(o, "F212N")) == 1
+
+
 # --------------------------------------------------------------------------- _ab_overlap
 def _ab_module_catalogs(true_dra_mas, true_ddec_mas, n=800, seed=95):
     """Two module catalogues of the SAME stars, A displaced from B by a known offset.
@@ -2897,3 +3290,673 @@ def test_ab_overlap_keeps_the_raw_peak_when_too_few_pairs_to_refine(monkeypatch)
     assert ov is not None
     assert ov["bulk_source"] == "histogram"
     assert ov["off"] == ov["peak_off"]
+
+
+# --------------------------------------------------------------- product globs (issue #163)
+def _miri_obs(field="brick", program="2221", obs="001", filts=("F770W",)):
+    return Observation(program=program, obs=obs, target="T", release_field=field,
+                       instrument="MIRI", filters=list(filts), visits=[], epoch="", notes="")
+
+
+def test_download_root_follows_the_monitor_declaration(monkeypatch):
+    """The QA download root is READ OFF `mast_monitor.DEFAULT_DOWNLOAD_DIR`, not restated.
+
+    Restating it (`f"{BASE}/ops/downloads"`) makes the two declarations able to drift, which is
+    exactly how QA stopped seeing auto-downloaded products (#163) -- and a pin that compares a
+    restatement to the constant is green under the default even after the constant moves.  So
+    MOVE the constant and require the QA root to follow it."""
+    from data_qa import mast_monitor
+    monkeypatch.delenv("QA_DOWNLOAD_DIR", raising=False)
+    monkeypatch.setattr(D, "BASE", "/orange/adamginsburg/jwst")     # the default QA_BASE
+    assert D._download_root() == mast_monitor.DEFAULT_DOWNLOAD_DIR
+
+    monkeypatch.setattr(mast_monitor, "DEFAULT_DOWNLOAD_DIR",
+                        "/orange/adamginsburg/jwst/ops/downloads2")
+    assert D._download_root() == "/orange/adamginsburg/jwst/ops/downloads2"
+    # ... and it is still re-rooted onto a moved BASE, so a tmp_path test tree lines up
+    monkeypatch.setattr(D, "BASE", "/tmp/qa")
+    assert D._download_root() == "/tmp/qa/ops/downloads2"
+    # a monitor downloading OUTSIDE the QA base is taken literally, not spliced onto BASE
+    monkeypatch.setattr(mast_monitor, "DEFAULT_DOWNLOAD_DIR", "/scratch/dl")
+    assert D._download_root() == "/scratch/dl"
+    # an explicit --download-dir run overrides both
+    monkeypatch.setenv("QA_DOWNLOAD_DIR", "/elsewhere/dl")
+    assert D._download_root() == "/elsewhere/dl"
+
+
+def test_mast_globs_reach_the_monitor_download_tree(tmp_path, monkeypatch):
+    """A product the monitor downloaded lands in `<BASE>/ops/downloads/mastDownload/JWST/...`,
+    one level below the `{BASE}/*/mastDownload` wildcard, so no MAST-side stage could see it."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    (tmp_path / "gc-treasury").mkdir()                    # field tree exists but holds nothing
+    sub = (tmp_path / "ops" / "downloads" / "mastDownload" / "JWST"
+           / "jw10678-o088_t001_nircam_clear-f212n")
+    sub.mkdir(parents=True)
+    _touch(sub, "jw10678-o088_t001_nircam_clear-f212n_i2d.fits")
+    _touch(sub, "jw10678-o088_t001_nircam_clear-f212n_cat.fits")
+    o = Observation(program="10678", obs="088", target="GC Treasury",
+                    release_field="gc-treasury", instrument="NIRCam", filters=["F212N"],
+                    visits=[], epoch="", notes="")
+    got = D._mast_i2d(o, "F212N")
+    assert got is not None and got.endswith("clear-f212n_i2d.fits")
+    cat = D._mast_l3_catalog(o, "F212N", allow_download=False)
+    assert cat is not None and cat.endswith("clear-f212n_cat.fits")
+
+    # MIRI parallel of the same tile, downloaded into the same tree
+    msub = (tmp_path / "ops" / "downloads" / "mastDownload" / "JWST"
+            / "jw10678-o088_t001_miri_f770w")
+    msub.mkdir(parents=True)
+    _touch(msub, "jw10678-o088_t001_miri_f770w_i2d.fits")
+    mo = _miri_obs(field="gc-treasury", program="10678", obs="088")
+    assert D._miri_i2d(mo, "F770W").endswith("jw10678-o088_t001_miri_f770w_i2d.fits")
+
+
+def test_download_tree_cannot_pull_in_another_observation(tmp_path, monkeypatch):
+    """The download tree is field-less and holds every program the monitor fetched, so the added
+    root must stay pinned to this obsid -- a sibling obs's mosaic in the same tree is not a hit."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    sub = tmp_path / "ops" / "downloads" / "mastDownload" / "JWST" / "other"
+    sub.mkdir(parents=True)
+    _touch(sub, "jw10678-o089_t001_nircam_clear-f212n_i2d.fits")     # a DIFFERENT observation
+    o = Observation(program="10678", obs="088", target="GC Treasury",
+                    release_field="gc-treasury", instrument="NIRCam", filters=["F212N"],
+                    visits=[], epoch="", notes="")
+    assert D._mast_i2d(o, "F212N") is None
+
+
+def test_miri_i2d_finds_the_locally_reduced_mosaic(tmp_path, monkeypatch):
+    """A treasury F770W tile reduced into `<field>/F770W/pipeline/` with no MAST copy anywhere:
+    the MIRI stage globbed mastDownload only, so it red-flagged 'no MIRI i2d on disk'."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "gc-treasury" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw10678-o088_t003_miri_f770w_i2d.fits")            # non-t001 tile token
+    o = _miri_obs(field="gc-treasury", program="10678", obs="088")
+    got = D._miri_i2d(o, "F770W")
+    assert got is not None and got.endswith("jw10678-o088_t003_miri_f770w_i2d.fits")
+    assert D._miri_i2d(o, "F1130W") is None            # a filter with no product stays None
+
+
+def test_miri_i2d_reduced_layout_skips_outlier_and_residual_products(tmp_path, monkeypatch):
+    """`<FILT>/pipeline/` also holds outlier-detection intermediates and photometry model/
+    residual mosaics.  `..._f770w_0_o002_outlier_i2d.fits` sorts BEFORE `..._f770w_i2d.fits`,
+    so a trailing wildcard would hand the MIRI stage an intermediate as the science mosaic."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "w51" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    for name in ("jw06151-o002_t001_miri_f770w_0_o002_outlier_i2d.fits",
+                 "jw06151-o002_t001_miri_f770w_15_o002_outlier_i2d.fits",
+                 "jw06151-o002_t001_miri_clear-f770w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_i2d.fits",
+                 "jw06151-o002_t001_miri_f770w_i2d.fits"):
+        _touch(pipe, name)
+    o = _miri_obs(field="w51", program="6151", obs="002")
+    got = D._miri_i2d(o, "F770W")
+    assert os.path.basename(got) == "jw06151-o002_t001_miri_f770w_i2d.fits"
+    stem = D._MIRI_REDUCED_STEMS[0].format(obsid=o.obsid, filt="f770w")
+    assert [os.path.basename(q) for q in sorted(glob.glob(f"{pipe}/{stem}"))] == \
+        ["jw06151-o002_t001_miri_f770w_i2d.fits"]
+
+
+def test_miri_i2d_prefers_the_mast_delivery_over_the_reduced_mosaic(tmp_path, monkeypatch):
+    """The reduced layout is a FALLBACK: where a MAST copy exists it still wins, so no
+    observation that resolves today resolves to a different file."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    md = tmp_path / "brick" / "mastDownload"; md.mkdir(parents=True)
+    _touch(md, "jw02221-o001_t001_miri_f770w_i2d.fits")
+    pipe = tmp_path / "brick" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw02221-o001_t001_miri_f770w_i2d.fits")
+    got = D._miri_i2d(_miri_obs(field="brick"), "F770W")
+    assert "/mastDownload/" in got
+
+
+def test_miri_obs_from_disk_reads_the_reduced_layout(tmp_path, monkeypatch):
+    """Portal-independent MIRI discovery: a locally-reduced tile with no MAST copy."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    for filt in ("F770W", "F1130W"):
+        pipe = tmp_path / "sickle" / filt / "pipeline"; pipe.mkdir(parents=True)
+        _touch(pipe, f"jw03958-o002_t001_miri_{filt.lower()}_i2d.fits")
+        _touch(pipe, f"jw03958-o002_t001_miri_{filt.lower()}_4_o002_outlier_i2d.fits")
+    o = D._miri_obs_from_disk("3958", "002", base=str(tmp_path))
+    assert o is not None and o.instrument == "MIRI"
+    assert o.release_field == "sickle"
+    assert o.filters == ["F1130W", "F770W"]          # the outlier intermediates add no filter
+
+
+def test_miri_obs_from_disk_skips_a_field_with_only_byproducts(tmp_path, monkeypatch):
+    """A field dir holding only outlier/model/residual mosaics for this obsid must not claim the
+    observation: it would return an Observation with no filters and mask the real field.
+
+    Widening the filter regex to also read the cataloging `_data_i2d` stem (#166 review) must not
+    widen it to the model/residual mosaics that sit beside it under the SAME `clear-<filt>-
+    mirimage_` prefix -- so the decoy dir carries one of each."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    junk = tmp_path / "aaa_scratch" / "F770W" / "pipeline"; junk.mkdir(parents=True)
+    for name in ("jw03958-o002_t001_miri_f770w_3_o002_outlier_i2d.fits",
+                 "jw03958-o002_t001_miri_clear-f770w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_model_i2d.fits",
+                 "jw03958-o002_t001_miri_clear-f770w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_i2d.fits",
+                 "jw03958-o002_t001_miri_clear-f770w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_smoothed_bg_i2d.fits"):
+        _touch(junk, name)
+    assert D._miri_filters(sorted(junk.glob("*.fits"))) == []
+    pipe = tmp_path / "sickle" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw03958-o002_t001_miri_f770w_i2d.fits")
+    o = D._miri_obs_from_disk("3958", "002", base=str(tmp_path))
+    assert o is not None and o.release_field == "sickle" and o.filters == ["F770W"]
+
+
+def test_miri_i2d_finds_the_cataloging_data_mosaic(tmp_path, monkeypatch):
+    """Some observations have ONLY the cataloging stage's `_data_i2d` resample under
+    `<FILT>/pipeline/` -- sgrb2 `jw05365-o002` F2550W on disk today has no plain
+    `jw05365-o002_t001_miri_f2550w_i2d.fits`.  Matching only the reduction stem left it
+    unreachable (#166 review B2)."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "sgrb2" / "F2550W" / "pipeline"; pipe.mkdir(parents=True)
+    for name in ("jw05365-o002_t001_miri_clear-f2550w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_model_i2d.fits",
+                 "jw05365-o002_t001_miri_clear-f2550w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_i2d.fits",
+                 "jw05365-o002_t001_miri_clear-f2550w-mirimage_group_m3_"
+                 "daophot_basic_mergedcat_residual_smoothed_bg_i2d.fits",
+                 "jw05365-o002_t001_miri_clear-f2550w-mirimage_data_i2d.fits"):
+        _touch(pipe, name)
+    o = _miri_obs(field="sgrb2", program="5365", obs="002", filts=("F2550W",))
+    got = D._miri_i2d(o, "F2550W")
+    assert os.path.basename(got) == \
+        "jw05365-o002_t001_miri_clear-f2550w-mirimage_data_i2d.fits"
+    # EXACTNESS, not sort-luck: `_data_i2d` admits exactly one of the four real names above, so
+    # a by-product cannot become the science mosaic by happening to sort ahead of it.  (Today
+    # `data` < `group_` < `resbgsub_` lexically, so a loose `*<filt>*_i2d.fits` would return the
+    # right file anyway -- and would stop doing so the day a mosaic sorts before `data`.)
+    stem = D._MIRI_REDUCED_STEMS[1].format(obsid=o.obsid, filt="f2550w")
+    assert [os.path.basename(q) for q in sorted(glob.glob(f"{pipe}/{stem}"))] == \
+        ["jw05365-o002_t001_miri_clear-f2550w-mirimage_data_i2d.fits"]
+    # ... and it is a FALLBACK: where the reduction's own stage-3 mosaic is there too, it wins
+    _touch(pipe, "jw05365-o002_t001_miri_f2550w_i2d.fits")
+    assert os.path.basename(D._miri_i2d(o, "F2550W")) == \
+        "jw05365-o002_t001_miri_f2550w_i2d.fits"
+    # the `_data` stem also declares its filter to `_miri_obs_from_disk`
+    os.remove(os.path.join(str(pipe), "jw05365-o002_t001_miri_f2550w_i2d.fits"))
+    disk = D._miri_obs_from_disk("5365", "002", base=str(tmp_path))
+    assert disk is not None and disk.release_field == "sgrb2" and disk.filters == ["F2550W"]
+
+
+def test_miri_panel_title_names_the_image_it_shows(tmp_path, monkeypatch):
+    """The panel title was hardcoded `MIRI <filt> MAST i2d`, so on the locally-reduced fallback
+    the PNG a human opens labelled our own mosaic a MAST delivery (#166 review B1)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from astropy.io import fits
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setattr(D, "_spitzer_for_miri", lambda f: None)
+    monkeypatch.setattr(D, "_saturation_mask", lambda o: None)
+    titles = []
+
+    def _grab(fig, name):
+        titles.append(fig.axes[0].get_title()); plt.close(fig); return name
+    monkeypatch.setattr(D, "_save", _grab)
+
+    def _make(path):
+        hdu = fits.HDUList([fits.PrimaryHDU(),
+                            fits.ImageHDU(np.arange(64, dtype="float32").reshape(8, 8),
+                                          name="SCI")])
+        hdu[1].header.update(dict(CTYPE1="RA---TAN", CTYPE2="DEC--TAN", CRPIX1=4, CRPIX2=4,
+                                  CRVAL1=266.0, CRVAL2=-28.9, CDELT1=-3e-5, CDELT2=3e-5))
+        hdu.writeto(path, overwrite=True)
+
+    o = _miri_obs(field="w51", program="6151", obs="002")
+    pipe = tmp_path / "w51" / "F770W" / "pipeline"; pipe.mkdir(parents=True)
+    _make(str(pipe / "jw06151-o002_t001_miri_f770w_i2d.fits"))
+    _png, m = D.miri_overview(o)
+    assert m["i2d_source"] == "reduced"
+    assert titles[-1] == "MIRI F770W reduced i2d"
+    assert "MAST" not in titles[-1]
+
+    md = tmp_path / "w51" / "mastDownload" / "JWST" / "p"; md.mkdir(parents=True)
+    _make(str(md / "jw06151-o002_t001_miri_f770w_i2d.fits"))
+    _png, m = D.miri_overview(o)
+    assert m["i2d_source"] == "mast"
+    assert titles[-1] == "MIRI F770W MAST i2d"
+
+
+def test_miri_caption_never_guesses_a_provenance():
+    """A metrics JSON written before #163 carries no `i2d_source`, and the no-image red-flag path
+    records none either -- the caption must not then assert one."""
+    cap = D._miri_caption(dict(filt="F770W"), "JWST-GC/data-qa")
+    assert "i2d image" in cap and "MAST" not in cap and "Reduced" not in cap
+
+
+def test_miri_obs_from_disk_reads_the_monitor_download_tree(tmp_path, monkeypatch):
+    """A tile the monitor auto-downloaded that no field tree has a copy of.  The tree is
+    field-less, so `release_field` comes from the monitor's own program->field map -- without it
+    `_run_miri` reports "portal + on-disk empty" and the observation gets no MIRI stage at all
+    (#166 review, non-blocking 3)."""
+    from data_qa import mast_monitor
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.delenv("QA_DOWNLOAD_DIR", raising=False)
+    monkeypatch.setattr(mast_monitor, "DEFAULT_DOWNLOAD_DIR",
+                        "/orange/adamginsburg/jwst/ops/downloads")
+    (tmp_path / "gc-treasury").mkdir()                    # field tree exists but holds nothing
+    sub = (tmp_path / "ops" / "downloads" / "mastDownload" / "JWST"
+           / "jw10678-o088_t001_miri_f770w")
+    sub.mkdir(parents=True)
+    _touch(sub, "jw10678-o088_t001_miri_f770w_i2d.fits")
+    o = D._miri_obs_from_disk("10678", "088", base=str(tmp_path))
+    assert o is not None and o.instrument == "MIRI" and o.filters == ["F770W"]
+    assert o.release_field == mast_monitor.field_for(10678, "088") == "gc-treasury"
+
+    # a program the monitor has no field for is NOT guessed at -- no Observation, no wrong field
+    assert mast_monitor.field_for(99999, "001") == ""
+    assert D._miri_obs_from_disk("99999", "001", base=str(tmp_path)) is None
+
+
+def test_obs_from_disk_builds_nircam_from_mast_when_no_mosaic(tmp_path, monkeypatch):
+    """A delivered tile whose reduce is held has no merged mosaic of ours yet, so the mosaic pass
+    finds nothing.  The MAST-only pass then builds the NIRCam observation from the MAST-delivered
+    i2d, so the tile still gets a QA issue (JWST-GC/data-qa#161)."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    for filt in ("f212n", "f480m"):
+        sub = (tmp_path / "gc-treasury" / "mastDownload" / "JWST"
+               / f"jw10678-o113_t113_nircam_clear-{filt}")
+        sub.mkdir(parents=True)
+        _touch(sub, f"jw10678-o113_t113_nircam_clear-{filt}_i2d.fits")
+    o = D._obs_from_disk("10678", "113", base=str(tmp_path))
+    assert o is not None and o.instrument == "NIRCam"
+    assert o.release_field == "gc-treasury"
+    assert o.filters == ["F212N", "F480M"]
+    assert o.issue_title == "GC Treasury — jw10678-o113 (NIRCam)"
+
+
+def test_obs_from_disk_prefers_our_mosaic_over_mast(tmp_path, monkeypatch):
+    """When our own merged mosaic exists the mosaic pass wins, so a reduced tile keeps its previous
+    behaviour and the MAST-only pass never overrides it."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    pipe = tmp_path / "gc-treasury" / "F212N" / "pipeline"; pipe.mkdir(parents=True)
+    _touch(pipe, "jw10678-o137_t001_nircam_clear-f212n-merged_i2d.fits")
+    mast = (tmp_path / "gc-treasury" / "mastDownload" / "JWST"
+            / "jw10678-o137_t137_nircam_clear-f480m"); mast.mkdir(parents=True)
+    _touch(mast, "jw10678-o137_t137_nircam_clear-f480m_i2d.fits")
+    o = D._obs_from_disk("10678", "137", base=str(tmp_path))
+    assert o is not None and o.filters == ["F212N"]      # from the mosaic pass, not the MAST i2d
+
+
+def test_mast_lookups_reach_a_split_field_tree(tmp_path, monkeypatch):
+    """`_mast_source_catalog`, `_mast_catalog_positions`, `_mast_i2d` and `_saturation_mask` used
+    a literal `{BASE}/{o.field}`, so on a split field (`<field>_o<obs>`, issue #119) they saw only
+    the one tree the registry names.  They go through `_field_roots` now, like every other
+    lookup, so the split tree and the base field are both reachable."""
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    (tmp_path / "gc2211_o023").mkdir()                   # the split tree: frames went here
+    md = (tmp_path / "gc2211" / "mastDownload" / "JWST"      # the MAST copy stayed in the base
+          / "jw02211-o023_t001_nircam_clear-f200w")
+    md.mkdir(parents=True)
+    _touch(md, "jw02211-o023_t001_nircam_clear-f200w_i2d.fits")
+    _touch(md, "jw02211-o023_t001_nircam_clear-f200w_cat.ecsv")
+    o = Observation(program="2211", obs="023", target="T", release_field="gc2211_o023",
+                    instrument="NIRCam", filters=["F200W"], visits=[], epoch="", notes="")
+    assert D._field_roots(o)[0].endswith("gc2211_o023")
+    assert D._mast_i2d(o, "F200W").endswith("clear-f200w_i2d.fits")
+    assert D._mast_source_catalog(o, "F200W").endswith("clear-f200w_cat.ecsv")
+# --------------------------------------------------------------------------- STAGE 12 linearity
+def test_linearity_fit_flat_is_zero_slope():
+    # a constant aperture-minus-PSF offset across brightness = a linear response: ~zero slope, no
+    # bright turn-over, baseline at the constant offset.
+    rng = np.random.default_rng(0)
+    m = np.repeat(np.arange(15.0, 21.0, 0.5), 20)
+    dmag = 0.40 + rng.normal(0, 0.002, size=m.size)
+    fit = D._linearity_fit(m, dmag)
+    assert fit is not None
+    assert abs(fit["slope"]) < 0.01
+    assert fit["turnover"] is None
+    assert abs(fit["baseline"] - 0.40) < 0.02
+
+
+def test_linearity_fit_detects_bright_turnover():
+    # flat at the faint end, departing at the bright end (a saturation roll-over): the turn-over is
+    # detected on the bright side and the linear-range slope stays small.
+    rng = np.random.default_rng(1)
+    centres = np.arange(15.0, 21.0, 0.5)
+    parts_m, parts_d = [], []
+    for c in centres:
+        base = 0.40 if c >= 17.0 else 0.40 + (17.0 - c) * 0.15   # rises going bright
+        parts_m.append(np.full(20, c))
+        parts_d.append(base + rng.normal(0, 0.002, size=20))
+    m = np.concatenate(parts_m); dmag = np.concatenate(parts_d)
+    fit = D._linearity_fit(m, dmag)
+    assert fit is not None
+    assert fit["turnover"] is not None
+    assert 16.0 < fit["turnover"] < 17.5          # departure begins around m ~ 16.8
+    assert abs(fit["slope"]) < 0.02               # faint (linear) range is flat
+
+
+def test_linearity_fit_recovers_injected_slope_and_trips_flag():
+    # A KNOWN linear trend must be recovered (would fail if the slope were hardcoded to 0), and a
+    # slope beyond _LIN_SLOPE_FLAG must set the flag path -- the flag's only exercise.
+    rng = np.random.default_rng(2)
+    m = np.repeat(np.arange(15.0, 21.0, 0.5), 30)
+    for s, expect_flag in [(0.005, False), (0.050, True)]:
+        dmag = 0.40 + s * (m - 18.0) + rng.normal(0, 0.002, size=m.size)
+        fit = D._linearity_fit(m, dmag)
+        assert fit is not None and fit["slope"] is not None
+        assert abs(fit["slope"] - s) < 5 * fit["slope_err"]        # trend recovered
+        assert abs(fit["slope"] - s) < 0.01                        # and quantitatively close
+        assert (abs(fit["slope"]) > D._LIN_SLOPE_FLAG) is expect_flag
+
+
+def test_linearity_fit_no_turnover_on_pure_trend():
+    # A pure global slope with NO saturation feature must NOT report a turn-over: the turn-over is
+    # measured against the fitted trend, so a constant slope alone does not trip it.
+    rng = np.random.default_rng(3)
+    m = np.repeat(np.arange(15.0, 21.0, 0.5), 30)
+    dmag = 0.40 + 0.05 * (m - 18.0) + rng.normal(0, 0.002, size=m.size)
+    fit = D._linearity_fit(m, dmag)
+    assert fit is not None
+    assert fit["turnover"] is None
+    assert abs(fit["slope"] - 0.05) < 0.01        # the slope still measures the real trend
+
+
+def _synth_mosaic(tmp_path, name="m.fits", nstars=100):
+    """A WCS mosaic with a grid of well-separated Gaussians spanning a range of fluxes; returns
+    (path, SkyCoord positions, flux array)."""
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
+    ny = nx = 520
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    g = np.linspace(40, nx - 40, 10)
+    XX, YY = np.meshgrid(g, g)
+    xs = XX.ravel(); ys = YY.ravel()
+    flux = np.geomspace(3e3, 3e5, len(xs)); sig = 1.5
+    img = np.zeros((ny, nx), "float32")
+    for xi, yi, f in zip(xs, ys, flux):
+        img += (f / (2 * np.pi * sig ** 2)) * np.exp(-((xx - xi) ** 2 + (yy - yi) ** 2) / (2 * sig ** 2))
+    w = WCS(naxis=2)
+    w.wcs.crpix = [nx / 2, ny / 2]; w.wcs.cdelt = [-1 / 3600.0, 1 / 3600.0]
+    w.wcs.crval = [266.4, -28.7]; w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    mp = str(tmp_path / name)
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.ImageHDU(img, header=w.to_header(), name="SCI")]).writeto(mp)
+    sc = w.pixel_to_world(xs, ys); sc = SkyCoord(sc.ra, sc.dec)
+    return mp, sc, flux
+
+
+def test_stage12_end_to_end_synthetic(tmp_path, monkeypatch):
+    pytest.importorskip("photutils"); pytest.importorskip("scipy")
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path))
+    mp, sc, flux = _synth_mosaic(tmp_path)
+    monkeypatch.setattr(D, "_psf_flux_positions", lambda o, f: (sc, flux.copy(), "synth.fits"))
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: mp)
+    o = Observation(program="1182", obs="004", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N", "F444W"], visits=[], epoch="", notes="")
+    png, m = D.stage12_photometric_linearity(o, "F212N", "F444W")
+    assert not m.get("red_flag")
+    assert m["primary_filter"] == "F212N"
+    assert set(m["filters_measured"]) == {"F212N", "F444W"}
+    # a constant Gaussian shape at every brightness -> the aperture misses the same fraction ->
+    # flat aper-minus-PSF -> ~zero linearity slope
+    assert abs(m["per_filter"]["F212N"]["slope"]) < 0.03
+    # one plot shown by default (primary) + the rest hidden in extra_figures
+    assert [f for f, _ in m["extra_figures"]] == ["F444W"]
+    assert os.path.exists(png)
+    for _f, p in m["extra_figures"]:
+        assert os.path.exists(p)
+
+
+def test_caption_stage12_table_and_primary():
+    m = dict(stage=12, sw="F212N", primary_filter="F212N",
+             filters_measured=["F212N", "F405N"],
+             per_filter={
+                 "F212N": dict(slope=0.006, slope_err=0.004, turnover_mag=15.5,
+                               aper_corr=0.42, n=1800, flagged=False),
+                 "F405N": dict(slope=0.031, slope_err=0.005, turnover_mag=14.0,
+                               aper_corr=0.55, n=900, flagged=True),
+             },
+             slope=0.006, slope_err=0.004, turnover_mag=15.5, aper_corr=0.42, n_isolated=1800,
+             n_flagged=1)
+    cap = D.caption_for(12, m)
+    assert "DOCROOT" not in cap and "qa_methods.md#stage12" in cap
+    assert "photometric linearity" in cap
+    assert "| filter |" in cap                       # per-filter table present
+    assert "F405N" in cap and "🚩" in cap            # flagged filter marked
+    assert "+0.006" in cap                           # primary slope reported
+    assert "expandable block" in cap                 # says the rest are hidden
+
+
+def test_details_block_embeds_extra(monkeypatch):
+    from data_qa import post_diagnostics as P
+    monkeypatch.setattr(P, "upload_asset",
+                        lambda repo, token, path, name: f"https://cdn/{name}")
+    o = Observation(program="1182", obs="004", target="Brick", release_field="brick",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    block = P._details_block("JWST-GC/data-qa", "tok", o, 12,
+                             [("F405N", f"/tmp/{o.obsid}_stage12_F405N.png"),
+                              ("F444W", f"/tmp/{o.obsid}_stage12_F444W.png")])
+    assert "<details>" in block and "</details>" in block
+    assert "Other 2 figure(s): F405N, F444W" in block
+    assert "**F405N**" in block and "**F444W**" in block
+    assert f"{o.obsid}_stage12_F405N.png" in block          # asset name = the png basename
+
+
+def test_details_block_asset_name_is_url_safe_with_spaced_label(monkeypatch):
+    """The asset name (release-asset URL path) must not carry spaces/parens from a free-text label
+    — GitHub rejects control characters in the path (stage 3's 'jicama-m8 vs VIRAC (calibration)')."""
+    from data_qa import post_diagnostics as P
+    seen = []
+    monkeypatch.setattr(P, "upload_asset",
+                        lambda repo, token, path, name: seen.append(name) or f"https://cdn/{name}")
+    o = Observation(program="10678", obs="132", target="GC Treasury", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    block = P._details_block("JWST-GC/data-qa", "tok", o, 3,
+                             [("jicama-m8 vs VIRAC (calibration)",
+                               f"/tmp/{o.obsid}_stage3_our.png")])
+    assert seen == [f"{o.obsid}_stage3_our.png"]           # basename, not the label
+    assert " " not in seen[0] and "(" not in seen[0]
+    assert "**jicama-m8 vs VIRAC (calibration)**" in block  # label still the visible caption
+
+
+# --------------------------------------------------------------------------- pagination robustness
+def _fake_req(script):
+    """Return a stand-in for post_diagnostics._req that yields (200, data, {'Link': link}) for each
+    scripted (data, link) in order, so pagination can be exercised without the network."""
+    calls = {"n": 0}
+
+    def fake(method, url, token, data=None, headers=None, raw=False, want_headers=False):
+        d, link = script[min(calls["n"], len(script) - 1)]
+        calls["n"] += 1
+        return (200, d, {"Link": link}) if want_headers else (200, d)
+    return fake, calls
+
+
+def test_paged_get_follows_next_cursor(monkeypatch):
+    from data_qa import post_diagnostics as P
+    page1 = [{"number": i} for i in range(100)]
+    page2 = [{"number": 100 + i} for i in range(30)]
+    nxt = '<https://api.github.com/x?page=2&after=cur>; rel="next"'
+    fake, _ = _fake_req([(page1, nxt), (page2, "")])
+    monkeypatch.setattr(P, "_req", fake)
+    monkeypatch.setattr(P.time, "sleep", lambda *a: None)
+    out = P._paged_get("https://api.github.com/x?page={page}", "tok", "test")
+    assert len(out) == 130                         # both pages, cursor followed to the end
+
+
+def test_paged_get_retries_spurious_empty_next_page(monkeypatch):
+    # page 1 advertises a next page; that next page comes back EMPTY once (spurious) then real.
+    from data_qa import post_diagnostics as P
+    page1 = [{"number": i} for i in range(100)]
+    page2 = [{"number": 100 + i} for i in range(20)]
+    nxt = '<https://api.github.com/x?page=2&after=cur>; rel="next"'
+    fake, _ = _fake_req([(page1, nxt), ([], nxt), (page2, "")])   # empty page2 then real page2
+    monkeypatch.setattr(P, "_req", fake)
+    monkeypatch.setattr(P.time, "sleep", lambda *a: None)
+    out = P._paged_get("https://api.github.com/x?page={page}", "tok", "test")
+    assert len(out) == 120                         # the spurious empty did not truncate the listing
+
+
+def test_issue_number_unions_truncated_scans(monkeypatch):
+    # first scan is TRUNCATED (a short page 1, no next, missing the target); a later scan sees it.
+    from data_qa import post_diagnostics as P
+    target = {"number": 1, "state": "open", "title": "Brick — jw02221-o001 (NIRCam)"}
+    truncated = [{"number": 9, "state": "open", "title": "something else"}]
+    full = truncated + [target]
+    seq = {"n": 0}
+
+    def fake_paged(url, token, what):
+        seq["n"] += 1
+        return truncated if seq["n"] == 1 else full
+    monkeypatch.setattr(P, "_paged_get", fake_paged)
+    n = P._issue_number("JWST-GC/data-qa", "tok", "Brick — jw02221-o001 (NIRCam)")
+    assert n == 1                                   # union across attempts recovered it
+
+
+def test_issue_number_absent_title_returns_none(monkeypatch):
+    from data_qa import post_diagnostics as P
+    monkeypatch.setattr(P, "_paged_get",
+                        lambda url, token, what: [{"number": 9, "state": "open", "title": "x"}])
+    assert P._issue_number("JWST-GC/data-qa", "tok", "NOPE") is None
+
+
+def test_load_reference_reads_refmag(tmp_path):
+    """The Step-0 gaia_virac2 reference catalogue carries its magnitude in `refmag`, not
+    `Ksmag`.  gc-treasury tiles have only this catalogue (no raw VIRAC2 Ksmag cache), so stage 3
+    photometric calibration goes blank ("need VIRAC refcat") unless load_reference reads refmag."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "gaia_virac2_refcat_epoch2026.70_o100.fits"
+    Table({"RA": np.linspace(266.4, 266.6, 5), "DEC": np.linspace(-28.95, -28.85, 5),
+           "refmag": np.array([12.0, 14.0, 16.0, 18.0, 20.0])}).write(p)
+    sc, mag = aa.load_reference(str(p), 2026.7)
+    assert sc is not None
+    assert mag is not None and np.isfinite(mag).all()
+    np.testing.assert_allclose(np.sort(mag), [12.0, 14.0, 16.0, 18.0, 20.0])
+
+
+def test_load_reference_prefers_ksmag_over_refmag(tmp_path):
+    """A raw VIRAC2 cache (reduction fields) carries both a real Ksmag and no refmag; where both a
+    Ksmag and a refmag exist, Ksmag wins so the calibration uses native VIRAC2 Ks."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "virac2.fits"
+    Table({"RAJ2000": np.linspace(266.4, 266.6, 4), "DEJ2000": np.linspace(-28.95, -28.85, 4),
+           "Ksmag": np.array([11.0, 13.0, 15.0, 17.0]),
+           "refmag": np.array([99.0, 99.0, 99.0, 99.0])}).write(p)
+    _, mag = aa.load_reference(str(p), 2026.7)
+    np.testing.assert_allclose(np.sort(mag), [11.0, 13.0, 15.0, 17.0])
+
+
+def test_load_reference_prefers_refmag_over_gaia_g(tmp_path):
+    """The physics half of the ranking: with both a NIR `refmag` and Gaia optical `phot_g_mean_mag`
+    present, refmag must win — choosing G for an F212N zeropoint is the failure the ranking prevents."""
+    from astropy.table import Table
+    from data_qa import astrometry_audit as aa
+    p = tmp_path / "ref.fits"
+    Table({"RA": np.linspace(266.4, 266.6, 4), "DEC": np.linspace(-28.95, -28.85, 4),
+           "refmag": np.array([14.0, 15.0, 16.0, 17.0]),
+           "phot_g_mean_mag": np.array([90.0, 91.0, 92.0, 93.0])}).write(p)
+    _, mag = aa.load_reference(str(p), 2026.7)
+    np.testing.assert_allclose(np.sort(mag), [14.0, 15.0, 16.0, 17.0])
+
+
+def test_stage3_reference_selects_virac2_over_gaia(tmp_path, monkeypatch):
+    """The gaia_virac2 refcat mixes VIRAC2 Ks and Gaia G in one refmag column; stage 3 must take the
+    VIRAC2 (NIR) rows only, else optical G wrecks the slope."""
+    from astropy.table import Table
+    from data_qa.observations import Observation
+    p = tmp_path / "gaia_virac2_refcat_epoch2026.70_o100.fits"
+    Table({"RA": np.linspace(266.40, 266.60, 6), "DEC": np.linspace(-28.95, -28.85, 6),
+           "source": np.array(["VIRAC2", "VIRAC2", "VIRAC2", "GaiaDR3", "GaiaDR3", "VIRAC2"]),
+           "refmag": np.array([14.0, 15.0, 16.0, 20.0, 21.0, np.nan])}).write(p)
+    o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    monkeypatch.setattr(D, "_viraccache_path", lambda o: None)
+    monkeypatch.setattr(D, "_refcat_path", lambda o: str(p))
+    sc, mag = D._stage3_reference(o, 2026.70)
+    np.testing.assert_allclose(np.sort(mag), [14.0, 15.0, 16.0])   # 3 finite VIRAC2 rows only
+    assert len(sc) == 3
+
+
+def _stage3_synth(monkeypatch, our=True):
+    """Synthetic stage-3 inputs.  The reference spans 11-19 mag (STRADDLING the [13,17] fit window,
+    so windowing is actually exercised), and MAST vs our photometry DIFFER (MAST noisy + a slope
+    error, ours clean unit-slope) so the grade-source and windowing assertions can't pass by accident
+    on identical fixtures."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa.observations import Observation
+    rng = np.random.default_rng(0)
+    n = 400
+    ra = 266.4 + rng.uniform(0, 0.02, n); dec = -28.9 + rng.uniform(0, 0.02, n)
+    ks = rng.uniform(11.0, 19.0, n)                 # straddles the [13,17] window
+    ref_sc = SkyCoord(ra * u.deg, dec * u.deg)
+    o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: None)
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2026.70)
+    monkeypatch.setattr(D, "_stage3_reference", lambda o, ep: (ref_sc, ks))
+    # MAST: a wrong slope (0.7) + large scatter -> would FAIL if it were graded
+    monkeypatch.setattr(D, "_mast_calibration_sources",
+                        lambda o, sw: (ref_sc, 0.7 * ks + 5.0 + rng.normal(0, 0.4, n)))
+    # ours: clean unit slope, tight scatter -> passes
+    our_val = ((ref_sc, ks + 3.0 + rng.normal(0, 0.05, n), "jicama-m2") if our
+               else (None, None, None))
+    monkeypatch.setattr(D, "_stage3_our_catalog", lambda o, sw: our_val)
+    return o
+
+
+def test_stage3_mast_primary_our_graded(monkeypatch):
+    o = _stage3_synth(monkeypatch, our=True)
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["primary_source"] == "MAST catalogue"     # MAST is the always-shown primary image
+    assert m["source"] == "jicama-m2"                  # verdict comes from OUR catalogue
+    assert m["passed"] is True                          # graded on OURS (unit slope): pass ...
+    assert not (0.8 < m["mast_slope"] < 1.2)            # ... NOT on MAST (slope 0.7) -> grade-source pinned
+    assert m.get("extra_figures")                       # our catalogue posted as a 2nd image
+    assert m["our_fit_windowed"] is True and m["our_n_fit"] < m["our_n_matched"]  # window applied
+
+
+def test_stage3_mast_only_informational(monkeypatch):
+    o = _stage3_synth(monkeypatch, our=False)
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["available"] is True                       # MAST shown -> stage posts
+    assert m["passed"] is None                          # ungraded, NOT red-flagged
+    assert m["primary_source"] == "MAST catalogue"
+    assert not m.get("extra_figures")                   # nothing graded to add
+
+
+def test_stage7_offset_recovers_true_offset_not_collapsed():
+    """A DEEP catalogue genuinely 60 mas off VIRAC must report ~60, NOT the ~13 a bare same-star
+    tie collapses to at its 0.05" radius.  Builds a dense reference, a JWST copy shifted by 60 mas,
+    plus many spurious deep sources (the pile-up that drives the collapse), and checks the recovered
+    bulk.  This pins the NUMBER (the reviewer's point: monkeypatching same_star_tie only pinned
+    routing)."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    rng = np.random.default_rng(3)
+    n = 4000
+    ra = 266.40 + rng.uniform(0, 0.03, n)
+    dec = -28.90 + rng.uniform(0, 0.03, n)
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.90))
+    jra = ra + 60.0 / 3.6e6 / cosd + rng.normal(0, 0.003 / 3600, n)   # true 60 mas RA offset
+    jdec = dec + rng.normal(0, 0.003 / 3600, n)
+    era = 266.40 + rng.uniform(0, 0.03, 8000)                          # spurious deep sources
+    ede = -28.90 + rng.uniform(0, 0.03, 8000)
+    jsc = SkyCoord(np.concatenate([jra, era]) * u.deg,
+                   np.concatenate([jdec, ede]) * u.deg)
+    out = D._bulk_offset(jsc, ref)
+    assert out is not None
+    assert 50.0 < out[2] < 70.0            # ~60, not the collapsed ~13
+
+
+def test_offset_panel_title_headlines_same_star_not_histogram():
+    """The offset panel must lead with the same-star tie (the authoritative estimator) and demote
+    the per-cell histogram median -- if someone simplifies it back to the histogram the figure would
+    misstate the measurement while the metrics stay correct, and this catches that."""
+    cc = {"n_cells": 12}
+    t = D._offset_panel_title(1.2, "same-star", {"off": 1.2, "npairs": 40}, 14.0, cc, 6.0, "gate 75")
+    lead, second = t.split("\n")[:2]
+    assert "1.2 mas [same-star]" in lead and "same-star pairs" in lead
+    assert "histogram median 14 mas" in second and "histogram median" not in lead
+    # with no same-star tie, the reported (headline) value is the histogram one, labelled as such
+    t2 = D._offset_panel_title(14.0, "histogram", None, 14.0, cc, 6.0, "gate 75")
+    assert "14.0 mas [histogram]" in t2.split("\n")[0]

@@ -1,0 +1,28 @@
+# scrontab entry to sync the "Data-QA field status" GitHub Projects board (view "QA status")
+# from the QA metrics on disk.  Install with:  EDITOR=nano scrontab -e  then paste the block.
+#
+# Runs AFTER data-qa-refresh-issues (which writes data_qa/metrics/*.json), so the board reflects
+# the freshest diagnostics.  It rewrites the script-owned fields only -- Measured, Review status,
+# Stages 1-6, Red flags, Offset (mas) -- and never touches the human-owned Workflow field.
+#
+# TOKEN: sync_project_board.py runs `gh issue list` (needs repo scope), `gh project ...` (needs
+# read:project + project) and resolves the org (needs read:org).  Simplest is ONE classic PAT with
+# all of repo + admin:org (or read:org) + project; put it in GH_TOKEN below.  Alternatively set
+# QA_REPO_TOKEN (repo) and QA_PROJECT_TOKEN (project + read:org) separately.
+#
+#   printf '%s' 'ghp_YOURTOKEN' > ~/.config/data-qa/board_token && chmod 600 ~/.config/data-qa/board_token
+#
+# --allow-missing: the board should reflect reality even while many tiles are not yet QA'd (those
+# read "No metrics" / "In progress"); drop it once metrics exist for every open issue if you want
+# the stale-tree guard back.
+
+#SCRON --qos=astronomy-dept-b
+#SCRON --account=astronomy-dept
+#SCRON --cpus-per-task=1
+#SCRON --mem=4gb
+#SCRON --time=00:30:00
+#SCRON --job-name=data-qa-board-sync
+#SCRON --chdir=/blue/adamginsburg/adamginsburg/repos/data-qa
+#SCRON -o /orange/adamginsburg/jwst/logs/dataqa_board_%j.out
+# min hour dom mon dow  -- 06:40 and 18:40 daily, 40 min after the issue refresh starts
+40 6,18 * * *  PATH=/blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin:$HOME/bin:$PATH GH_TOKEN=$(cat ~/.config/data-qa/board_token) python scripts/sync_project_board.py --apply --allow-missing

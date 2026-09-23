@@ -73,6 +73,107 @@ def _guidestar_block(o: Observation) -> str:
     return "\n".join(lines) + "\n"
 
 
+# JWST-GC Globus guest collection (rooted at /orange/adamginsburg/jwst): its HTTPS data
+# plane serves collection-relative paths, so a released product's download URL is
+# ``_GLOBUS_HTTPS_BASE + <path relative to _GLOBUS_ROOT>``.  Kept in step with
+# scripts/release/stage_release.py in jwst-gc-pipeline.
+_GLOBUS_HTTPS_BASE = "https://g-92a536.55ba.08cc.data.globus.org"
+_GLOBUS_ROOT = "/orange/adamginsburg/jwst"
+_GLOBUS_COLLECTION_ID = "d9873d5e-0fbd-4980-aedf-4ca56f65a045"      # "JWST root" guest collection
+# Globus tutorial native client, used only to mint a short-lived HTTPS token; the same recipe
+# ships in jwst-gc-pipeline scripts/release/make_webpage.py for the public release.
+_GLOBUS_NATIVE_CLIENT = "3b1925c0-a87b-452b-a492-2c9921d3bd14"
+# per-detector and intermediate products that are not the released mosaic + its catalogue
+_GLOBUS_PROD_EXCLUDE = ("outlier", "_model_", "_residual_", "smoothed_bg",
+                        "destreak", "_crf", "_cr_", "segm", "nrca", "nrcb")
+
+# These files are shared with the Treasury team over Globus (a free Globus/ORCID login), NOT a
+# public release, so the HTTPS URLs redirect to Globus auth.  This is the command-line recipe to
+# fetch them with a short-lived bearer token; it is the same per issue (only the URL list varies).
+_GLOBUS_DOWNLOAD_HELP = (
+    "These are pipeline products on the JWST-GC Globus collection (`" + _GLOBUS_COLLECTION_ID
+    + "`), not a public release, so the URLs redirect to Globus auth.  Access is granted per "
+    "field: program 10678 (`gc-treasury`) is shared with the Treasury team group today; other "
+    "fields may need a read rule added first, so a 403 after logging in means \"ask for access\" "
+    "rather than a broken link.  Fetch the files from the command line with a short-lived bearer "
+    "token:\n\n"
+    "```\n"
+    "pip install globus-sdk                 # once\n"
+    "python - <<'PY'                        # opens an ORCID/Globus login; prints a ~48 h token\n"
+    "import globus_sdk\n"
+    'C = "' + _GLOBUS_COLLECTION_ID + '"\n'
+    'cl = globus_sdk.NativeAppAuthClient("' + _GLOBUS_NATIVE_CLIENT + '")\n'
+    'cl.oauth2_start_flow(requested_scopes=f"https://auth.globus.org/scopes/{C}/https")\n'
+    'print("Log in here:", cl.oauth2_get_authorize_url())\n'
+    'tok = cl.oauth2_exchange_code_for_tokens(input("code: ").strip())\n'
+    'print("TOKEN:", tok.by_resource_server[C]["access_token"])\n'
+    "PY\n"
+    "TOKEN=<paste the printed token>\n"
+    'wget --header="Authorization: Bearer $TOKEN" -i urls.txt      # urls.txt = the list below\n'
+    "```\n\n"
+    "Or transfer with the Globus CLI: `globus login`, then `globus transfer "
+    + _GLOBUS_COLLECTION_ID + ":<path> <your-endpoint>:<dest>`."
+)
+
+
+def _globus_products(o: Observation):
+    """``(filter, kind, url)`` for this obs's pipeline i2d + catalogue files, as Globus HTTPS
+    download URLs, from the on-disk pipeline dir.  ``kind`` is ``i2d`` or ``catalog``; one of
+    each per filter, preferring the merged mosaic + merged catalogue and skipping per-detector
+    and intermediate products."""
+    import glob
+    inst = o.instrument.lower()
+    rows = []
+    for f in o.filters:
+        pdir = f"{_GLOBUS_ROOT}/{o.field}/{f}/pipeline"
+        for kind, suffix in (("i2d", "i2d.fits"), ("catalog", "cat.ecsv")):
+            hits = [p for p in glob.glob(f"{pdir}/{o.obsid}*_t001_{inst}_*_{suffix}")
+                    if not any(t in os.path.basename(p).lower() for t in _GLOBUS_PROD_EXCLUDE)]
+            # prefer the merged mosaic, and the plain science i2d over the cataloging
+            # ``_data_i2d`` resample, then shortest name.
+            hits.sort(key=lambda p: ("merged" not in (b := os.path.basename(p).lower()),
+                                     "_data_i2d" in b, len(b), b))
+            if hits:
+                rel = os.path.relpath(hits[0], _GLOBUS_ROOT)
+                rows.append((f, kind, f"{_GLOBUS_HTTPS_BASE}/{rel}"))
+    return rows
+
+
+def _globus_block(o: Observation) -> str:
+    """Markdown block: per-filter i2d + catalogue links on the Globus collection, plus a
+    collapsed command-line recipe (bearer-token ``wget``) and the plain URL list it consumes.
+    The files need a Globus login, so a bare URL is not fetchable without the token."""
+    rows = _globus_products(o)
+    if not rows:
+        return ("### Data files (Globus)\n_No pipeline `i2d`/catalogue on disk yet; this "
+                "section fills in once the observation is reduced._\n\n")
+    by_filt = {}
+    for f, kind, url in rows:
+        by_filt.setdefault(f, {})[kind] = url
+    lines = ["### Data files (Globus)",
+             "Pipeline products for this observation on the JWST-GC Globus collection. Access is "
+             "granted per field (10678/`gc-treasury` is shared with the Treasury team; other fields "
+             "may need a read rule added). See the download recipe below."]
+    for f in o.filters:
+        d = by_filt.get(f)
+        if d:
+            parts = [f"[{k}]({d[k]})" for k in ("i2d", "catalog") if k in d]
+            lines.append(f"- `{f}` — " + " · ".join(parts))
+    urls = "\n".join(url for _, _, url in rows)
+    lines.append("\n<details><summary>Download from the command line</summary>\n\n"
+                 + _GLOBUS_DOWNLOAD_HELP
+                 + "\n\n**`urls.txt`:**\n```\n" + urls + "\n```\n</details>\n")
+    return "\n".join(lines) + "\n\n"
+
+
+# The JWST-GC Aladin viewer (all-survey HiPS overlays).  A plain link: the page centres
+# itself from its own preset buttons and does not read URL coordinates, so the issue links
+# the viewer rather than claiming a per-field centring the page does not do.  Per-field
+# centring is a follow-up that first brings the page under version control (it is a
+# hand-maintained file in the live docroot today).
+_ALADIN_PAGE = "https://starformation.astro.ufl.edu/avm_images/jwst_gc_aladin.html"
+
+
 def render_body(o: Observation) -> str:
     M = _qa_metrics(o)
     s1, s2, s3, s4, s5 = (M.get(f"stage{n}", {}) for n in (1, 2, 3, 4, 5))
@@ -103,9 +204,10 @@ def render_body(o: Observation) -> str:
                      or str(s4.get("source", "")).startswith("release")
                      or bool(s3.get("passed")))
     #  - JWST1PASS (stage 10): a MATCHUP.XYMEEE / LOG.psfperts product exists.
-    jwst1pass_present = bool(s10) and not s10.get("red_flag")
+    jwst1pass_present = bool(s10) and s10.get("available") is not False and not s10.get("red_flag")
     #  - peppar: stage 6 drew a peppar curve (peppar_kind set) or stage 11 built the ePSF grid.
-    peppar_present = bool(s6.get("peppar_kind")) or (bool(s11) and not s11.get("red_flag"))
+    peppar_present = bool(s6.get("peppar_kind")) or (
+        bool(s11) and s11.get("available") is not False and not s11.get("red_flag"))
 
     filt_rows = "\n".join(f"  - [ ] `{f}` — mosaic reviewed; astrometry + photometry OK"
                           for f in o.filters) or "  - (filters TBD)"
@@ -117,6 +219,7 @@ def render_body(o: Observation) -> str:
     visits = ", ".join(o.visits) or "—"
     notes = f"\n> **Notes:** {o.notes}\n" if o.notes else ""
     guidestar = _guidestar_block(o)
+    globus = _globus_block(o)
 
     # combined-tile note: released mosaics carry a merged obsid (jw..-oOOO-TTT), so say so
     merged_note = (f" (mosaic merges obs {o.obs} + {' + '.join(o.merged_obsids)}; "
@@ -138,9 +241,10 @@ def render_body(o: Observation) -> str:
 ### Archive & data
 - APT program (PDF): {o.mast_program_url}
 - MAST data search: {o.mast_search_url}
+- JWST-GC Aladin viewer: {_ALADIN_PAGE}
 - On-disk mosaics: `{o.product_glob()}`
 
-{dropped_note}{guidestar}{notes}
+{globus}{dropped_note}{guidestar}{notes}
 ### QA checklist
 <sub>boxes with a ✓ are auto-set from the diagnostic replies below (`data_qa.diagnostics`); the rest are manual.</sub>
 - [{_ck(delivered)}] Observation delivered / retrieved

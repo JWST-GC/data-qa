@@ -22,12 +22,27 @@ def test_render_body_has_checklist_and_marker(obs):
 
 
 def test_render_body_has_no_web_release_references(obs):
-    """The starformation web release is the last, post-QA step: it must never appear
-    in the issue body or QA process (only MAST/archive links belong here)."""
+    """The starformation web release is the last, post-QA step: the release page and its
+    direct downloads must never appear in the issue body.  This guard concerns only those; it
+    does not require the Aladin viewer link (that is asserted separately), and any starformation
+    reference that IS present must be the viewer, which is archive tooling rather than the
+    release page."""
+    import re
     body = mi.render_body(obs)
-    assert "starformation" not in body
     assert "Release page" not in body and "Direct downloads" not in body
     assert "MAST data search" in body            # archive link still present
+    hosts = re.findall(r"starformation\.astro\.ufl\.edu\S*", body)
+    assert all("avm_images/jwst_gc_aladin.html" in h for h in hosts)
+
+
+def test_render_body_links_aladin_viewer(obs):
+    """The overview links the JWST-GC Aladin viewer.  It is a plain link: the viewer centres
+    from its own presets and does not read URL coordinates, so the body claims no per-field
+    centring."""
+    body = mi.render_body(obs)
+    assert mi._ALADIN_PAGE in body
+    assert "centred on this field" not in body
+    assert "?ra=" not in body
 
 
 def test_render_body_asks_destreak_decision(obs):
@@ -106,3 +121,36 @@ def test_sync_observation_preserves_human_checkbox_via_github_plumbing(
     (method, url, data), = calls
     assert method == "PATCH" and url.endswith("/issues/7")
     assert "- [x] Background / stripes / artifacts acceptable" in data["body"]
+
+
+def test_globus_block_lists_i2d_and_catalog(tmp_path, monkeypatch, obs):
+    """The Globus section links one i2d + one catalogue per filter and a scriptable URL
+    list, preferring the plain merged science i2d over the _data_i2d resample and skipping
+    per-detector and model/residual products."""
+    monkeypatch.setattr(mi, "_GLOBUS_ROOT", str(tmp_path))
+    pdir = tmp_path / "brick" / "F212N" / "pipeline"
+    pdir.mkdir(parents=True)
+    for name in (
+        "jw02221-o001_t001_nircam_clear-f212n-merged_i2d.fits",           # preferred
+        "jw02221-o001_t001_nircam_clear-f212n-merged_data_i2d.fits",      # resample, not preferred
+        "jw02221-o001_t001_nircam_clear-f212n-nrca_i2d.fits",            # per-detector, excluded
+        "jw02221-o001_t001_nircam_clear-f212n-merged_cat.ecsv",
+        "jw02221-o001_t001_nircam_clear-f212n-merged_m2_daophot_basic_mergedcat_model_i2d.fits",
+    ):
+        (pdir / name).write_text("")
+    block = mi._globus_block(obs)
+    assert "### Data files (Globus)" in block
+    assert "clear-f212n-merged_i2d.fits" in block
+    assert "_data_i2d" not in block and "-nrca_" not in block and "_model_" not in block
+    assert "clear-f212n-merged_cat.ecsv" in block
+    assert f"{mi._GLOBUS_HTTPS_BASE}/brick/F212N/pipeline/" in block
+    # command-line download recipe: bearer-token wget + the scriptable URL list
+    assert "Authorization: Bearer" in block and "globus-sdk" in block
+    assert mi._GLOBUS_COLLECTION_ID in block and "urls.txt" in block
+
+
+def test_globus_block_empty_when_unreduced(tmp_path, monkeypatch, obs):
+    """With no pipeline products on disk the section states that it fills in after reduction."""
+    monkeypatch.setattr(mi, "_GLOBUS_ROOT", str(tmp_path))
+    (tmp_path / "brick").mkdir()
+    assert "fills in once the observation is reduced" in mi._globus_block(obs)
