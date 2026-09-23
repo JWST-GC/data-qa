@@ -3942,6 +3942,7 @@ def test_stage3_red_flags_misregistered_pipeline_catalogue(monkeypatch):
     _, m = D.stage3_calibration(o, "F212N")
     assert m["red_flag"] is True and m["passed"] is False
     assert "135 mas off VIRAC" in m["red_flag_reason"]
+    assert m["registration_flag"] is True and m["photometry_passed"] is True  # zeropoint clean
     assert "RED FLAG" in D.caption_for(3, m)
 
 
@@ -4059,3 +4060,11 @@ def test_stage7_pick_primary_mast_fallback_keeps_comparison():
     assert png == "o_stage7.png"
     assert "primary_figure" not in m
     assert m["extra_figures"] == [("jicama vs VIRAC (per-cell offset)", "o_stage7_jicama_offset.png")]
+
+
+def test_caption_stage3_notes_undetermined_offset():
+    m = dict(available=True, passed=True, our_slope=1.0, slope=1.0, scatter=0.1, n_matched=500,
+             source="jicama-m8", offset_to_virac_mas=None)
+    assert "could not be measured" in D.caption_for(3, m)
+    m["offset_to_virac_mas"] = 3.0
+    assert "could not be measured" not in D.caption_for(3, m)

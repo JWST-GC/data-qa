@@ -1356,7 +1356,7 @@ def _fetch_virac2_ks(o: Observation):
     t.meta["NOTE"] = (f"VIRAC2 II/387 over the {os.path.basename(_refcat_path(o))} footprint, "
                       f"for the data-qa stage-3 Ks zeropoint; RAJ2000/DEJ2000 at epoch 2014.0")
     os.makedirs(os.path.dirname(cache), exist_ok=True)
-    tmp = cache + ".tmp.fits"
+    tmp = f"{cache}.{os.getpid()}.tmp.fits"      # per-process: obs sharing a refcat run in parallel
     t.write(tmp, overwrite=True)
     os.replace(tmp, cache)
     return cache
@@ -1540,6 +1540,9 @@ def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_ma
         a.text(0.98, 0.02, f"matched after removing bulk offset {off:.0f} mas", transform=a.transAxes,
                ha="right", va="bottom", fontsize=7.5,
                color="#c33" if off > _STAGE3_REGISTRATION_FLAG_MAS else "0.3")
+    else:
+        a.text(0.98, 0.02, "bulk offset undetermined (ambiguous cross-correlation); matched unshifted",
+               transform=a.transAxes, ha="right", va="bottom", fontsize=7.5, color="#c80")
     sub = dict(source=src_label, n_matched=int(g.sum()), n_fit=int(xf.size), fit_windowed=windowed,
                match="one-to-one mutual NN, 0.1 arcsec, after bulk-offset removal",
                offset_to_virac_mas=off, offset_dra_mas=off_ra, offset_ddec_mas=off_de,
@@ -1608,11 +1611,13 @@ def stage3_calibration(o: Observation, sw):
             metrics.update(passed=sub["passed"], source=lbl, slope=sub["slope"],
                            scatter=sub["scatter"], n_matched=sub["n_matched"],
                            locus_offset=sub["locus_offset"], zeropoint_fit=sub["zeropoint_fit"],
-                           offset_to_virac_mas=sub.get("offset_to_virac_mas"))
+                           offset_to_virac_mas=sub.get("offset_to_virac_mas"),
+                           photometry_passed=sub["passed"], registration_flag=False)
             off = sub.get("offset_to_virac_mas")
             if off is not None and off > _STAGE3_REGISTRATION_FLAG_MAS:
-                # our catalogue sits far off VIRAC: a registration defect of the pipeline product
-                metrics.update(passed=False, red_flag=True, red_flag_reason=(
+                # our catalogue sits far off VIRAC: a registration defect of the pipeline product.
+                # photometry_passed keeps the zeropoint verdict on its own.
+                metrics.update(passed=False, red_flag=True, registration_flag=True, red_flag_reason=(
                     f"pipeline catalogue {lbl} is {off:.0f} mas off VIRAC (bulk offset; the "
                     f"pipeline ties to VIRAC2/Gaia at ~25 mas) -- re-tie the astrometry"))
 
@@ -6877,6 +6882,9 @@ def _caption_for_impl(n, metrics):
                    "(http://svo2.cab.inta-csic.es/theory/fps/index.php?id=Paranal/VISTA.Ks)). ")
         match_note = ("Stars are paired one-to-one (mutual nearest neighbour within 0.1″) after "
                       "removing each catalogue's bulk offset from VIRAC. ")
+        if metrics.get("our_slope") is not None and metrics.get("offset_to_virac_mas") is None:
+            match_note += ("The bulk offset could not be measured (ambiguous cross-correlation), so "
+                           "this catalogue was matched without a shift. ")
         if metrics.get("red_flag"):
             return (f"🚩 **Stage 3 — RED FLAG.** {metrics.get('red_flag_reason')}. The photometric "
                     f"locus is still shown (slope {metrics.get('slope', float('nan')):.2f}, scatter "
