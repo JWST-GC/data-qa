@@ -219,8 +219,8 @@ def test_caption_stage3_grades_on_our_catalog_and_names_mast():
                                 slope=1.0, scatter=0.28, our_slope=1.0,
                                 mast_slope=0.99, mast_scatter=0.30))
     assert "right stars were matched" not in cap and "NOT a fit" not in cap
-    # the graded panel is named (our catalogue) and MAST is called out as shown alongside
-    assert "jicama-m8" in cap and "MAST" in cap
+    # the graded panel is named (our catalogue) and MAST is called out as in the dropdown
+    assert "jicama-m8" in cap and "MAST" in cap and "dropdown" in cap
     assert "slope" in cap and "scatter" in cap
 
 
@@ -3903,14 +3903,16 @@ def _stage3_synth(monkeypatch, our=True):
     return o
 
 
-def test_stage3_mast_primary_our_graded(monkeypatch):
+def test_stage3_our_primary_mast_in_dropdown(monkeypatch):
     o = _stage3_synth(monkeypatch, our=True)
-    _, m = D.stage3_calibration(o, "F212N")
-    assert m["primary_source"] == "MAST catalogue"     # MAST is the always-shown primary image
+    png, m = D.stage3_calibration(o, "F212N")
+    assert m["primary_source"] == "jicama-m2"          # our catalogue is the shown image ...
+    assert png.endswith(f"{o.obsid}_stage3.png")
+    labels = [lbl for lbl, _ in m["extra_figures"]]
+    assert labels == ["MAST catalogue vs VIRAC (calibration)"]   # ... MAST still posted, in dropdown
     assert m["source"] == "jicama-m2"                  # verdict comes from OUR catalogue
     assert m["passed"] is True                          # graded on OURS (unit slope): pass ...
     assert not (0.8 < m["mast_slope"] < 1.2)            # ... NOT on MAST (slope 0.7) -> grade-source pinned
-    assert m.get("extra_figures")                       # our catalogue posted as a 2nd image
     assert m["our_fit_windowed"] is True and m["our_n_fit"] < m["our_n_matched"]  # window applied
 
 
@@ -3960,3 +3962,12 @@ def test_offset_panel_title_headlines_same_star_not_histogram():
     # with no same-star tie, the reported (headline) value is the histogram one, labelled as such
     t2 = D._offset_panel_title(14.0, "histogram", None, 14.0, cc, 6.0, "gate 75")
     assert "14.0 mas [histogram]" in t2.split("\n")[0]
+
+
+def test_caption_stage7_names_dropdown_when_jicama_primary():
+    # jicama per-cell offset figure is the shown image -> the caption says the MAST comparison moved
+    base = dict(stage=7, mast_offset_med_mas=40.0, jicama_offset_med_mas=10.0)
+    cap = D.caption_for(7, dict(base, primary_figure="jicama_offset"))
+    assert "dropdown" in cap and "per-cell offset" in cap
+    cap = D.caption_for(7, base)                    # comparison figure shown -> no dropdown note
+    assert "dropdown" not in cap
