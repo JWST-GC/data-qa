@@ -10,6 +10,7 @@ Stdlib-only (urllib) so it runs in CI with just ``GITHUB_TOKEN``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import os
@@ -27,6 +28,12 @@ class PostError(Exception):
     """A GitHub post/upload step failed; caller decides whether to continue other stages."""
 UPLOADS = "https://uploads.github.com"
 ASSET_RELEASE_TAG = os.environ.get("QA_ASSET_TAG", "qa-assets")
+# GitHub caps a release at 1000 assets ("file_count limited to 1000 assets per release"), and the
+# QA figures (~15 per observation x ~160 issues) exceed that, so the bucket is sharded: each asset
+# goes to ``{ASSET_RELEASE_TAG}-NN`` chosen by a stable hash of its name, which keeps same-name
+# replacement working.  The original un-sharded release is the legacy bucket: an asset of the same
+# name there is deleted on re-upload so it stops holding a slot.
+ASSET_SHARDS = int(os.environ.get("QA_ASSET_SHARDS", "16"))
 DIAG_MARKER = "<!-- data-qa:diag:stage{n} -->"
 
 # The function in data_qa/diagnostics.py that builds each stage's figure + numbers, so every
@@ -84,30 +91,87 @@ def _req(method, url, token, data=None, headers=None, raw=False, want_headers=Fa
 
 
 # --------------------------------------------------------------------------- release-asset host
-def _ensure_release(repo, token):
-    """Return the ``qa-assets`` bucket release, creating it once if missing."""
-    st, rel = _req("GET", f"{API}/repos/{repo}/releases/tags/{ASSET_RELEASE_TAG}", token)
-    if st == 200:
-        return rel
-    st, rel = _req("POST", f"{API}/repos/{repo}/releases", token, data=json.dumps({
-        "tag_name": ASSET_RELEASE_TAG,
-        "name": "QA diagnostic assets",
-        "body": "Bucket release hosting QA diagnostic figures embedded in issue comments. "
-                "Managed by data_qa.post_diagnostics; do not edit by hand.",
-        "prerelease": True,
-    }).encode())
-    if st >= 300:
-        raise PostError(f"could not create {ASSET_RELEASE_TAG} release: {rel}")
+_RELEASES = {}                                  # (repo, tag) -> release object, per process
+
+
+def _ensure_release(repo, token, tag=ASSET_RELEASE_TAG, create=True):
+    """Return the bucket release for ``tag`` (cached per process), creating it once if missing.
+    With ``create=False`` a missing release returns None."""
+    if (repo, tag) in _RELEASES:
+        return _RELEASES[(repo, tag)]
+    st, rel = _req("GET", f"{API}/repos/{repo}/releases/tags/{tag}", token)
+    if st != 200:
+        if not create:
+            return None
+        st, rel = _req("POST", f"{API}/repos/{repo}/releases", token, data=json.dumps({
+            "tag_name": tag,
+            "name": f"QA diagnostic assets ({tag})",
+            "body": "Bucket release hosting QA diagnostic figures embedded in issue comments. "
+                    "Managed by data_qa.post_diagnostics; do not edit by hand.",
+            "prerelease": True,
+        }).encode())
+        if st >= 300:
+            # a concurrent array task may have created it first -> re-read before failing
+            st, rel = _req("GET", f"{API}/repos/{repo}/releases/tags/{tag}", token)
+            if st != 200:
+                raise PostError(f"could not create {tag} release: {rel}")
+    _RELEASES[(repo, tag)] = rel
     return rel
 
 
+def _asset_shard_tag(asset_name):
+    """Stable shard release tag for ``asset_name`` (same name -> same shard on every run)."""
+    h = int(hashlib.sha1(asset_name.encode()).hexdigest()[:8], 16)
+    return f"{ASSET_RELEASE_TAG}-{h % ASSET_SHARDS:02d}"
+
+
+def _release_assets(repo, token, rel):
+    """All assets of ``rel`` by name, via the paginated assets endpoint (the list embedded in the
+    release object is not guaranteed complete)."""
+    out, page = {}, 1
+    while True:
+        st, data = _req("GET", f"{API}/repos/{repo}/releases/{rel['id']}/assets"
+                               f"?per_page=100&page={page}", token)
+        if st != 200 or not data:
+            return out
+        out.update({a["name"]: a["id"] for a in data})
+        if len(data) < 100:
+            return out
+        page += 1
+
+
+_ASSET_INDEX = {}                               # (repo, tag) -> {name: id}, per process
+
+
+def _asset_index(repo, token, tag, rel):
+    if (repo, tag) not in _ASSET_INDEX:
+        _ASSET_INDEX[(repo, tag)] = _release_assets(repo, token, rel)
+    return _ASSET_INDEX[(repo, tag)]
+
+
+def _delete_asset(repo, token, tag, rel, asset_name):
+    """Delete ``asset_name`` from ``rel`` if present; returns True when one was removed."""
+    idx = _asset_index(repo, token, tag, rel)
+    aid = idx.get(asset_name)
+    if aid is None:
+        return False
+    st, data = _req("DELETE", f"{API}/repos/{repo}/releases/assets/{aid}", token)
+    if st >= 300 and st != 404:
+        raise PostError(f"could not delete existing asset {asset_name} ({st}): {data}")
+    idx.pop(asset_name, None)
+    return True
+
+
 def upload_asset(repo, token, png_path, asset_name):
-    """Upload ``png_path`` as ``asset_name`` on the bucket release; replace if it exists.
-    Returns the browser_download_url (renders inline in markdown)."""
-    rel = _ensure_release(repo, token)
-    for a in rel.get("assets", []):
-        if a["name"] == asset_name:
-            _req("DELETE", f"{API}/repos/{repo}/releases/assets/{a['id']}", token)
+    """Upload ``png_path`` as ``asset_name`` on its shard release; replace if it exists there, and
+    drop a same-name copy from the legacy un-sharded release.  Returns the browser_download_url
+    (renders inline in markdown)."""
+    tag = _asset_shard_tag(asset_name)
+    rel = _ensure_release(repo, token, tag)
+    _delete_asset(repo, token, tag, rel, asset_name)
+    legacy = _ensure_release(repo, token, ASSET_RELEASE_TAG, create=False)
+    if legacy is not None:
+        _delete_asset(repo, token, ASSET_RELEASE_TAG, legacy, asset_name)
     with open(png_path, "rb") as fh:
         blob = fh.read()
     ctype = mimetypes.guess_type(png_path)[0] or "image/png"
@@ -115,6 +179,7 @@ def upload_asset(repo, token, png_path, asset_name):
     st, data = _req("POST", url, token, data=blob, headers={"Content-Type": ctype})
     if st >= 300:
         raise PostError(f"asset upload failed ({st}): {data}")
+    _asset_index(repo, token, tag, rel)[asset_name] = data.get("id")
     return data["browser_download_url"]
 
 
