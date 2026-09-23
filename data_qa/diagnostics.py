@@ -4349,13 +4349,21 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
                                           f"{o.obsid}_stage7_jicama_offset.png")
         if jp is not None:
             metrics["jicama_offset_med_mas"] = jsub.get("offset_med_mas")
-            if str(jsrc).startswith("release"):
-                metrics["primary_figure"] = "jicama_offset"
-                metrics.setdefault("extra_figures", []).append(
-                    ("MAST vs pipeline (mosaics, depth, offsets)", main_png))
-                return jp, metrics
-            metrics.setdefault("extra_figures", []).append(
-                ("jicama vs VIRAC (per-cell offset)", jp))
+            return _stage7_pick_primary(main_png, jp, jsrc, metrics)
+    return main_png, metrics
+
+
+def _stage7_pick_primary(main_png, jicama_png, jicama_src, metrics):
+    """Choose stage 7's shown image.  A per-cell offset figure built from a release (jicama)
+    catalogue is the primary and the MAST-vs-pipeline comparison goes to the dropdown; when the
+    positions fell back to the MAST catalogue, the comparison stays primary and the offset figure
+    goes to the dropdown.  Returns (primary_png, metrics)."""
+    extra = metrics.setdefault("extra_figures", [])
+    if str(jicama_src).startswith("release"):
+        metrics["primary_figure"] = "jicama_offset"
+        extra.append(("MAST vs pipeline (mosaics, depth, offsets)", main_png))
+        return jicama_png, metrics
+    extra.append(("jicama vs VIRAC (per-cell offset)", jicama_png))
     return main_png, metrics
 
 

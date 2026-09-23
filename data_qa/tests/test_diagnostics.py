@@ -3971,3 +3971,21 @@ def test_caption_stage7_names_dropdown_when_jicama_primary():
     assert "dropdown" in cap and "per-cell offset" in cap
     cap = D.caption_for(7, base)                    # comparison figure shown -> no dropdown note
     assert "dropdown" not in cap
+
+
+def test_stage7_pick_primary_release_jicama_promoted():
+    # a release (jicama) offset figure is shown; the MAST comparison moves to the dropdown
+    png, m = D._stage7_pick_primary("o_stage7.png", "o_stage7_jicama_offset.png",
+                                    "release:jw10678-o132_f212n_m8.fits", {})
+    assert png == "o_stage7_jicama_offset.png"
+    assert m["primary_figure"] == "jicama_offset"
+    assert m["extra_figures"] == [("MAST vs pipeline (mosaics, depth, offsets)", "o_stage7.png")]
+
+
+def test_stage7_pick_primary_mast_fallback_keeps_comparison():
+    # positions fell back to MAST -> the comparison stays primary, offset figure in the dropdown
+    png, m = D._stage7_pick_primary("o_stage7.png", "o_stage7_jicama_offset.png",
+                                    "MAST:jw10678-o132_cat.fits", {})
+    assert png == "o_stage7.png"
+    assert "primary_figure" not in m
+    assert m["extra_figures"] == [("jicama vs VIRAC (per-cell offset)", "o_stage7_jicama_offset.png")]
