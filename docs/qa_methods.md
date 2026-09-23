@@ -298,6 +298,11 @@ lies along it.
 linear fit on sigma-clipped data to measure the slope and the scatter about
 the locus. `n_matched` is the number of cross-matches, `n_locus`is the number of cross-matches after sigma-clipping.. 
 
+When a pipeline ([jicama](#glossary-jicama)) catalogue exists, its panel is the image shown and
+carries the verdict; the MAST catalogue panel is always computed and sits in the "Other figures"
+dropdown. With no pipeline catalogue yet, the MAST panel is shown for information and the stage is
+ungraded.
+
 <details>
 <summary>What to do?</summary>
 <br>
@@ -648,6 +653,11 @@ Source: [`data_qa/diagnostics.py` → `stage12_photometric_linearity`](../data_q
 
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
+
+**Which figure is shown.** When a jicama release catalogue exists, the image shown is its
+per-cell offset from VIRAC (the [stage 4](#stage4) analysis run on our catalogue), and the
+MAST-vs-pipeline comparison figure described below sits in the "Other figures" dropdown. Without a
+jicama catalogue, the comparison figure is shown.
 
 **What it shows.** The gain of the pipeline over the raw **MAST-delivered** products, over one
 common central window of the mosaic:

@@ -1465,11 +1465,11 @@ def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_ma
 
 def stage3_calibration(o: Observation, sw):
     """Photometric zeropoint check: JWST catalogue mag vs VIRAC reference mag for matched stars.
-    The MAST-delivered catalogue is ALWAYS shown (primary panel) as the archive baseline; OUR
-    pipeline catalogue (merged release, else per-filter PSF) is added as a second panel WHEN
-    AVAILABLE and carries the stage verdict.  With no pipeline catalogue yet, MAST is shown for
-    information and the stage stays ungraded rather than red-flagging the archive's crowding-limited
-    aperture photometry."""
+    OUR pipeline catalogue (merged release, else per-filter PSF), when available, is the primary
+    panel and carries the stage verdict; the MAST-delivered catalogue is always computed as the
+    archive baseline and goes in the collapsed "other figures" dropdown.  With no pipeline catalogue
+    yet, MAST is the primary panel, shown for information, and the stage stays ungraded rather than
+    red-flagging the archive's crowding-limited aperture photometry."""
     metrics = dict(stage=3, sw=sw)
     path = _mosaic_path(o, sw)
     ep = _obs_epoch(o, path)
@@ -1500,7 +1500,8 @@ def stage3_calibration(o: Observation, sw):
                        na_reason="no VIRAC/Gaia reference magnitudes resolved")
         return png, metrics
 
-    # MAST panel first -> the always-shown primary image; ours (when present) is the graded panel.
+    # Ours first -> the primary image and the graded panel; MAST (always computed) then lands in the
+    # dropdown.  With no pipeline catalogue, MAST is the primary.
     primary_png = None
     extra = []
 
@@ -1522,10 +1523,10 @@ def stage3_calibration(o: Observation, sw):
                            scatter=sub["scatter"], n_matched=sub["n_matched"],
                            locus_offset=sub["locus_offset"], zeropoint_fit=sub["zeropoint_fit"])
 
-    if mast_sc is not None:
-        _emit(mast_sc, mast_mag, "MAST catalogue", "mast", is_our=False)
     if our_sc is not None:
         _emit(our_sc, our_mag, our_lbl, "our", is_our=True)
+    if mast_sc is not None:
+        _emit(mast_sc, mast_mag, "MAST catalogue", "mast", is_our=False)
 
     if primary_png is None:
         # Every catalogue present but too few stars matched the reference to fit a locus.
@@ -4338,16 +4339,31 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     main_png = _save(fig, f"{o.obsid}_stage7.png")
 
     # Second figure: the jicama-vs-VIRAC per-cell offset -- the stage-4 analysis run on OUR
-    # catalogue (stage 4 itself now measures the MAST catalogue).  Omitted, not red-flagged, when
-    # no jicama catalogue is on disk yet.
+    # catalogue (stage 4 itself measures the MAST catalogue).  When it is built from a real jicama
+    # (release) catalogue it becomes the PRIMARY image and the MAST-vs-pipeline comparison moves to
+    # the dropdown; if _jwst_positions fell back to MAST, the comparison stays primary and this
+    # figure is added to the dropdown.  Omitted, not red-flagged, when no catalogue is on disk.
     jpos, jsrc = _jwst_positions(o, sw)
     if jpos is not None and ref_sc is not None:
         jp, jsub = _offset_summary_figure(o, sw, jpos, ref_sc, jsrc,
                                           f"{o.obsid}_stage7_jicama_offset.png")
         if jp is not None:
-            metrics.setdefault("extra_figures", []).append(
-                ("jicama vs VIRAC (per-cell offset)", jp))
             metrics["jicama_offset_med_mas"] = jsub.get("offset_med_mas")
+            return _stage7_pick_primary(main_png, jp, jsrc, metrics)
+    return main_png, metrics
+
+
+def _stage7_pick_primary(main_png, jicama_png, jicama_src, metrics):
+    """Choose stage 7's shown image.  A per-cell offset figure built from a release (jicama)
+    catalogue is the primary and the MAST-vs-pipeline comparison goes to the dropdown; when the
+    positions fell back to the MAST catalogue, the comparison stays primary and the offset figure
+    goes to the dropdown.  Returns (primary_png, metrics)."""
+    extra = metrics.setdefault("extra_figures", [])
+    if str(jicama_src).startswith("release"):
+        metrics["primary_figure"] = "jicama_offset"
+        extra.append(("MAST vs pipeline (mosaics, depth, offsets)", main_png))
+        return jicama_png, metrics
+    extra.append(("jicama vs VIRAC (per-cell offset)", jicama_png))
     return main_png, metrics
 
 
@@ -6615,7 +6631,14 @@ def _caption_for_impl(n, metrics):
         # counts in the COMMON WINDOW (fair), not the full-field totals
         nj = metrics.get("n_jicama_window"); nm = metrics.get("n_mast_window")
         mo = metrics.get("mast_offset_med_mas"); jo = metrics.get("jicama_offset_med_mas")
-        base = ("**Stage 7 — MAST vs pipeline.** The TOP row shows the "
+        base = ("**Stage 7 — MAST vs pipeline.** ")
+        if metrics.get("primary_figure") == "jicama_offset":
+            base += ("The figure shown is the [jicama](DOCROOT#glossary-jicama) catalogue's "
+                     "per-cell offset from VIRAC; the MAST-vs-pipeline comparison figure described "
+                     "next is in the dropdown below. In that comparison, the ")
+        else:
+            base += "The "
+        base += ("TOP row shows the "
                 "[MAST-delivered](DOCROOT#glossary-mtier) level-3 `i2d` mosaic next to our pipeline "
                 "mosaic over the same sky region. The BOTTOM-LEFT panel compares source counts — the "
                 "[jicama](DOCROOT#glossary-jicama) catalogue vs the MAST catalogue "
@@ -6776,7 +6799,7 @@ def _caption_for_impl(n, metrics):
                 f"catalogue: slope {metrics.get('slope', float('nan')):.2f}, scatter about the "
                 f"locus {metrics.get('scatter', float('nan')):.2f} mag. ")
         if metrics.get("mast_slope") is not None:
-            base += (f"The **MAST catalogue** is shown alongside (slope "
+            base += (f"The **MAST catalogue** panel is in the dropdown below (slope "
                      f"{metrics['mast_slope']:.2f}, scatter {metrics['mast_scatter']:.2f}); its "
                      f"aperture photometry is crowding-limited, so it is not graded. ")
         return base + refband + "([how this is made](DOCROOT#stage3))"
