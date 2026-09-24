@@ -1299,33 +1299,113 @@ _STAGE3_FIT_MAG_MIN = 13.0
 _STAGE3_FIT_MAG_MAX = 17.0
 
 
+# A pipeline catalogue whose bulk offset from VIRAC exceeds this is mis-registered: the pipeline
+# ties to VIRAC2/Gaia at the ~25 mas level, so a larger offset is a registration defect of our
+# product (e.g. Sgr B2 jw05365-o001, ~135 mas).  Stage 3 removes the offset before matching, so the
+# photometric check still runs, and flags the registration.
+_STAGE3_REGISTRATION_FLAG_MAS = 50.0
+
+
+def _stage3_ks_cache_path(o: Observation):
+    """Where the stage-3 VIRAC2 Ks cache for ``o`` lives: next to its position refcat, one file per
+    refcat (per-obs for gc-treasury), or None when the obs has no refcat to define the footprint."""
+    ref = _refcat_path(o)
+    if not ref:
+        return None
+    stem = os.path.splitext(os.path.basename(ref))[0]
+    return os.path.join(os.path.dirname(ref), "virac2_ks_cache", f"virac2_ks_{stem}.fits")
+
+
+def _fetch_virac2_ks(o: Observation):
+    """Raw VIRAC2 (II/387, RAJ2000/DEJ2000 at 2014.0 + pmRA/pmDE + J/H/Ks) over the footprint of
+    ``o``'s position refcat, cached on disk.  Returns the cache path or None.
+
+    The Step-0 ``gaia_virac2_refcat`` stores VIRAC2 **J** in ``refmag`` (build_gaia_virac2_refcat
+    writes ``rows_v['refmag'] = vJ``), so it cannot serve a Ks zeropoint: J-Ks in the GC is several
+    magnitudes and extinction-dependent (o132 graded against it gave a -3 mag offset with 1.8 mag
+    scatter).  ``QA_VIRAC_DOWNLOAD=0`` disables the query (cache reads still work)."""
+    cache = _stage3_ks_cache_path(o)
+    if not cache:
+        return None
+    if os.path.exists(cache):
+        return cache
+    if os.environ.get("QA_VIRAC_DOWNLOAD", "1") == "0":
+        return None
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.table import Table
+    ref = Table.read(_used(_refcat_path(o), "position refcat (footprint for the VIRAC2 Ks query)"))
+    cols = {c.lower(): c for c in ref.colnames}
+    ra = np.asarray(ref[cols["ra"]], float); dec = np.asarray(ref[cols["dec"]], float)
+    g = np.isfinite(ra) & np.isfinite(dec)
+    if g.sum() == 0:
+        return None
+    cen = SkyCoord(np.median(ra[g]) * u.deg, np.median(dec[g]) * u.deg)
+    radius = cen.separation(SkyCoord(ra[g] * u.deg, dec[g] * u.deg)).max() + 5 * u.arcsec
+    from astroquery.vizier import Vizier
+    viz = Vizier(columns=["RAJ2000", "DEJ2000", "pmRA", "pmDE", "Jmag", "Hmag", "Ksmag"],
+                 row_limit=-1, timeout=300)
+    try:
+        res = viz.query_region(cen, radius=radius, catalog="II/387/virac2")
+    except (OSError, ValueError) as exc:           # network / VizieR service errors
+        print(f"  stage 3: VIRAC2 Ks query failed for {o.obsid}: {exc}")
+        return None
+    if not res or len(res[0]) == 0:
+        return None
+    t = res[0]
+    t.meta["NOTE"] = (f"VIRAC2 II/387 over the {os.path.basename(_refcat_path(o))} footprint, "
+                      f"for the data-qa stage-3 Ks zeropoint; RAJ2000/DEJ2000 at epoch 2014.0")
+    os.makedirs(os.path.dirname(cache), exist_ok=True)
+    tmp = f"{cache}.{os.getpid()}.tmp.fits"      # per-process: obs sharing a refcat run in parallel
+    t.write(tmp, overwrite=True)
+    os.replace(tmp, cache)
+    return cache
+
+
 def _stage3_reference(o: Observation, ep):
-    """(SkyCoord, mag) for the stage-3 photometric reference, restricted to a clean NIR band, or
-    (None, None).  The Step-0 ``gaia_virac2_refcat`` mixes VIRAC2 Ks (NIR) and Gaia DR3 G (optical)
-    in one ``refmag`` column (``source`` says which); only the VIRAC2 rows track a JWST NIR band, so
-    a Gaia-G contaminated reference gives a garbage slope.  Select the VIRAC2 rows; their RA/DEC are
-    already PM-propagated to the catalogue epoch, so no further propagation is applied.  A raw VIRAC2
-    cache (reduction fields) has a native ``Ksmag`` and no ``source`` column -> defer to
-    ``load_reference`` (which also PM-propagates from 2014)."""
-    ref = _viraccache_path(o) or _refcat_path(o)
-    if not ref or not ep:
+    """(SkyCoord, Ks) for the stage-3 photometric reference, PM-propagated to ``ep``, or
+    (None, None).  Uses a raw VIRAC2 cache with a real ``Ksmag`` column: the field's
+    ``astrometry_diag`` cache when present, else a VizieR VIRAC2 query over the obs footprint
+    (``_fetch_virac2_ks``).  The gaia_virac2 refcat's ``refmag`` is never used here: its VIRAC2 rows
+    carry J, not Ks."""
+    if not ep:
+        return None, None
+    ref = _viraccache_path(o) or _fetch_virac2_ks(o)
+    if not ref:
         return None, None
     from astropy.table import Table
-    t = Table.read(_used(ref, "VIRAC2/Gaia reference catalogue"))
-    cols = {c.lower(): c for c in t.colnames}
-    if "source" in cols and "refmag" in cols:
-        import astropy.units as u
-        from astropy.coordinates import SkyCoord
-        src = np.array([str(s).upper() for s in np.asarray(t[cols["source"]])])
-        rmag = np.asarray(t[cols["refmag"]], float)
-        keep = np.char.find(src, "VIRAC") >= 0
-        keep &= np.isfinite(rmag)
-        if keep.sum() == 0:
-            return aa.load_reference(ref, ep)      # no VIRAC rows -> fall back to whatever loads
-        ra = np.asarray(t[cols["ra"]], float)[keep]
-        dec = np.asarray(t[cols["dec"]], float)[keep]
-        return SkyCoord(ra * u.deg, dec * u.deg), rmag[keep]
+    t = Table.read(_used(ref, "VIRAC2 Ks reference (stage 3)"))
+    if "ksmag" not in {c.lower() for c in t.colnames}:
+        return None, None
     return aa.load_reference(ref, ep)
+
+
+def _one_to_one_match(ref_sc, jsc, radius_arcsec=0.1):
+    """Mutual nearest-neighbour pairs within ``radius_arcsec``: (ref_index, jwst_index) arrays.
+    Each VIRAC star and each JWST star appears at most once, the same rule the astrometric
+    registration uses, so a JWST star can never stand in for several VIRAC stars (or vice versa)."""
+    import astropy.units as u
+    idx, sep, _ = ref_sc.match_to_catalog_sky(jsc)
+    back, _, _ = jsc.match_to_catalog_sky(ref_sc)
+    ok = (sep < radius_arcsec * u.arcsec) & (back[idx] == np.arange(len(ref_sc)))
+    return np.nonzero(ok)[0], idx[ok]
+
+
+def _stage3_align(jsc, ref_sc):
+    """Shift ``jsc`` onto VIRAC by the xcorr bulk offset so a 0.1-arcsec match pairs the right
+    stars.  Returns (shifted SkyCoord, dra_mas, ddec_mas) with d = VIRAC - JWST, or (jsc, None, None) when the xcorr peak
+    is ambiguous (then no shift is applied)."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    xc = aa.xcorr(jsc, ref_sc, maxsep=1.5 * u.arcsec)
+    if not (xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= 100):
+        return jsc, None, None
+    cosd = float(np.cos(np.radians(np.median(jsc.dec.deg))))
+    # xcorr(a=JWST, b=VIRAC) reports VIRAC - JWST, the shift that moves JWST onto VIRAC (as in
+    # _bulk_offset)
+    shifted = SkyCoord((jsc.ra.deg + xc["dra"] / 3.6e6 / cosd) * u.deg,
+                       (jsc.dec.deg + xc["ddec"] / 3.6e6) * u.deg)
+    return shifted, float(xc["dra"]), float(xc["ddec"])
 
 
 def _mast_calibration_sources(o: Observation, sw):
@@ -1415,15 +1495,14 @@ def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_ma
     Returns (png, submetrics); submetrics carries slope/scatter/passed, or (None, {na_reason}) when
     too few stars match to fit a locus.  The cyan 1:1 line is the ideal unit-slope relation; the
     free slope and locus scatter gate the zeropoint."""
-    import astropy.units as u
-    # Anchor on VIRAC (sparse, bright) -> nearest JWST source.  A JWST catalogue goes far deeper, so
-    # an all-pairs match would pair faint JWST sources with the wrong VIRAC star; nearest-from-VIRAC
-    # keeps the locus clean.
-    idx, sep, _ = ref_sc.match_to_catalog_sky(jsc)
-    keep = sep < 0.1 * u.arcsec
-    if keep.sum() < 30:
-        return None, dict(source=src_label, na_reason=f"only {int(keep.sum())} matched stars")
-    x = ref_mag[keep]; y = jmag[idx[keep]]
+    # Remove the catalogue's bulk offset from VIRAC first (a 0.1" match on a frame ~100 mas off
+    # pairs neighbours, not the same star: Sgr B2 jw05365-o001 jicama went from slope 0.33 /
+    # scatter 1.33 to 0.99 / 0.09 once shifted), then keep one-to-one mutual pairs only.
+    jal, off_ra, off_de = _stage3_align(jsc, ref_sc)
+    ir, ij = _one_to_one_match(ref_sc, jal)
+    if ir.size < 30:
+        return None, dict(source=src_label, na_reason=f"only {int(ir.size)} matched stars")
+    x = ref_mag[ir]; y = jmag[ij]
     g = np.isfinite(x) & np.isfinite(y)
     x, y = x[g], y[g]
     # Fit the SLOPE/SCATTER only over the clean magnitude window (saturation + faint-noise cut);
@@ -1456,7 +1535,17 @@ def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_ma
              fontsize=7.5, color="0.4")
     # Split gate: keep the SLOPE window tight (a zeropoint check must falsify on slope), widen only
     # the SCATTER for the real narrow-vs-broad colour/extinction spread.
+    off = None if off_ra is None else float(np.hypot(off_ra, off_de))
+    if off is not None:
+        a.text(0.98, 0.02, f"matched after removing bulk offset {off:.0f} mas", transform=a.transAxes,
+               ha="right", va="bottom", fontsize=7.5,
+               color="#c33" if off > _STAGE3_REGISTRATION_FLAG_MAS else "0.3")
+    else:
+        a.text(0.98, 0.02, "bulk offset undetermined (ambiguous cross-correlation); matched unshifted",
+               transform=a.transAxes, ha="right", va="bottom", fontsize=7.5, color="#c80")
     sub = dict(source=src_label, n_matched=int(g.sum()), n_fit=int(xf.size), fit_windowed=windowed,
+               match="one-to-one mutual NN, 0.1 arcsec, after bulk-offset removal",
+               offset_to_virac_mas=off, offset_dra_mas=off_ra, offset_ddec_mas=off_de,
                n_locus=n_locus, n_locus_unclipped=n_unclipped, clip_exit=clip_exit,
                slope=float(slope), zeropoint_fit=float(zp), scatter=scat, locus_offset=float(zp1),
                passed=bool(0.8 < slope < 1.2 and scat < 0.8))
@@ -1494,10 +1583,10 @@ def stage3_calibration(o: Observation, sw):
         # A source catalogue exists but no VIRAC/Gaia reference WITH magnitudes resolved.  Every
         # field carries a Step-0 refcat, so this is unexpected; stay ungraded rather than red-flag.
         png = _note_figure(o, "stage3", "NO VIRAC REFERENCE MAGNITUDES",
-                           "found a source catalogue but no VIRAC/Gaia reference with magnitudes "
-                           "to calibrate against.")
+                           "found a source catalogue but no VIRAC2 Ks reference (no raw VIRAC2 "
+                           "cache and the VizieR VIRAC2 query returned nothing).")
         metrics.update(available=True, passed=None,
-                       na_reason="no VIRAC/Gaia reference magnitudes resolved")
+                       na_reason="no VIRAC2 Ks reference resolved")
         return png, metrics
 
     # Ours first -> the primary image and the graded panel; MAST (always computed) then lands in the
@@ -1521,7 +1610,16 @@ def stage3_calibration(o: Observation, sw):
         if is_our:
             metrics.update(passed=sub["passed"], source=lbl, slope=sub["slope"],
                            scatter=sub["scatter"], n_matched=sub["n_matched"],
-                           locus_offset=sub["locus_offset"], zeropoint_fit=sub["zeropoint_fit"])
+                           locus_offset=sub["locus_offset"], zeropoint_fit=sub["zeropoint_fit"],
+                           offset_to_virac_mas=sub.get("offset_to_virac_mas"),
+                           photometry_passed=sub["passed"], registration_flag=False)
+            off = sub.get("offset_to_virac_mas")
+            if off is not None and off > _STAGE3_REGISTRATION_FLAG_MAS:
+                # our catalogue sits far off VIRAC: a registration defect of the pipeline product.
+                # photometry_passed keeps the zeropoint verdict on its own.
+                metrics.update(passed=False, red_flag=True, registration_flag=True, red_flag_reason=(
+                    f"pipeline catalogue {lbl} is {off:.0f} mas off VIRAC (bulk offset; the "
+                    f"pipeline ties to VIRAC2/Gaia at ~25 mas) -- re-tie the astrometry"))
 
     if our_sc is not None:
         _emit(our_sc, our_mag, our_lbl, "our", is_our=True)
@@ -6782,6 +6880,16 @@ def _caption_for_impl(n, metrics):
         # (the refcat keeps only VIRAC-sourced rows for the fit); name it + link the profile.
         refband = ("The reference magnitude is VVV/VISTA **Ks** ([SVO filter profile]"
                    "(http://svo2.cab.inta-csic.es/theory/fps/index.php?id=Paranal/VISTA.Ks)). ")
+        match_note = ("Stars are paired one-to-one (mutual nearest neighbour within 0.1″) after "
+                      "removing each catalogue's bulk offset from VIRAC. ")
+        if metrics.get("our_slope") is not None and metrics.get("offset_to_virac_mas") is None:
+            match_note += ("The bulk offset could not be measured (ambiguous cross-correlation), so "
+                           "this catalogue was matched without a shift. ")
+        if metrics.get("red_flag"):
+            return (f"🚩 **Stage 3 — RED FLAG.** {metrics.get('red_flag_reason')}. The photometric "
+                    f"locus is still shown (slope {metrics.get('slope', float('nan')):.2f}, scatter "
+                    f"{metrics.get('scatter', float('nan')):.2f} mag). " + match_note + refband
+                    + "([how this is made](DOCROOT#stage3))")
         if metrics.get("our_slope") is None:            # nothing graded -> informational
             src = metrics.get("primary_source") or metrics.get("source") or "MAST catalogue"
             base = (f"**Stage 3 — photometric calibration (zeropoint).** JWST catalogue magnitude "
@@ -6797,7 +6905,7 @@ def _caption_for_impl(n, metrics):
                 f"{metrics.get('sw', 'SW')} catalogue magnitude vs {virac} for "
                 f"{metrics.get('n_matched', '?')} {xm} stars. The graded panel is the **{src}** "
                 f"catalogue: slope {metrics.get('slope', float('nan')):.2f}, scatter about the "
-                f"locus {metrics.get('scatter', float('nan')):.2f} mag. ")
+                f"locus {metrics.get('scatter', float('nan')):.2f} mag. " + match_note)
         if metrics.get("mast_slope") is not None:
             base += (f"The **MAST catalogue** panel is in the dropdown below (slope "
                      f"{metrics['mast_slope']:.2f}, scatter {metrics['mast_scatter']:.2f}); its "
