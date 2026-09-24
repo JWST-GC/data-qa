@@ -3279,6 +3279,8 @@ def test_refresh_field_pooled_status_is_not_a_failure():
     out = "| cataloging m8 | ✅ | 2026-08-16 | 6 catalogs · field-pooled, filenames carry no obsid |"
     assert _run_refresh_rc(2045, out, rc=0) == "CLEAN"
     assert _run_refresh_rc(2045, "no issue titled 'X'", rc=0) == "FAILURE"
+    miri = "no MIRI obs for program 2045 obs 003 (portal + on-disk empty)"
+    assert _run_refresh_rc(2045, miri, rc=0) == "FAILURE"
 
 
 def test_refresh_pending_exemption_is_treasury_only_and_failure_only():
