@@ -3943,7 +3943,9 @@ def test_stage3_red_flags_misregistered_pipeline_catalogue(monkeypatch):
     assert m["red_flag"] is True and m["passed"] is False
     assert "135 mas off VIRAC" in m["red_flag_reason"]
     assert m["registration_flag"] is True and m["photometry_passed"] is True  # zeropoint clean
-    assert "RED FLAG" in D.caption_for(3, m)
+    cap = D.caption_for(3, m)
+    assert "RED FLAG" in cap and "plot is empty" not in cap     # the locus IS drawn
+    assert "slope 1.0" in cap or "slope 0.9" in cap
 
 
 def _stage3_synth(monkeypatch, our=True):
@@ -4105,3 +4107,8 @@ def test_caption_stage3_notes_undetermined_offset():
     assert "could not be measured" in D.caption_for(3, m)
     m["offset_to_virac_mas"] = 3.0
     assert "could not be measured" not in D.caption_for(3, m)
+
+
+def test_caption_stage3_no_photometry_red_flag_keeps_empty_wording():
+    m = dict(stage=3, red_flag=True, passed=False, red_flag_reason="no JWST photometry")
+    assert "plot is empty" in D.caption_for(3, m)
