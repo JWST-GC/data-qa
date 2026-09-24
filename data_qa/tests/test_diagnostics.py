@@ -3857,22 +3857,93 @@ def test_load_reference_prefers_refmag_over_gaia_g(tmp_path):
     np.testing.assert_allclose(np.sort(mag), [14.0, 15.0, 16.0, 17.0])
 
 
-def test_stage3_reference_selects_virac2_over_gaia(tmp_path, monkeypatch):
-    """The gaia_virac2 refcat mixes VIRAC2 Ks and Gaia G in one refmag column; stage 3 must take the
-    VIRAC2 (NIR) rows only, else optical G wrecks the slope."""
+def test_stage3_reference_never_uses_refcat_refmag(tmp_path, monkeypatch):
+    """The gaia_virac2 refcat's VIRAC2 rows carry J in refmag; stage 3 must not grade a Ks zeropoint
+    against it.  With no raw Ks cache and no VizieR result, the reference is absent (ungraded)."""
     from astropy.table import Table
     from data_qa.observations import Observation
     p = tmp_path / "gaia_virac2_refcat_epoch2026.70_o100.fits"
     Table({"RA": np.linspace(266.40, 266.60, 6), "DEC": np.linspace(-28.95, -28.85, 6),
-           "source": np.array(["VIRAC2", "VIRAC2", "VIRAC2", "GaiaDR3", "GaiaDR3", "VIRAC2"]),
-           "refmag": np.array([14.0, 15.0, 16.0, 20.0, 21.0, np.nan])}).write(p)
+           "source": np.array(["VIRAC2"] * 6), "refmag": np.arange(14.0, 20.0)}).write(p)
     o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
                     instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
     monkeypatch.setattr(D, "_viraccache_path", lambda o: None)
     monkeypatch.setattr(D, "_refcat_path", lambda o: str(p))
+    monkeypatch.setenv("QA_VIRAC_DOWNLOAD", "0")
+    assert D._stage3_reference(o, 2026.70) == (None, None)
+
+
+def test_stage3_reference_reads_cached_virac2_ks(tmp_path, monkeypatch):
+    """A cached VizieR VIRAC2 table next to the refcat supplies Ksmag, PM-propagated from 2014."""
+    from astropy.table import Table
+    from data_qa.observations import Observation
+    p = tmp_path / "gaia_virac2_refcat_epoch2026.70_o100.fits"
+    Table({"RA": [266.5], "DEC": [-28.9], "source": ["VIRAC2"], "refmag": [18.0]}).write(p)
+    o = Observation(program="10678", obs="100", target="T", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    monkeypatch.setattr(D, "_viraccache_path", lambda o: None)
+    monkeypatch.setattr(D, "_refcat_path", lambda o: str(p))
+    monkeypatch.setenv("QA_VIRAC_DOWNLOAD", "0")
+    cache = D._stage3_ks_cache_path(o)
+    import os
+    os.makedirs(os.path.dirname(cache))
+    Table({"RAJ2000": [266.5, 266.51], "DEJ2000": [-28.9, -28.91], "pmRA": [0.0, 0.0],
+           "pmDE": [10.0, 0.0], "Jmag": [18.0, 19.0], "Ksmag": [12.0, 13.0]}).write(cache)
     sc, mag = D._stage3_reference(o, 2026.70)
-    np.testing.assert_allclose(np.sort(mag), [14.0, 15.0, 16.0])   # 3 finite VIRAC2 rows only
-    assert len(sc) == 3
+    np.testing.assert_allclose(mag, [12.0, 13.0])                   # Ks, not J
+    assert abs((sc[0].dec.deg - (-28.9)) * 3.6e6 - 127.0) < 1.0     # 10 mas/yr x 12.7 yr
+
+
+def test_one_to_one_match_rejects_shared_partner():
+    """Two VIRAC stars around ONE JWST star: only the mutual pair survives."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    ref = SkyCoord([266.5, 266.5 + 0.06 / 3600] * u.deg, [-28.9, -28.9] * u.deg)
+    jw = SkyCoord([266.5 + 0.01 / 3600] * u.deg, [-28.9] * u.deg)
+    ir, ij = D._one_to_one_match(ref, jw)
+    assert list(ir) == [0] and list(ij) == [0]
+
+
+def test_calibration_figure_recovers_locus_under_bulk_offset(monkeypatch):
+    """A catalogue 130 mas off VIRAC (Sgr B2 case) in a dense field: without the shift the 0.1"
+    match pairs neighbours; with it the true unit-slope locus comes back and the offset is reported."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from data_qa.observations import Observation
+    rng = np.random.default_rng(1)
+    n = 6000
+    ra = 266.4 + rng.uniform(0, 0.03, n); dec = -28.9 + rng.uniform(0, 0.03, n)
+    ks = rng.uniform(12.0, 18.0, n)
+    ref = SkyCoord(ra * u.deg, dec * u.deg)
+    cosd = np.cos(np.radians(-28.9))
+    jra = ra + (-30.0 / 3.6e6) / cosd; jde = dec + 127.0 / 3.6e6       # 130 mas off
+    # deep JWST: every VIRAC star + 3x as many faint field stars
+    fra = 266.4 + rng.uniform(0, 0.03, 3 * n); fde = -28.9 + rng.uniform(0, 0.03, 3 * n)
+    jsc = SkyCoord(np.r_[jra, fra] * u.deg, np.r_[jde, fde] * u.deg)
+    jmag = np.r_[ks + rng.normal(0, 0.05, n), rng.uniform(18, 23, 3 * n)]
+    o = Observation(program="5365", obs="001", target="T", release_field="sgrb2",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    png, sub = D._calibration_figure(o, "F212N", jsc, jmag, "jicama-m7", ref, ks,
+                                     "t_stage3_offset.png")
+    assert abs(sub["offset_to_virac_mas"] - 130.0) < 15.0
+    assert 0.9 < sub["slope"] < 1.1 and sub["scatter"] < 0.2
+
+
+def test_stage3_red_flags_misregistered_pipeline_catalogue(monkeypatch):
+    o = _stage3_synth(monkeypatch, our=True)
+    real = D._calibration_figure
+
+    def fake(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out):
+        png, sub = real(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out)
+        if lbl != "MAST catalogue":
+            sub["offset_to_virac_mas"] = 135.0
+        return png, sub
+    monkeypatch.setattr(D, "_calibration_figure", fake)
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["red_flag"] is True and m["passed"] is False
+    assert "135 mas off VIRAC" in m["red_flag_reason"]
+    assert m["registration_flag"] is True and m["photometry_passed"] is True  # zeropoint clean
+    assert "RED FLAG" in D.caption_for(3, m)
 
 
 def _stage3_synth(monkeypatch, our=True):
@@ -4027,3 +4098,10 @@ def test_stage2_rebuilt_or_other_program_not_flagged(tmp_path, monkeypatch):
     o = _stage2_cat(tmp_path, monkeypatch, "10678", D._M8_REBUILD_EPOCH - 3600, tier="m7")
     _, m = D.stage2_cmd(o, "F212N", "F480M")
     assert not m.get("pending_rebuild")                  # only m8 carries the #931 defect
+
+def test_caption_stage3_notes_undetermined_offset():
+    m = dict(available=True, passed=True, our_slope=1.0, slope=1.0, scatter=0.1, n_matched=500,
+             source="jicama-m8", offset_to_virac_mas=None)
+    assert "could not be measured" in D.caption_for(3, m)
+    m["offset_to_virac_mas"] = 3.0
+    assert "could not be measured" not in D.caption_for(3, m)

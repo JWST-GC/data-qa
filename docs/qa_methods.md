@@ -303,9 +303,19 @@ Stage 3 shows a 2-D histogram of JWST SW catalog magnitude versus
 line** is anchored on the densest stellar ridge (the mode of JWST−Ks); a well-calibrated catalog
 lies along it.
 
-`stage3_calibration` matches VIRAC sources to the nearest JWST source within 0.1″. Then it performs a
+`stage3_calibration` first removes each catalogue's bulk offset from VIRAC (the
+[xcorr histogram peak](#glossary-xcorr)), then pairs stars one-to-one: mutual nearest neighbours
+within 0.1″, so no JWST star stands in for several VIRAC stars. Then it performs a
 linear fit on sigma-clipped data to measure the slope and the scatter about
-the locus. `n_matched` is the number of cross-matches, `n_locus`is the number of cross-matches after sigma-clipping.. 
+the locus.
+
+The reference is VIRAC2 **Ks**, read from a raw VIRAC2 table (the field's `astrometry_diag`
+cache, else a VizieR II/387 query over the observation's footprint, cached next to the refcat).
+The `gaia_virac2_refcat` `refmag` column holds VIRAC2 **J**, so stage 3 does not use it.
+
+A pipeline catalogue whose bulk offset from VIRAC exceeds 50 mas is red-flagged: the pipeline
+ties to VIRAC2/Gaia at the ~25 mas level, so a larger offset is a registration defect to fix
+by re-tying the astrometry. `n_matched` is the number of cross-matches, `n_locus`is the number of cross-matches after sigma-clipping.. 
 
 When a pipeline ([jicama](#glossary-jicama)) catalogue exists, its panel is the image shown and
 carries the verdict; the MAST catalogue panel is always computed and sits in the "Other figures"
