@@ -3273,6 +3273,14 @@ def test_refresh_pending_treasury_tile_does_not_turn_the_job_red():
     ) == "PENDING"
 
 
+def test_refresh_field_pooled_status_is_not_a_failure():
+    """pipeline_status prints 'field-pooled, filenames carry no obsid' for every
+    field-pooled catalogue row; that routine note must not read as 'no obs'."""
+    out = "| cataloging m8 | ✅ | 2026-08-16 | 6 catalogs · field-pooled, filenames carry no obsid |"
+    assert _run_refresh_rc(2045, out, rc=0) == "CLEAN"
+    assert _run_refresh_rc(2045, "no issue titled 'X'", rc=0) == "FAILURE"
+
+
 def test_refresh_pending_exemption_is_treasury_only_and_failure_only():
     """The exemption is narrow: a CURATED field with no products on disk is
     still a failure, and any other failure on a treasury tile still counts."""
