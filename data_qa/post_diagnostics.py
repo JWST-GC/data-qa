@@ -162,6 +162,12 @@ def _delete_asset(repo, token, tag, rel, asset_name):
     return True
 
 
+def _already_exists(data):
+    """True for GitHub's 422 'already_exists' validation error on an asset name."""
+    errs = data.get("errors") if isinstance(data, dict) else None
+    return any(isinstance(e, dict) and e.get("code") == "already_exists" for e in errs or [])
+
+
 def upload_asset(repo, token, png_path, asset_name):
     """Upload ``png_path`` as ``asset_name`` on its shard release; replace if it exists there, and
     drop a same-name copy from the legacy un-sharded release.  Returns the browser_download_url
@@ -174,6 +180,12 @@ def upload_asset(repo, token, png_path, asset_name):
     ctype = mimetypes.guess_type(png_path)[0] or "image/png"
     url = f"{UPLOADS}/repos/{repo}/releases/{rel['id']}/assets?name={asset_name}"
     st, data = _req("POST", url, token, data=blob, headers={"Content-Type": ctype})
+    if st == 422 and _already_exists(data):
+        # a concurrent array task (e.g. a second issue for the same obs) uploaded this name after
+        # our per-process index was read -> re-read the index, replace its copy, retry once
+        _ASSET_INDEX.pop((repo, tag), None)
+        _delete_asset(repo, token, tag, rel, asset_name)
+        st, data = _req("POST", url, token, data=blob, headers={"Content-Type": ctype})
     if st >= 300:
         raise PostError(f"asset upload failed ({st}): {data}")
     _asset_index(repo, token, tag, rel)[asset_name] = data.get("id")
