@@ -3933,8 +3933,8 @@ def test_stage3_red_flags_misregistered_pipeline_catalogue(monkeypatch):
     o = _stage3_synth(monkeypatch, our=True)
     real = D._calibration_figure
 
-    def fake(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out):
-        png, sub = real(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out)
+    def fake(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out, system="Vega"):
+        png, sub = real(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out, system)
         if lbl != "MAST catalogue":
             sub["offset_to_virac_mas"] = 135.0
         return png, sub
@@ -3948,7 +3948,7 @@ def test_stage3_red_flags_misregistered_pipeline_catalogue(monkeypatch):
     assert "slope 1.0" in cap or "slope 0.9" in cap
 
 
-def _stage3_synth(monkeypatch, our=True):
+def _stage3_synth(monkeypatch, our=True, our_offset=3.0, our_system="Vega", our_why=None):
     """Synthetic stage-3 inputs.  The reference spans 11-19 mag (STRADDLING the [13,17] fit window,
     so windowing is actually exercised), and MAST vs our photometry DIFFER (MAST noisy + a slope
     error, ours clean unit-slope) so the grade-source and windowing assertions can't pass by accident
@@ -3968,10 +3968,10 @@ def _stage3_synth(monkeypatch, our=True):
     monkeypatch.setattr(D, "_stage3_reference", lambda o, ep: (ref_sc, ks))
     # MAST: a wrong slope (0.7) + large scatter -> would FAIL if it were graded
     monkeypatch.setattr(D, "_mast_calibration_sources",
-                        lambda o, sw: (ref_sc, 0.7 * ks + 5.0 + rng.normal(0, 0.4, n)))
+                        lambda o, sw: (ref_sc, 0.7 * ks + 5.0 + rng.normal(0, 0.4, n), "Vega"))
     # ours: clean unit slope, tight scatter -> passes
-    our_val = ((ref_sc, ks + 3.0 + rng.normal(0, 0.05, n), "jicama-m2") if our
-               else (None, None, None))
+    our_val = ((ref_sc, ks + our_offset + rng.normal(0, 0.05, n), "jicama-m2", our_system, our_why)
+               if our else (None,) * 5)
     monkeypatch.setattr(D, "_stage3_our_catalog", lambda o, sw: our_val)
     return o
 
@@ -4099,3 +4099,78 @@ def test_caption_stage3_notes_undetermined_offset():
 def test_caption_stage3_no_photometry_red_flag_keeps_empty_wording():
     m = dict(stage=3, red_flag=True, passed=False, red_flag_reason="no JWST photometry")
     assert "plot is empty" in D.caption_for(3, m)
+
+
+def test_perfilter_vega_mag_matches_pipeline_conversion():
+    """flux = sum of MJy/sr pixels -> Jy via the pixel solid angle -> Vega with the SVO zero point
+    (jwst-gc-pipeline merge_catalogs).  jw10678-o086 F212N: instrumental mags sat ~26 mag below Ks."""
+    import astropy.units as u
+    from astropy.table import Table
+    t = Table({"flux": [189685.8, 100.8]}); t.meta["PIXSCALE"] = 0.03122293448156842
+    mag, why = D._perfilter_vega_mag(t, "F212N", np.asarray(t["flux"], float))
+    assert why is None
+    pixar = ((0.03122293448156842 * u.arcsec) ** 2).to(u.sr).value
+    expect = -2.5 * np.log10(189685.8 * 1e6 * pixar / 674.83)
+    assert abs(mag[0] - expect) < 1e-6 and 12.0 < mag[0] < 14.0     # a K~13 star, not -13
+
+
+def test_perfilter_vega_mag_explains_instrumental_fallback():
+    from astropy.table import Table
+    t = Table({"flux": [1000.0]})                                   # no PIXSCALE
+    mag, why = D._perfilter_vega_mag(t, "F212N", np.array([1000.0]))
+    assert abs(mag[0] + 7.5) < 1e-9 and "PIXSCALE" in why
+    t.meta["PIXSCALE"] = 0.031
+    _, why = D._perfilter_vega_mag(t, "F999X", np.array([1000.0]))
+    assert "zero point" in why
+
+
+def test_stage3_labels_systems_and_rejects_uncalibrated_vega(monkeypatch):
+    # a column labelled Vega that sits 26 mag off Ks is not Vega -> red flag naming the units
+    o = _stage3_synth(monkeypatch, our=True, our_offset=-26.0)
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["our_mag_system"] == "Vega" and m["our_mag_system_verified"] is False
+    assert m["red_flag"] is True and "not Vega" in m["red_flag_reason"]
+    cap = D.caption_for(3, m)
+    assert "VIRAC Ks in **Vega**" in cap and "FAILED the unit check" in cap
+    assert "MAST catalogue F212N in **Vega**" in cap
+
+
+def test_stage3_instrumental_is_labelled_with_reason(monkeypatch):
+    o = _stage3_synth(monkeypatch, our=True, our_offset=-26.0, our_system="instrumental",
+                      our_why="the catalogue header carries no PIXSCALE")
+    _, m = D.stage3_calibration(o, "F212N")
+    assert m["our_mag_system"] == "instrumental" and m["passed"] is True   # slope still graded
+    assert not m.get("red_flag")                    # correctly labelled instrumental: not a defect
+    cap = D.caption_for(3, m)
+    assert "**instrumental**" in cap and "because the catalogue header carries no PIXSCALE" in cap
+
+
+def test_not_applicable_stage_draws_neutral_card_not_red_flag(monkeypatch):
+    # stage 8 with no second band: "not reduced yet" must never be drawn as a RED FLAG
+    drawn = []
+    monkeypatch.setattr(D, "_red_flag_figure", lambda *a, **k: drawn.append("red") or "r.png")
+    monkeypatch.setattr(D, "_note_figure", lambda *a, **k: drawn.append("note") or "n.png")
+    monkeypatch.setattr(D, "_interfilter_residuals", lambda o, sw: None)
+    monkeypatch.setattr(D, "_perfilter_interfilter_residuals", lambda o, sw: None)
+    from data_qa.observations import Observation
+    o = Observation(program="10678", obs="086", target="T", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    _, m = D.stage8_distortion(o, "F212N")
+    assert drawn == ["note"] and m["passed"] is None
+
+
+def test_missing_sw_reads_pending_not_failed(tmp_path, monkeypatch):
+    # 10678 o087: F480M reduced while F212N is still at image2.  Stage 1 must read "not done yet"
+    # (passed=None), and the SW-graded stages must report pending instead of crashing on sw=None.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    red = tmp_path / "gc-treasury" / "F480M" / "pipeline"
+    _write_i2d(str(red / "jw10678-o087_t001_nircam_clear-f480m-merged_i2d.fits"))
+    o = Observation(program="10678", obs="087", target="GC Treasury", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F480M"], visits=[], epoch="", notes="")
+    _png, m1 = D.stage1_mosaics(o, None, "F480M")
+    assert m1["passed"] is None
+    cap = D.caption_for(1, m1)
+    assert "nan" not in cap and "pending" in cap and "RED FLAG" not in cap
+    for n in D._STAGES_NEEDING_SW:
+        png, m = D._dispatch_stage(o, n, None, "F480M")
+        assert png is None and m["available"] is False and m["passed"] is None

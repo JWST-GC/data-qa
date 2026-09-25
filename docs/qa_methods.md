@@ -294,8 +294,25 @@ Source: [`data_qa/diagnostics.py` → `stage2_cmd`](../data_qa/diagnostics.py).
 
 Stage 3 shows a 2-D histogram of JWST SW catalog magnitude versus
 [VIRAC Ks](#glossary-virac) for the [cross-matched](#glossary-crossmatch) stars. The **cyan 1:1
-line** is anchored on the densest stellar ridge (the mode of JWST−Ks); a well-calibrated catalog
-lies along it.
+line** is JWST = Ks; a well-calibrated catalog lies along it.
+
+**Magnitude systems.** Every axis label and caption names the system of each magnitude:
+instrumental, Vega or AB. VIRAC Ks is Vega. Stage 3 plots JWST magnitudes in Vega:
+- the merged release catalogue's `mag_vega_<filter>` column;
+- a per-filter jicama PSF catalogue's `flux`, converted as jwst-gc-pipeline `merge_catalogs` does
+  it. `flux` is the fitted sum of MJy/sr pixels, so F[Jy] = flux × 10⁶ × Ω_pix, with Ω_pix taken
+  from the header `PIXSCALE`. Then Vega mag = −2.5 log₁₀(F / ZP), where ZP is the SVO
+  `JWST/NIRCam.<filter>` Vega zero point;
+- the MAST catalogue's `aper_total_vegamag`, falling back to `aper_total_abmag` (labelled AB) only
+  when no Vega column exists.
+
+If Vega cannot be determined (no `PIXSCALE`, an unexpected flux unit, or no tabulated zero point),
+the panel shows the instrumental −2.5 log₁₀(flux), labelled "instrumental", and the caption gives
+the reason. For an instrumental panel, the cyan line is a unit-slope line drawn through the locus.
+
+A Vega or AB locus must lie within ±5 mag of Ks, since both GC-star NIR colours and the AB−Vega
+offset are below ~2 mag. A catalogue whose calibrated column fails this check is red-flagged for
+wrong units in the catalogue.
 
 `stage3_calibration` first removes each catalogue's bulk offset from VIRAC (the
 [xcorr histogram peak](#glossary-xcorr)), then pairs stars one-to-one: mutual nearest neighbours
