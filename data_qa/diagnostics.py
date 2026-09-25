@@ -2144,9 +2144,15 @@ def _offset_summary_figure(o: Observation, sw, jsc, ref_sc, src_label, out_name)
     # sizeable fraction of its 0.05" radius (jw10678 o132 jicama: bare tie 13.5 mas, true ~66) and
     # would understate a real mis-registration; _bulk_offset does not.
     cloud = _bulk_offset(jsc, ref_sc)
-    off_med = float(cloud[2]) if cloud is not None else float(cc["off_med"])
+    # No confident whole-field xcorr peak -> the field offset is UNMEASURABLE from this selection.
+    # The per-cell weighted median is NOT a substitute: cells pass a looser peak floor
+    # (_CELL_PR_FLOOR), and with no real peak each cell locks onto its own noise spike.  jw10678
+    # o112 (rebuilt m8): cells at 600-2200 mas in random directions gave a 464 mas "field offset"
+    # that overwrote stage 7's measured 6.4 mas and was published as a real mis-registration.
+    off_med = float(cloud[2]) if cloud is not None else None
     sub = dict(offset_med_mas=off_med, offset_scatter_mas=cc["spread"], n_cells=cc["n_cells"],
-               cell_coverage=cc["coverage"], source=src_label)
+               cell_coverage=cc["coverage"], source=src_label,
+               offset_unmeasurable=cloud is None)
     fig, ax = _fig(1, 2, 6.4, 5.4)
     fig.subplots_adjust(wspace=0.5, top=0.84, bottom=0.14)
     a0 = ax[0][0]
@@ -2183,7 +2189,8 @@ def _offset_summary_figure(o: Observation, sw, jsc, ref_sc, src_label, out_name)
     a1.set_aspect("equal")
     a1.set_xlabel("ΔRA [mas]")
     a1.set_ylabel("ΔDec [mas]")
-    a1.set_title(f"offset from VIRAC {off_med:.1f} mas (xcorr + same-star residual)", fontsize=8)
+    a1.set_title(f"offset from VIRAC {off_med:.1f} mas (xcorr + same-star residual)" if off_med is not None
+                 else "offset from VIRAC UNMEASURABLE (no confident whole-field xcorr peak)", fontsize=8)
     fig.suptitle(f"{o.target} {o.obsid} — {sw} jicama − VIRAC offset", fontsize=11)
     fig.text(0.5, 0.005, f"Data source: {_dataset_label(sub)}", ha="center", fontsize=8, color="0.4")
     return _save(fig, out_name), sub
@@ -4459,7 +4466,12 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
         jp, jsub = _offset_summary_figure(o, sw, jpos, ref_sc, jsrc,
                                           f"{o.obsid}_stage7_jicama_offset.png")
         if jp is not None:
-            metrics["jicama_offset_med_mas"] = jsub.get("offset_med_mas")
+            # The per-cell figure uses the position-valid selection (_jwst_positions); the headline
+            # jicama offset above uses the full flux catalogue.  Keep the headline when it was
+            # measured, and record the figure's value under its own key.
+            metrics["jicama_cell_offset_med_mas"] = jsub.get("offset_med_mas")
+            if metrics.get("jicama_offset_med_mas") is None:
+                metrics["jicama_offset_med_mas"] = jsub.get("offset_med_mas")
             return _stage7_pick_primary(main_png, jp, jsrc, metrics)
     return main_png, metrics
 
@@ -6749,7 +6761,13 @@ def _caption_for_impl(n, metrics):
         if metrics.get("primary_figure") == "jicama_offset":
             base += ("The figure shown is the [jicama](DOCROOT#glossary-jicama) catalogue's "
                      "per-cell offset from VIRAC; the MAST-vs-pipeline comparison figure described "
-                     "next is in the dropdown below. In that comparison, the ")
+                     "next is in the dropdown below. ")
+            if metrics.get("jicama_cell_offset_med_mas") is None and jo is not None:
+                base += ("That per-cell figure uses only rows whose position passed the "
+                         "position-validity cut, and that selection has no confident whole-field "
+                         "xcorr peak, so its field offset reads UNMEASURABLE; the offset quoted "
+                         "below comes from the full catalogue. ")
+            base += "In that comparison, the "
         else:
             base += "The "
         base += ("TOP row shows the "

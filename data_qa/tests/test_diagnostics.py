@@ -1763,8 +1763,17 @@ def test_offset_summary_figure_measures_or_blank(monkeypatch):
     monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: {"off": 1.2, "npairs": 40, "scatter": 0.3})
     monkeypatch.setattr(D, "_offset_cloud", lambda j, r: (np.array([1.0, 2.0]), np.array([0.0, 0.0]), 1.0))
     monkeypatch.setattr(D, "_save", lambda fig, name: name)
+    monkeypatch.setattr(D, "_bulk_offset",
+                        lambda j, r, *a, **k: (np.array([1.0, 2.0]), np.array([0.0, 0.0]), 1.2))
     png, sub = D._offset_summary_figure(_obs(), "F212N", jsc, ref, "release:x_m3_cat.ecsv", "out.png")
-    assert png == "out.png" and sub["offset_med_mas"] is not None
+    assert png == "out.png" and sub["offset_med_mas"] == 1.2 and sub["offset_unmeasurable"] is False
+    # no confident whole-field peak -> UNMEASURABLE; the noise-locked per-cell median (jw10678 o112:
+    # 464 mas from cells at 600-2200 mas) must never stand in for the field offset
+    monkeypatch.setattr(D, "_cell_consistency", lambda c, d: {"cells": c, "off_med": 464.0,
+                        "spread": 900.0, "n_cells": len(c), "coverage": 1.0})
+    monkeypatch.setattr(D, "_bulk_offset", lambda j, r, *a, **k: None)
+    png, sub = D._offset_summary_figure(_obs(), "F212N", jsc, ref, "release:x_m3_cat.ecsv", "out.png")
+    assert png == "out.png" and sub["offset_med_mas"] is None and sub["offset_unmeasurable"] is True
     # no catalogue -> blank (no figure, no metrics), never a red flag
     assert D._offset_summary_figure(_obs(), "F212N", None, ref, "x", "o.png") == (None, {})
 
@@ -4099,3 +4108,13 @@ def test_caption_stage3_notes_undetermined_offset():
 def test_caption_stage3_no_photometry_red_flag_keeps_empty_wording():
     m = dict(stage=3, red_flag=True, passed=False, red_flag_reason="no JWST photometry")
     assert "plot is empty" in D.caption_for(3, m)
+
+
+def test_caption_stage7_cell_figure_unmeasurable_keeps_full_catalogue_offset():
+    # o112: per-cell (position-valid) selection unmeasurable, full catalogue 6 mas vs MAST 28 mas.
+    m = dict(stage=7, passed=True, primary_figure="jicama_offset", jicama_is_release=True,
+             mast_offset_med_mas=28.3, jicama_offset_med_mas=6.4, jicama_cell_offset_med_mas=None,
+             n_jicama_window=93167, n_mast_window=27365)
+    cap = D.caption_for(7, m)
+    assert "UNMEASURABLE" in cap and "6 mas (jicama) vs 28 mas (MAST)" in cap
+    assert "mis-registration" not in cap
