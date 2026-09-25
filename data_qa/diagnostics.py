@@ -1148,7 +1148,7 @@ def stage2_cmd(o: Observation, sw, lw):
                   f"calibrated photometry) — a CMD needs magnitudes; the merged/MAST catalogue is "
                   f"not built yet" if dao_only else
                   f"no release catalogue and no MAST source catalogue for {want} yet")
-        png = _red_flag_figure(o, "stage2", "NO CATALOG FOR CMD",
+        png = _note_figure(o, "stage2", "NO CATALOG FOR CMD",
                                f"The CMD is empty: {reason}.")
         metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
@@ -1422,33 +1422,85 @@ def _stage3_align(jsc, ref_sc):
 
 
 def _mast_calibration_sources(o: Observation, sw):
-    """(SkyCoord, mag) from the MAST-delivered per-i2d source catalogue for the calibration check,
-    or (None, None).  MAST is the always-shown baseline; its aperture photometry is crowding-limited
+    """(SkyCoord, mag, magnitude system) from the MAST-delivered per-i2d source catalogue for the
+    calibration check, or (None, None, None).  MAST is the always-shown baseline; its aperture photometry is crowding-limited
     in the GC, so stage 3 grades on OUR catalogue, not this one."""
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     from astropy.table import Table
     mp = _mast_source_catalog(o, sw)
     if not mp:
-        return None, None
+        return None, None, None
     m = Table.read(_used(mp, f"JWST catalogue, MAST per-i2d ({sw})"))
-    magc = next((c for c in ("aper_total_abmag", "aper50_abmag", "aper70_abmag",
+    # Vega first (the system stage 3 plots in); AB only when the catalogue carries no Vega column
+    magc = next((c for c in ("aper_total_vegamag", "aper50_vegamag", "aper70_vegamag",
+                             "aper30_vegamag", "aper_total_abmag", "aper50_abmag", "aper70_abmag",
                              "aper30_abmag") if c in m.colnames), None)
     if not magc:
-        return None, None
+        return None, None, None
+    system = "Vega" if "vegamag" in magc else "AB"
     if "sky_centroid" in m.colnames:
         sc = m["sky_centroid"]; ra = np.asarray(sc.ra.deg, float); dec = np.asarray(sc.dec.deg, float)
     else:
         low = {c.lower(): c for c in m.colnames}
         if "sky_centroid.ra" not in low or "sky_centroid.dec" not in low:
-            return None, None
+            return None, None, None
         ra = np.asarray(m[low["sky_centroid.ra"]], float)
         dec = np.asarray(m[low["sky_centroid.dec"]], float)
     mag = np.asarray(m[magc], float)
     g = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(mag)
     if g.sum() < 30:
-        return None, None
-    return SkyCoord(ra[g] * u.deg, dec[g] * u.deg), mag[g]
+        return None, None, None
+    return SkyCoord(ra[g] * u.deg, dec[g] * u.deg), mag[g], system
+
+
+# Vega zero points (Jy) of JWST/NIRCam.<filter> from the SVO Filter Profile Service ('ZeroPoint',
+# Pogson), the same table jwst-gc-pipeline merge_catalogs reads through SvoFps to write mag_vega_<f>.
+# Tabulated here (fetched 2026-09-25) so stage 3 does not need network access on a compute node.
+_NIRCAM_VEGA_ZP_JY = {
+    "F070W": 2768.40, "F090W": 2244.95, "F115W": 1746.12, "F140M": 1288.65, "F150W": 1172.06,
+    "F150W2": 1149.94, "F162M": 1023.04, "F164N": 985.58, "F182M": 844.94, "F187N": 794.85,
+    "F200W": 757.65, "F210M": 688.03, "F212N": 674.83, "F250M": 504.65, "F277W": 430.14,
+    "F300M": 369.65, "F322W2": 343.30, "F323N": 320.94, "F335M": 298.91, "F356W": 271.39,
+    "F360M": 260.31, "F405N": 206.97, "F410M": 208.75, "F430M": 190.70, "F444W": 184.10,
+    "F460M": 164.11, "F466N": 157.77, "F470N": 159.50, "F480M": 153.22,
+}
+# A GC star's Vega (or AB) JWST magnitude lies within a few mag of its VIRAC Ks: NIR colours of GC
+# stars and the AB-Vega offset are each below ~2 mag.  An instrumental -2.5 log10(flux) sits ~20-30
+# mag away (jw10678-o086 F212N: -26 mag).  A locus offset beyond this bound means the magnitudes are
+# not in the system they claim.
+_STAGE3_MAG_SYSTEM_MAX_OFFSET = 5.0
+
+
+def _perfilter_vega_mag(tbl, filt, flux):
+    """Vega magnitude of a per-filter jicama PSF catalogue's ``flux`` -> (mag, None), or the
+    instrumental ``-2.5 log10(flux)`` and the reason Vega could not be determined -> (mag, reason).
+
+    Same conversion as jwst-gc-pipeline merge_catalogs: ``flux`` is the fitted sum of pixels in the
+    cal/crf image unit MJy/sr, so F[Jy] = flux * 1e6 * (pixel solid angle in sr), and
+    Vega mag = -2.5 log10(F / ZP_Vega) with the SVO zero point."""
+    import astropy.units as u
+    with np.errstate(invalid="ignore", divide="ignore"):
+        instr = -2.5 * np.log10(flux)
+    zp = _NIRCAM_VEGA_ZP_JY.get(str(filt).upper())
+    if zp is None:
+        return instr, f"no SVO Vega zero point is tabulated for {filt}"
+    low = {c.lower(): c for c in tbl.colnames}
+    unit = getattr(tbl[low["flux"]], "unit", None) if "flux" in low else None
+    if unit is not None and unit != u.dimensionless_unscaled and unit != u.MJy / u.sr:
+        return instr, (f"the catalogue flux unit is {unit}, not the MJy/sr pixel sum the Vega "
+                       f"conversion assumes")
+    pix = tbl.meta.get("PIXSCALE") or tbl.meta.get("pixscale")
+    try:
+        pix = float(pix)
+    except (TypeError, ValueError):
+        pix = None
+    if not pix or not np.isfinite(pix) or pix <= 0:
+        return instr, ("the catalogue header carries no PIXSCALE, so the pixel solid angle needed "
+                       "to turn the summed MJy/sr flux into Jy is unknown")
+    pixar_sr = ((pix * u.arcsec) ** 2).to(u.sr).value
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return -2.5 * np.log10(flux * 1e6 * pixar_sr / zp), None
 
 
 def _perfilter_psf_photometry(o: Observation, filt):
@@ -1474,10 +1526,11 @@ def _perfilter_psf_photometry(o: Observation, filt):
 
 
 def _stage3_our_catalog(o: Observation, sw):
-    """(SkyCoord, mag, source_label) for OUR pipeline catalogue used to GRADE the calibration, or
-    (None, None, None).  Prefers the cross-band merged release catalogue (``mag_vega_<sw>``); falls
-    back to the per-filter PSF catalogue's instrumental mag (``-2.5 log10 flux``) so tiles that have
-    reached only per-filter photometry still grade.  This is the 'jicama when available' half of the
+    """(SkyCoord, mag, source_label, mag_system, why_not_vega) for OUR pipeline catalogue used to
+    GRADE the calibration, or five Nones.  Prefers the cross-band merged release catalogue
+    (``mag_vega_<sw>``); falls back to the per-filter PSF catalogue's flux, converted to Vega with
+    the pipeline's own conversion (``_perfilter_vega_mag``), or left instrumental with the reason
+    when Vega cannot be determined, so tiles that have reached only per-filter photometry still grade.  This is the 'jicama when available' half of the
     MAST-always / ours-when-available pattern."""
     from astropy.table import Table
     # 1) cross-band merged release catalogue with a Vega magnitude
@@ -1488,8 +1541,8 @@ def _stage3_our_catalog(o: Observation, sw):
             sc = m[sccol]; mag = np.asarray(m[magcol], float)
             g = np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg) & np.isfinite(mag)
             if g.sum() >= 30:
-                return sc[g], mag[g], _source_label_from_path(cat)
-    # 2) per-filter PSF catalogue: instrumental mag from flux
+                return sc[g], mag[g], _source_label_from_path(cat), "Vega", None
+    # 2) per-filter PSF catalogue: flux -> Vega (instrumental, with the reason, if that fails)
     p = _perfilter_psf_photometry(o, sw)
     if p:
         m = Table.read(_used(p, f"JWST catalogue, pipeline per-filter PSF ({sw})"))
@@ -1499,11 +1552,14 @@ def _stage3_our_catalog(o: Observation, sw):
             pos = (np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)
                    & np.isfinite(flux) & (flux > 0))
             if pos.sum() >= 30:
-                return sc[pos], -2.5 * np.log10(flux[pos]), _source_label_from_path(p)
-    return None, None, None
+                mag, why = _perfilter_vega_mag(m, sw, flux[pos])
+                return (sc[pos], mag, _source_label_from_path(p),
+                        "instrumental" if why else "Vega", why)
+    return None, None, None, None, None
 
 
-def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_mag, out_name):
+def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_mag, out_name,
+                        mag_system="Vega"):
     """VIRAC reference mag vs one JWST catalogue's mag: hexbin locus + 1:1 line + sigma-clipped fit.
     Returns (png, submetrics); submetrics carries slope/scatter/passed, or (None, {na_reason}) when
     too few stars match to fit a locus.  The cyan 1:1 line is the ideal unit-slope relation; the
@@ -1531,11 +1587,25 @@ def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_ma
     hcnt, hedge = np.histogram(dy, bins=60)
     zp1 = float(0.5 * (hedge[int(np.argmax(hcnt))] + hedge[int(np.argmax(hcnt)) + 1]))   # locus offset
     xs = np.array([np.nanmin(x), np.nanmax(x)])
-    a.plot(xs, xs, "c-", lw=1.4, label="1:1 reference line")
+    # Verify the claimed system: a calibrated (Vega/AB) locus sits within a few mag of Ks; one that
+    # does not is not in the system its column claims (e.g. an instrumental -2.5 log10 flux).
+    calibrated = mag_system in ("Vega", "AB")
+    system_ok = (not calibrated) or abs(zp1) <= _STAGE3_MAG_SYSTEM_MAX_OFFSET
+    if calibrated:
+        a.plot(xs, xs, "c-", lw=1.4, label="1:1 reference line")
+    else:                   # no zero point: a unit-slope line through the locus, not the 1:1 line
+        a.plot(xs, xs + zp1, "c-", lw=1.4, label=f"unit slope through locus (offset {zp1:.1f})")
     a.plot(xs, slope * xs + zp, "g--", lw=1.4, label="fitted locus")
     if windowed:                                   # mark the magnitude range the fit used
         a.axvspan(_STAGE3_FIT_MAG_MIN, _STAGE3_FIT_MAG_MAX, color="0.7", alpha=0.15, zorder=0)
-    a.set_xlabel("VIRAC2 reference mag (VVV/VISTA Ks)"); a.set_ylabel(f"JWST {sw} mag ({src_label})")
+    a.set_xlabel("VIRAC2 Ks [Vega mag] (VVV/VISTA Ks)")
+    a.set_ylabel(f"JWST {sw} [{mag_system} mag] ({src_label})")
+    if not system_ok:
+        a.text(0.02, 0.80, f"offset {zp1:+.1f} mag from Ks:\nNOT a {mag_system} magnitude",
+               transform=a.transAxes, ha="left", va="top", fontsize=9, color="#c33", weight="bold")
+    elif not calibrated:
+        a.text(0.02, 0.80, "instrumental: -2.5 log10(flux),\nno zero point applied",
+               transform=a.transAxes, ha="left", va="top", fontsize=8.5, color="#c80")
     a.legend(fontsize=8, loc="upper left")
     # Say which exit the clip took: n_locus == n_fit reads the same whether the clip converged with
     # nothing to reject or was refused for want of survivors, and those are different numbers.
@@ -1561,6 +1631,7 @@ def _calibration_figure(o: Observation, sw, jsc, jmag, src_label, ref_sc, ref_ma
                offset_to_virac_mas=off, offset_dra_mas=off_ra, offset_ddec_mas=off_de,
                n_locus=n_locus, n_locus_unclipped=n_unclipped, clip_exit=clip_exit,
                slope=float(slope), zeropoint_fit=float(zp), scatter=scat, locus_offset=float(zp1),
+               mag_system=mag_system, mag_system_verified=bool(calibrated and system_ok),
                passed=bool(0.8 < slope < 1.2 and scat < 0.8))
     return _save(fig, out_name), sub
 
@@ -1577,8 +1648,10 @@ def stage3_calibration(o: Observation, sw):
     ep = _obs_epoch(o, path)
     ref_sc, ref_mag = _stage3_reference(o, ep)     # VIRAC2 Ks (clean NIR band), PM-propagated
 
-    mast_sc, mast_mag = _mast_calibration_sources(o, sw)
-    our_sc, our_mag, our_lbl = _stage3_our_catalog(o, sw)
+    mast_sc, mast_mag, mast_sys = _mast_calibration_sources(o, sw)
+    our_sc, our_mag, our_lbl, our_sys, our_why = _stage3_our_catalog(o, sw)
+    if our_why:
+        metrics["our_not_vega_reason"] = our_why
 
     if mast_sc is None and our_sc is None:
         # Nothing to calibrate: no MAST and no pipeline source catalogue yet -> the stage has not
@@ -1588,7 +1661,7 @@ def stage3_calibration(o: Observation, sw):
                   f"calibrated photometry) — calibration needs magnitudes; see stage 4 for the "
                   f"frame offset" if dao_only else
                   f"no MAST or pipeline source catalogue for {sw} yet")
-        png = _red_flag_figure(o, "stage3", "NO PHOTOMETRY TO CALIBRATE", reason + ".")
+        png = _note_figure(o, "stage3", "NO PHOTOMETRY TO CALIBRATE", reason + ".")
         metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
 
@@ -1607,10 +1680,10 @@ def stage3_calibration(o: Observation, sw):
     primary_png = None
     extra = []
 
-    def _emit(jsc, jmag, lbl, kind, is_our):
+    def _emit(jsc, jmag, lbl, kind, is_our, system):
         nonlocal primary_png
         out = f"{o.obsid}_stage3.png" if primary_png is None else f"{o.obsid}_stage3_{kind}.png"
-        png, sub = _calibration_figure(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out)
+        png, sub = _calibration_figure(o, sw, jsc, jmag, lbl, ref_sc, ref_mag, out, system)
         if png is None:                            # too few matched stars for this catalogue -> skip
             return
         for k, v in sub.items():
@@ -1625,19 +1698,30 @@ def stage3_calibration(o: Observation, sw):
                            scatter=sub["scatter"], n_matched=sub["n_matched"],
                            locus_offset=sub["locus_offset"], zeropoint_fit=sub["zeropoint_fit"],
                            offset_to_virac_mas=sub.get("offset_to_virac_mas"),
-                           photometry_passed=sub["passed"], registration_flag=False)
+                           photometry_passed=sub["passed"], registration_flag=False,
+                           mag_system=system, mag_system_verified=sub["mag_system_verified"])
+            if system in ("Vega", "AB") and not sub["mag_system_verified"]:
+                # the catalogue's own calibrated column is tens of mag off Ks: wrong units in the
+                # pipeline product, a data defect
+                metrics.update(passed=False, photometry_passed=False, red_flag=True,
+                               mag_system_flag=True, red_flag_reason=(
+                                   f"{lbl} {sw} magnitudes labelled {system} sit "
+                                   f"{sub['locus_offset']:+.1f} mag from VIRAC Ks -- not {system} "
+                                   f"magnitudes (wrong units in the catalogue)"))
             off = sub.get("offset_to_virac_mas")
             if off is not None and off > _STAGE3_REGISTRATION_FLAG_MAS:
                 # our catalogue sits far off VIRAC: a registration defect of the pipeline product.
                 # photometry_passed keeps the zeropoint verdict on its own.
-                metrics.update(passed=False, red_flag=True, registration_flag=True, red_flag_reason=(
-                    f"pipeline catalogue {lbl} is {off:.0f} mas off VIRAC (bulk offset; the "
-                    f"pipeline ties to VIRAC2/Gaia at ~25 mas) -- re-tie the astrometry"))
+                why = (f"pipeline catalogue {lbl} is {off:.0f} mas off VIRAC (bulk offset; the "
+                       f"pipeline ties to VIRAC2/Gaia at ~25 mas) -- re-tie the astrometry")
+                prev = metrics.get("red_flag_reason")
+                metrics.update(passed=False, red_flag=True, registration_flag=True,
+                               red_flag_reason=f"{prev}; {why}" if prev else why)
 
     if our_sc is not None:
-        _emit(our_sc, our_mag, our_lbl, "our", is_our=True)
+        _emit(our_sc, our_mag, our_lbl, "our", is_our=True, system=our_sys)
     if mast_sc is not None:
-        _emit(mast_sc, mast_mag, "MAST catalogue", "mast", is_our=False)
+        _emit(mast_sc, mast_mag, "MAST catalogue", "mast", is_our=False, system=mast_sys)
 
     if primary_png is None:
         # Every catalogue present but too few stars matched the reference to fit a locus.
@@ -2424,7 +2508,7 @@ def stage4_offsets(o: Observation, sw):
     if jsc is None or ref_sc is None:
         why = ("no MAST L3 catalogue on disk for this filter" if jsc is None
                else "no VIRAC2/Gaia reference catalogue on disk")
-        png = _red_flag_figure(o, "stage4", "MAST↔VIRAC OFFSET UNAVAILABLE",
+        png = _note_figure(o, "stage4", "MAST↔VIRAC OFFSET UNAVAILABLE",
                                f"The positional-offset plot is empty: {why}.")
         metrics.update(available=False, na_reason=why, passed=None, n_cells=0)
         return png, metrics
@@ -3411,7 +3495,7 @@ def stage9_psf_vs_aper(o: Observation, sw, r_ap=3.0, r_in=6.0, r_out=9.0, iso_px
     if sc is None or not mpath:
         reason = ("no jicama catalog with a PSF flux column for this filter" if sc is None
                   else "no mosaic on disk to measure aperture photometry on")
-        png = _red_flag_figure(o, "stage9", "PSF-vs-APER UNMEASURABLE",
+        png = _note_figure(o, "stage9", "PSF-vs-APER UNMEASURABLE",
                                f"Cannot compare PSF vs aperture photometry: {reason}.")
         metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
@@ -3718,7 +3802,7 @@ def stage10_photometric_consistency(o: Observation, sw, lw):
     filt = next((f for f in (sw, lw) if f and _jwst1pass_matchup(o, f)), None)
     if filt is None:
         reason = "no JWST1PASS MATCHUP.XYMEEE product on disk for this obs/filter"
-        png = _red_flag_figure(o, "stage10", "JWST1PASS CONSISTENCY UNAVAILABLE",
+        png = _note_figure(o, "stage10", "JWST1PASS CONSISTENCY UNAVAILABLE",
                                f"Cannot build the across-exposure consistency panels: {reason}.")
         metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
@@ -4195,7 +4279,7 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
     mast_path = _mast_i2d(o, sw)
     our_path = _mosaic_path(o, sw)
     if not mast_path:
-        png = _red_flag_figure(o, "stage7", "NO MAST i2d ON DISK",
+        png = _note_figure(o, "stage7", "NO MAST i2d ON DISK",
                                f"No MAST-delivered {sw} i2d in mastDownload/ for this obs, so the "
                                f"before/after comparison can't be made. (Not a data defect — the "
                                f"raw MAST product just isn't staged locally.)")
@@ -4701,7 +4785,7 @@ def stage8_distortion(o: Observation, sw):
         # NOT APPLICABLE, not a defect: a single-filter or not-yet-reduced obs simply has no second
         # band to difference.  Use a distinct "measurement unavailable" state -- do NOT red_flag it
         # and do NOT mark it failed (either would post a non-defect as a defect).
-        png = _red_flag_figure(o, "stage8", "DISTORTION MAP NOT APPLICABLE",
+        png = _note_figure(o, "stage8", "DISTORTION MAP NOT APPLICABLE",
                                f"No inter-filter distortion map for {sw}: need either a merged "
                                f"catalogue carrying {sw} positions plus a second filter's, or a "
                                f"per-filter catalogue for {sw} and a second filter of this obs. "
@@ -4974,7 +5058,7 @@ def miri_overview(o: Observation, filt=None):
     if not mpath:
         # No image, so no provenance: leave `i2d_source` absent rather than recording "reduced"
         # for a figure that shows nothing.
-        png = _red_flag_figure(o, "miri", "NO MIRI i2d ON DISK",
+        png = _note_figure(o, "miri", "NO MIRI i2d ON DISK",
                                f"No MIRI i2d for {o.obsid} in mastDownload/ or in a "
                                f"<FILT>/pipeline/ reduction dir "
                                f"(filters tried: {', '.join(filts)}).")
@@ -5506,7 +5590,7 @@ def _stage6_figure(o: Observation, sw, lw, exclude=None, png_suffix=""):
     if not any_data:
         plt.close(fig)          # close the empty curve fig before the red-flag builds its own
         reason = "no per-exposure DAOPHOT catalogs on disk for this obs/filter"
-        png = _red_flag_figure(o, "stage6" + png_suffix, "ASTROMETRIC-ERROR CURVE UNAVAILABLE",
+        png = _note_figure(o, "stage6" + png_suffix, "ASTROMETRIC-ERROR CURVE UNAVAILABLE",
                                f"Cannot build the precision-vs-magnitude curve: {reason}.")
         metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
@@ -5826,7 +5910,7 @@ def stage11_effective_psf(o: Observation, sw, lw):
     filt = next((f for f in (sw, lw) if f and _peppar_dir(o, f)), None)
     if filt is None:
         reason = "no peppar per-frame catalogues on disk for this obs/filter"
-        png = _red_flag_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE",
+        png = _note_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE",
                                f"Cannot build the per-exposure effective PSF: {reason}.")
         metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
@@ -5846,7 +5930,7 @@ def stage11_effective_psf(o: Observation, sw, lw):
             exps.append(mo.group(1))
     if not exps:
         reason = f"no exposures found under peppar {filt}/{det}"
-        png = _red_flag_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE", reason + ".")
+        png = _note_figure(o, "stage11", "EFFECTIVE-PSF CHECK UNAVAILABLE", reason + ".")
         metrics.update(available=False, na_reason=reason, passed=None)
         return png, metrics
 
@@ -6155,7 +6239,7 @@ def stage12_photometric_linearity(o: Observation, sw, lw=None, r_ap=3.0, iso_px=
     metrics["reasons"] = reasons
     if not figures:
         why = "no filter had a mosaic + PSF-flux catalogue with enough clean isolated stars"
-        png = _red_flag_figure(o, "stage12", "LINEARITY UNMEASURABLE",
+        png = _note_figure(o, "stage12", "LINEARITY UNMEASURABLE",
                                f"Cannot measure photometric linearity: {why}.")
         metrics.update(available=False, na_reason=why, passed=None,
                        filters_measured=[], per_filter={})
@@ -6207,6 +6291,30 @@ def _dispatch_stage(o, n, sw, lw):
     if n == 12:
         return stage12_photometric_linearity(o, sw, lw)
     raise ValueError(n)
+
+
+def _stage3_units_note(m):
+    """Caption sentence naming the magnitude system of every stage-3 panel (always stated: a
+    magnitude is instrumental, Vega or AB), with the reason whenever a panel is not Vega."""
+    sw = m.get("sw", "SW")
+    parts = []
+    for kind, name in (("our", m.get("our_source") or "pipeline catalogue"), ("mast", "MAST catalogue")):
+        sysn = m.get(f"{kind}_mag_system")
+        if not sysn:
+            continue
+        txt = f"{name} {sw} in **{sysn}** magnitudes"
+        if sysn in ("Vega", "AB") and m.get(f"{kind}_mag_system_verified") is False:
+            txt += (f", which FAILED the unit check (locus {m.get(f'{kind}_locus_offset', float('nan')):+.1f}"
+                    f" mag from Ks, beyond ±{_STAGE3_MAG_SYSTEM_MAX_OFFSET:.0f})")
+        elif sysn == "instrumental" and kind == "our":
+            txt += (f" (-2.5 log10 flux, no zero point) because {m.get('our_not_vega_reason')}"
+                    if m.get("our_not_vega_reason") else " (-2.5 log10 flux, no zero point)")
+        elif sysn == "AB":
+            txt += " (the catalogue carries no Vega column)"
+        parts.append(txt)
+    if not parts:
+        return ""
+    return "Magnitude systems: VIRAC Ks in **Vega**; " + "; ".join(parts) + ". "
 
 
 def build_stage(o, n, sw, lw):
@@ -6479,12 +6587,13 @@ def _caption_for_impl(n, metrics):
         return _caption_stage8(metrics)
     if n == 12:
         return _caption_stage12(metrics)
-    # Stage 7, and stage 3's registration flag, build their own red-flag captions below (those
+    # Stage 7, and stage 3's registration / magnitude-system flags, build their own red-flag captions (those
     # cases still render a full figure, so the generic "the plot is empty" wording would not fit).
     if metrics.get("available") is False:
         return (f"**Stage {n} — pending.** The input data for this stage are not yet on disk "
                 f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
-    if metrics.get("red_flag") and n != 7 and not (n == 3 and metrics.get("registration_flag")):
+    if metrics.get("red_flag") and n != 7 and not (
+            n == 3 and (metrics.get("registration_flag") or metrics.get("mag_system_flag"))):
         return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate. "
@@ -6898,6 +7007,7 @@ def _caption_for_impl(n, metrics):
                    "(http://svo2.cab.inta-csic.es/theory/fps/index.php?id=Paranal/VISTA.Ks)). ")
         match_note = ("Stars are paired one-to-one (mutual nearest neighbour within 0.1″) after "
                       "removing each catalogue's bulk offset from VIRAC. ")
+        refband += _stage3_units_note(metrics)
         if metrics.get("our_slope") is not None and metrics.get("offset_to_virac_mas") is None:
             match_note += ("The bulk offset could not be measured (ambiguous cross-correlation), so "
                            "this catalogue was matched without a shift. ")
