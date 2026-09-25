@@ -280,12 +280,6 @@ magnitude of the LF peak bin.
 A second figure in the dropdown shows the same CMD with the SW magnitude on the y axis, since SW
 and LW saturate at different magnitudes.
 
-GC-Treasury (10678) m8 catalogs written before the jwst-gc-pipeline #931 satstar fix (file mtime
-before 2026-09-23 21:18 EDT; override with `QA_M8_REBUILD_EPOCH`) carry saturated stars merged in
-from other tiles and an empty strip at F480M 12.0–12.4. Stage 2 marks such a catalog with a red
-"pending rebuild" banner and leaves it ungraded (`pending_rebuild`, `passed = None`) until the
-rebuilt m8 lands at the same path.
-
 <details>
 <summary>What to do?</summary>
 <br>

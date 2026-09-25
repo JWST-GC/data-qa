@@ -1112,28 +1112,6 @@ def _mag_cols(t, sw, lw):
     return find(sw), find(lw)
 
 
-# GC-Treasury 10678 m8 catalogues written before jwst-gc-pipeline #931/#947 merged other tiles'
-# saturated stars into each tile and dropped stars just under the satstar severity gate (empty
-# F480M 12.0-12.4 strip; data-qa#177).  The fixed finalize jobs rewrite m8 at the same path, so an
-# m8 older than the fix is the stale build.  Overridable (epoch seconds) via QA_M8_REBUILD_EPOCH.
-_M8_REBUILD_EPOCH = float(os.environ.get("QA_M8_REBUILD_EPOCH", "1790212680"))  # 2026-09-23 21:18 EDT
-_M8_REBUILD_PROGRAMS = {"10678"}
-
-
-def _m8_pending_rebuild(o: Observation, cat):
-    """True when ``cat`` is a 10678 m8 catalogue built before the #931 satstar fix."""
-    if str(o.program) not in _M8_REBUILD_PROGRAMS or not cat or "_m8" not in os.path.basename(cat):
-        return False
-    return os.path.getmtime(cat) < _M8_REBUILD_EPOCH
-
-
-def _pending_rebuild_banner(fig):
-    fig.text(0.5, 1.0, "STALE CATALOGUE — pending rebuild\n(jwst-gc-pipeline#931: foreign-tile "
-             "satstars + gap at F480M 12.0–12.4)", ha="center", va="bottom", fontsize=13,
-             color="white", weight="bold", zorder=100,
-             bbox=dict(boxstyle="round", facecolor="#c33", alpha=0.85, edgecolor="none"))
-
-
 def stage2_cmd(o: Observation, sw, lw):
     """Colour-magnitude diagram (LW vs SW-LW) with the luminosity function as a RIGHT-SIDE
     marginal whose y-axis (magnitude) is locked to the CMD -- the LF reads straight across
@@ -1259,9 +1237,6 @@ def stage2_cmd(o: Observation, sw, lw):
         peak_hi = _draw_cmd(gs, 1, hi, "S/N > 10 in both bands")
         metrics.update(n_stars_hi_sn=int(np.sum(hi)), lf_turnover_hi_sn=peak_hi)
     fig.suptitle(f"{o.target} {o.obsid} — CMD ({kind.replace('_dedup', '')})", fontsize=11)
-    stale = _m8_pending_rebuild(o, cat)
-    if stale:
-        _pending_rebuild_banner(fig)
     png = _save(fig, f"{o.obsid}_stage2.png")
 
     # Same diagram with the SW band on the y axis (SW saturates differently from LW; data-qa#177).
@@ -1272,14 +1247,8 @@ def stage2_cmd(o: Observation, sw, lw):
         _draw_cmd(gs, 1, hi, "S/N > 10 in both bands", msw, sw)
     fig.suptitle(f"{o.target} {o.obsid} — CMD, {sw} on y ({kind.replace('_dedup', '')})",
                  fontsize=11)
-    if stale:
-        _pending_rebuild_banner(fig)
     metrics["extra_figures"] = [(f"CMD with {sw} on the y axis",
                                  _save(fig, f"{o.obsid}_stage2_{sw.lower()}y.png"))]
-    if stale:
-        metrics.update(passed=None, pending_rebuild=True,
-                       na_reason="m8 catalogue predates the jwst-gc-pipeline#931 satstar fix; "
-                                 "rebuild queued")
     return png, metrics
 
 
@@ -6563,11 +6532,6 @@ def _caption_for_impl(n, metrics):
         if metrics.get("extra_figures"):
             body += (f"The dropdown below shows the same CMD with {metrics.get('sw') or 'the SW band'} "
                      f"on the y axis. ")
-        if metrics.get("pending_rebuild"):
-            body = ("⏳ **Stale catalogue — pending rebuild.** This m8 catalogue predates "
-                    "jwst-gc-pipeline#931, which removes saturated stars merged in from other tiles "
-                    "and fills the empty strip at F480M 12.0–12.4. The rebuild is queued; this "
-                    "comment will be regenerated when it lands. ") + body
         return body + "([how this is made](DOCROOT#stage2))"
     if n == 4:
         # Built in code so it renders cleanly whatever was measured, and gated on the CELL COUNT:
