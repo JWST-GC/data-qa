@@ -133,6 +133,26 @@ def test_upload_failure_keeps_legacy_copy(tmp_path, monkeypatch):
     with pytest.raises(P.PostError):
         P.upload_asset("o/r", "tok", str(png), name)
     assert state["qa-assets"] == {name: 7}                          # old comment image still live
+    posts = [u for m, u in state["_calls"] if m == "POST" and "assets?name=" in u]
+    assert len(posts) == 1                                          # a full shard is not retried
+
+
+def test_upload_replaces_asset_a_concurrent_task_uploaded(tmp_path, monkeypatch):
+    """Two array tasks posting the same obs (two issues for 2092 o005): the other task uploads the
+    name after this process cached the release index, so the POST hits 422 already_exists."""
+    from data_qa import post_diagnostics as P
+    png = tmp_path / "x.png"; png.write_bytes(b"png")
+    name = "jw02092-o005_stage10.png"
+    tag = P._asset_shard_tag(name)
+    state = {"qa-assets": {}, tag: {}}
+    monkeypatch.setattr(P, "_req", _fake_github(state))
+    monkeypatch.setattr(P, "_RELEASES", {}); monkeypatch.setattr(P, "_ASSET_INDEX", {})
+    rel = P._ensure_release("o/r", "tok", tag)
+    P._asset_index("o/r", "tok", tag, rel)                          # index cached while empty
+    state[tag][name] = 77                                           # the other task's upload
+    url = P.upload_asset("o/r", "tok", str(png), name)
+    assert url == f"https://dl/{tag}/{name}"
+    assert list(state[tag]) == [name] and state[tag][name] != 77    # replaced, not duplicated
 
 
 def test_ensure_release_rereads_after_concurrent_create(monkeypatch):
