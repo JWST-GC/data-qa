@@ -4157,3 +4157,20 @@ def test_not_applicable_stage_draws_neutral_card_not_red_flag(monkeypatch):
                     instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
     _, m = D.stage8_distortion(o, "F212N")
     assert drawn == ["note"] and m["passed"] is None
+
+
+def test_missing_sw_reads_pending_not_failed(tmp_path, monkeypatch):
+    # 10678 o087: F480M reduced while F212N is still at image2.  Stage 1 must read "not done yet"
+    # (passed=None), and the SW-graded stages must report pending instead of crashing on sw=None.
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    red = tmp_path / "gc-treasury" / "F480M" / "pipeline"
+    _write_i2d(str(red / "jw10678-o087_t001_nircam_clear-f480m-merged_i2d.fits"))
+    o = Observation(program="10678", obs="087", target="GC Treasury", release_field="gc-treasury",
+                    instrument="NIRCam", filters=["F480M"], visits=[], epoch="", notes="")
+    _png, m1 = D.stage1_mosaics(o, None, "F480M")
+    assert m1["passed"] is None
+    cap = D.caption_for(1, m1)
+    assert "nan" not in cap and "pending" in cap and "RED FLAG" not in cap
+    for n in D._STAGES_NEEDING_SW:
+        png, m = D._dispatch_stage(o, n, None, "F480M")
+        assert png is None and m["available"] is False and m["passed"] is None

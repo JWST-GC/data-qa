@@ -1092,9 +1092,10 @@ def stage1_mosaics(o: Observation, sw, lw):
                    nominal_filters=list(o.filters), available_filters=avail,
                    mosaic_filters=with_mosaic, awaiting_reduction=awaiting_reduction,
                    mast_fallback_filters=mast_shown, dropped_filters=dropped,
-                   # pass on SW alone ONLY when the obs genuinely has no LW-channel filter;
-                   # if an LW filter exists but its mosaic/pick is missing, that is NOT a pass.
-                   passed=bool(psw and (plw or not _has_lw(o))))
+                   # pass on SW alone ONLY when the obs genuinely has no LW-channel filter.  A
+                   # channel whose reduced mosaic is not on disk yet is "not done yet" (None, a
+                   # neutral state), never a failure: red flags are for badly behaved data.
+                   passed=True if (psw and (plw or not _has_lw(o))) else None)
     return png, metrics
 
 
@@ -6265,9 +6266,19 @@ def stage12_photometric_linearity(o: Observation, sw, lw=None, r_ap=3.0, iso_px=
     return primary_png, metrics
 
 
+# Stages that need an SW filter name to build at all.  A treasury tile whose LW mosaic lands
+# before its SW reduction (10678 o075-o087: F480M reduced, F212N still at image2) crashed these on
+# ``sw.lower()``; they now report "pending" until the SW products exist.  (Stages 4 and 6-12
+# already degrade to a neutral n/a card on their own.)
+_STAGES_NEEDING_SW = (2, 3, 5)
+
+
 def _dispatch_stage(o, n, sw, lw):
     if n == 1:
         return stage1_mosaics(o, sw, lw)
+    if sw is None and n in _STAGES_NEEDING_SW:
+        return None, dict(stage=n, sw=sw, lw=lw, available=False, passed=None,
+                          na_reason="no reduced short-wavelength (SW) filter on disk yet")
     if n == 2:
         return stage2_cmd(o, sw, lw)
     if n == 3:
@@ -6598,10 +6609,14 @@ def _caption_for_impl(n, metrics):
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate. "
                 f"([how this stage works](DOCROOT#stage{n}))")
-    if n == 1 and (metrics.get("dropped_filters") or metrics.get("awaiting_reduction")):
-        base = CAPTIONS[1].format(**{k: (v if v is not None else float("nan"))
-                                     for k, v in metrics.items() if k in ("sw", "lw")})
+    if n == 1 and (metrics.get("dropped_filters") or metrics.get("awaiting_reduction")
+                   or metrics.get("sw") is None):
+        base = CAPTIONS[1].format(sw=metrics.get("sw") or "no filter reduced yet",
+                                  lw=metrics.get("lw") or "no filter")
         notes = []
+        if metrics.get("sw") is None:
+            notes.append("no short-wavelength (SW) filter has a reduced product on disk yet, so "
+                         "the SW-based stages are pending until the SW reduction finishes")
         if metrics.get("awaiting_reduction"):
             # a filter with a raw MAST i2d / catalogue but no reduced science mosaic yet: its panel
             # reads 'no i2d' while the MAST product still exists -- say so, don't imply data loss
