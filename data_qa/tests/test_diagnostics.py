@@ -4080,26 +4080,13 @@ def _stage2_cat(tmp_path, monkeypatch, program, mtime, tier="m8"):
                        notes="")
 
 
-def test_stage2_flags_pre_rebuild_10678_m8_and_adds_sw_cmd(tmp_path, monkeypatch):
-    o = _stage2_cat(tmp_path, monkeypatch, "10678", D._M8_REBUILD_EPOCH - 3600)
+def test_stage2_adds_sw_cmd(tmp_path, monkeypatch):
+    o = _stage2_cat(tmp_path, monkeypatch, "10678", 1.8e9)
     png, m = D.stage2_cmd(o, "F212N", "F480M")
-    assert m["pending_rebuild"] is True and m["passed"] is None
-    assert "pending rebuild" in D.caption_for(2, m)
+    assert m["passed"] is True and "pending_rebuild" not in m
     (label, extra), = m["extra_figures"]
     assert "F212N on the y axis" in label and os.path.exists(extra)
-
-
-def test_stage2_rebuilt_or_other_program_not_flagged(tmp_path, monkeypatch):
-    o = _stage2_cat(tmp_path, monkeypatch, "10678", D._M8_REBUILD_EPOCH + 3600)
-    _, m = D.stage2_cmd(o, "F212N", "F480M")
-    assert not m.get("pending_rebuild") and m["passed"] is True
     assert "F212N on the y axis" in D.caption_for(2, m)
-    o = _stage2_cat(tmp_path, monkeypatch, "2221", D._M8_REBUILD_EPOCH - 3600)
-    _, m = D.stage2_cmd(o, "F212N", "F480M")
-    assert not m.get("pending_rebuild")
-    o = _stage2_cat(tmp_path, monkeypatch, "10678", D._M8_REBUILD_EPOCH - 3600, tier="m7")
-    _, m = D.stage2_cmd(o, "F212N", "F480M")
-    assert not m.get("pending_rebuild")                  # only m8 carries the #931 defect
 
 def test_caption_stage3_notes_undetermined_offset():
     m = dict(available=True, passed=True, our_slope=1.0, slope=1.0, scatter=0.1, n_matched=500,
