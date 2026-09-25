@@ -133,6 +133,8 @@ def test_upload_failure_keeps_legacy_copy(tmp_path, monkeypatch):
     with pytest.raises(P.PostError):
         P.upload_asset("o/r", "tok", str(png), name)
     assert state["qa-assets"] == {name: 7}                          # old comment image still live
+    posts = [u for m, u in state["_calls"] if m == "POST" and "assets?name=" in u]
+    assert len(posts) == 1                                          # a full shard is not retried
 
 
 def test_upload_replaces_asset_a_concurrent_task_uploaded(tmp_path, monkeypatch):
