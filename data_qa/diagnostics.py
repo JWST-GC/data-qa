@@ -6510,12 +6510,12 @@ def _caption_for_impl(n, metrics):
         return _caption_stage8(metrics)
     if n == 12:
         return _caption_stage12(metrics)
-    # Stage 7 builds its own red-flag caption below (its red-flag cases still render a full figure,
-    # so the generic "the plot is empty" wording would not fit).
+    # Stage 7, and stage 3's registration flag, build their own red-flag captions below (those
+    # cases still render a full figure, so the generic "the plot is empty" wording would not fit).
     if metrics.get("available") is False:
         return (f"**Stage {n} — pending.** The input data for this stage are not yet on disk "
                 f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
-    if metrics.get("red_flag") and n != 7:
+    if metrics.get("red_flag") and n != 7 and not (n == 3 and metrics.get("registration_flag")):
         return (f"🚩 **Stage {n} — RED FLAG.** The plot is empty: "
                 f"{metrics.get('red_flag_reason', 'no data to show')}. "
                 f"An empty result here means the measurement could not be made — investigate. "
