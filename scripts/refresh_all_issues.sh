@@ -180,7 +180,9 @@ rc_any=0
 # --- classifiers (extracted VERBATIM by tests/test_mast_monitor.py; keep them self-contained)
 # rc_any is a REAL failure signal: set it on a non-zero exit or an error keyword in the
 # output, NOT merely because the display-grep matched nothing (a quiet success prints little).
-failure_keyword() { case "$1" in *FAILED*|*"no obs"*|*"no issue"*) return 0;; esac; return 1; }
+# Match the obs-lookup failure messages in full: a bare "no obs" also matched pipeline_status's routine
+# "field-pooled, filenames carry no obsid" and turned every field-pooled issue red.
+failure_keyword() { case "$1" in *FAILED*|*"no obs for program"*|*"no MIRI obs for program"*|*"no issue"*) return 0;; esac; return 1; }
 note_failure() { failure_keyword "$1" && return 0; [ "$2" -ne 0 ]; }
 
 # ...with one EXPECTED, BOUNDED and NON-ABSORBING exception.  A treasury tile's QA issue is
