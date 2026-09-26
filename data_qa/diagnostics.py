@@ -6268,9 +6268,10 @@ def stage12_photometric_linearity(o: Observation, sw, lw=None, r_ap=3.0, iso_px=
 
 # Stages that need an SW filter name to build at all.  A treasury tile whose LW mosaic lands
 # before its SW reduction (10678 o075-o087: F480M reduced, F212N still at image2) crashed these on
-# ``sw.lower()``; they now report "pending" until the SW products exist.  (Stages 4 and 6-12
-# already degrade to a neutral n/a card on their own.)
-_STAGES_NEEDING_SW = (2, 3, 5)
+# ``sw.lower()`` (stages 8/9 via _interfilter_residuals on o077/o084); they now report
+# "pending" until the SW products exist.  (Stages 4, 6, 7 and 10-12 already degrade to a neutral
+# n/a card on their own.)
+_STAGES_NEEDING_SW = (2, 3, 5, 8, 9)
 
 
 def _dispatch_stage(o, n, sw, lw):

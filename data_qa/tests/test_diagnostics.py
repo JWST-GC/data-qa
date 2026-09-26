@@ -4174,3 +4174,8 @@ def test_missing_sw_reads_pending_not_failed(tmp_path, monkeypatch):
     for n in D._STAGES_NEEDING_SW:
         png, m = D._dispatch_stage(o, n, None, "F480M")
         assert png is None and m["available"] is False and m["passed"] is None
+    # Every stage must survive sw=None: 10678 o077/o084 crashed in stages 8/9
+    # (_interfilter_residuals on f1=None) after 2/3/5 were guarded.
+    for n in range(2, 13):
+        _png, m = D._dispatch_stage(o, n, None, "F480M")
+        assert m.get("passed") is not False, (n, m)
