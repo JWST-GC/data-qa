@@ -155,6 +155,51 @@ def test_upload_replaces_asset_a_concurrent_task_uploaded(tmp_path, monkeypatch)
     assert list(state[tag]) == [name] and state[tag][name] != 77    # replaced, not duplicated
 
 
+def test_upload_retries_404_from_concurrent_replace(tmp_path, monkeypatch):
+    """#38/#115 share jw02092-o005: while the other task replaces the asset, our POST can get 404.
+    The upload backs off, re-reads the index and retries instead of failing the stage."""
+    from data_qa import post_diagnostics as P
+    png = tmp_path / "x.png"; png.write_bytes(b"png")
+    name = "jw02092-o005_stage7.png"
+    tag = P._asset_shard_tag(name)
+    state = {"qa-assets": {}, tag: {}}
+    real = _fake_github(state)
+    seen = {"posts": 0}
+
+    def flaky(method, url, token, **kw):
+        if method == "POST" and "assets?name=" in url:
+            seen["posts"] += 1
+            if seen["posts"] <= 2:
+                return (404, {"message": "Not Found"})
+        return real(method, url, token, **kw)
+    monkeypatch.setattr(P, "_req", flaky)
+    monkeypatch.setattr(P, "_RELEASES", {}); monkeypatch.setattr(P, "_ASSET_INDEX", {})
+    monkeypatch.setattr(P, "_UPLOAD_RACE_SLEEP_S", 0)
+    assert P.upload_asset("o/r", "tok", str(png), name) == f"https://dl/{tag}/{name}"
+    assert seen["posts"] == 3 and list(state[tag]) == [name]
+
+
+def test_upload_gives_up_after_bounded_404_retries(tmp_path, monkeypatch):
+    from data_qa import post_diagnostics as P
+    png = tmp_path / "x.png"; png.write_bytes(b"png")
+    name = "jw02092-o005_stage6.png"
+    tag = P._asset_shard_tag(name)
+    state = {"qa-assets": {}, tag: {}}
+    real = _fake_github(state)
+    seen = {"posts": 0}
+
+    def always404(method, url, token, **kw):
+        if method == "POST" and "assets?name=" in url:
+            seen["posts"] += 1
+            return (404, {"message": "Not Found"})
+        return real(method, url, token, **kw)
+    monkeypatch.setattr(P, "_req", always404)
+    monkeypatch.setattr(P, "_RELEASES", {}); monkeypatch.setattr(P, "_ASSET_INDEX", {})
+    monkeypatch.setattr(P, "_UPLOAD_RACE_SLEEP_S", 0)
+    with pytest.raises(P.PostError):
+        P.upload_asset("o/r", "tok", str(png), name)
+    assert seen["posts"] == 1 + P._UPLOAD_RACE_RETRIES
+
 def test_ensure_release_rereads_after_concurrent_create(monkeypatch):
     from data_qa import post_diagnostics as P
     seen = {"gets": 0}
