@@ -141,6 +141,8 @@ def _release_assets(repo, token, rel):
 
 
 _ASSET_INDEX = {}                               # (repo, tag) -> {name: id}, per process
+_UPLOAD_RACE_RETRIES = 3                         # same-name upload races (422 / 404)
+_UPLOAD_RACE_SLEEP_S = 2.0
 
 
 def _asset_index(repo, token, tag, rel):
@@ -180,9 +182,14 @@ def upload_asset(repo, token, png_path, asset_name):
     ctype = mimetypes.guess_type(png_path)[0] or "image/png"
     url = f"{UPLOADS}/repos/{repo}/releases/{rel['id']}/assets?name={asset_name}"
     st, data = _req("POST", url, token, data=blob, headers={"Content-Type": ctype})
-    if st == 422 and _already_exists(data):
-        # a concurrent array task (e.g. a second issue for the same obs) uploaded this name after
-        # our per-process index was read -> re-read the index, replace its copy, retry once
+    for attempt in range(_UPLOAD_RACE_RETRIES):
+        if not ((st == 422 and _already_exists(data)) or st == 404):
+            break
+        # a concurrent array task (e.g. a second issue for the same obs) uploaded or replaced this
+        # name after our per-process index was read.  GitHub answers 422 already_exists, or 404
+        # while the other task's copy is mid-replace (#38/#115, array 43396066) -> back off,
+        # re-read the index, replace its copy, retry
+        time.sleep(_UPLOAD_RACE_SLEEP_S * (attempt + 1))
         _ASSET_INDEX.pop((repo, tag), None)
         _delete_asset(repo, token, tag, rel, asset_name)
         st, data = _req("POST", url, token, data=blob, headers={"Content-Type": ctype})
