@@ -155,7 +155,6 @@ def test_upload_replaces_asset_a_concurrent_task_uploaded(tmp_path, monkeypatch)
     assert list(state[tag]) == [name] and state[tag][name] != 77    # replaced, not duplicated
 
 
-
 def test_upload_retries_404_from_concurrent_replace(tmp_path, monkeypatch):
     """#38/#115 share jw02092-o005: while the other task replaces the asset, our POST can get 404.
     The upload backs off, re-reads the index and retries instead of failing the stage."""

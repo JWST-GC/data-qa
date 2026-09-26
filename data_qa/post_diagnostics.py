@@ -14,6 +14,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 import re
 import time
 import urllib.error
@@ -189,7 +190,8 @@ def upload_asset(repo, token, png_path, asset_name):
         # name after our per-process index was read.  GitHub answers 422 already_exists, or 404
         # while the other task's copy is mid-replace (#38/#115, array 43396066) -> back off,
         # re-read the index, replace its copy, retry
-        time.sleep(_UPLOAD_RACE_SLEEP_S * (attempt + 1))
+        # jittered so two colliding tasks do not retry in lockstep and delete each other's copy
+        time.sleep(_UPLOAD_RACE_SLEEP_S * (attempt + 1) * random.uniform(0.5, 1.5))
         _ASSET_INDEX.pop((repo, tag), None)
         _delete_asset(repo, token, tag, rel, asset_name)
         st, data = _req("POST", url, token, data=blob, headers={"Content-Type": ctype})
