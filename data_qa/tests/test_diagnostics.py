@@ -4174,3 +4174,11 @@ def test_missing_sw_reads_pending_not_failed(tmp_path, monkeypatch):
     for n in D._STAGES_NEEDING_SW:
         png, m = D._dispatch_stage(o, n, None, "F480M")
         assert png is None and m["available"] is False and m["passed"] is None
+    # Every stage must survive sw=None without a red flag: 10678 o077/o084 crashed in stages 8/9
+    # (_interfilter_residuals on f1=None) after 2/3/5 were guarded.  This fixture holds only the
+    # F480M i2d, so stages outside _STAGES_NEEDING_SW may reach n/a from missing catalogues; it
+    # guards against crashes, and a fixture with LW catalogues + MAST products would be needed to
+    # exercise their sw=None handling on real inputs.
+    for n in range(2, 13):
+        _png, m = D._dispatch_stage(o, n, None, "F480M")
+        assert m.get("passed") is not False, (n, m)
