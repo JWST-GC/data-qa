@@ -4466,14 +4466,22 @@ def stage7_mast_vs_pipeline(o: Observation, sw):
         jp, jsub = _offset_summary_figure(o, sw, jpos, ref_sc, jsrc,
                                           f"{o.obsid}_stage7_jicama_offset.png")
         if jp is not None:
-            # The per-cell figure uses the position-valid selection (_jwst_positions); the headline
-            # jicama offset above uses the full flux catalogue.  Keep the headline when it was
-            # measured, and record the figure's value under its own key.
-            metrics["jicama_cell_offset_med_mas"] = jsub.get("offset_med_mas")
-            if metrics.get("jicama_offset_med_mas") is None:
-                metrics["jicama_offset_med_mas"] = jsub.get("offset_med_mas")
+            _stage7_merge_cell_offset(metrics, jsub)
             return _stage7_pick_primary(main_png, jp, jsrc, metrics)
     return main_png, metrics
+
+
+def _stage7_merge_cell_offset(metrics, jsub):
+    """Fold the per-cell figure's offset into the stage-7 metrics.  The per-cell figure uses the
+    position-valid selection (_jwst_positions); the headline jicama offset uses the full flux
+    catalogue.  Keep the headline when it was measured (o112: the cell selection has no xcorr peak
+    while the full catalogue sits 6 mas from VIRAC), and record the figure's value under its own
+    key."""
+    metrics["jicama_cell_offset_med_mas"] = jsub.get("offset_med_mas")
+    metrics["jicama_cell_offset_unmeasurable"] = bool(jsub.get("offset_unmeasurable"))
+    if metrics.get("jicama_offset_med_mas") is None:
+        metrics["jicama_offset_med_mas"] = jsub.get("offset_med_mas")
+    return metrics
 
 
 def _stage7_pick_primary(main_png, jicama_png, jicama_src, metrics):
@@ -6762,7 +6770,7 @@ def _caption_for_impl(n, metrics):
             base += ("The figure shown is the [jicama](DOCROOT#glossary-jicama) catalogue's "
                      "per-cell offset from VIRAC; the MAST-vs-pipeline comparison figure described "
                      "next is in the dropdown below. ")
-            if metrics.get("jicama_cell_offset_med_mas") is None and jo is not None:
+            if metrics.get("jicama_cell_offset_unmeasurable") and jo is not None:
                 base += ("That per-cell figure uses only rows whose position passed the "
                          "position-validity cut, and that selection has no confident whole-field "
                          "xcorr peak, so its field offset reads UNMEASURABLE; the offset quoted "

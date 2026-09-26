@@ -4114,7 +4114,27 @@ def test_caption_stage7_cell_figure_unmeasurable_keeps_full_catalogue_offset():
     # o112: per-cell (position-valid) selection unmeasurable, full catalogue 6 mas vs MAST 28 mas.
     m = dict(stage=7, passed=True, primary_figure="jicama_offset", jicama_is_release=True,
              mast_offset_med_mas=28.3, jicama_offset_med_mas=6.4, jicama_cell_offset_med_mas=None,
-             n_jicama_window=93167, n_mast_window=27365)
+             jicama_cell_offset_unmeasurable=True, n_jicama_window=93167, n_mast_window=27365)
     cap = D.caption_for(7, m)
     assert "UNMEASURABLE" in cap and "6 mas (jicama) vs 28 mas (MAST)" in cap
     assert "mis-registration" not in cap
+    # A measured per-cell offset does not get the UNMEASURABLE note.
+    m.update(jicama_cell_offset_med_mas=5.9, jicama_cell_offset_unmeasurable=False)
+    assert "UNMEASURABLE" not in D.caption_for(7, m)
+
+
+def test_stage7_merge_cell_offset_keeps_measured_headline():
+    # o112: full-catalogue headline 6.4 mas; the per-cell figure is unmeasurable.  The cell value
+    # must not overwrite the headline.
+    m = D._stage7_merge_cell_offset(dict(jicama_offset_med_mas=6.4),
+                                    dict(offset_med_mas=None, offset_unmeasurable=True))
+    assert m["jicama_offset_med_mas"] == 6.4
+    assert m["jicama_cell_offset_med_mas"] is None and m["jicama_cell_offset_unmeasurable"]
+    # A measured cell value also leaves a measured headline alone.
+    m = D._stage7_merge_cell_offset(dict(jicama_offset_med_mas=6.4),
+                                    dict(offset_med_mas=464.0, offset_unmeasurable=False))
+    assert m["jicama_offset_med_mas"] == 6.4 and m["jicama_cell_offset_med_mas"] == 464.0
+    # No headline: fall back to the cell value.
+    m = D._stage7_merge_cell_offset(dict(jicama_offset_med_mas=None),
+                                    dict(offset_med_mas=5.9, offset_unmeasurable=False))
+    assert m["jicama_offset_med_mas"] == 5.9
