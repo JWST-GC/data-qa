@@ -710,7 +710,7 @@ median Δmag are dropped as mismatches (flux vetting). At least 50 vetted pairs 
 median ΔDec, and their quadrature sum), the per-axis positional scatter (1.4826·MAD), the bulk
 magnitude difference (median Δmag, **Vega**) and its scatter, and the number of pairs.
 
-**Red flag.** A neighbour **disagrees** when its bulk offset exceeds `_NB_OFFSET_FLAG_MAS` (20 mas)
+**Red flag.** A neighbour **disagrees** when its bulk offset exceeds `_NB_OFFSET_FLAG_MAS` (50 mas)
 or its |bulk Δmag| exceeds `_NB_DMAG_FLAG` (0.1 mag); any disagreeing neighbour red-flags the
 stage. A neighbour without an m8 catalogue, or one whose match fails the xcorr contrast or pair-count
 gates, is listed as **not graded** and never raises a flag. When this tile itself has no m8
@@ -721,7 +721,7 @@ outlined, and each overlap shaded green (agrees), red (disagrees) or grey (not g
 with its bulk offset and Δmag. Each graded neighbour has its own three-panel figure in the expandable
 block, worst first: F212N flux versus flux (log–log, Jy, with the 1:1 line), Δmag (Vega) versus
 magnitude with the ±0.1 mag flag band, and the per-source ΔRA/ΔDec cloud with the bulk marked and the
-20 mas flag radius drawn. The caption lists every neighbour in a table. Metrics: `neighbors` (per
+50 mas flag radius drawn. The caption lists every neighbour in a table. Metrics: `neighbors` (per
 neighbour: `status`, `overlap_arcmin2`, `n_pairs`, `dra_mas`, `ddec_mas`, `offset_mas`,
 `astrom_scatter_mas`, `dmag_bulk`, `dmag_scatter`, `catalog`), `n_neighbors`, `n_graded`,
 `n_pending`, `n_flagged`, `flagged_neighbors`, `worst_offset_mas`, `worst_abs_dmag`.

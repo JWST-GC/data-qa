@@ -134,7 +134,7 @@ def test_sregion_parse_and_neighbour_discovery(program):
 
 
 def test_neighbour_agreement_recovers_injected_offset_and_dmag(program):
-    program("040"); program("041", dra_mas=30.0, ddec_mas=-15.0, dmag=0.15)
+    program("040"); program("041", dra_mas=60.0, ddec_mas=-30.0, dmag=0.15)
     mine, nbrs = D._overlapping_neighbors(_obs("040"), "F212N")
     nb = next(n for n in nbrs if n["obs"] == "041")
     cat = D._m8_catalog_path
@@ -142,20 +142,20 @@ def test_neighbour_agreement_recovers_injected_offset_and_dmag(program):
     b = D._load_nb_sample(cat(_obs("041")), "F212N", nb["overlap_xy"], nb["frame"])
     res = D._neighbor_agreement(a, b)
     assert res is not None and res["n_pairs"] > 200
-    # this − neighbour: the neighbour was shifted by (+30, −15) and dimmed by 0.15 mag
-    assert res["dra_mas"] == pytest.approx(-30.0, abs=1.0)
-    assert res["ddec_mas"] == pytest.approx(15.0, abs=1.0)
+    # this − neighbour: the neighbour was shifted by (+60, −30) and dimmed by 0.15 mag
+    assert res["dra_mas"] == pytest.approx(-60.0, abs=1.0)
+    assert res["ddec_mas"] == pytest.approx(30.0, abs=1.0)
     assert res["dmag_bulk"] == pytest.approx(-0.15, abs=0.01)
     assert res["astrom_scatter_mas"] == pytest.approx(2 * np.sqrt(2), rel=0.3)
     assert D._nb_flagged(res)
 
 
 def test_stage13_flags_only_the_disagreeing_neighbour(program):
-    program("040"); program("041", dra_mas=25.0); program("042")
+    program("040"); program("041", dra_mas=60.0); program("042")
     png, m = D.stage13_neighbor_overlap(_obs("040"), "F212N", "F480M")
     assert os.path.exists(png)
     nb = m["neighbors"]
-    assert nb["041"]["status"] == "disagree" and nb["041"]["offset_mas"] > 20
+    assert nb["041"]["status"] == "disagree" and nb["041"]["offset_mas"] > 50
     assert nb["042"]["status"] == "agree" and nb["042"]["offset_mas"] < 3
     assert abs(nb["042"]["dmag_bulk"]) < 0.01
     assert m["passed"] is False and m["red_flag"] and m["flagged_neighbors"] == ["041"]
@@ -174,7 +174,7 @@ def test_stage13_zeropoint_offset_alone_flags(program):
 
 
 def test_stage13_all_agree_passes(program):
-    program("040"); program("041", dra_mas=5.0, dmag=0.03); program("042")
+    program("040"); program("041", dra_mas=35.0, dmag=0.03); program("042")   # < 50 mas agrees
     _, m = D.stage13_neighbor_overlap(_obs("040"), "F212N", "F480M")
     assert m["passed"] is True and not m.get("red_flag") and m["n_graded"] == 2
 
@@ -224,14 +224,14 @@ def test_stage13_dispatch_and_sw_gate():
 
 def test_stage13_neighbour_with_only_m7_is_pending(program):
     """Stage 13 grades m8 against m8 only: an m7 neighbour is not yet the product to grade."""
-    program("040"); program("041", kind="m7", dra_mas=40.0); program("042")
+    program("040"); program("041", kind="m7", dra_mas=80.0); program("042")
     _, m = D.stage13_neighbor_overlap(_obs("040"), "F212N", "F480M")
     assert m["neighbors"]["041"]["status"] == "pending"
     assert m["n_graded"] == 1 and m["passed"] is True and not m.get("red_flag")
 
 
 def test_stage13_plain_m8_is_graded_when_no_dedup(program):
-    program("040"); program("041", kind="m8", dra_mas=25.0)
+    program("040"); program("041", kind="m8", dra_mas=60.0)
     _, m = D.stage13_neighbor_overlap(_obs("040"), "F212N", "F480M")
     assert m["neighbors"]["041"]["status"] == "disagree"
 
