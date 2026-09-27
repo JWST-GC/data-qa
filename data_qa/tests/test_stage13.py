@@ -53,9 +53,14 @@ def _stars(n=6000, seed=1):
     return RA0 + x / 3600 / cosd, DEC0 + y / 3600, flux
 
 
-def _write_m8(base, obs, verts, stars, dra_mas=0.0, ddec_mas=0.0, dmag=0.0, seed=0):
-    """An m8_dedup catalogue holding the stars inside ``verts``, re-observed with 2 mas / 1 %
-    noise, shifted by (dra_mas, ddec_mas) and dimmed by ``dmag``."""
+def _write_m8(base, obs, verts, stars, dra_mas=0.0, ddec_mas=0.0, dmag=0.0, seed=0,
+              kind="m8_dedup", mag_outlier_frac=0.0, contaminate=None):
+    """A catalogue (``kind``: m8_dedup / m8 / m7) holding the stars inside ``verts``, re-observed
+    with 2 mas / 1 % noise, shifted by (dra_mas, ddec_mas) and dimmed by ``dmag``.
+
+    ``mag_outlier_frac`` of the rows get a +2 mag photometric error (mismatch-like impostors).
+    ``contaminate={column: value}`` appends a copy of every row, displaced by +60 mas in RA and
+    dimmed by 0.3 mag, with ``column`` set to ``value``; the comparison sample must drop them all."""
     from astropy.table import Table
     from matplotlib.path import Path as MPath
     ra, dec, flux = stars
@@ -78,20 +83,36 @@ def _write_m8(base, obs, verts, stars, dra_mas=0.0, ddec_mas=0.0, dmag=0.0, seed
     t["near_saturated_f212n_f212n"] = np.zeros(n, bool)
     t["replaced_saturated_f212n"] = np.zeros(n, bool)
     t["independently_detected_f212n"] = np.ones(n, bool)
+    if mag_outlier_frac:
+        bad = rng.random(n) < mag_outlier_frac
+        t["flux_jy_f212n"][bad] *= 10 ** (-0.4 * 2.0)
+        t["eflux_jy_f212n"][bad] *= 10 ** (-0.4 * 2.0)    # keep S/N: only the flux vet may drop them
+        t["mag_vega_f212n"][bad] += 2.0
+    if contaminate:
+        from astropy.table import vstack
+        c = t.copy()
+        c["skycoord_f212n.ra"] += 60.0 / 3.6e6 / cosd
+        c["flux_jy_f212n"] *= 10 ** (-0.4 * 0.3)
+        c["mag_vega_f212n"] += 0.3
+        for col, val in contaminate.items():
+            c[col] = val
+        t = vstack([t, c])
     d = f"{base}/{FIELD}/catalogs"
     os.makedirs(d, exist_ok=True)
-    t.write(f"{d}/basic_merged_indivexp_photometry_tables_merged_resbgsub_m8_dedup_o{obs}.fits")
+    t.write(f"{d}/basic_merged_indivexp_photometry_tables_merged_resbgsub_{kind}_o{obs}.fits")
 
 
 @pytest.fixture
 def program(tmp_path, monkeypatch):
-    """Tiles o040 (ix 0, this), o041 (ix 1), o042 (ix -1), o043 (ix 2, not touching o040) and a
-    far tile o046.  Returns a helper that writes the m8 catalogues requested by the test."""
+    """Tiles o040 (ix 0, this), o041 (ix 1), o042 (ix -1), o043 (ix 2, not touching o040), o044
+    (a 1" x 60" sliver overlap with o040, below the area floor) and a far tile o046.  Returns a
+    helper that writes the catalogues requested by the test."""
     base = str(tmp_path / "base")
     monkeypatch.setattr(D, "BASE", base)
     monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "out"))
     monkeypatch.setenv("QA_DOWNLOAD_DIR", str(tmp_path / "dl"))
-    layout = {"040": 0, "041": 1, "042": -1, "043": 2, "046": 40}
+    layout = {"040": 0, "041": 1, "042": -1, "043": 2, "044": -(TILE_AS - 1.0) / STEP_AS,
+              "046": 40}
     verts = {o: _tile_vertices(ix) for o, ix in layout.items()}
     for o, v in verts.items():
         _write_i2d(base, o, v)
@@ -106,7 +127,8 @@ def test_sregion_parse_and_neighbour_discovery(program):
     mine, nbrs = D._overlapping_neighbors(_obs("040"), "F212N")
     assert mine is not None and mine.shape == (4, 2)
     got = {n["obs"]: n["area_arcmin2"] for n in nbrs}
-    assert set(got) == {"041", "042"}                    # o043 only touches o041; o046 is far
+    # o043 only touches o041; o044's 1" sliver (0.017 arcmin2) is below the area floor; o046 is far
+    assert set(got) == {"041", "042"}
     strip = (TILE_AS - STEP_AS) * TILE_AS / 3600.0       # 15" x 60" overlap
     assert all(abs(a - strip) < 0.01 for a in got.values())
 
@@ -198,3 +220,58 @@ def test_stage13_prefers_m8_dedup_over_plain_m8(program, tmp_path):
 def test_stage13_dispatch_and_sw_gate():
     png, m = D._dispatch_stage(_obs("040"), 13, None, "F480M")
     assert png is None and m["available"] is False
+
+
+def test_stage13_neighbour_with_only_m7_is_pending(program):
+    """Stage 13 grades m8 against m8 only: an m7 neighbour is not yet the product to grade."""
+    program("040"); program("041", kind="m7", dra_mas=40.0); program("042")
+    _, m = D.stage13_neighbor_overlap(_obs("040"), "F212N", "F480M")
+    assert m["neighbors"]["041"]["status"] == "pending"
+    assert m["n_graded"] == 1 and m["passed"] is True and not m.get("red_flag")
+
+
+def test_stage13_plain_m8_is_graded_when_no_dedup(program):
+    program("040"); program("041", kind="m8", dra_mas=25.0)
+    _, m = D.stage13_neighbor_overlap(_obs("040"), "F212N", "F480M")
+    assert m["neighbors"]["041"]["status"] == "disagree"
+
+
+@pytest.mark.parametrize("contaminate", [
+    {"is_saturated_f212n": True},
+    {"near_saturated_f212n_f212n": True},
+    {"replaced_saturated_f212n": True},
+    {"independently_detected_f212n": False},
+    {"eflux_jy_f212n": 1.0},                    # S/N << _NB_MIN_SNR
+    {"qfit_f212n": 0.5},                        # qfit > _NB_MAX_QFIT
+    {"mag_vega_f212n": np.nan},
+], ids=lambda c: next(iter(c)))
+def test_stage13_sample_cuts_drop_contaminants(program, contaminate):
+    """Each quality cut on its own removes a contaminating copy of every star (displaced 60 mas,
+    0.3 mag fainter), so the sample size and the measured bulk match the clean catalogue."""
+    program("040"); program("041", contaminate=contaminate)
+    mine, nbrs = D._overlapping_neighbors(_obs("040"), "F212N")
+    nb = next(n for n in nbrs if n["obs"] == "041")
+    from astropy.io import fits
+    from matplotlib.path import Path as MPath
+    path = D._m8_catalog_path(_obs("041"))
+    b = D._load_nb_sample(path, "F212N", nb["overlap_xy"], nb["frame"])
+    with fits.open(path) as h:
+        d = h[1].data
+        clean = d[: len(d) // 2]                          # the first half is the clean copy
+        xy = D._radec_to_plane(np.c_[clean["skycoord_f212n.ra"], clean["skycoord_f212n.dec"]],
+                               *nb["frame"])
+    n_clean_in_strip = int(MPath(nb["overlap_xy"]).contains_points(xy).sum())
+    assert n_clean_in_strip > 200
+    assert len(b["ra"]) == n_clean_in_strip
+    a = D._load_nb_sample(D._m8_catalog_path(_obs("040")), "F212N", nb["overlap_xy"], nb["frame"])
+    res = D._neighbor_agreement(a, b)
+    assert res is not None
+    assert res["offset_mas"] < 3 and abs(res["dmag_bulk"]) < 0.01
+
+
+def test_stage13_flux_vet_rejects_mismatched_photometry(program):
+    """40 % of the neighbour's rows carry a +2 mag error; the flux vet removes them, so the bulk
+    Δmag stays at the injected 0 (an unvetted median would move by ~0.015 mag)."""
+    program("040"); program("041", mag_outlier_frac=0.4)
+    _, m = D.stage13_neighbor_overlap(_obs("040"), "F212N", "F480M")
+    assert abs(m["neighbors"]["041"]["dmag_bulk"]) < 0.005
