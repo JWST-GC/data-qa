@@ -46,7 +46,7 @@ STAGE_FUNC = {
     8: "stage8_distortion",
     9: "stage9_psf_vs_aper",
     10: "stage10_photometric_consistency", 11: "stage11_effective_psf",
-    12: "stage12_photometric_linearity",
+    12: "stage12_photometric_linearity", 13: "stage13_neighbor_overlap",
     "6clean": "stage6_astrom_error",          # stage 6 recomputed excluding bad-PSF exposures
     "miri": "miri_overview",
 }

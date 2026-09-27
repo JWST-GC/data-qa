@@ -681,6 +681,54 @@ Stage 12 is display-only (it does not drive an issue-body checkbox); the flag su
 Source: [`data_qa/diagnostics.py` → `stage12_photometric_linearity`](../data_qa/diagnostics.py)
 (`_measure_psf_aper`, `_linearity_fit`).
 
+<a id="stage13"></a>
+## Stage 13 — agreement with neighbouring tiles
+
+**What it shows.** Whether this tile's m8 catalogue agrees with the m8 catalogue of every
+neighbouring pointing of the same program in the sky they share. Adjacent tiles of a mosaic program
+(GC Treasury 10678 tiles overlap their neighbours by 0.2–3.5 arcmin²) observe the same stars twice
+and are reduced and registered independently, so a bulk disagreement in the overlap points to a
+registration or zero-point defect in one of the two tiles.
+
+**Finding neighbours.** Every other observation of the program with a short-wave (F212N for 10678)
+mosaic on disk — the reduced `-merged` i2d, else the MAST level-3 i2d — is tested against this
+tile's footprint. Footprints are the `S_REGION` polygons of the mosaics' SCI headers, intersected in
+a local tangent plane. An overlap smaller than `_NB_MIN_OVERLAP_ARCMIN2` (0.05 arcmin²; corner
+touches) is ignored. A tile with no overlapping neighbour gets no stage-13 comment.
+
+**Matching.** For each neighbour where **both** tiles have an m8 catalogue (the newest `m8_dedup`,
+else a plain m8), the sources inside the overlap polygon are selected from each: detected in the
+band on their own (`independently_detected_<band>`, so forced fills are excluded), not saturated,
+near-saturated or saturation-replaced, [S/N > 20](#glossary-snr), `qfit < 0.2`, finite Vega
+magnitude. Positions are the per-band `skycoord_<band>`. The coarse [bulk](#glossary-bulk) comes
+from the peak of the 2-D histogram of all pair separations within 1.5″ (`xcorr`, gated on the peak
+contrast), which stays robust at Galactic-centre crowding. After shifting by that peak, sources are
+paired one-to-one (mutual nearest neighbour) within 100 mas, and pairs more than 0.5 mag from the
+median Δmag are dropped as mismatches (flux vetting). At least 50 vetted pairs are required.
+
+**The numbers.** Per neighbour, all as **this tile − neighbour**: the bulk offset (median ΔRA·cosδ,
+median ΔDec, and their quadrature sum), the per-axis positional scatter (1.4826·MAD), the bulk
+magnitude difference (median Δmag, **Vega**) and its scatter, and the number of pairs.
+
+**Red flag.** A neighbour **disagrees** when its bulk offset exceeds `_NB_OFFSET_FLAG_MAS` (20 mas)
+or its |bulk Δmag| exceeds `_NB_DMAG_FLAG` (0.1 mag); any disagreeing neighbour red-flags the
+stage. A neighbour without an m8 catalogue, or one whose match fails the xcorr contrast or pair-count
+gates, is listed as **not graded** and never raises a flag. When this tile itself has no m8
+catalogue the stage is pending. With no graded neighbour the stage carries no pass/fail.
+
+**The figure.** The primary figure is a footprint map: this tile filled, each overlapping neighbour
+outlined, and each overlap shaded green (agrees), red (disagrees) or grey (not graded) and labelled
+with its bulk offset and Δmag. Each graded neighbour has its own three-panel figure in the expandable
+block, worst first: F212N flux versus flux (log–log, Jy, with the 1:1 line), Δmag (Vega) versus
+magnitude with the ±0.1 mag flag band, and the per-source ΔRA/ΔDec cloud with the bulk marked and the
+20 mas flag radius drawn. The caption lists every neighbour in a table. Metrics: `neighbors` (per
+neighbour: `status`, `overlap_arcmin2`, `n_pairs`, `dra_mas`, `ddec_mas`, `offset_mas`,
+`astrom_scatter_mas`, `dmag_bulk`, `dmag_scatter`, `catalog`), `n_neighbors`, `n_graded`,
+`n_pending`, `n_flagged`, `flagged_neighbors`, `worst_offset_mas`, `worst_abs_dmag`.
+
+Source: [`data_qa/diagnostics.py` → `stage13_neighbor_overlap`](../data_qa/diagnostics.py)
+(`_overlapping_neighbors`, `_load_nb_sample`, `_neighbor_agreement`).
+
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 
