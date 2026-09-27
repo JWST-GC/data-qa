@@ -6286,12 +6286,372 @@ def stage12_photometric_linearity(o: Observation, sw, lw=None, r_ap=3.0, iso_px=
     return primary_png, metrics
 
 
+# --------------------------------------------------------------------------- STAGE 13
+# Neighbour-overlap agreement.  Adjacent pointings of a mosaic program (10678 tiles overlap their
+# neighbours by 0.2-3.5 arcmin^2) observe the same stars twice, reduced independently.  Their m8
+# catalogues must agree on position and brightness in the overlap; a bulk disagreement is a
+# registration or zero-point defect in one of the two tiles.
+_NB_MIN_OVERLAP_ARCMIN2 = 0.05      # smaller slivers (corner touches) hold too few stars to grade
+_NB_OFFSET_FLAG_MAS = 20.0          # red flag: bulk positional disagreement beyond this
+_NB_DMAG_FLAG = 0.1                 # red flag: bulk F212N (Vega) magnitude disagreement beyond this
+_NB_MIN_SNR = 20.0                  # per-source S/N floor for the comparison sample
+_NB_MAX_QFIT = 0.2                  # PSF-fit quality ceiling (drops blends / poor fits)
+_NB_MATCH_RADIUS_AS = 0.1           # pair radius AFTER removing the xcorr bulk shift
+_NB_FLUX_VET_MAG = 0.5              # pairs this far from the median Δmag are mismatches, not stars
+_NB_MIN_PAIRS = 50                  # fewest flux-vetted pairs for a graded neighbour
+
+
+def _sregion_radec(path):
+    """(N, 2) array of footprint vertices (RA, Dec in deg) from an i2d's ``S_REGION`` POLYGON, or
+    None.  The SCI header carries it for every jwst level-3 mosaic; the primary header does not."""
+    from astropy.io import fits
+    for ext in ("SCI", 0):
+        try:
+            sreg = fits.getheader(path, ext).get("S_REGION")
+        except (OSError, KeyError, IndexError):
+            continue
+        if not sreg:
+            continue
+        toks = str(sreg).split()
+        if not toks or toks[0].upper() != "POLYGON":
+            continue
+        nums = []
+        for t in toks[1:]:
+            try:
+                nums.append(float(t))
+            except ValueError:
+                continue                        # the frame token (ICRS) and any stray words
+        if len(nums) >= 6 and len(nums) % 2 == 0:
+            return np.array(nums).reshape(-1, 2)
+    return None
+
+
+def _footprint_path(o, filt):
+    """The mosaic whose ``S_REGION`` gives this observation's ``filt`` footprint: our reduced
+    mosaic when present, else the MAST level-3 i2d (same pointing, so the same footprint)."""
+    return _mosaic_path(o, filt) or _mast_i2d(o, filt)
+
+
+def _program_obs_with_footprint(o, filt):
+    """Every OTHER observation of ``o.program`` with a ``filt`` mosaic on disk under this field's
+    roots (reduced ``-merged`` mosaic or MAST i2d), as sorted 3-digit obs strings."""
+    prog = f"jw{int(o.program):05d}"
+    fl = filt.lower()
+    pats = [f"{d}/{prog}-o*_t001_nircam_clear-{fl}-merged_i2d.fits"
+            for d in _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")]
+    pats += [f"{root}/mastDownload/JWST/{prog}-o*_t*_nircam_clear-{fl}/{prog}-o*_i2d.fits"
+             for root in _mast_roots(o, cross_field=False)]
+    found = set()
+    for pat in pats:
+        for p in glob.glob(pat):
+            m = re.search(rf"{prog}-o(\d{{3}})_", os.path.basename(p))
+            if m and m.group(1) != o.obs:
+                found.add(m.group(1))
+    return sorted(found)
+
+
+def _radec_to_plane(radec, ra0, dec0):
+    """Local tangent-plane coordinates in arcsec (x = ΔRA·cos δ0, y = ΔDec), for polygon tests."""
+    radec = np.asarray(radec, float)
+    return np.c_[(radec[:, 0] - ra0) * np.cos(np.radians(dec0)) * 3600.0,
+                 (radec[:, 1] - dec0) * 3600.0]
+
+
+def _overlapping_neighbors(o, filt, min_area_arcmin2=_NB_MIN_OVERLAP_ARCMIN2):
+    """Observations of the same program whose ``filt`` footprint overlaps this one's.
+
+    Returns ``(this_vertices, [dict(obs, vertices, overlap_xy, area_arcmin2, frame), ...])``, where
+    ``overlap_xy`` is the intersection polygon in the tangent plane of ``frame=(ra0, dec0)``; or
+    ``(None, [])`` when this observation has no footprint on disk."""
+    from shapely.geometry import Polygon
+    mine_path = _footprint_path(o, filt)
+    mine = _sregion_radec(_used(mine_path, "footprint (this obs)")) if mine_path else None
+    if mine is None:
+        return None, []
+    ra0, dec0 = float(np.mean(mine[:, 0])), float(np.mean(mine[:, 1]))
+    pm = Polygon(_radec_to_plane(mine, ra0, dec0)).buffer(0)
+    out = []
+    for nb in _program_obs_with_footprint(o, filt):
+        onb = replace(o, obs=nb, merged_obsids=[])
+        path = _footprint_path(onb, filt)
+        v = _sregion_radec(path) if path else None
+        if v is None:
+            continue
+        pn = Polygon(_radec_to_plane(v, ra0, dec0)).buffer(0)
+        if not pm.intersects(pn):
+            continue
+        inter = pm.intersection(pn)
+        area = inter.area / 3600.0
+        if area < min_area_arcmin2 or inter.geom_type != "Polygon":
+            continue
+        _used(path, "footprint (neighbour)")
+        out.append(dict(obs=nb, vertices=v, overlap_xy=np.asarray(inter.exterior.coords),
+                        area_arcmin2=float(area), frame=(ra0, dec0)))
+    return mine, out
+
+
+def _m8_catalog_path(o):
+    """This observation's m8 catalogue (newest ``m8_dedup``, else newest plain m8), or None.  Stage 13 compares
+    only m8 against m8: an earlier merge level in either tile is not yet the product to grade."""
+    best = None
+    for p, kind, tier, mtime in _catalog_candidates(o):
+        # the deduplicated m8 is the deliverable; a plain m8 is used only when no dedup exists
+        rank = (kind == "m8_dedup", mtime)
+        if tier == 8 and (best is None or rank > best[1]):
+            best = (p, rank)
+    return best[0] if best else None
+
+
+def _load_nb_sample(path, filt, overlap_xy, frame):
+    """Clean ``filt`` sources of an m8 catalogue that fall inside the overlap polygon: detected in
+    ``filt`` on their own (not forced-filled), unsaturated, S/N > _NB_MIN_SNR, qfit <
+    _NB_MAX_QFIT, finite Vega magnitude.  Positions are the per-band ``skycoord_<filt>`` so the
+    comparison is band-to-band.  Returns a dict of arrays, or None if a column is missing."""
+    from astropy.io import fits
+    from matplotlib.path import Path as MPath
+    fl = filt.lower()
+    need = [f"skycoord_{fl}.ra", f"skycoord_{fl}.dec", f"flux_jy_{fl}", f"eflux_jy_{fl}",
+            f"mag_vega_{fl}", f"qfit_{fl}"]
+    flags_bad = [f"is_saturated_{fl}", f"near_saturated_{fl}_{fl}", f"replaced_saturated_{fl}"]
+    with fits.open(_used(path, "m8 catalogue"), memmap=True) as hdul:
+        d = hdul[1].data
+        names = set(d.columns.names)
+        if not all(c in names for c in need):
+            return None
+        cols = {c: np.asarray(d[c]) for c in need}
+        bad = np.zeros(len(d), bool)
+        for c in flags_bad:
+            if c in names:
+                bad |= np.asarray(d[c]).astype(bool)
+        indep = (np.asarray(d[f"independently_detected_{fl}"]).astype(bool)
+                 if f"independently_detected_{fl}" in names else np.ones(len(d), bool))
+    ra, dec = cols[f"skycoord_{fl}.ra"], cols[f"skycoord_{fl}.dec"]
+    flux, eflux = cols[f"flux_jy_{fl}"], cols[f"eflux_jy_{fl}"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        snr = flux / eflux
+    good = (indep & ~bad & np.isfinite(ra) & np.isfinite(dec) & np.isfinite(cols[f"mag_vega_{fl}"])
+            & (snr > _NB_MIN_SNR) & (cols[f"qfit_{fl}"] < _NB_MAX_QFIT))
+    xy = _radec_to_plane(np.c_[ra[good], dec[good]], *frame)
+    inside = MPath(overlap_xy).contains_points(xy)
+    sel = np.flatnonzero(good)[inside]
+    return dict(ra=ra[sel], dec=dec[sel], flux=flux[sel], mag=cols[f"mag_vega_{fl}"][sel])
+
+
+def _neighbor_agreement(a, b):
+    """Bulk positional + photometric agreement of two overlap samples (``a`` = this obs, ``b`` =
+    neighbour).  Offsets are reported as **this − neighbour**.
+
+    Positions: coarse bulk from the ``xcorr`` pair-separation histogram peak (robust at GC
+    crowding), then pairs within _NB_MATCH_RADIUS_AS of the shifted catalogue, kept one-to-one
+    (mutual nearest), flux-vetted (|Δmag − median| < _NB_FLUX_VET_MAG).  The bulk is the median
+    per-pair offset of the vetted pairs; the scatter is 1.4826·MAD.  Returns a dict, or None when
+    the xcorr peak is unsupported or too few pairs survive."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord, match_coordinates_sky
+    if a is None or b is None or len(a["ra"]) < _NB_MIN_PAIRS or len(b["ra"]) < _NB_MIN_PAIRS:
+        return None
+    sa = SkyCoord(a["ra"] * u.deg, a["dec"] * u.deg)
+    sb = SkyCoord(b["ra"] * u.deg, b["dec"] * u.deg)
+    xc = aa.xcorr(sa, sb, maxsep=1.5 * u.arcsec)
+    if not (xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO):
+        return None
+    cosd = float(np.cos(np.radians(np.median(a["dec"]))))
+    # xcorr's (dra, ddec) moves a ONTO b (b − a); shift a by it, then pair mutual nearest neighbours
+    sa_al = SkyCoord((a["ra"] + xc["dra"] / 3.6e6 / cosd) * u.deg,
+                     (a["dec"] + xc["ddec"] / 3.6e6) * u.deg)
+    ib, sep_ab, _ = match_coordinates_sky(sa_al, sb)
+    ia_back, _, _ = match_coordinates_sky(sb, sa_al)
+    ia = np.arange(len(sa_al))
+    ok = (sep_ab.to(u.arcsec).value < _NB_MATCH_RADIUS_AS) & (ia_back[ib] == ia)
+    ia, ib = ia[ok], ib[ok]
+    if len(ia) < _NB_MIN_PAIRS:
+        return None
+    # total this − neighbour = (aligned − neighbour) − (b − a shift)
+    dra = (sa_al[ia].ra - sb[ib].ra).to(u.mas).value * cosd - xc["dra"]
+    dde = (sa_al[ia].dec - sb[ib].dec).to(u.mas).value - xc["ddec"]
+    dmag = a["mag"][ia] - b["mag"][ib]
+    vet = np.abs(dmag - np.median(dmag)) < _NB_FLUX_VET_MAG
+    if int(vet.sum()) < _NB_MIN_PAIRS:
+        return None
+    ia, ib, dra, dde, dmag = ia[vet], ib[vet], dra[vet], dde[vet], dmag[vet]
+
+    def _mad(x):
+        return float(1.4826 * np.median(np.abs(x - np.median(x))))
+    bra, bde = float(np.median(dra)), float(np.median(dde))
+    return dict(ia=ia, ib=ib, dra=dra, dde=dde, dmag=dmag,
+                n_pairs=int(len(ia)), dra_mas=bra, ddec_mas=bde,
+                offset_mas=float(np.hypot(bra, bde)),
+                astrom_scatter_mas=float(np.hypot(_mad(dra), _mad(dde)) / np.sqrt(2)),
+                dmag_bulk=float(np.median(dmag)), dmag_scatter=_mad(dmag),
+                xcorr_peak_ratio=float(xc["peak_ratio"]), xcorr_npeak=int(xc.get("npeak", 0)))
+
+
+def _nb_flagged(res):
+    return (res["offset_mas"] > _NB_OFFSET_FLAG_MAS) or (abs(res["dmag_bulk"]) > _NB_DMAG_FLAG)
+
+
+def _stage13_pair_figure(o, nb, filt, a, b, res):
+    """Per-neighbour figure: flux vs flux (log-log, Jy), Δmag (Vega) vs magnitude, and the
+    per-source astrometric offset cloud with the bulk marked against the red-flag radius."""
+    fig, ax = _fig(1, 3, 4.6, 4.4)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.83, bottom=0.14, wspace=0.32)
+    fa, fb = a["flux"][res["ia"]], b["flux"][res["ib"]]
+    ma = a["mag"][res["ia"]]
+    p = ax[0][0]
+    p.hexbin(np.log10(fb), np.log10(fa), gridsize=60, bins="log", cmap="viridis", mincnt=1)
+    lo, hi = np.nanpercentile(np.log10(np.r_[fa, fb]), [0.2, 99.8])
+    p.plot([lo, hi], [lo, hi], color="red", lw=1.0, label="1:1")
+    p.set_xlim(lo, hi); p.set_ylim(lo, hi)
+    p.set_xlabel(f"log10 {filt} flux, o{nb} [Jy]")
+    p.set_ylabel(f"log10 {filt} flux, o{o.obs} [Jy]")
+    p.legend(fontsize=8, loc="upper left")
+    p.set_title(f"{filt} flux vs flux ({res['n_pairs']} pairs)", fontsize=9)
+    p = ax[0][1]
+    p.hexbin(ma, res["dmag"], gridsize=60, bins="log", cmap="viridis", mincnt=1)
+    p.axhline(res["dmag_bulk"], color="cyan", lw=1.3, label=f"bulk {res['dmag_bulk']:+.3f} mag")
+    for s in (-1, 1):
+        p.axhline(s * _NB_DMAG_FLAG, color="red", lw=0.9, ls="--")
+    p.set_ylim(-_NB_FLUX_VET_MAG, _NB_FLUX_VET_MAG)
+    p.set_xlabel(f"{filt} o{o.obs} [Vega mag]")
+    p.set_ylabel(f"Δ{filt} (o{o.obs} − o{nb}) [Vega mag]")
+    p.legend(fontsize=8, loc="upper left")
+    p.set_title(f"Δmag: σ={res['dmag_scatter']:.3f} mag (red: ±{_NB_DMAG_FLAG} flag)", fontsize=9)
+    p = ax[0][2]
+    lim = max(60.0, 1.3 * res["offset_mas"], 3 * res["astrom_scatter_mas"])
+    lim = min(lim, 1000 * _NB_MATCH_RADIUS_AS + 40)
+    p.hexbin(res["dra"], res["dde"], gridsize=50, bins="log", cmap="viridis", mincnt=1,
+             extent=(-lim, lim, -lim, lim))
+    p.add_patch(plt_circle(_NB_OFFSET_FLAG_MAS, "red"))
+    p.plot([res["dra_mas"]], [res["ddec_mas"]], "x", color="cyan", ms=10, mew=2,
+           label=f"bulk {res['offset_mas']:.1f} mas")
+    p.axhline(0, color="k", lw=0.5); p.axvline(0, color="k", lw=0.5)
+    p.set_xlim(-lim, lim); p.set_ylim(-lim, lim); p.set_aspect("equal")
+    p.set_xlabel(f"ΔRA·cosδ (o{o.obs} − o{nb}) [mas]")
+    p.set_ylabel("ΔDec [mas]")
+    p.legend(fontsize=8, loc="upper left")
+    p.set_title(f"per-source offset: σ={res['astrom_scatter_mas']:.1f} mas/axis "
+                f"(red: {_NB_OFFSET_FLAG_MAS:.0f} mas flag)", fontsize=9)
+    flag = " — RED FLAG: DISAGREE" if _nb_flagged(res) else ""
+    fig.suptitle(f"{o.target} {o.obsid} vs neighbour o{nb} — {filt} m8 overlap{flag}",
+                 fontsize=11, y=0.97)
+    return _save(fig, f"{o.obsid}_stage13_o{nb}.png")
+
+
+def _stage13_summary_figure(o, filt, mine, nbrs, per_nb):
+    """Footprint map: this tile filled, each overlapping neighbour outlined and labelled with its
+    bulk offset / Δmag, coloured green (agrees), red (disagrees) or grey (not graded)."""
+    fig, ax = _fig(1, 1, 7.0, 6.0)
+    p = ax[0][0]
+    ra0, dec0 = nbrs[0]["frame"]
+    xy = _radec_to_plane(mine, ra0, dec0) / 60.0
+    p.fill(xy[:, 0], xy[:, 1], color="#9ecae1", alpha=0.6, lw=1.5, ec="#08519c")
+    p.text(*xy.mean(0), f"o{o.obs}\n(this)", ha="center", va="center", fontsize=10,
+           fontweight="bold", color="#08306b")
+    for nb in nbrs:
+        d = per_nb[nb["obs"]]
+        col = {"agree": "#2ca02c", "disagree": "#d62728"}.get(d["status"], "#7f7f7f")
+        v = _radec_to_plane(nb["vertices"], ra0, dec0) / 60.0
+        p.plot(np.r_[v[:, 0], v[:, 0][:1]], np.r_[v[:, 1], v[:, 1][:1]], color=col, lw=1.4)
+        ov = nb["overlap_xy"] / 60.0
+        p.fill(ov[:, 0], ov[:, 1], color=col, alpha=0.35, lw=0)
+        if d["status"] in ("agree", "disagree"):
+            lab = f"o{nb['obs']}\n{d['offset_mas']:.0f} mas\n{d['dmag_bulk']:+.3f} mag"
+        else:
+            lab = f"o{nb['obs']}\n{d['status_text']}"
+        p.text(*v.mean(0), lab, ha="center", va="center", fontsize=8, color=col)
+    p.invert_xaxis()
+    p.set_aspect("equal")
+    p.set_xlabel("ΔRA·cosδ [arcmin] (east left)")
+    p.set_ylabel("ΔDec [arcmin]")
+    p.set_title(f"{filt} m8 overlap with neighbouring tiles (this − neighbour; Vega mag)\n"
+                f"green: agrees; red: > {_NB_OFFSET_FLAG_MAS:.0f} mas or > {_NB_DMAG_FLAG} mag; "
+                f"grey: not graded", fontsize=9)
+    fig.suptitle(f"{o.target} {o.obsid} — neighbour agreement", fontsize=11)
+    return _save(fig, f"{o.obsid}_stage13.png")
+
+
+def stage13_neighbor_overlap(o: Observation, sw, lw=None):
+    """Agreement of this tile's m8 catalogue with each overlapping neighbour's m8 catalogue.
+
+    1. Find every observation of the same program whose ``sw`` footprint (mosaic ``S_REGION``)
+       overlaps this one by at least _NB_MIN_OVERLAP_ARCMIN2.  None -> not applicable.
+    2. For each neighbour with an m8 catalogue on BOTH sides, cross-match the clean overlap
+       samples (``_neighbor_agreement``) and plot flux vs flux, Δmag and the per-source offset.
+    3. Red flag only when both m8 catalogues exist and the bulk disagreement exceeds
+       _NB_OFFSET_FLAG_MAS or _NB_DMAG_FLAG.  A neighbour lacking m8, or one whose match is
+       unsupported, is listed as not graded and never raises a flag."""
+    metrics = dict(stage=13, sw=sw, lw=lw, filter=sw)
+    mine, nbrs = _overlapping_neighbors(o, sw)
+    if mine is None:
+        metrics.update(available=False, passed=None,
+                       na_reason=f"no {sw} mosaic footprint on disk for this observation")
+        return None, metrics
+    if not nbrs:
+        metrics.update(available=False, passed=None, n_neighbors=0,
+                       na_reason=f"no other {o.program} observation overlaps this {sw} footprint")
+        return None, metrics
+    my_cat = _m8_catalog_path(o)
+    metrics["neighbors_overlapping"] = [n["obs"] for n in nbrs]
+    if my_cat is None:
+        metrics.update(available=False, passed=None, n_neighbors=len(nbrs),
+                       na_reason="this observation has no m8 catalogue yet")
+        return None, metrics
+    metrics["catalog"] = my_cat
+    per_nb, figs = {}, []
+    for nb in nbrs:
+        onb = replace(o, obs=nb["obs"], merged_obsids=[])
+        d = dict(overlap_arcmin2=round(nb["area_arcmin2"], 3))
+        nb_cat = _m8_catalog_path(onb)
+        if nb_cat is None:
+            d.update(status="pending", status_text="no m8 yet")
+            per_nb[nb["obs"]] = d
+            continue
+        d["catalog"] = nb_cat
+        a = _load_nb_sample(my_cat, sw, nb["overlap_xy"], nb["frame"])
+        b = _load_nb_sample(nb_cat, sw, nb["overlap_xy"], nb["frame"])
+        res = _neighbor_agreement(a, b)
+        if res is None:
+            d.update(status="unmeasured", status_text="too few matches",
+                     n_this=0 if a is None else len(a["ra"]),
+                     n_neighbor=0 if b is None else len(b["ra"]))
+            per_nb[nb["obs"]] = d
+            continue
+        flagged = _nb_flagged(res)
+        d.update({k: v for k, v in res.items() if k not in ("ia", "ib", "dra", "dde", "dmag")})
+        d.update(status="disagree" if flagged else "agree", flagged=flagged)
+        png = _stage13_pair_figure(o, nb["obs"], sw, a, b, res)
+        figs.append((nb["obs"], png, flagged, res["offset_mas"]))
+        per_nb[nb["obs"]] = d
+    graded = {k: v for k, v in per_nb.items() if v["status"] in ("agree", "disagree")}
+    flagged = sorted(k for k, v in graded.items() if v["status"] == "disagree")
+    metrics.update(neighbors=per_nb, n_neighbors=len(nbrs), n_graded=len(graded),
+                   n_flagged=len(flagged), flagged_neighbors=flagged,
+                   n_pending=sum(1 for v in per_nb.values() if v["status"] == "pending"))
+    if graded:
+        metrics["worst_offset_mas"] = max(v["offset_mas"] for v in graded.values())
+        metrics["worst_abs_dmag"] = max(abs(v["dmag_bulk"]) for v in graded.values())
+        metrics["passed"] = not flagged
+    else:
+        metrics["passed"] = None                   # nothing graded yet: neutral, never a flag
+    if flagged:
+        metrics["red_flag"] = True
+        metrics["red_flag_reason"] = (
+            f"bulk disagreement with neighbour(s) {', '.join('o' + k for k in flagged)} beyond "
+            f"{_NB_OFFSET_FLAG_MAS:.0f} mas or {_NB_DMAG_FLAG} mag")
+    png = _stage13_summary_figure(o, sw, mine, nbrs, per_nb)
+    # worst-first so the first expandable plot is the one that needs attention
+    figs.sort(key=lambda t: (not t[2], -t[3]))
+    metrics["extra_figures"] = [(f"neighbour o{nb} ({'🚩 disagrees' if fl else 'agrees'})", p)
+                                for nb, p, fl, _ in figs]
+    return png, metrics
+
+
 # Stages that need an SW filter name to build at all.  A treasury tile whose LW mosaic lands
 # before its SW reduction (10678 o075-o087: F480M reduced, F212N still at image2) crashed these on
 # ``sw.lower()`` (stages 8/9 via _interfilter_residuals on o077/o084); they now report
 # "pending" until the SW products exist.  (Stages 4, 6, 7 and 10-12 already degrade to a neutral
 # n/a card on their own.)
-_STAGES_NEEDING_SW = (2, 3, 5, 8, 9)
+_STAGES_NEEDING_SW = (2, 3, 5, 8, 9, 13)
 
 
 def _dispatch_stage(o, n, sw, lw):
@@ -6322,6 +6682,8 @@ def _dispatch_stage(o, n, sw, lw):
         return stage11_effective_psf(o, sw, lw)
     if n == 12:
         return stage12_photometric_linearity(o, sw, lw)
+    if n == 13:
+        return stage13_neighbor_overlap(o, sw, lw)
     raise ValueError(n)
 
 
@@ -6396,6 +6758,7 @@ _HEADLINE = {
     10: "**Stage 10 — JWST1PASS across-exposure consistency.**",
     11: "**Stage 11 — effective PSF per exposure.**",
     12: "**Stage 12 — photometric linearity.**",
+    13: "**Stage 13 — agreement with neighbouring tiles.**",
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
@@ -6594,6 +6957,54 @@ def _caption_stage12(metrics):
     return base + "([how this is made](DOCROOT#stage12))"
 
 
+def _caption_stage13(metrics):
+    """Stage-13 caption: the method, a per-neighbour table (every neighbour, graded or not), and
+    the flag line.  Offsets and Δmag are this tile − neighbour."""
+    if metrics.get("available") is False:
+        return (f"**Stage 13 — pending.** The input data for this stage are not yet on disk "
+                f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
+    filt = metrics.get("filter") or metrics.get("sw") or "SW"
+    base = (f"**Stage 13 — agreement with neighbouring tiles ({filt}).** Every other observation of "
+            f"this program whose {filt} footprint overlaps this one is a neighbour. In each overlap, "
+            f"the two m8 catalogues are cross-matched on clean {filt} sources (independently "
+            f"detected, unsaturated, [S/N > {_NB_MIN_SNR:.0f}](DOCROOT#glossary-snr), qfit < "
+            f"{_NB_MAX_QFIT}): a pair-separation histogram peak gives the coarse "
+            f"[bulk](DOCROOT#glossary-bulk), then one-to-one pairs within "
+            f"{1000 * _NB_MATCH_RADIUS_AS:.0f} mas of the shifted positions, flux-vetted "
+            f"(|Δmag − median| < {_NB_FLUX_VET_MAG} mag), give the bulk offset (median) and scatter "
+            f"(1.4826·MAD). Magnitudes are **Vega**; fluxes are in Jy. Offsets and Δmag are "
+            f"**this tile − neighbour**. The map shows each overlap; per-neighbour flux-vs-flux, "
+            f"Δmag and per-source offset plots are in the expandable block below. A neighbour "
+            f"without an m8 catalogue is listed as not graded and raises no flag. ")
+    per = metrics.get("neighbors") or {}
+    if per:
+        rows = ["", "| neighbour | overlap (arcmin²) | pairs | bulk offset (mas) | ΔRA, ΔDec (mas) "
+                "| σ_pos (mas/axis) | Δmag (Vega) | σ_mag | status |",
+                "|---|---|---|---|---|---|---|---|---|"]
+        for nb in sorted(per):
+            d = per[nb]
+            if d.get("status") in ("agree", "disagree"):
+                flag = "🚩 disagrees" if d["status"] == "disagree" else "agrees"
+                rows.append(f"| o{nb} | {d['overlap_arcmin2']:.2f} | {d['n_pairs']} | "
+                            f"{d['offset_mas']:.1f} | {d['dra_mas']:+.1f}, {d['ddec_mas']:+.1f} | "
+                            f"{d['astrom_scatter_mas']:.1f} | {d['dmag_bulk']:+.3f} | "
+                            f"{d['dmag_scatter']:.3f} | {flag} |")
+            else:
+                rows.append(f"| o{nb} | {d.get('overlap_arcmin2', float('nan')):.2f} | — | — | — "
+                            f"| — | — | — | not graded ({d.get('status_text', d.get('status'))}) |")
+        base += "\n".join(rows) + "\n\n"
+    ng = metrics.get("n_graded") or 0
+    if metrics.get("red_flag"):
+        base += f"🚩 {metrics.get('red_flag_reason')}. "
+    elif ng:
+        base += (f"All {ng} graded neighbour(s) agree within {_NB_OFFSET_FLAG_MAS:.0f} mas and "
+                 f"{_NB_DMAG_FLAG} mag (worst {metrics.get('worst_offset_mas', float('nan')):.1f} "
+                 f"mas, {metrics.get('worst_abs_dmag', float('nan')):.3f} mag). ")
+    else:
+        base += "No neighbour is graded yet, so no pass/fail is set. "
+    return base + "([how this is made](DOCROOT#stage13))"
+
+
 def _caption_for_impl(n, metrics):
     if n == "6clean":
         exps = ", ".join(metrics.get("excluded_exposures") or [])
@@ -6619,6 +7030,8 @@ def _caption_for_impl(n, metrics):
         return _caption_stage8(metrics)
     if n == 12:
         return _caption_stage12(metrics)
+    if n == 13:
+        return _caption_stage13(metrics)
     # Stage 7, and stage 3's registration / magnitude-system flags, build their own red-flag captions (those
     # cases still render a full figure, so the generic "the plot is empty" wording would not fit).
     if metrics.get("available") is False:
@@ -7262,7 +7675,7 @@ def main(argv=None):
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
     ap.add_argument("--stage", nargs="+", type=int,
-                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
