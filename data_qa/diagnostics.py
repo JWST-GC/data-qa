@@ -6293,6 +6293,9 @@ def stage12_photometric_linearity(o: Observation, sw, lw=None, r_ap=3.0, iso_px=
 # registration or zero-point defect in one of the two tiles.
 _NB_MIN_OVERLAP_ARCMIN2 = 0.05      # smaller slivers (corner touches) hold too few stars to grade
 _NB_OFFSET_FLAG_MAS = 50.0          # red flag: bulk positional disagreement beyond this
+# 50 mas is a maintainer decision (#344).  On the 2026-09-27 survey of 101 graded 10678 overlap
+# pairs the median bulk offset was 26 mas and 71 pairs exceeded 20 mas, with ~2 mas per-pair
+# scatter; 50 mas flags the 30 pairs whose registration disagrees well beyond that population.
 _NB_DMAG_FLAG = 0.1                 # red flag: bulk F212N (Vega) magnitude disagreement beyond this
 _NB_MIN_SNR = 20.0                  # per-source S/N floor for the comparison sample
 _NB_MAX_QFIT = 0.2                  # PSF-fit quality ceiling (drops blends / poor fits)
