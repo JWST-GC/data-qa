@@ -326,6 +326,14 @@ def _sticky_checkboxes(new_body: str, old_body: str) -> str:
     return "\n".join(out)
 
 
+def _carry_index(new_body: str, old_body: str) -> str:
+    """Carry the comment-index block (written by ``post_diagnostics.update_index``) from the
+    remote body into the regenerated body, which does not know the comment URLs."""
+    from .post_diagnostics import _INDEX_RE, splice_index
+    m = _INDEX_RE.search(old_body or "")
+    return splice_index(new_body, m.group(0)) if m else new_body
+
+
 def sync_observation(o, token, repo, existing, dry_run=False):
     title, body, labels = o.issue_title, render_body(o), labels_for(o)
     if title in existing:
@@ -334,6 +342,7 @@ def sync_observation(o, token, repo, existing, dry_run=False):
         if dry_run:
             return f"UPDATE #{num}: {title}"
         body = _sticky_checkboxes(body, it.get("body", ""))     # preserve human + prior marks
+        body = _carry_index(body, it.get("body", ""))           # keep the comment index block
         _req("PATCH", f"{API}/repos/{repo}/issues/{num}", token,
              {"body": body, "labels": labels})
         return f"updated #{num}: {title}"
