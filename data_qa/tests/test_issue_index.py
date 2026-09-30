@@ -41,3 +41,46 @@ def test_make_issues_carries_index_across_rerender():
     new = _carry_index("fresh body\n", old)
     assert new.startswith("fresh body") and new.count(INDEX_START) == 1
     assert _carry_index("fresh body\n", "no index here") == "fresh body\n"
+
+
+import pytest
+
+from data_qa import post_diagnostics as PD
+
+
+@pytest.fixture(autouse=True)
+def _no_cached_issue_numbers():
+    PD._ISSUE_NUMBERS.clear()
+    yield
+    PD._ISSUE_NUMBERS.clear()
+
+
+class _O:
+    issue_title = "T"
+
+
+def _fake_api(monkeypatch, body, patch_status=200):
+    calls = []
+    monkeypatch.setattr(PD, "_issue_number", lambda repo, token, title: 7)
+    monkeypatch.setattr(PD, "_paged_get", lambda url, token, what: COMMENTS)
+
+    def req(method, url, token, data=None, **kw):
+        calls.append(method)
+        if method == "GET":
+            return 200, {"body": body}
+        return patch_status, {}
+    monkeypatch.setattr(PD, "_req", req)
+    return calls
+
+
+def test_update_index_patches_only_on_change(monkeypatch):
+    calls = _fake_api(monkeypatch, "body")
+    assert PD.update_index(_O(), "o/r", token="t") is True and calls == ["GET", "PATCH"]
+    calls = _fake_api(monkeypatch, splice_index("body", render_index(COMMENTS)))
+    assert PD.update_index(_O(), "o/r", token="t") is False and calls == ["GET"]
+
+
+def test_update_index_raises_on_failed_patch(monkeypatch):
+    _fake_api(monkeypatch, "body", patch_status=500)
+    with pytest.raises(PD.PostError):
+        PD.update_index(_O(), "o/r", token="t")
