@@ -1,3 +1,6 @@
+import pytest
+
+from data_qa import post_diagnostics as PD
 from data_qa.make_issues import _carry_index
 from data_qa.post_diagnostics import INDEX_END, INDEX_START, render_index, splice_index
 
@@ -41,18 +44,6 @@ def test_make_issues_carries_index_across_rerender():
     new = _carry_index("fresh body\n", old)
     assert new.startswith("fresh body") and new.count(INDEX_START) == 1
     assert _carry_index("fresh body\n", "no index here") == "fresh body\n"
-
-
-import pytest
-
-from data_qa import post_diagnostics as PD
-
-
-@pytest.fixture(autouse=True)
-def _no_cached_issue_numbers():
-    PD._ISSUE_NUMBERS.clear()
-    yield
-    PD._ISSUE_NUMBERS.clear()
 
 
 class _O:

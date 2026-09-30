@@ -16,6 +16,15 @@ def _no_mast_network(monkeypatch):
     monkeypatch.setenv("QA_MAST_DOWNLOAD", "0")
 
 
+@pytest.fixture(autouse=True)
+def _no_cached_issue_numbers():
+    """post_diagnostics caches issue numbers per process; clear it so no test sees another's."""
+    from data_qa import post_diagnostics
+    post_diagnostics._ISSUE_NUMBERS.clear()
+    yield
+    post_diagnostics._ISSUE_NUMBERS.clear()
+
+
 def _make_wcs(crval, crpix, scale_deg, pa_deg):
     from astropy.wcs import WCS
     w = WCS(naxis=2)
