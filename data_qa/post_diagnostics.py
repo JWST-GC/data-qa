@@ -272,12 +272,15 @@ def _paged_get(url_tmpl, token, what):
 # _fetch_page, so only a SHORT truncated page -- indistinguishable in-scan from a real last page --
 # reaches here), and a genuinely-absent title stays absent across all of them.
 _SCAN_ATTEMPTS = 8
+_ISSUE_NUMBERS = {}                             # (repo, title) -> issue number, per process
 
 
 def _issue_number(repo, token, title):
     """Number of the canonical issue with ``title``.  Titles can be duplicated (a closed
     dup + the live one), so collect ALL matches and prefer an OPEN issue; never post to a
     closed duplicate."""
+    if (repo, title) in _ISSUE_NUMBERS:
+        return _ISSUE_NUMBERS[(repo, title)]
     url = f"{API}/repos/{repo}/issues?state=all&per_page=100&page={{page}}"
     states = {}                                  # number -> state, unioned across attempts
     for _ in range(_SCAN_ATTEMPTS):
@@ -289,7 +292,8 @@ def _issue_number(repo, token, title):
     if not states:
         return None
     open_ = [n for n, s in states.items() if s == "open"]
-    return min(open_) if open_ else min(states)
+    _ISSUE_NUMBERS[(repo, title)] = min(open_) if open_ else min(states)
+    return _ISSUE_NUMBERS[(repo, title)]
 
 
 def _find_stage_comment(repo, token, num, marker):
@@ -359,6 +363,91 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra
         raise PostError(f"comment {action} failed ({st}): {data}")
     print(f"  stage {stage}: {action} comment on #{num} -> {data.get('html_url')}")
     return data
+
+
+# --------------------------------------------------------------------------- issue-body index
+# GitHub lists comments in creation order, and a stage comment is created when its inputs first
+# land, so stage 4 can sit below stage 11.  The issue body therefore carries an index of the
+# machine comments in a fixed order, spliced between these markers (``make_issues`` carries the
+# block across its body re-render).
+INDEX_START = "<!-- data-qa:index -->"
+INDEX_END = "<!-- /data-qa:index -->"
+_INDEX_RE = re.compile(re.escape(INDEX_START) + r".*?" + re.escape(INDEX_END), re.S)
+_DIAG_RE = re.compile(r"<!-- data-qa:diag:stage(\w+) -->")
+_STAGE_TITLE_RE = re.compile(r"^\*\*Stage \S+ [—-] (.+?)\.?\*\*", re.M)
+_OTHER_MARKERS = (("<!-- data-qa:pipeline-status -->", "Pipeline progress"),
+                  ("<!-- data-qa:monitor -->", "MAST monitor events"))
+
+
+def _stage_sort_key(tag):
+    """Numeric stages in order, a suffixed variant (``6clean``) right after its base stage,
+    non-numeric tags (``miri``) last."""
+    m = re.match(r"(\d+)(.*)", tag)
+    return (0, int(m.group(1)), m.group(2)) if m else (1, 0, tag)
+
+
+def render_index(comments):
+    """Markdown index block linking every machine comment in a fixed order: pipeline progress,
+    MAST monitor, then the diagnostic stages by stage number.  Human comments are left out."""
+    lines = []
+    for marker, label in _OTHER_MARKERS:
+        for c in comments:
+            if marker in (c.get("body") or ""):
+                lines.append(f"- [{label}]({c['html_url']})")
+                break
+    stages = {}
+    for c in comments:
+        body = c.get("body") or ""
+        m = _DIAG_RE.search(body)
+        if m and m.group(1) not in stages:
+            t = _STAGE_TITLE_RE.search(body)
+            stages[m.group(1)] = (t.group(1).strip() if t else None, c["html_url"])
+    for tag in sorted(stages, key=_stage_sort_key):
+        title, url = stages[tag]
+        name = "MIRI overview" if tag == "miri" else (
+            "Stage 6 (bad-PSF exposures excluded)" if tag == "6clean" else f"Stage {tag}")
+        lines.append(f"- [{name}]({url})" + (f" — {title}" if title and tag != "6clean" else ""))
+    if not lines:
+        return ""
+    return (f"{INDEX_START}\n### Index\n<sub>links to the auto-posted comments below, in stage "
+            f"order (GitHub shows comments in the order they were first posted).</sub>\n\n"
+            + "\n".join(lines) + f"\n{INDEX_END}")
+
+
+def splice_index(body, block):
+    """Replace the index block in ``body`` (or append it at the end); an empty ``block`` removes it."""
+    body = body or ""
+    if _INDEX_RE.search(body):
+        out = _INDEX_RE.sub(lambda _: block, body)
+    elif block:
+        out = body.rstrip("\n") + "\n\n" + block
+    else:
+        out = body
+    return out.rstrip("\n") + "\n"
+
+
+def update_index(o: Observation, repo, token=None):
+    """Rebuild the index block in ``o``'s issue body from its current comments.  One comment
+    listing + one issue GET; the body is PATCHed only when the index changed."""
+    token = token or _token()
+    num = _issue_number(repo, token, o.issue_title)
+    if num is None:
+        return None
+    comments = _paged_get(f"{API}/repos/{repo}/issues/{num}/comments?per_page=100&page={{page}}",
+                          token, f"comment listing on #{num}")
+    st, issue = _req("GET", f"{API}/repos/{repo}/issues/{num}", token)
+    if st >= 300:
+        raise PostError(f"issue fetch failed ({st}): {issue}")
+    old = issue.get("body") or ""
+    new = splice_index(old, render_index(comments))
+    if new.rstrip("\n") == old.rstrip("\n"):
+        return False
+    st, data = _req("PATCH", f"{API}/repos/{repo}/issues/{num}", token,
+                    data=json.dumps({"body": new}).encode())
+    if st >= 300:
+        raise PostError(f"index update failed ({st}): {data}")
+    print(f"  index: updated on #{num}")
+    return True
 
 
 def unpost_stage(o: Observation, stage, repo, token=None):

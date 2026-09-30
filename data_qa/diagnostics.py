@@ -7670,7 +7670,17 @@ def _run_miri(args):
                 post_stage(o, "miri", png, _miri_caption(metrics, args.repo), args.repo)
         except (PostError, OSError) as e:
             print(f"  MIRI: post FAILED (figure built OK): {e}", file=sys.stderr)
+        _update_index(o, args.repo)
     return 0
+
+
+def _update_index(o, repo):
+    """Refresh the issue-body comment index once per run, after all stage posts."""
+    from .post_diagnostics import update_index, PostError
+    try:
+        update_index(o, repo)
+    except (PostError, OSError) as e:
+        print(f"  index: update FAILED: {e}", file=sys.stderr)
 
 
 def main(argv=None):
@@ -7756,6 +7766,8 @@ def main(argv=None):
                           f"excluding {metrics.get('excluded_exposures')}")
             except (PostError, OSError) as e:
                 print(f"  stage {n}: post FAILED (figure built OK): {e}", file=sys.stderr)
+    if args.post:
+        _update_index(o, args.repo)
     print(f"metrics -> {mpath}")
     return 0
 
