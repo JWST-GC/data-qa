@@ -1450,30 +1450,54 @@ def test_daophot_glob_prefers_this_obs(tmp_path, monkeypatch):
     assert not any("_o050_" in os.path.basename(g) for g in got)
 
 
-def test_daophot_glob_rollcorr_tag_prefers_corrected_copies(tmp_path, monkeypatch):
-    monkeypatch.setattr(D, "BASE", str(tmp_path))
-    monkeypatch.setenv("QA_ROLLCORR_TAG", "v1_perframe")
+def _rollcorr_tree(tmp_path, dets, corrected):
     d = tmp_path / "gc2211" / "F200W"; d.mkdir(parents=True)
     r = tmp_path / "gc2211" / "catalogs_rollcorr" / "v1_perframe"; r.mkdir(parents=True)
-    _touch(d, "f200w_nrca1_o023_visit001_exp1_m3_daophot_basic.fits")
-    _touch(r, "f200w_nrca1_o023_visit001_exp1_m3_daophot_basic.fits")
-    _touch(d, "f200w_nrca1_o050_visit001_exp1_m3_daophot_basic.fits")
-    got = D._daophot_glob(_obs(obs="023"), "F200W")
-    assert got and D._is_rollcorr(got)
-    # no corrected copy for o050 -> the uncorrected cats, never another obs's corrected ones
-    got50 = D._daophot_glob(_obs(obs="050"), "F200W")
-    assert got50 and not D._is_rollcorr(got50)
-    assert all("_o050_" in os.path.basename(g) for g in got50)
+    for det in dets:
+        for e in (1, 2):
+            name = f"f200w_{det}_o023_visit001_exp{e}_m3_daophot_basic.fits"
+            _touch(d, name)
+            if det in corrected:
+                _touch(r, name)
+    return d, r
+
+
+def test_daophot_glob_rollcorr_uses_complete_corrected_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setenv("QA_ROLLCORR_TAG", "v1_perframe")
+    _rollcorr_tree(tmp_path, ("nrca1", "nrcb1"), corrected=("nrca1", "nrcb1"))
+    o = _obs(obs="023")
+    for det in ("nrca1", "nrcb1", "*"):
+        got = D._daophot_glob(o, "F200W", det, rollcorr=True)
+        assert got and D._is_rollcorr(got)
+    assert len(D._daophot_glob(o, "F200W", "nrca1", rollcorr=True)) == 2
+
+
+def test_daophot_glob_rollcorr_partial_set_falls_back_for_every_detector(tmp_path, monkeypatch):
+    # NRCB1 has no corrected copies -> NRCA1 must not be served rotated against unrotated NRCB1
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setenv("QA_ROLLCORR_TAG", "v1_perframe")
+    _rollcorr_tree(tmp_path, ("nrca1", "nrcb1"), corrected=("nrca1",))
+    o = _obs(obs="023")
+    assert D._rollcorr_set(o, "F200W") is None
+    for det in ("nrca1", "nrcb1"):
+        got = D._daophot_glob(o, "F200W", det, rollcorr=True)
+        assert got and not D._is_rollcorr(got)
+
+
+def test_daophot_glob_rollcorr_scoped_to_callers_that_ask(tmp_path, monkeypatch):
+    # the env var alone changes nothing: only stage 5 passes rollcorr=True
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setenv("QA_ROLLCORR_TAG", "v1_perframe")
+    _rollcorr_tree(tmp_path, ("nrca1",), corrected=("nrca1",))
+    assert not D._is_rollcorr(D._daophot_glob(_obs(obs="023"), "F200W"))
 
 
 def test_daophot_glob_ignores_rollcorr_without_tag(tmp_path, monkeypatch):
     monkeypatch.setattr(D, "BASE", str(tmp_path))
     monkeypatch.delenv("QA_ROLLCORR_TAG", raising=False)
-    d = tmp_path / "gc2211" / "F200W"; d.mkdir(parents=True)
-    r = tmp_path / "gc2211" / "catalogs_rollcorr" / "v1_perframe"; r.mkdir(parents=True)
-    _touch(d, "f200w_nrca1_o023_visit001_exp1_m3_daophot_basic.fits")
-    _touch(r, "f200w_nrca1_o023_visit001_exp1_m3_daophot_basic.fits")
-    assert not D._is_rollcorr(D._daophot_glob(_obs(obs="023"), "F200W"))
+    _rollcorr_tree(tmp_path, ("nrca1",), corrected=("nrca1",))
+    assert not D._is_rollcorr(D._daophot_glob(_obs(obs="023"), "F200W", rollcorr=True))
 
 
 def test_stage5_caption_roll_note():

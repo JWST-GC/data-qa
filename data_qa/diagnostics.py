@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fnmatch
 import glob
 import json
 import os
@@ -853,7 +854,7 @@ def _viraccache_path(o: Observation):
 _DAO_OBS_RE = re.compile(r"_o(\d{3})_")     # per-exposure token is underscore-bounded: _o023_visit
 
 
-def _daophot_glob(o: Observation, filt, det="*"):
+def _daophot_glob(o: Observation, filt, det="*", rollcorr=False):
     """Obs-scoped per-exposure daophot cats for filt (+ detector).  Fields name these either
     untokened (brick: ``f212n_nrca1_visit*``) or per-obs (gc2211: ``f200w_nrca1_o023_visit*``,
     with an older untokened generation possibly alongside).  Never hand one observation's
@@ -862,13 +863,10 @@ def _daophot_glob(o: Observation, filt, det="*"):
       * if a per-obs generation exists but not for this obs -> return [] (don't fall back to a
         different obs or a stale untokened generation);
       * else use the untokened files (single-obs-per-field layout)."""
-    tag = _rollcorr_tag()
-    if tag:
-        # roll-corrected COPIES (jwst-gc-pipeline catalog_roll_correction --include-perframe),
-        # flat under catalogs_rollcorr/<tag>/; same obs-scoping rules as the primary tree
-        hits = _daophot_glob_in(o, f"catalogs_rollcorr/{tag}/{filt.lower()}_{det}")
-        if hits:
-            return hits
+    if rollcorr:
+        corr = _rollcorr_set(o, filt)
+        if corr is not None:
+            return [c for c in corr if fnmatch.fnmatch(os.path.basename(c), f"{filt.lower()}_{det}_*")]
     return _daophot_glob_in(o, f"{filt}/{filt.lower()}_{det}")
 
 
@@ -876,6 +874,23 @@ def _rollcorr_tag():
     """``QA_ROLLCORR_TAG`` names a ``<field>/catalogs_rollcorr/<tag>/`` set of per-exposure cats
     carrying the per-visit roll correction (JWST-GC/data-qa#346).  Unset = uncorrected cats."""
     return os.environ.get("QA_ROLLCORR_TAG") or None
+
+
+def _rollcorr_set(o: Observation, filt):
+    """The roll-corrected per-exposure cats for (obs, filt), or None.  Roll-corrected COPIES are
+    written by jwst-gc-pipeline ``catalog_roll_correction --include-perframe`` flat under
+    ``<field>/catalogs_rollcorr/<tag>/``.  Decided once for the whole (obs, filt): the corrected
+    set is used only when it holds every primary exposure on every detector, so a partial set
+    never puts rotated NRCA positions against unrotated NRCB ones."""
+    tag = _rollcorr_tag()
+    if not tag:
+        return None
+    prim = _daophot_glob_in(o, f"{filt}/{filt.lower()}_*")
+    corr = _daophot_glob_in(o, f"catalogs_rollcorr/{tag}/{filt.lower()}_*")
+    have = {os.path.basename(c) for c in corr}
+    if prim and all(os.path.basename(p) in have for p in prim):
+        return [c for c in corr if os.path.basename(c) in {os.path.basename(p) for p in prim}]
+    return None
 
 
 def _is_rollcorr(paths):
@@ -2875,7 +2890,7 @@ def stage4_offsets(o: Observation, sw):
 _SW_DETS = ["nrca1", "nrca2", "nrca3", "nrca4", "nrcb1", "nrcb2", "nrcb3", "nrcb4"]
 
 
-def _per_detector_offsets(o, filt, ref_sc):
+def _per_detector_offsets(o, filt, ref_sc, rollcorr=False):
     """Per-detector median residual vs a common frame, from the per-exposure daophot cats
     (pooled), for the 8 SW detectors.  Returns {det: dict(ra,dec,dra,dde,mad,n)} in mas.
     Uses the catalogs' skycoord_centroid (same WCS generation as the current mosaic)."""
@@ -2885,7 +2900,7 @@ def _per_detector_offsets(o, filt, ref_sc):
     from astropy.table import Table
     out = {}
     for d in _SW_DETS:
-        cats = _daophot_glob(o, filt, d)          # obs-scoped
+        cats = _daophot_glob(o, filt, d, rollcorr=rollcorr)          # obs-scoped
         if not cats:
             continue
         try:
@@ -2969,7 +2984,7 @@ def _finite_sc(sc):
     return sc[np.isfinite(sc.ra.deg) & np.isfinite(sc.dec.deg)]
 
 
-def _module_positions(o, filt):
+def _module_positions(o, filt, rollcorr=False):
     """(NRCA, NRCB) finite SkyCoords for the A-vs-B comparison, pooled from the per-detector
     daophot cats, plus per-module ``meta``.  The per-detector cats are the PRIMARY source.  A module
     comes back None for one of two reasons -- it is genuinely ABSENT (a single-module obs, e.g.
@@ -2986,7 +3001,7 @@ def _module_positions(o, filt):
     def pool(dets):
         cats = []
         for d in dets:
-            cats += _daophot_glob(o, filt, d)          # obs-scoped
+            cats += _daophot_glob(o, filt, d, rollcorr=rollcorr)          # obs-scoped
         if not cats:
             return None, dict(present=False, n_raw=0, n_nan=0, nan_frac=0.0, dead=False)
         try:
@@ -3157,7 +3172,7 @@ def _draw_ab_footprint(ax, ovd, label):
                  fontsize=8)
 
 
-def _module_hi_sn(o, filt, snmin=10.0):
+def _module_hi_sn(o, filt, snmin=10.0, rollcorr=False):
     """(NRCA, NRCB) finite SkyCoords restricted to flux S/N > ``snmin`` (S/N = flux_fit/flux_err
     from the per-exposure PSF fit), pooled from the per-detector daophot cats.  Used for the
     stage-5 high-S/N overlap panel, where the residual scatter measures how well the two modules
@@ -3168,7 +3183,7 @@ def _module_hi_sn(o, filt, snmin=10.0):
     def pool(dets):
         cats = []
         for d in dets:
-            cats += _daophot_glob(o, filt, d)          # obs-scoped
+            cats += _daophot_glob(o, filt, d, rollcorr=rollcorr)          # obs-scoped
         tabs = []
         for c in cats:
             try:
@@ -3216,7 +3231,7 @@ def stage5_intermodule(o: Observation, sw):
     # SAME stars: align A onto B by the peak, keep the tight matches, measure their spread.
     ov = None
     single_module = None
-    a_sc, b_sc, minfo = _module_positions(o, filt)
+    a_sc, b_sc, minfo = _module_positions(o, filt, rollcorr=True)
     metrics["nan_frac"] = round(max(minfo["a"]["nan_frac"], minfo["b"]["nan_frac"]), 4)
     # A module whose cats exist on disk but hold too few finite centroids is an astrometry
     # FAILURE (dead).  Surface it loudly; left alone it reads as a single-module obs and passes.
@@ -3235,10 +3250,10 @@ def stage5_intermodule(o: Observation, sw):
     if (a_sc is None) ^ (b_sc is None):
         single_module = "NRCA" if a_sc is not None else "NRCB"
     if _rollcorr_tag():
-        # record which generation was measured: a requested tag with no corrected copies for
-        # this obs falls back to the uncorrected cats, and the caption must say so
+        # record which generation was measured: a requested tag without a COMPLETE corrected set
+        # for this (obs, filt) falls back to the uncorrected cats, and the caption must say so
         metrics.update(roll_tag=_rollcorr_tag(),
-                       roll_corrected=_is_rollcorr(_daophot_glob(o, filt)))
+                       roll_corrected=_rollcorr_set(o, filt) is not None)
     ov = _ab_overlap(a_sc, b_sc)
     if ov:
         metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"],
@@ -3250,7 +3265,7 @@ def stage5_intermodule(o: Observation, sw):
     # centroid is known.  This adds a panel; the all-stars panel above stays.
     ov_hi = None
     if ov:
-        a_hi, b_hi = _module_hi_sn(o, filt, snmin=10.0)
+        a_hi, b_hi = _module_hi_sn(o, filt, snmin=10.0, rollcorr=True)
         ov_hi = _ab_overlap(a_hi, b_hi)
         if ov_hi:
             metrics.update(intermodule_off_hi=ov_hi["off"], intermodule_rms_hi=ov_hi["rms"],
@@ -3259,7 +3274,8 @@ def stage5_intermodule(o: Observation, sw):
                            intermodule_bulk_source_hi=ov_hi["bulk_source"])
 
     # (1) per-detector residuals vs VIRAC, bulk-subtracted
-    det = _per_detector_offsets(o, filt, ref_sc) if ref_sc is not None else {}
+    det = (_per_detector_offsets(o, filt, ref_sc, rollcorr=True)
+           if ref_sc is not None else {})
     if det:
         gdra = np.median([v["dra"] for v in det.values()])
         gdde = np.median([v["dde"] for v in det.values()])
@@ -7044,8 +7060,8 @@ def _roll_note(metrics):
         return (f"\n\nPositions come from per-exposure catalogues with the per-visit roll "
                 f"correction applied (JWST-GC/data-qa#346, set `{metrics['roll_tag']}`).")
     if metrics.get("roll_tag"):
-        return ("\n\n⚠️ No roll-corrected per-exposure catalogues exist for this observation; "
-                "these positions are uncorrected (JWST-GC/data-qa#346).")
+        return ("\n\n⚠️ No complete set of roll-corrected per-exposure catalogues exists for this "
+                "observation, so these positions are uncorrected (JWST-GC/data-qa#346).")
     return ""
 
 
