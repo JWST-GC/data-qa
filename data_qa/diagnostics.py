@@ -862,7 +862,27 @@ def _daophot_glob(o: Observation, filt, det="*"):
       * if a per-obs generation exists but not for this obs -> return [] (don't fall back to a
         different obs or a stale untokened generation);
       * else use the untokened files (single-obs-per-field layout)."""
-    base = f"{filt}/{filt.lower()}_{det}"
+    tag = _rollcorr_tag()
+    if tag:
+        # roll-corrected COPIES (jwst-gc-pipeline catalog_roll_correction --include-perframe),
+        # flat under catalogs_rollcorr/<tag>/; same obs-scoping rules as the primary tree
+        hits = _daophot_glob_in(o, f"catalogs_rollcorr/{tag}/{filt.lower()}_{det}")
+        if hits:
+            return hits
+    return _daophot_glob_in(o, f"{filt}/{filt.lower()}_{det}")
+
+
+def _rollcorr_tag():
+    """``QA_ROLLCORR_TAG`` names a ``<field>/catalogs_rollcorr/<tag>/`` set of per-exposure cats
+    carrying the per-visit roll correction (JWST-GC/data-qa#346).  Unset = uncorrected cats."""
+    return os.environ.get("QA_ROLLCORR_TAG") or None
+
+
+def _is_rollcorr(paths):
+    return bool(paths) and all("/catalogs_rollcorr/" in p for p in paths)
+
+
+def _daophot_glob_in(o: Observation, base):
     tok = _fglob(o, f"{base}_o{o.obs}_visit*_*_m3_daophot_basic.fits")
     if tok:
         return tok
@@ -3214,6 +3234,11 @@ def stage5_intermodule(o: Observation, sw):
         return png, metrics
     if (a_sc is None) ^ (b_sc is None):
         single_module = "NRCA" if a_sc is not None else "NRCB"
+    if _rollcorr_tag():
+        # record which generation was measured: a requested tag with no corrected copies for
+        # this obs falls back to the uncorrected cats, and the caption must say so
+        metrics.update(roll_tag=_rollcorr_tag(),
+                       roll_corrected=_is_rollcorr(_daophot_glob(o, filt)))
     ov = _ab_overlap(a_sc, b_sc)
     if ov:
         metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"],
@@ -3413,6 +3438,10 @@ def stage5_intermodule(o: Observation, sw):
         title_extra += f"  ·  ⚠ {nan_frac * 100:.0f}% NaN centroids"
     metrics["passed"] = bool((single_module or (ov and ov["off"] < aa.THRESH["intermodule"]))
                              and not high_nan)
+    if metrics.get("roll_corrected"):
+        title_extra += "  ·  roll-corrected"
+    elif metrics.get("roll_tag"):
+        title_extra += "  ·  ⚠ roll correction unavailable (uncorrected cats)"
     fig.suptitle(f"{o.target} {o.obsid} — module overlap measurement ({filt}){title_extra}",
                  fontsize=11, y=suptitle_y)
     return _save(fig, f"{o.obsid}_stage5.png"), metrics
@@ -7008,6 +7037,73 @@ def _caption_stage13(metrics):
     return base + "([how this is made](DOCROOT#stage13))"
 
 
+def _roll_note(metrics):
+    """Stage-5 caption suffix saying whether the per-exposure cats carry the per-visit roll
+    correction (JWST-GC/data-qa#346)."""
+    if metrics.get("roll_corrected"):
+        return (f"\n\nPositions come from per-exposure catalogues with the per-visit roll "
+                f"correction applied (JWST-GC/data-qa#346, set `{metrics['roll_tag']}`).")
+    if metrics.get("roll_tag"):
+        return ("\n\n⚠️ No roll-corrected per-exposure catalogues exist for this observation; "
+                "these positions are uncorrected (JWST-GC/data-qa#346).")
+    return ""
+
+
+def _stage5_caption(metrics):
+    # Built entirely in code, which lets it (a) gate the S/N>10 clause on the panel actually
+    # being present (ov_hi), (b) get the panel POSITION right ("to its right", it is gs[0,2]),
+    # and (c) survive a missing intermodule_diff without a KeyError.
+    diff = metrics.get("intermodule_diff")
+    diff_clause = (f" The [per-detector quiver](DOCROOT#glossary-quiver) shows an A–B diff of "
+                   f"{diff:.1f} mas." if diff is not None else "")
+    if metrics.get("intermodule_off") is None:
+        # a legitimate single-module obs, or two modules sharing no stars to compare
+        if metrics.get("single_module"):
+            return (f"**Stage 5 — inter-detector agreement.** Single module "
+                    f"({metrics['single_module']}) for this observation, so there is no "
+                    f"NRCA–NRCB comparison to make and the "
+                    f"[JWST-against-itself](DOCROOT#glossary-reffree) overlap panel is "
+                    f"omitted.{diff_clause} ([how this is made](DOCROOT#stage5))")
+        return ("**Stage 5 — inter-detector / inter-module agreement.**"
+                f"{diff_clause} ([how this is made](DOCROOT#stage5))")
+    # overlap measured -> full caption; the S/N>10 panel is only present when ov_hi succeeded
+    off = metrics.get("intermodule_off"); rms = metrics.get("intermodule_rms")
+    no = metrics.get("n_overlap")
+    # top row is quiver + all-stars + optional S/N>10; the all-stars panel is TOP-MIDDLE when
+    # the S/N panel is present (3 cols), else TOP-RIGHT (2 cols).  The footprint is its own
+    # full-width row below.
+    ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
+    base = ("**Stage 5 — inter-detector / inter-module agreement.**\n\n"
+            "TOP-LEFT [per-detector quiver](DOCROOT#glossary-quiver): each detector's median "
+            "residual **against VIRAC** (field offset removed); every detector gets a vector, "
+            "including NRCB2, which shares no sky with NRCA. NRCA−NRCB difference "
+            f"{(diff if diff is not None else float('nan')):.1f} mas.\n\n"
+            f"{ov_pos} panel: [JWST against itself](DOCROOT#glossary-reffree) in the "
+            f"NRCA∩NRCB overlap — {off:.1f} mas offset, {rms:.1f} mas scatter (ΔRA and ΔDec "
+            f"combined) over {no} shared stars, with ΔRA/ΔDec marginal histograms.")
+    pk = metrics.get("intermodule_peak_off")
+    if pk is not None and off is not None:
+        base += (f" The offset is the [xcorr histogram peak](DOCROOT#glossary-xcorr) refined on "
+                 f"the SAME stars the peak pairs; the peak alone reads {pk:.1f} mas. The "
+                 f"residual cloud is drawn about the peak, so its displacement from the centre "
+                 f"is the peak's error, which the refinement takes out.")
+    if metrics.get("n_overlap_hi"):
+        base += (f"\n\nThe panel to its right repeats it for "
+                 f"[S/N > 10](DOCROOT#glossary-snr) stars ({metrics['n_overlap_hi']} stars, "
+                 f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas scatter).")
+    if metrics.get("n_overlap_footprint"):
+        base += ("\n\nThe full-width row below maps the overlap stars on the sky, "
+                 "coloured by per-star |A−B|.")
+    if metrics.get("cutout_footprint_mismatch"):
+        base += ("\n\n⚠️ The BOTTOM cutout strip is empty because **no drizzled mosaic covers the "
+                 "module-overlap zone — the catalogue and the mosaic are on disjoint footprints** "
+                 "(a reduction mismatch, not a QA gap).\n\n([how this is made](DOCROOT#stage5))")
+    else:
+        base += ("\n\nThe BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`."
+                 "\n\n([how this is made](DOCROOT#stage5))")
+    return base
+
+
 def _caption_for_impl(n, metrics):
     if n == "6clean":
         exps = ", ".join(metrics.get("excluded_exposures") or [])
@@ -7226,58 +7322,7 @@ def _caption_for_impl(n, metrics):
                      "yet to be photometrically catalogued, which is what stage 3 red-flags.)")
         return base
     if n == 5:
-        # Built entirely in code, which lets it (a) gate the S/N>10 clause on the panel actually
-        # being present (ov_hi), (b) get the panel POSITION right ("to its right", it is gs[0,2]),
-        # and (c) survive a missing intermodule_diff without a KeyError.
-        diff = metrics.get("intermodule_diff")
-        diff_clause = (f" The [per-detector quiver](DOCROOT#glossary-quiver) shows an A–B diff of "
-                       f"{diff:.1f} mas." if diff is not None else "")
-        if metrics.get("intermodule_off") is None:
-            # a legitimate single-module obs, or two modules sharing no stars to compare
-            if metrics.get("single_module"):
-                return (f"**Stage 5 — inter-detector agreement.** Single module "
-                        f"({metrics['single_module']}) for this observation, so there is no "
-                        f"NRCA–NRCB comparison to make and the "
-                        f"[JWST-against-itself](DOCROOT#glossary-reffree) overlap panel is "
-                        f"omitted.{diff_clause} ([how this is made](DOCROOT#stage5))")
-            return ("**Stage 5 — inter-detector / inter-module agreement.**"
-                    f"{diff_clause} ([how this is made](DOCROOT#stage5))")
-        # overlap measured -> full caption; the S/N>10 panel is only present when ov_hi succeeded
-        off = metrics.get("intermodule_off"); rms = metrics.get("intermodule_rms")
-        no = metrics.get("n_overlap")
-        # top row is quiver + all-stars + optional S/N>10; the all-stars panel is TOP-MIDDLE when
-        # the S/N panel is present (3 cols), else TOP-RIGHT (2 cols).  The footprint is its own
-        # full-width row below.
-        ov_pos = "TOP-MIDDLE" if metrics.get("n_overlap_hi") else "TOP-RIGHT"
-        base = ("**Stage 5 — inter-detector / inter-module agreement.**\n\n"
-                "TOP-LEFT [per-detector quiver](DOCROOT#glossary-quiver): each detector's median "
-                "residual **against VIRAC** (field offset removed); every detector gets a vector, "
-                "including NRCB2, which shares no sky with NRCA. NRCA−NRCB difference "
-                f"{(diff if diff is not None else float('nan')):.1f} mas.\n\n"
-                f"{ov_pos} panel: [JWST against itself](DOCROOT#glossary-reffree) in the "
-                f"NRCA∩NRCB overlap — {off:.1f} mas offset, {rms:.1f} mas scatter (ΔRA and ΔDec "
-                f"combined) over {no} shared stars, with ΔRA/ΔDec marginal histograms.")
-        pk = metrics.get("intermodule_peak_off")
-        if pk is not None and off is not None:
-            base += (f" The offset is the [xcorr histogram peak](DOCROOT#glossary-xcorr) refined on "
-                     f"the SAME stars the peak pairs; the peak alone reads {pk:.1f} mas. The "
-                     f"residual cloud is drawn about the peak, so its displacement from the centre "
-                     f"is the peak's error, which the refinement takes out.")
-        if metrics.get("n_overlap_hi"):
-            base += (f"\n\nThe panel to its right repeats it for "
-                     f"[S/N > 10](DOCROOT#glossary-snr) stars ({metrics['n_overlap_hi']} stars, "
-                     f"{metrics.get('intermodule_rms_hi', float('nan')):.1f} mas scatter).")
-        if metrics.get("n_overlap_footprint"):
-            base += ("\n\nThe full-width row below maps the overlap stars on the sky, "
-                     "coloured by per-star |A−B|.")
-        if metrics.get("cutout_footprint_mismatch"):
-            base += ("\n\n⚠️ The BOTTOM cutout strip is empty because **no drizzled mosaic covers the "
-                     "module-overlap zone — the catalogue and the mosaic are on disjoint footprints** "
-                     "(a reduction mismatch, not a QA gap).\n\n([how this is made](DOCROOT#stage5))")
-        else:
-            base += ("\n\nThe BOTTOM strip shows overlap-star cutouts from the SW merged `i2d`."
-                     "\n\n([how this is made](DOCROOT#stage5))")
-        return base
+        return _stage5_caption(metrics) + _roll_note(metrics)
     if n == 9:
         ni = metrics.get("n_isolated"); ac = metrics.get("aper_corr_med")
         sct = metrics.get("aper_psf_scatter")

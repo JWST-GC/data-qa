@@ -1450,6 +1450,40 @@ def test_daophot_glob_prefers_this_obs(tmp_path, monkeypatch):
     assert not any("_o050_" in os.path.basename(g) for g in got)
 
 
+def test_daophot_glob_rollcorr_tag_prefers_corrected_copies(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setenv("QA_ROLLCORR_TAG", "v1_perframe")
+    d = tmp_path / "gc2211" / "F200W"; d.mkdir(parents=True)
+    r = tmp_path / "gc2211" / "catalogs_rollcorr" / "v1_perframe"; r.mkdir(parents=True)
+    _touch(d, "f200w_nrca1_o023_visit001_exp1_m3_daophot_basic.fits")
+    _touch(r, "f200w_nrca1_o023_visit001_exp1_m3_daophot_basic.fits")
+    _touch(d, "f200w_nrca1_o050_visit001_exp1_m3_daophot_basic.fits")
+    got = D._daophot_glob(_obs(obs="023"), "F200W")
+    assert got and D._is_rollcorr(got)
+    # no corrected copy for o050 -> the uncorrected cats, never another obs's corrected ones
+    got50 = D._daophot_glob(_obs(obs="050"), "F200W")
+    assert got50 and not D._is_rollcorr(got50)
+    assert all("_o050_" in os.path.basename(g) for g in got50)
+
+
+def test_daophot_glob_ignores_rollcorr_without_tag(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.delenv("QA_ROLLCORR_TAG", raising=False)
+    d = tmp_path / "gc2211" / "F200W"; d.mkdir(parents=True)
+    r = tmp_path / "gc2211" / "catalogs_rollcorr" / "v1_perframe"; r.mkdir(parents=True)
+    _touch(d, "f200w_nrca1_o023_visit001_exp1_m3_daophot_basic.fits")
+    _touch(r, "f200w_nrca1_o023_visit001_exp1_m3_daophot_basic.fits")
+    assert not D._is_rollcorr(D._daophot_glob(_obs(obs="023"), "F200W"))
+
+
+def test_stage5_caption_roll_note():
+    base = dict(single_module="NRCB")
+    assert "roll" not in D.caption_for(5, base)
+    assert "roll correction applied" in D.caption_for(
+        5, dict(base, roll_tag="v1", roll_corrected=True))
+    assert "uncorrected" in D.caption_for(5, dict(base, roll_tag="v1", roll_corrected=False))
+
+
 def test_daophot_glob_other_obs_only_returns_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(D, "BASE", str(tmp_path))
     d = tmp_path / "gc2211" / "F200W"; d.mkdir(parents=True)
