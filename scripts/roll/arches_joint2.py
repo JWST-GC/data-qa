@@ -15,7 +15,7 @@ import measure_rotation as M
 
 EPOCH = 2023.6339
 RA0, DEC0 = 266.4677709391126, -28.85953243375873
-base = "/orange/adamginsburg/jwst/arches/catalogs"
+base = os.environ.get("ARCHES_CATDIR", "/orange/adamginsburg/jwst/arches/catalogs")
 NBOOT = 300
 
 

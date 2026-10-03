@@ -15,6 +15,9 @@ They are not part of the `data_qa` package or the automated issue refresh.
 
 theta > 0 rotates JWST positions from North toward East to land on the reference.
 
+`arches_joint2.py` reads the m7 catalogues from `ARCHES_CATDIR` (default
+`/orange/adamginsburg/jwst/arches/catalogs`).
+
 Reference-catalogue caches (`refcache/`) and outputs go next to the scripts by default; set
 `ROLL_WORKDIR` to put them elsewhere. Queries go to VizieR (II/387/virac2, I/355/gaiadr3) when no
 cache exists.

@@ -12,9 +12,9 @@ Method (per ~/.claude memory dataqa-astrometry-offset-method):
 theta convention: theta_PA > 0 means the correction rotates JWST positions from North toward
 East (increasing position angle) to land on the reference.
 """
-import sys, os, glob, json, re
+import sys, os, json, re
 import numpy as np
-from astropy.table import Table, vstack
+from astropy.table import Table
 from astropy.io import fits
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
