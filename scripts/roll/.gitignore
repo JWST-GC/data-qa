@@ -1,0 +1,4 @@
+refcache/
+results/
+results_*/
+*.json
