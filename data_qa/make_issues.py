@@ -225,8 +225,12 @@ def render_body(o: Observation) -> str:
     merged_note = (f" (mosaic merges obs {o.obs} + {' + '.join(o.merged_obsids)}; "
                    f"product id `{o.mosaic_obsid}`)" if o.merged_obsids else "")
 
+    banner_txt = (observations.CURATED.get(o.obsid, {}).get("banner_nircam")
+                  if o.instrument == "NIRCam" else None)
+    banner = f"> [!WARNING]\n> {banner_txt}\n\n" if banner_txt else ""
+
     return f"""{AUTOGEN_MARKER}
-**Observation `{o.obsid}`** — {o.target} / {o.instrument}
+{banner}**Observation `{o.obsid}`** — {o.target} / {o.instrument}
 
 | field | value |
 |-------|-------|
