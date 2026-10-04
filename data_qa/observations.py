@@ -79,13 +79,13 @@ CURATED: Dict[str, dict] = {
     "jw10678-o084": dict(
         banner_nircam=(
             "**Roll correction for this tile comes from a NEIGHBOUR TIE; the VIRAC2/Gaia fit is rejected.**  \n"
-            "> Adopted roll: **+18.1 ± 2.0″** (F212N; data-qa#346; jwst-gc-pipeline#1088).\n>\n"
-            "> **Why.** Inside this footprint the VIRAC2-to-Gaia rotation grows from +1.8″ at 2014 "
+            "Adopted roll: **+18.1 ± 2.0″** (F212N; data-qa#346; jwst-gc-pipeline#1088).\n\n"
+            "**Why.** Inside this footprint the VIRAC2-to-Gaia rotation grows from +1.8″ at 2014 "
             "to +5.4″ at 2026, while the control tile o083 stays flat: a local VIRAC2 proper-motion "
             "systematic. The VIRAC2 roll (+7.45″) leaves the largest stage-13 overlap residuals with "
             "every neighbour (2.8 / 3.1 / 4.4 mas per axis vs o075 / o076 / o083); the neighbour tie "
-            "gives 2.7 / 2.3 / 3.4 mas.\n>\n"
-            "> **Method.** One common rotation fitted to the stage-13 overlap stars of o075, o076 and "
+            "gives 2.7 / 2.3 / 3.4 mas.\n\n"
+            "**Method.** One common rotation fitted to the stage-13 overlap stars of o075, o076 and "
             "o083, each neighbour with its own roll row applied (o085 excluded). Per-neighbour rolls "
             "20.86 / 19.66 / 17.37″; error = their spread. Candidates: VIRAC2 +7.45″, Gaia DR3 "
             "+14.88″, neighbour tie +18.11″. Figures: data-qa#346."),
@@ -93,8 +93,8 @@ CURATED: Dict[str, dict] = {
     "jw10678-o085": dict(
         banner_nircam=(
             "**Roll correction for this tile is ADOPTED BY FIAT: +18.0″, with no error bar.**  \n"
-            "> (F212N; data-qa#346; jwst-gc-pipeline#1088.) Remeasurement is pending.\n>\n"
-            "> **Why.** Adjacent 10678 pointings should share nearly the same roll; the other 10678 "
+            "(F212N; data-qa#346; jwst-gc-pipeline#1088.) Remeasurement is pending.\n\n"
+            "**Why.** Adjacent 10678 pointings should share nearly the same roll; the other 10678 "
             "rows have median 18.4″. The o085 measurements disagree with each other: VIRAC2 +5.21″, "
             "Gaia DR3 +11.10″ (64 stars), stage-13 neighbour tie +13.23″ (o076 +15.95, o086 +11.62, "
             "o078 +25.38). Inside this footprint the VIRAC2-to-Gaia rotation grows from −1.3″ at "

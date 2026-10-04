@@ -227,7 +227,9 @@ def render_body(o: Observation) -> str:
 
     banner_txt = (observations.CURATED.get(o.obsid, {}).get("banner_nircam")
                   if o.instrument == "NIRCam" else None)
-    banner = f"> [!WARNING]\n> {banner_txt}\n\n" if banner_txt else ""
+    # quote EVERY line so a multi-paragraph banner stays inside the admonition
+    banner = ("> [!WARNING]\n" + "\n".join(f"> {ln}" if ln else ">" for ln in banner_txt.split("\n"))
+              + "\n\n") if banner_txt else ""
 
     return f"""{AUTOGEN_MARKER}
 {banner}**Observation `{o.obsid}`** — {o.target} / {o.instrument}
