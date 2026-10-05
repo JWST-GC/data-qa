@@ -225,8 +225,14 @@ def render_body(o: Observation) -> str:
     merged_note = (f" (mosaic merges obs {o.obs} + {' + '.join(o.merged_obsids)}; "
                    f"product id `{o.mosaic_obsid}`)" if o.merged_obsids else "")
 
+    banner_txt = (observations.CURATED.get(o.obsid, {}).get("banner_nircam")
+                  if o.instrument == "NIRCam" else None)
+    # quote EVERY line so a multi-paragraph banner stays inside the admonition
+    banner = ("> [!WARNING]\n" + "\n".join(f"> {ln}" if ln else ">" for ln in banner_txt.split("\n"))
+              + "\n\n") if banner_txt else ""
+
     return f"""{AUTOGEN_MARKER}
-**Observation `{o.obsid}`** — {o.target} / {o.instrument}
+{banner}**Observation `{o.obsid}`** — {o.target} / {o.instrument}
 
 | field | value |
 |-------|-------|
