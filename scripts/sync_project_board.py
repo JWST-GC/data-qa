@@ -11,7 +11,8 @@ value fields and never touches a third:
   never clobbered.  Lifecycle: Data taken -> QA assigned / under examination -> Needs discussion /
   Needs attention -> Done.
 * plus read-only detail fields: **Stages 1-6** (glyph line), **Red flags** (count),
-  **Offset (mas)** (stage-4 median tie).
+  **Offset (mas)** (stage-4 median tie), **Neighbour offset (mas)** (stage-13 worst median
+  offset to an overlapping tile).
 
 It re-runs no analysis and detects nothing; it only reflects the metrics on disk.
 
@@ -41,7 +42,7 @@ import subprocess
 import sys
 
 _OBS_RE = re.compile(r"jw(\d{5})-o(\d{3}).*\((NIRCam|MIRI|Niriss|NIRSpec)\)", re.I)
-_STAGE_RE = re.compile(r"stage(\d)")
+_STAGE_RE = re.compile(r"stage(\d+)$")  # whole key: stage13 is stage 13, not stage 1
 _GLYPH = {"RF": "🚩", "ok": "✅", "fail": "⚠️", "err": "🟥", "?": "·"}
 
 # Measured single-select: category -> option label.  _MEASURED_OPTIONS is derived from this so the
@@ -164,7 +165,7 @@ def _rows(repo, include_meta=False):
             if not include_meta:
                 continue                    # non-observation (dev/tracking) issue: off the QA board
             rows.append(dict(num=it["number"], url=it["url"], cat="meta", line="", nrf=0,
-                             offset=None, has_metrics=True))
+                             offset=None, nb_offset=None, has_metrics=True))
             continue
         obsid = f"jw{m.group(1)}-o{m.group(2)}"
         inst = m.group(3)
@@ -173,10 +174,12 @@ def _rows(repo, include_meta=False):
         cat = _classify(inst, metrics, st)
         s4 = metrics.get("stage4", {}) if isinstance(metrics, dict) else {}
         offset = s4.get("offset_med_mas")
+        s13 = metrics.get("stage13", {}) if isinstance(metrics, dict) else {}
+        nb_offset = None if s13.get("error") else s13.get("worst_offset_mas")
         if cat in ("MIRI", "meta", "nometrics"):
             line, nrf = "", 0
         rows.append(dict(num=it["number"], url=it["url"], cat=cat, line=line, nrf=nrf,
-                         offset=offset,
+                         offset=offset, nb_offset=nb_offset,
                          # a NIRCam obs issue that SHOULD have metrics but doesn't:
                          has_metrics=not (inst.lower() == "nircam" and metrics is None)))
     return rows
@@ -284,6 +287,7 @@ def main(argv=None):
     fstages = _ensure_field(args.owner, pnum, "Stages 1-6", "TEXT", fields, apply)
     fnrf = _ensure_field(args.owner, pnum, "Red flags", "NUMBER", fields, apply)
     foff = _ensure_field(args.owner, pnum, "Offset (mas)", "NUMBER", fields, apply)
+    fnboff = _ensure_field(args.owner, pnum, "Neighbour offset (mas)", "NUMBER", fields, apply)
     meas_opt = {o["name"]: o["id"] for o in (fmeas or {}).get("options", [])}
     rev_opt = {o["name"]: o["id"] for o in (frev or {}).get("options", [])}
 
@@ -327,6 +331,9 @@ def main(argv=None):
         if foff and r["offset"] is not None:
             _gh("project", "item-edit", "--id", iid, "--project-id", pid,
                 "--field-id", foff["id"], "--number", str(round(float(r["offset"]), 1)))
+        if fnboff and r["nb_offset"] is not None:
+            _gh("project", "item-edit", "--id", iid, "--project-id", pid,
+                "--field-id", fnboff["id"], "--number", str(round(float(r["nb_offset"]), 1)))
 
     # archive cards no longer wanted: a closed issue, or (default) a non-observation issue whose
     # card predates the QA-only board -- either way it is not in `rows`, so it stops inflating counts.

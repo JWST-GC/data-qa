@@ -28,6 +28,26 @@ def test_stage_status_glyphs_and_error():
         assert g in line
 
 
+def test_stage_status_two_digit_stages_do_not_alias_stage1():
+    # stage10..13 keys once matched r"stage(\d)" as stage 1 and overwrote its glyph
+    line, nrf, st = S._stage_status(_m({1: {"passed": True}, 13: {"red_flag": True}}))
+    assert st[1] == "ok" and st[13] == "RF"
+    assert line.startswith("✅") and nrf == 1
+
+
+def test_rows_carry_stage13_neighbour_offset(monkeypatch):
+    issues = '[{"number": 7, "title": "jw10678-o070 GC Treasury (NIRCam)", "url": "u"}]'
+    monkeypatch.setattr(S, "_gh", lambda *a, **k: (issues, 0))
+    met = _m({n: {"passed": True} for n in range(1, 7)})
+    met["stage13"] = {"worst_offset_mas": 29.86, "passed": True}
+    monkeypatch.setattr(S, "_load_metrics", lambda obsid: met)
+    (r,) = S._rows("JWST-GC/data-qa")
+    assert r["nb_offset"] == pytest.approx(29.86)
+    met["stage13"] = {"error": "boom", "worst_offset_mas": 1.0}
+    (r,) = S._rows("JWST-GC/data-qa")
+    assert r["nb_offset"] is None
+
+
 def test_classify_miri_regardless_of_metrics():
     assert S._classify("MIRI", _m({1: {"passed": True}}), {1: "ok"}) == "MIRI"
 
@@ -107,6 +127,7 @@ def _run(monkeypatch, tmp_path, argv):
         "Stages 1-6": {"name": "Stages 1-6", "id": "F_st"},
         "Red flags": {"name": "Red flags", "id": "F_rf"},
         "Offset (mas)": {"name": "Offset (mas)", "id": "F_off"},
+        "Neighbour offset (mas)": {"name": "Neighbour offset (mas)", "id": "F_nboff"},
     }
 
     def fake_gh(*args, check=True):
