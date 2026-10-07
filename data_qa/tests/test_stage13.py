@@ -197,14 +197,21 @@ def test_stage13_no_neighbour_with_m8_is_neutral(program):
 def test_stage13_this_obs_missing_m8_is_pending(program):
     program("041"); program("042")
     png, m = D.stage13_neighbor_overlap(_obs("040"), "F212N", "F480M")
-    assert png is None and m["available"] is False and m["passed"] is None
+    # no figure, so nothing is posted: a text-only PNG carries no graphical information
+    assert png is None
+    assert m["available"] is False and m["passed"] is None and not m.get("red_flag")
     assert "m8" in m["na_reason"]
+    assert D._caption_stage13(m).startswith("**Stage 13 — pending.**")
 
 
 def test_stage13_isolated_tile_is_not_applicable(program):
     program("046")
     png, m = D.stage13_neighbor_overlap(_obs("046"), "F212N", "F480M")
-    assert png is None and m["available"] is False and m["n_neighbors"] == 0
+    assert png is None
+    assert m["available"] is False and m["n_neighbors"] == 0 and m["passed"] is None
+    cap = D._caption_stage13(m)
+    assert cap.startswith("**Stage 13 — not applicable.**") and "pending" not in cap
+    assert "F212N" in cap                      # filter name keeps its case
 
 
 def test_stage13_prefers_m8_dedup_over_plain_m8(program, tmp_path):

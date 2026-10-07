@@ -6635,7 +6635,7 @@ def stage13_neighbor_overlap(o: Observation, sw, lw=None):
                        na_reason=f"no {sw} mosaic footprint on disk for this observation")
         return None, metrics
     if not nbrs:
-        metrics.update(available=False, passed=None, n_neighbors=0,
+        metrics.update(available=False, passed=None, n_neighbors=0, no_neighbors=True,
                        na_reason=f"no other {o.program} observation overlaps this {sw} footprint")
         return None, metrics
     my_cat = _m8_catalog_path(o)
@@ -7008,6 +7008,10 @@ def _caption_stage12(metrics):
 def _caption_stage13(metrics):
     """Stage-13 caption: the method, a per-neighbour table (every neighbour, graded or not), and
     the flag line.  Offsets and Δmag are this tile − neighbour."""
+    if metrics.get("no_neighbors"):
+        r = metrics.get("na_reason", "")
+        return (f"**Stage 13 — not applicable.** {r[:1].upper() + r[1:]}, so "
+                f"there is no overlap to compare. No pass/fail is set.")
     if metrics.get("available") is False:
         return (f"**Stage 13 — pending.** The input data for this stage are not yet on disk "
                 f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
