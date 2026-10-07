@@ -6633,20 +6633,17 @@ def stage13_neighbor_overlap(o: Observation, sw, lw=None):
     if mine is None:
         metrics.update(available=False, passed=None,
                        na_reason=f"no {sw} mosaic footprint on disk for this observation")
-        return _note_figure(o, "stage13", "NEIGHBOUR COMPARISON UNAVAILABLE",
-                            metrics["na_reason"] + "."), metrics
+        return None, metrics
     if not nbrs:
         metrics.update(available=False, passed=None, n_neighbors=0, no_neighbors=True,
                        na_reason=f"no other {o.program} observation overlaps this {sw} footprint")
-        return _note_figure(o, "stage13", "NO OVERLAPPING NEIGHBOUR TILE",
-                            metrics["na_reason"] + "."), metrics
+        return None, metrics
     my_cat = _m8_catalog_path(o)
     metrics["neighbors_overlapping"] = [n["obs"] for n in nbrs]
     if my_cat is None:
         metrics.update(available=False, passed=None, n_neighbors=len(nbrs),
                        na_reason="this observation has no m8 catalogue yet")
-        return _note_figure(o, "stage13", "NO m8 CATALOGUE YET",
-                            metrics["na_reason"] + "."), metrics
+        return None, metrics
     metrics["catalog"] = my_cat
     per_nb, figs = {}, []
     for nb in nbrs:
