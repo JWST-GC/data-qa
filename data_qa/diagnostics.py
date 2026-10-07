@@ -6633,17 +6633,20 @@ def stage13_neighbor_overlap(o: Observation, sw, lw=None):
     if mine is None:
         metrics.update(available=False, passed=None,
                        na_reason=f"no {sw} mosaic footprint on disk for this observation")
-        return None, metrics
+        return _note_figure(o, "stage13", "NEIGHBOUR COMPARISON UNAVAILABLE",
+                            metrics["na_reason"] + "."), metrics
     if not nbrs:
-        metrics.update(available=False, passed=None, n_neighbors=0,
+        metrics.update(available=False, passed=None, n_neighbors=0, no_neighbors=True,
                        na_reason=f"no other {o.program} observation overlaps this {sw} footprint")
-        return None, metrics
+        return _note_figure(o, "stage13", "NO OVERLAPPING NEIGHBOUR TILE",
+                            metrics["na_reason"] + "."), metrics
     my_cat = _m8_catalog_path(o)
     metrics["neighbors_overlapping"] = [n["obs"] for n in nbrs]
     if my_cat is None:
         metrics.update(available=False, passed=None, n_neighbors=len(nbrs),
                        na_reason="this observation has no m8 catalogue yet")
-        return None, metrics
+        return _note_figure(o, "stage13", "NO m8 CATALOGUE YET",
+                            metrics["na_reason"] + "."), metrics
     metrics["catalog"] = my_cat
     per_nb, figs = {}, []
     for nb in nbrs:
@@ -7008,6 +7011,9 @@ def _caption_stage12(metrics):
 def _caption_stage13(metrics):
     """Stage-13 caption: the method, a per-neighbour table (every neighbour, graded or not), and
     the flag line.  Offsets and Δmag are this tile − neighbour."""
+    if metrics.get("no_neighbors"):
+        return (f"**Stage 13 — not applicable.** {metrics.get('na_reason', '').capitalize()}, so "
+                f"there is no overlap to compare. No pass/fail is set.")
     if metrics.get("available") is False:
         return (f"**Stage 13 — pending.** The input data for this stage are not yet on disk "
                 f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
