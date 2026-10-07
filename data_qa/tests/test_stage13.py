@@ -211,6 +211,7 @@ def test_stage13_isolated_tile_is_not_applicable(program):
     assert m["available"] is False and m["n_neighbors"] == 0 and m["passed"] is None
     cap = D._caption_stage13(m)
     assert cap.startswith("**Stage 13 — not applicable.**") and "pending" not in cap
+    assert "F212N" in cap                      # filter name keeps its case
 
 
 def test_stage13_prefers_m8_dedup_over_plain_m8(program, tmp_path):
