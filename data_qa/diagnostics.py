@@ -870,10 +870,25 @@ def _daophot_glob(o: Observation, filt, det="*", rollcorr=False):
     return _daophot_glob_in(o, f"{filt}/{filt.lower()}_{det}")
 
 
-def _rollcorr_tag():
-    """``QA_ROLLCORR_TAG`` names a ``<field>/catalogs_rollcorr/<tag>/`` set of per-exposure cats
-    carrying the per-visit roll correction (JWST-GC/data-qa#346).  Unset = uncorrected cats."""
-    return os.environ.get("QA_ROLLCORR_TAG") or None
+# Per-program default roll-correction set (JWST-GC/data-qa#346), so scheduled refreshes and
+# manual runs measure stage 5 on the same catalogues.  Programs not listed stay uncorrected.
+_ROLLCORR_DEFAULT_TAG = {10678: "v1_dataqa346_perframe"}
+
+
+def _rollcorr_tag(o: Observation = None):
+    """The ``<field>/catalogs_rollcorr/<tag>/`` set of per-exposure cats carrying the per-visit
+    roll correction (JWST-GC/data-qa#346), or None for uncorrected cats.  ``QA_ROLLCORR_TAG``
+    overrides the per-program default; ``QA_ROLLCORR_TAG=none`` forces uncorrected cats."""
+    env = os.environ.get("QA_ROLLCORR_TAG")
+    if env:
+        return None if env.lower() == "none" else env
+    if o is None:
+        return None
+    try:
+        prog = int(o.program)
+    except (TypeError, ValueError):
+        return None
+    return _ROLLCORR_DEFAULT_TAG.get(prog)
 
 
 def _rollcorr_set(o: Observation, filt):
@@ -882,7 +897,7 @@ def _rollcorr_set(o: Observation, filt):
     ``<field>/catalogs_rollcorr/<tag>/``.  Decided once for the whole (obs, filt): the corrected
     set is used only when it holds every primary exposure on every detector, so a partial set
     never puts rotated NRCA positions against unrotated NRCB ones."""
-    tag = _rollcorr_tag()
+    tag = _rollcorr_tag(o)
     if not tag:
         return None
     prim = _daophot_glob_in(o, f"{filt}/{filt.lower()}_*")
@@ -3249,10 +3264,10 @@ def stage5_intermodule(o: Observation, sw):
         return png, metrics
     if (a_sc is None) ^ (b_sc is None):
         single_module = "NRCA" if a_sc is not None else "NRCB"
-    if _rollcorr_tag():
+    if _rollcorr_tag(o):
         # record which generation was measured: a requested tag without a COMPLETE corrected set
         # for this (obs, filt) falls back to the uncorrected cats, and the caption must say so
-        metrics.update(roll_tag=_rollcorr_tag(),
+        metrics.update(roll_tag=_rollcorr_tag(o),
                        roll_corrected=_rollcorr_set(o, filt) is not None)
     ov = _ab_overlap(a_sc, b_sc)
     if ov:

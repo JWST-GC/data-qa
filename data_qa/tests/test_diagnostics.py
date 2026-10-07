@@ -1500,6 +1500,20 @@ def test_daophot_glob_ignores_rollcorr_without_tag(tmp_path, monkeypatch):
     assert not D._is_rollcorr(D._daophot_glob(_obs(obs="023"), "F200W", rollcorr=True))
 
 
+def test_rollcorr_tag_per_program_default_and_env_override(monkeypatch):
+    # 10678 defaults to the #346 per-frame set so the cron refresh measures corrected cats
+    monkeypatch.delenv("QA_ROLLCORR_TAG", raising=False)
+    o10678 = Observation(program="10678", obs="135", target="T", release_field="gc-treasury",
+                         instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")
+    assert D._rollcorr_tag(o10678) == "v1_dataqa346_perframe"
+    assert D._rollcorr_tag(_obs()) is None                  # other programs stay uncorrected
+    assert D._rollcorr_tag() is None
+    monkeypatch.setenv("QA_ROLLCORR_TAG", "v2_other")
+    assert D._rollcorr_tag(o10678) == "v2_other" and D._rollcorr_tag(_obs()) == "v2_other"
+    monkeypatch.setenv("QA_ROLLCORR_TAG", "none")
+    assert D._rollcorr_tag(o10678) is None
+
+
 def test_stage5_caption_roll_note():
     base = dict(single_module="NRCB")
     assert "roll" not in D.caption_for(5, base)
