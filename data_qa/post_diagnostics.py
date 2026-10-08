@@ -328,6 +328,24 @@ def _details_block(repo, token, o, stage, extra_images):
     return "".join(parts)
 
 
+# Phrase _roll_note (diagnostics.py) puts in a stage-5 caption measured on roll-corrected cats.
+_ROLL_APPLIED = "roll correction applied"
+
+
+class RollDowngradeError(PostError):
+    """A post/unpost refused because it would drop the roll correction from stage 5."""
+
+
+def _roll_downgrade(stage, existing, caption):
+    """True when this post would replace a roll-corrected stage-5 comment with an uncorrected one
+    (JWST-GC/data-qa#346).  That happened when a run lacking the roll tag (an old checkout, a
+    partial corrected set, ``QA_ROLLCORR_TAG=none``) re-posted over corrected comments.
+    ``QA_ALLOW_ROLL_DOWNGRADE=1`` lets a deliberate downgrade through."""
+    if str(stage) != "5" or not existing or os.environ.get("QA_ALLOW_ROLL_DOWNGRADE") == "1":
+        return False
+    return _ROLL_APPLIED in (existing.get("body") or "") and _ROLL_APPLIED not in (caption or "")
+
+
 def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra_images=None):
     """Idempotently post/update the stage-N comment on ``o``'s issue with the figure.
 
@@ -342,6 +360,9 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra
     # an already-replaced release asset behind.
     marker = DIAG_MARKER.format(n=stage)
     existing = _find_stage_comment(repo, token, num, marker)
+    if _roll_downgrade(stage, existing, caption):
+        raise RollDowngradeError("refusing to replace the roll-corrected stage-5 comment with "
+                                 "an uncorrected one (set QA_ALLOW_ROLL_DOWNGRADE=1 to force)")
     asset_name = f"{o.obsid}_stage{stage}.png"
     img_url = upload_asset(repo, token, png_path, asset_name)
     extra_block = _details_block(repo, token, o, stage, extra_images) if extra_images else ""
@@ -464,6 +485,9 @@ def unpost_stage(o: Observation, stage, repo, token=None):
     existing = _find_stage_comment(repo, token, num, marker)
     if not existing:
         return None
+    if _roll_downgrade(stage, existing, ""):
+        raise RollDowngradeError("refusing to delete the roll-corrected stage-5 comment "
+                                 "(set QA_ALLOW_ROLL_DOWNGRADE=1 to force)")
     st, data = _req("DELETE", f"{API}/repos/{repo}/issues/comments/{existing['id']}", token)
     if st >= 300:
         raise PostError(f"comment delete failed ({st}): {data}")
