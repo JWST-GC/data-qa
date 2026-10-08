@@ -214,3 +214,42 @@ def test_ensure_release_rereads_after_concurrent_create(monkeypatch):
     monkeypatch.setattr(P, "_RELEASES", {})
     assert P._ensure_release("o/r", "tok", "qa-assets-03")["id"] == 9
     assert seen["gets"] == 2
+
+
+def _guarded_post(monkeypatch, existing_body, caption, stage=5):
+    from data_qa import post_diagnostics as P
+    calls = []
+    monkeypatch.setattr(P, "_issue_number", lambda repo, token, title: 5)
+    monkeypatch.setattr(P, "_find_stage_comment",
+                        lambda repo, token, num, marker: {"id": 42, "body": existing_body})
+    monkeypatch.setattr(P, "upload_asset", lambda *a, **k: calls.append("upload") or "url")
+    monkeypatch.setattr(P, "_req", lambda *a, **k: calls.append(a[0]) or (200, {"html_url": "u"}))
+    P.post_stage(_obs(), stage, "x.png", caption, "JWST-GC/data-qa", token="tok")
+    return calls
+
+
+def test_post_stage_refuses_roll_correction_downgrade(monkeypatch):
+    # a run without the roll tag must not overwrite a roll-corrected stage-5 comment (#346)
+    from data_qa import post_diagnostics as P
+    monkeypatch.delenv("QA_ALLOW_ROLL_DOWNGRADE", raising=False)
+    with pytest.raises(P.PostError, match="roll-corrected"):
+        _guarded_post(monkeypatch, "... per-visit roll correction applied ...", "plain caption")
+
+
+def test_post_stage_roll_guard_allows_corrected_and_other_stages(monkeypatch):
+    monkeypatch.delenv("QA_ALLOW_ROLL_DOWNGRADE", raising=False)
+    old = "... roll correction applied ..."
+    assert "PATCH" in _guarded_post(monkeypatch, old, "new: roll correction applied (set v1)")
+    assert "PATCH" in _guarded_post(monkeypatch, "uncorrected", "plain caption")
+    assert "PATCH" in _guarded_post(monkeypatch, old, "plain caption", stage=4)
+    monkeypatch.setenv("QA_ALLOW_ROLL_DOWNGRADE", "1")
+    assert "PATCH" in _guarded_post(monkeypatch, old, "plain caption")
+
+
+def test_roll_guard_phrase_matches_stage5_caption():
+    # the guard keys on the caption text: keep the two in step
+    from data_qa import diagnostics as D, post_diagnostics as P
+    cap = D.caption_for(5, dict(single_module="NRCB", roll_tag="v1", roll_corrected=True))
+    assert P._ROLL_APPLIED in cap
+    assert P._ROLL_APPLIED not in D.caption_for(5, dict(single_module="NRCB", roll_tag="v1",
+                                                        roll_corrected=False))
