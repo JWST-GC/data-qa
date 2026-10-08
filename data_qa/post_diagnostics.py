@@ -332,6 +332,10 @@ def _details_block(repo, token, o, stage, extra_images):
 _ROLL_APPLIED = "roll correction applied"
 
 
+class RollDowngradeError(PostError):
+    """A post/unpost refused because it would drop the roll correction from stage 5."""
+
+
 def _roll_downgrade(stage, existing, caption):
     """True when this post would replace a roll-corrected stage-5 comment with an uncorrected one
     (JWST-GC/data-qa#346).  That happened when a run lacking the roll tag (an old checkout, a
@@ -357,8 +361,8 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra
     marker = DIAG_MARKER.format(n=stage)
     existing = _find_stage_comment(repo, token, num, marker)
     if _roll_downgrade(stage, existing, caption):
-        raise PostError("refusing to replace the roll-corrected stage-5 comment with an "
-                        "uncorrected one (set QA_ALLOW_ROLL_DOWNGRADE=1 to force)")
+        raise RollDowngradeError("refusing to replace the roll-corrected stage-5 comment with "
+                                 "an uncorrected one (set QA_ALLOW_ROLL_DOWNGRADE=1 to force)")
     asset_name = f"{o.obsid}_stage{stage}.png"
     img_url = upload_asset(repo, token, png_path, asset_name)
     extra_block = _details_block(repo, token, o, stage, extra_images) if extra_images else ""
@@ -481,6 +485,9 @@ def unpost_stage(o: Observation, stage, repo, token=None):
     existing = _find_stage_comment(repo, token, num, marker)
     if not existing:
         return None
+    if _roll_downgrade(stage, existing, ""):
+        raise RollDowngradeError("refusing to delete the roll-corrected stage-5 comment "
+                                 "(set QA_ALLOW_ROLL_DOWNGRADE=1 to force)")
     st, data = _req("DELETE", f"{API}/repos/{repo}/issues/comments/{existing['id']}", token)
     if st >= 300:
         raise PostError(f"comment delete failed ({st}): {data}")

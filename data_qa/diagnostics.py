@@ -7825,13 +7825,14 @@ def main(argv=None):
             with open(mpath, "w") as fh:
                 json.dump(all_metrics, fh, indent=2, default=_json_default)
             continue
+        prior = all_metrics.get(f"stage{n}")
         all_metrics[f"stage{n}"] = metrics
         print(f"  stage {n}: {png}  passed={metrics.get('passed')}")
         with open(mpath, "w") as fh:          # persist before the (fallible) network post
             json.dump(all_metrics, fh, indent=2, default=_json_default)
         if args.post:
             try:
-                from .post_diagnostics import post_stage, unpost_stage, PostError
+                from .post_diagnostics import post_stage, unpost_stage, PostError, RollDowngradeError
                 if metrics.get("available") is False:
                     unpost_stage(o, n, args.repo)
                 else:
@@ -7844,6 +7845,13 @@ def main(argv=None):
                                caption_for("6clean", metrics), args.repo)
                     print(f"  stage 6clean: {metrics['clean_png']}  "
                           f"excluding {metrics.get('excluded_exposures')}")
+            except RollDowngradeError as e:
+                # the corrected comment stays, so keep the metrics that match it on disk too
+                print(f"  stage {n}: post FAILED (figure built OK): {e}", file=sys.stderr)
+                if prior is not None:
+                    all_metrics[f"stage{n}"] = prior
+                    with open(mpath, "w") as fh:
+                        json.dump(all_metrics, fh, indent=2, default=_json_default)
             except (PostError, OSError) as e:
                 print(f"  stage {n}: post FAILED (figure built OK): {e}", file=sys.stderr)
     if args.post:

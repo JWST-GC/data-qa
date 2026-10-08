@@ -253,3 +253,40 @@ def test_roll_guard_phrase_matches_stage5_caption():
     assert P._ROLL_APPLIED in cap
     assert P._ROLL_APPLIED not in D.caption_for(5, dict(single_module="NRCB", roll_tag="v1",
                                                         roll_corrected=False))
+
+
+def test_unpost_stage_refuses_to_delete_roll_corrected_stage5(monkeypatch):
+    from data_qa import post_diagnostics as P
+    monkeypatch.delenv("QA_ALLOW_ROLL_DOWNGRADE", raising=False)
+    calls = []
+    monkeypatch.setattr(P, "_issue_number", lambda repo, token, title: 5)
+    monkeypatch.setattr(P, "_find_stage_comment", lambda repo, token, num, marker:
+                        {"id": 42, "body": "roll correction applied"})
+    monkeypatch.setattr(P, "_req", _record_req(calls))
+    with pytest.raises(P.RollDowngradeError):
+        P.unpost_stage(_obs(), 5, "JWST-GC/data-qa", token="tok")
+    assert calls == []
+    assert P.unpost_stage(_obs(), 4, "JWST-GC/data-qa", token="tok") == 42   # other stages
+
+
+def test_refused_roll_downgrade_keeps_prior_stage5_metrics(tmp_path, monkeypatch):
+    # the corrected comment stays, so metrics.json must keep the corrected stage-5 numbers
+    import json
+    from data_qa import diagnostics as D, post_diagnostics as P
+    o = _obs()
+    monkeypatch.setattr(D, "__file__", str(tmp_path / "diagnostics.py"))
+    (tmp_path / "metrics").mkdir()
+    mpath = tmp_path / "metrics" / f"{o.obsid}.json"
+    prior = {"stage": 5, "roll_tag": "v1", "roll_corrected": True, "passed": True}
+    mpath.write_text(json.dumps({"stage5": prior}))
+    monkeypatch.setattr(D, "registry", lambda programs=None: [o])
+    monkeypatch.setattr(D, "_available_filters", lambda o: ["F212N", "F480M"])
+    monkeypatch.setattr(D, "_filters_with_mosaic", lambda o: ["F212N", "F480M"])
+    monkeypatch.setattr(D, "build_stage", lambda o, n, sw, lw: ("x.png", {"stage": 5, "passed": True}))
+    monkeypatch.setattr(D, "_update_index", lambda o, repo: None)
+
+    def _refuse(*a, **k):
+        raise P.RollDowngradeError("refusing")
+    monkeypatch.setattr(P, "post_stage", _refuse)
+    assert D.main(["--program", o.program, "--obs", o.obs, "--stage", "5", "--post"]) == 0
+    assert json.loads(mpath.read_text())["stage5"] == prior
