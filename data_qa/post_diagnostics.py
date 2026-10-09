@@ -363,7 +363,8 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra
     if _roll_downgrade(stage, existing, caption):
         raise RollDowngradeError("refusing to replace the roll-corrected stage-5 comment with "
                                  "an uncorrected one (set QA_ALLOW_ROLL_DOWNGRADE=1 to force)")
-    asset_name = f"{o.obsid}_stage{stage}.png"
+    # keep the figure's own extension: stage 14 posts an animated GIF
+    asset_name = f"{o.obsid}_stage{stage}{os.path.splitext(png_path)[1] or '.png'}"
     img_url = upload_asset(repo, token, png_path, asset_name)
     extra_block = _details_block(repo, token, o, stage, extra_images) if extra_images else ""
     body = (f"{marker}\n### QA diagnostic — stage {stage}\n\n"

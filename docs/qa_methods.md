@@ -729,6 +729,69 @@ neighbour: `status`, `overlap_arcmin2`, `n_pairs`, `dra_mas`, `ddec_mas`, `offse
 Source: [`data_qa/diagnostics.py` → `stage13_neighbor_overlap`](../data_qa/diagnostics.py)
 (`_overlapping_neighbors`, `_load_nb_sample`, `_neighbor_agreement`).
 
+<a id="stage14"></a>
+## Stage 14 — fit by iteration (animated cutout)
+
+**What it shows.** An animated GIF that steps one 3″×3″ cutout of the tile through the
+crowded-field photometry iterations, so a reader can see what each pass of the PSF fit found, what
+it subtracted, and what it left behind. It is a visual check of the fit and carries no pass/fail.
+
+**Frames.** The first frame (`raw`) shows the released mosaic with nothing subtracted. Then comes
+one frame for every iteration that wrote a PSF-model, residual and smoothed-background mosaic in
+**both** filters (`m2` … `m7`; tags `m<n>`, else `resbgsub_m<n>`, read from
+`<obsid>_t001_nircam_clear-<filt>-merged_<tag>_daophot_basic_mergedcat_{model,residual,residual_smoothed_bg}_i2d.fits`).
+Only the model and residual mosaics are required. The pipeline deletes all but the last two
+smoothed-background mosaics of a run (jwst-gc-pipeline#1105), and the gc-treasury F212N maps were
+removed entirely on 2026-10-06; a missing map leaves its background panel blank, labelled "map not
+kept", and is listed in the caption and in the `background_not_kept` metric.
+When an m8 catalogue exists (the newest `m8_dedup`, else a plain m8), a last `m8` frame shows that
+catalogue over the m7 images: m8 adds forced cross-band photometry and writes no new mosaics. The
+first and last frames hold for 2.5 s, the others for 1.2 s.
+
+**Panels.** Two rows: the short-wave filter (F212N for 10678) on top, the long-wave filter
+(F480M) below. Four columns: the released image, the PSF model mosaic, the smoothed background
+mosaic, and the residual mosaic. The residual mosaic is image − model with the background **not**
+subtracted, so image = model + residual reads directly along a row and the background panel is the
+smooth part of the residual.
+
+**Stretch.** All four panels of a row share one asinh stretch, fixed for the whole animation so
+frames compare directly. It is anchored on the image cutout: black at sky − 2σ (sky = median,
+σ = 1.4826·MAD), linear to about 3σ above sky (asinh softening = 3σ / range, clipped to
+10⁻⁴–0.1), logarithmic above, with the top at the 99.95th-percentile pixel so saturated stars and
+their artefacts stay resolved.
+
+**Dots.** The model panels carry that iteration's sources, coloured with the Okabe–Ito palette:
+blue = short-wave only, orange = long-wave only, yellow = found in both. For `m2` … `m7` the two
+per-filter catalogues
+(`catalogs/<filt>_merged_o<obs>_indivexp_merged_<tag>_dao_basic.fits`, `skycoord.ra/dec`) are
+cross-matched by mutual nearest neighbour within 0.10″ (`_S14_MATCH_ARCSEC`, the cross-filter
+default of `merge_catalogs`); matched sources are drawn at the short-wave position. For `m8` the
+merged catalogue already carries the match: a band counts as a detection where it is matched
+(`mask_<band>` false) and is not a forced fill (`forced_filled_<band>` false), and each class is
+drawn at its own band's `skycoord_<band>`. Forced fills therefore never count as detections. The
+frame title gives the three counts. The GIF is quantised to one shared palette for all frames, with
+the three dot colours pinned, so dot colours stay constant from frame to frame.
+
+**Choosing the cutout.** Candidate centres are random short-wave sources from the last iteration's
+catalogue, drawn with a generator seeded by the obsid (CRC-32), so the same tile always gives the
+same cutout. Up to 60 candidates are tried; a candidate is kept when the image cutouts and the
+last iteration's model, residual and background cutouts are fully finite in both filters, and the
+search stops at 15 kept candidates. The chosen centre is the kept candidate with the median
+short-wave source count in its 3″ box, a typical spot in the tile rather than its emptiest or most
+crowded.
+
+**Not applicable.** No long-wave filter, no iteration with all three mosaics in both filters, no
+short-wave catalogue at the last iteration, or no fully covered cutout: the stage returns no figure
+and posts nothing; the reason is recorded as `na_reason` in the metrics.
+
+**Metrics.** `center_ra`, `center_dec`, `n_sw_sources_final` (short-wave sources in the chosen
+box), `iterations` (frame labels, e.g. `raw, m2, …, m7, m8`), `counts` (per frame:
+`both`/`sw`/`lw`), `background_not_kept` (`<filter> m<n>` for each pruned background map),
+`inputs`; `passed` is always null.
+
+Source: [`data_qa/diagnostics.py` → `stage14_iteration_animation`](../data_qa/diagnostics.py)
+(`_s14_iter_products`, `_s14_classify`, `_s14_m8_classes`, `_s14_pick_center`).
+
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 

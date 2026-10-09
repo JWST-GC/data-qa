@@ -6709,12 +6709,350 @@ def stage13_neighbor_overlap(o: Observation, sw, lw=None):
     return png, metrics
 
 
+# --------------------------------------------------------------------------- stage 14
+# Per-iteration fit animation: a 3"x3" cutout of image / model / background / residual for the SW
+# and LW filter, one GIF frame per photometry iteration (raw, m2 ... m7, m8).
+_S14_SIZE_ARCSEC = 3.0
+_S14_MATCH_ARCSEC = 0.10          # merge_catalogs cross-filter default: mutual NN within 0.10"
+_S14_ITERS = (2, 3, 4, 5, 6, 7)   # iterations that write model/residual/background mosaics
+# Okabe-Ito colours: readable on a grey image and for red/green colour-blind viewers
+_S14_COLORS = {"sw": "#56B4E9", "lw": "#D55E00", "both": "#F0E442"}
+
+
+def _s14_iter_products(o: Observation, filt):
+    """{iteration: dict(tag, model, residual, background)} for every iteration whose model and
+    residual mosaics exist for this obs+filter.  ``background`` is None when the smoothed-background
+    mosaic is gone: the pipeline prunes all but the last two (jwst-gc-pipeline#1105), and the
+    gc-treasury F212N maps were swept entirely on 2026-10-06."""
+    dirs = _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")
+    out = {}
+    for n in _S14_ITERS:
+        for tag in (f"m{n}", f"resbgsub_m{n}"):
+            stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_{tag}_daophot_basic_mergedcat"
+            hit = {}
+            for kind, suffix in (("model", "model_i2d"), ("residual", "residual_i2d"),
+                                 ("background", "residual_smoothed_bg_i2d")):
+                for d in dirs:
+                    g = sorted(glob.glob(f"{d}/{stem}_{suffix}.fits"))
+                    if g:
+                        hit[kind] = g[-1]
+                        break
+            if "model" in hit and "residual" in hit:
+                out[n] = dict(tag=tag, background=hit.get("background"),
+                              model=hit["model"], residual=hit["residual"])
+                break
+    return out
+
+
+def _s14_cat_radec(path, prefix="skycoord"):
+    from astropy.io import fits
+    with fits.open(path, memmap=True) as h:
+        d = h[1].data
+        return np.asarray(d[f"{prefix}.ra"], float), np.asarray(d[f"{prefix}.dec"], float)
+
+
+def _s14_perfilter_catalog(o: Observation, filt, tag):
+    hits = _fglob(o, f"catalogs/{filt.lower()}_merged_o{o.obs}_indivexp_merged_{tag}_dao_basic.fits")
+    return hits[0] if hits else None
+
+
+def _s14_m8_catalog(o: Observation):
+    for pat in (f"catalogs/basic_merged_indivexp_photometry_tables_merged_resbgsub_m8_dedup_o{o.obs}.fits",
+                f"catalogs/basic_merged_indivexp_photometry_tables_merged_resbgsub_m8_o{o.obs}.fits"):
+        hits = _fglob(o, pat)
+        if hits:
+            return hits[0]
+    return None
+
+
+def _s14_in_box(ra, dec, c, half):
+    """Boolean mask of sources inside a square of half-width ``half`` arcsec around SkyCoord c."""
+    dx = (ra - c.ra.deg) * np.cos(np.deg2rad(c.dec.deg)) * 3600.0
+    dy = (dec - c.dec.deg) * 3600.0
+    return (np.abs(dx) < half) & (np.abs(dy) < half)
+
+
+def _s14_classify(sw_rd, lw_rd, radius=_S14_MATCH_ARCSEC):
+    """Mutual-nearest-neighbour cross-match of two small (ra, dec) sets within ``radius``.
+    Returns {class: (ra, dec)} for 'both' (at the SW position), 'sw' only and 'lw' only."""
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    (ra1, de1), (ra2, de2) = sw_rd, lw_rd
+    m1 = np.zeros(len(ra1), bool); m2 = np.zeros(len(ra2), bool)
+    if len(ra1) and len(ra2):
+        c1 = SkyCoord(ra1 * u.deg, de1 * u.deg); c2 = SkyCoord(ra2 * u.deg, de2 * u.deg)
+        i12, s12, _ = c1.match_to_catalog_sky(c2)
+        i21, _, _ = c2.match_to_catalog_sky(c1)
+        ok = (s12.arcsec < radius) & (i21[i12] == np.arange(len(ra1)))
+        m1[ok] = True; m2[i12[ok]] = True
+    return {"both": (ra1[m1], de1[m1]), "sw": (ra1[~m1], de1[~m1]), "lw": (ra2[~m2], de2[~m2])}
+
+
+def _s14_m8_classes(path, sw, lw, c, half):
+    """Classes from the m8 merged catalogue.  m8 force-fits every source in the band it was not
+    found in, so a band counts as a detection only where it is matched AND not a forced fill."""
+    from astropy.io import fits
+    s, l = sw.lower(), lw.lower()
+    with fits.open(path, memmap=True) as h:
+        d = h[1].data
+        rr, dr = np.asarray(d["skycoord_ref.ra"], float), np.asarray(d["skycoord_ref.dec"], float)
+        sel = np.flatnonzero(_s14_in_box(rr, dr, c, half))
+        cols = h[1].columns.names
+        if not all(f"mask_{b}" in cols and f"skycoord_{b}.ra" in cols for b in (s, l)):
+            return None
+
+        def det(b):
+            ok = ~np.asarray(d[f"mask_{b}"][sel]).astype(bool)
+            if f"forced_filled_{b}" in cols:
+                ok &= ~np.asarray(d[f"forced_filled_{b}"][sel]).astype(bool)
+            return ok
+        ds, dl = det(s), det(l)
+        ras, des = np.asarray(d[f"skycoord_{s}.ra"][sel], float), np.asarray(d[f"skycoord_{s}.dec"][sel], float)
+        ral, del_ = np.asarray(d[f"skycoord_{l}.ra"][sel], float), np.asarray(d[f"skycoord_{l}.dec"][sel], float)
+    both, so, lo = ds & dl, ds & ~dl, dl & ~ds
+    return {"both": (ras[both], des[both]), "sw": (ras[so], des[so]), "lw": (ral[lo], del_[lo])}
+
+
+def _s14_cutout(path, c, role):
+    """(data, wcs) of a _S14_SIZE_ARCSEC square cutout of a mosaic's SCI plane, or None when the
+    cutout falls off the mosaic."""
+    from astropy.io import fits
+    from astropy.nddata import Cutout2D, NoOverlapError
+    from astropy.wcs import WCS
+    import astropy.units as u
+    with fits.open(_used(path, role), memmap=True) as h:
+        sci = h["SCI"] if "SCI" in h else h[1]
+        w = WCS(sci.header)
+        try:
+            co = Cutout2D(sci.data, c, _S14_SIZE_ARCSEC * u.arcsec, wcs=w, mode="partial",
+                          fill_value=np.nan)
+        except NoOverlapError:
+            return None
+        return np.array(co.data, dtype="float32"), co.wcs
+
+
+def _s14_data(path, c, role):
+    """Cutout data of ``path`` around ``c``, or None when the file is absent or misses the cutout."""
+    cut = _s14_cutout(path, c, role) if path else None
+    return None if cut is None else cut[0]
+
+
+def _s14_pick_center(o, sw, lw, sw_rd, image_paths, final_paths, seed=None):
+    """A reproducible 'somewhere' in the field: candidate centres are random SW sources (seeded
+    by the obsid); keep those whose image cutouts AND final-iteration model/residual/background
+    cutouts are fully finite in both filters, and take the candidate with the median source
+    count, so the frame is typical for the tile rather than its emptiest or most crowded spot."""
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    import zlib
+    rng = np.random.default_rng(zlib.crc32(o.obsid.encode()) if seed is None else seed)
+    ra, de = sw_rd
+    half = _S14_SIZE_ARCSEC / 2.0
+    cand = []
+    for i in rng.choice(len(ra), size=min(60, len(ra)), replace=False):
+        c = SkyCoord(ra[i] * u.deg, de[i] * u.deg)
+        ok = True
+        for p in list(image_paths) + list(final_paths):
+            cut = _s14_cutout(p, c, "stage14 centre test")
+            if cut is None or not np.isfinite(cut[0]).all():
+                ok = False
+                break
+        if ok:
+            cand.append((int(_s14_in_box(ra, de, c, half).sum()), c))
+        if len(cand) >= 15:
+            break
+    if not cand:
+        return None, 0
+    cand.sort(key=lambda t: t[0])
+    n, c = cand[len(cand) // 2]
+    return c, n
+
+
+def _s14_frame(fig_axes, frame, norms, colors=_S14_COLORS):
+    """Draw one animation frame onto a fresh 2x4 axes grid."""
+    axes = fig_axes
+    for row, band in enumerate(("sw", "lw")):
+        b = frame["bands"][band]
+        panels = [("image", b["image"]), ("model", b["model"]),
+                  ("background", b["background"]), ("residual", b["residual"])]
+        for col, (name, data) in enumerate(panels):
+            ax = axes[row][col]
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_facecolor("0.85")
+            if data is None:
+                # a NaN image of the cutout's shape keeps the panel geometry fixed across frames
+                ax.imshow(np.full(b["image"].shape, np.nan), origin="lower", cmap="gray")
+                msg = ("no model yet" if frame["label"] == "raw" else
+                       "map not kept\n(pipeline retention)" if name == "background" and not b.get("bg_kept")
+                       else "no coverage")
+                ax.text(0.5, 0.5, msg, ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9, color="0.35")
+            else:
+                ax.imshow(data, origin="lower", cmap="gray", norm=norms[band],
+                          interpolation="nearest")
+            if name == "model" and frame["classes"] is not None:
+                w = b["wcs"]
+                for cls in ("both", "sw", "lw"):
+                    ra, de = frame["classes"][cls]
+                    if len(ra):
+                        x, y = w.world_to_pixel_values(ra, de)
+                        ax.scatter(x, y, s=4, c=colors[cls], lw=0, alpha=0.9)
+                ny, nx = data.shape if data is not None else b["image"].shape
+                ax.set_xlim(-0.5, nx - 0.5); ax.set_ylim(-0.5, ny - 0.5)
+            if row == 0:
+                ax.set_title(name, fontsize=10)
+            if col == 0:
+                ax.set_ylabel(frame["band_names"][band], fontsize=10)
+
+
+def stage14_iteration_animation(o: Observation, sw, lw):
+    """GIF stepping a 3"x3" cutout through the photometry iterations.
+
+    Rows: SW and LW filter.  Columns: released image, PSF model mosaic, smoothed background
+    mosaic, residual mosaic.  Frames: raw (image only), then every iteration with model, residual
+    and background mosaics (m2 ... m7), then m8 (catalogue only: m8 adds forced cross-band
+    photometry and writes no new mosaics, so its frame reuses the m7 images).  Dots on the model
+    panels mark that iteration's sources: SW only, LW only, or found in both (mutual nearest
+    neighbour within 0.10\", the pipeline's cross-filter rule)."""
+    import io
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from astropy.visualization import ImageNormalize, AsinhStretch
+    from PIL import Image
+    metrics = dict(stage=14, sw=sw, lw=lw)
+    if lw is None:
+        metrics.update(available=False, passed=None, na_reason="no long-wavelength filter on disk")
+        return None, metrics
+    img = {"sw": _mosaic_path(o, sw), "lw": _mosaic_path(o, lw)}
+    prods = {"sw": _s14_iter_products(o, sw), "lw": _s14_iter_products(o, lw)}
+    iters = sorted(set(prods["sw"]) & set(prods["lw"]))
+    if not (img["sw"] and img["lw"]) or not iters:
+        metrics.update(available=False, passed=None,
+                       na_reason="no iteration with model/residual/background mosaics in both filters")
+        return None, metrics
+    cats = {n: (_s14_perfilter_catalog(o, sw, prods["sw"][n]["tag"]),
+                _s14_perfilter_catalog(o, lw, prods["lw"][n]["tag"])) for n in iters}
+    last = iters[-1]
+    if cats[last][0] is None:
+        metrics.update(available=False, passed=None,
+                       na_reason=f"no {sw} m{last} catalogue to choose a cutout from")
+        return None, metrics
+    sw_last = _s14_cat_radec(_used(cats[last][0], f"{sw} m{last} catalogue"))
+    finals = [prods[b][last][k] for b in ("sw", "lw") for k in ("model", "residual", "background")
+              if prods[b][last][k]]
+    c, nsrc = _s14_pick_center(o, sw, lw, sw_last, img.values(), finals)
+    if c is None:
+        metrics.update(available=False, passed=None,
+                       na_reason="no 3\" cutout fully covered by both filters' mosaics")
+        return None, metrics
+    half = _S14_SIZE_ARCSEC / 2.0
+    pad = half + 0.3
+
+    def classes_for(n):
+        ps, pl = cats[n]
+        if ps is None or pl is None:
+            return None
+        rds = []
+        for p, f in ((ps, sw), (pl, lw)):
+            ra, de = _s14_cat_radec(_used(p, f"{f} m{n} catalogue"))
+            k = _s14_in_box(ra, de, c, pad)
+            rds.append((ra[k], de[k]))
+        cl = _s14_classify(*rds)
+        return {k: (ra[_s14_in_box(ra, de, c, half)], de[_s14_in_box(ra, de, c, half)])
+                for k, (ra, de) in cl.items()}
+
+    cut_img = {b: _s14_cutout(img[b], c, "mosaic (displayed)") for b in ("sw", "lw")}
+    band_names = {"sw": sw, "lw": lw}
+    frames = [dict(label="raw", note="released mosaic, nothing subtracted", classes=None,
+                   bands={b: dict(image=cut_img[b][0], wcs=cut_img[b][1], model=None,
+                                  background=None, residual=cut_img[b][0]) for b in ("sw", "lw")},
+                   band_names=band_names)]
+    for n in iters:
+        bands = {}
+        for b in ("sw", "lw"):
+            p = prods[b][n]
+            bands[b] = dict(image=cut_img[b][0], wcs=cut_img[b][1],
+                            model=_s14_data(p["model"], c, f"m{n} model mosaic"),
+                            background=_s14_data(p["background"], c, f"m{n} background mosaic"),
+                            residual=_s14_data(p["residual"], c, f"m{n} residual mosaic"),
+                            bg_kept=bool(p["background"]))
+        frames.append(dict(label=f"m{n}", note=prods["sw"][n]["tag"], classes=classes_for(n),
+                           bands=bands, band_names=band_names))
+    m8 = _s14_m8_catalog(o)
+    m8_classes = _s14_m8_classes(_used(m8, "m8 catalogue"), sw, lw, c, half) if m8 else None
+    if m8_classes is not None:
+        frames.append(dict(label="m8", note="m8 catalogue (forced fills excluded); images are m7",
+                           classes=m8_classes,
+                           bands=frames[-1]["bands"], band_names=band_names))
+
+    # one fixed stretch per band for the whole animation, so frames compare directly
+    norms = {}
+    for b in ("sw", "lw"):
+        # the residual mosaic is image - model (background NOT subtracted), so all four panels
+        # share the image stretch: image = model + residual reads directly off the row, and the
+        # background panel is the smooth part of the residual
+        # sky-anchored asinh: linear to ~3 sigma above sky, logarithmic above, top at the
+        # brightest pixel so saturated stars and their artifacts stay resolved, not clipped
+        im = cut_img[b][0]
+        sky = np.nanmedian(im)
+        sig = 1.4826 * np.nanmedian(np.abs(im - sky))
+        lo, hi = sky - 2.0 * sig, np.nanpercentile(im, 99.95)
+        soft = float(np.clip(3.0 * sig / max(hi - lo, 1e-12), 1e-4, 0.1))
+        norms[b] = ImageNormalize(vmin=lo, vmax=hi, stretch=AsinhStretch(soft))
+
+    pil, counts = [], {}
+    for fr in frames:
+        fig, axes = _fig(2, 4, w=2.6, h=2.75)
+        fig.subplots_adjust(left=0.05, right=0.99, bottom=0.10, top=0.84, wspace=0.04, hspace=0.06)
+        _s14_frame(axes, fr, norms)
+        if fr["classes"] is not None:
+            k = {cls: len(v[0]) for cls, v in fr["classes"].items()}
+            counts[fr["label"]] = k
+            ctxt = f"   dots: {k['both']} both · {k['sw']} {sw} only · {k['lw']} {lw} only"
+        else:
+            ctxt = ""
+        fig.suptitle(f"{o.obsid}  {fr['label']}  ({fr['note']}){ctxt}\n"
+                     f"3\"x3\" at RA {c.ra.deg:.5f} Dec {c.dec.deg:+.5f};  one asinh stretch per row; "
+                     f"residual = image − model (background not subtracted)",
+                     fontsize=8.5)
+        handles = [Line2D([], [], marker="o", ls="", ms=6, mfc=_S14_COLORS[k_], mec="none", label=lab)
+                   for k_, lab in (("sw", f"{sw} only"), ("lw", f"{lw} only"), ("both", "both (same star)"))]
+        fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=8, frameon=False)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=90)
+        plt.close(fig)
+        buf.seek(0)
+        pil.append(Image.open(buf).convert("RGB").copy())
+    os.makedirs(OUTDIR, exist_ok=True)
+    out = os.path.join(OUTDIR, f"{o.obsid}_stage14.gif")
+    dur = [1200] * len(pil)
+    dur[0] = dur[-1] = 2500
+    # ONE palette for every frame: per-frame adaptive palettes shift the dot colours between frames
+    sheet = Image.new("RGB", (pil[0].width, pil[0].height * len(pil)))
+    for i, im in enumerate(pil):
+        sheet.paste(im, (0, i * im.height))
+    pal = sheet.quantize(colors=253, method=Image.Quantize.MEDIANCUT)
+    # pin the dot colours: they cover too few pixels to survive median-cut on their own
+    entries = pal.getpalette()[:253 * 3]
+    for hexc in _S14_COLORS.values():
+        entries += [int(hexc[i:i + 2], 16) for i in (1, 3, 5)]
+    pal = Image.new("P", (1, 1)); pal.putpalette(entries)
+    q = [im.quantize(palette=pal, dither=Image.Dither.NONE) for im in pil]
+    q[0].save(out, save_all=True, append_images=q[1:], duration=dur, loop=0)
+    metrics.update(available=True, passed=None, center_ra=float(c.ra.deg), center_dec=float(c.dec.deg),
+                   n_sw_sources_final=int(nsrc), iterations=[f["label"] for f in frames],
+                   background_not_kept=[f"{band_names[b]} m{n}" for n in iters for b in ("sw", "lw")
+                                        if not prods[b][n]["background"]],
+                   counts=counts)
+    return out, metrics
+
+
 # Stages that need an SW filter name to build at all.  A treasury tile whose LW mosaic lands
 # before its SW reduction (10678 o075-o087: F480M reduced, F212N still at image2) crashed these on
 # ``sw.lower()`` (stages 8/9 via _interfilter_residuals on o077/o084); they now report
 # "pending" until the SW products exist.  (Stages 4, 6, 7 and 10-12 already degrade to a neutral
 # n/a card on their own.)
-_STAGES_NEEDING_SW = (2, 3, 5, 8, 9, 13)
+_STAGES_NEEDING_SW = (2, 3, 5, 8, 9, 13, 14)
 
 
 def _dispatch_stage(o, n, sw, lw):
@@ -6747,6 +7085,8 @@ def _dispatch_stage(o, n, sw, lw):
         return stage12_photometric_linearity(o, sw, lw)
     if n == 13:
         return stage13_neighbor_overlap(o, sw, lw)
+    if n == 14:
+        return stage14_iteration_animation(o, sw, lw)
     raise ValueError(n)
 
 
@@ -6822,6 +7162,7 @@ _HEADLINE = {
     11: "**Stage 11 — effective PSF per exposure.**",
     12: "**Stage 12 — photometric linearity.**",
     13: "**Stage 13 — agreement with neighbouring tiles.**",
+    14: "**Stage 14 — fit by iteration (animated cutout).**",
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
@@ -7072,6 +7413,34 @@ def _caption_stage13(metrics):
     return base + "([how this is made](DOCROOT#stage13))"
 
 
+def _caption_stage14(metrics):
+    """Stage-14 caption: what the animation shows and how each panel is made."""
+    if metrics.get("available") is False:
+        return (f"**Stage 14 — pending.** The input data for this stage are not yet on disk "
+                f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
+    sw, lw = metrics.get("sw", "SW"), metrics.get("lw", "LW")
+    its = metrics.get("iterations") or []
+    has_m8 = "m8" in its
+    return (f"**Stage 14 — fit by iteration (animated cutout).** A 3\"×3\" cutout at RA "
+            f"{metrics.get('center_ra', float('nan')):.5f}, Dec {metrics.get('center_dec', float('nan')):+.5f} "
+            f"steps through the photometry iterations ({' → '.join(its)}). Top row {sw}, bottom row "
+            f"{lw}; columns are the released image, the PSF model mosaic, the smoothed background "
+            f"mosaic and the residual mosaic (image − model, background not subtracted). All four "
+            f"panels in a row share one asinh stretch, fixed for the whole animation: black at sky − "
+            f"2σ, linear to about 3σ above sky, logarithmic up to the 99.95th-percentile pixel. Dots "
+            f"on the model panels mark that iteration's sources: blue = {sw} only, orange = {lw} "
+            f"only, yellow = found in both (mutual nearest neighbour within 0.10\", the pipeline's "
+            f"cross-filter rule). "
+            + ("The m8 frame shows the m8 catalogue (forced cross-band fills excluded) over the m7 "
+               "images, since m8 writes no new mosaics. " if has_m8 else "")
+            + (f"Background maps not kept on disk (pipeline retention, jwst-gc-pipeline#1105), "
+               f"shown blank: {', '.join(metrics['background_not_kept'])}. "
+               if metrics.get("background_not_kept") else "")
+            + "The cutout centre is a seeded-random typical spot in the field (median source "
+              "count among fully covered candidates). No pass/fail is set. "
+              "([how this is made](DOCROOT#stage14))")
+
+
 def _roll_note(metrics):
     """Stage-5 caption suffix saying whether the per-exposure cats carry the per-visit roll
     correction (JWST-GC/data-qa#346)."""
@@ -7166,6 +7535,8 @@ def _caption_for_impl(n, metrics):
         return _caption_stage12(metrics)
     if n == 13:
         return _caption_stage13(metrics)
+    if n == 14:
+        return _caption_stage14(metrics)
     # Stage 7, and stage 3's registration / magnitude-system flags, build their own red-flag captions (those
     # cases still render a full figure, so the generic "the plot is empty" wording would not fit).
     if metrics.get("available") is False:
@@ -7768,7 +8139,7 @@ def main(argv=None):
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
     ap.add_argument("--stage", nargs="+", type=int,
-                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
