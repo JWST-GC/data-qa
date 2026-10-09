@@ -6883,7 +6883,8 @@ def _s14_frame(fig_axes, frame, norms, colors=_S14_COLORS):
                 # a NaN image of the cutout's shape keeps the panel geometry fixed across frames
                 ax.imshow(np.full(b["image"].shape, np.nan), origin="lower", cmap="gray")
                 msg = ("no model yet" if frame["label"] == "raw" else
-                       "map not kept\n(pipeline retention)" if name == "background" else "no coverage")
+                       "map not kept\n(pipeline retention)" if name == "background" and not b.get("bg_kept")
+                       else "no coverage")
                 ax.text(0.5, 0.5, msg, ha="center", va="center",
                         transform=ax.transAxes, fontsize=9, color="0.35")
             else:
@@ -6973,7 +6974,8 @@ def stage14_iteration_animation(o: Observation, sw, lw):
             bands[b] = dict(image=cut_img[b][0], wcs=cut_img[b][1],
                             model=_s14_data(p["model"], c, f"m{n} model mosaic"),
                             background=_s14_data(p["background"], c, f"m{n} background mosaic"),
-                            residual=_s14_data(p["residual"], c, f"m{n} residual mosaic"))
+                            residual=_s14_data(p["residual"], c, f"m{n} residual mosaic"),
+                            bg_kept=bool(p["background"]))
         frames.append(dict(label=f"m{n}", note=prods["sw"][n]["tag"], classes=classes_for(n),
                            bands=bands, band_names=band_names))
     m8 = _s14_m8_catalog(o)
