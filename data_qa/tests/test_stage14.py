@@ -151,3 +151,23 @@ def test_post_stage_keeps_gif_extension(monkeypatch):
     P.post_stage(_obs(), 14, "/x/jw10678-o066_stage14.gif", "cap", "JWST-GC/data-qa", token="t")
     P.post_stage(_obs(), 4, "/x/jw10678-o066_stage4.png", "cap", "JWST-GC/data-qa", token="t")
     assert names == ["jw10678-o066_stage14.gif", "jw10678-o066_stage4.png"]
+
+
+def test_stage14_missing_background_maps(field, monkeypatch):
+    """Pruned smoothed-background mosaics (jwst-gc-pipeline#1105) leave a blank panel, not n/a."""
+    from PIL import Image
+    prods = {f: {n: dict(p, background=None if f == "F212N" else p["background"])
+                 for n, p in d.items()} for f, d in field["prods"].items()}
+    monkeypatch.setattr(D, "_s14_iter_products", lambda o, f: prods.get(f, {}))
+    out, m = D.stage14_iteration_animation(_obs(), "F212N", "F480M")
+    assert m["available"] is True and m["background_not_kept"] == ["F212N m2", "F212N m3"]
+    with Image.open(out) as im:
+        assert im.n_frames == 4
+    assert "F212N m2, F212N m3" in D.caption_for(14, m)
+
+
+def test_stage14_m8_without_band_columns_is_skipped(field, tmp_path, monkeypatch):
+    Table({"skycoord_ref.ra": [RA0], "skycoord_ref.dec": [DEC0]}).write(tmp_path / "m8bare.fits")
+    monkeypatch.setattr(D, "_s14_m8_catalog", lambda o: str(tmp_path / "m8bare.fits"))
+    _, m = D.stage14_iteration_animation(_obs(), "F212N", "F480M")
+    assert m["iterations"] == ["raw", "m2", "m3"]

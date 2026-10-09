@@ -740,6 +740,10 @@ it subtracted, and what it left behind. It is a visual check of the fit and carr
 one frame for every iteration that wrote a PSF-model, residual and smoothed-background mosaic in
 **both** filters (`m2` … `m7`; tags `m<n>`, else `resbgsub_m<n>`, read from
 `<obsid>_t001_nircam_clear-<filt>-merged_<tag>_daophot_basic_mergedcat_{model,residual,residual_smoothed_bg}_i2d.fits`).
+Only the model and residual mosaics are required. The pipeline deletes all but the last two
+smoothed-background mosaics of a run (jwst-gc-pipeline#1105), and the gc-treasury F212N maps were
+removed entirely on 2026-10-06; a missing map leaves its background panel blank, labelled "map not
+kept", and is listed in the caption and in the `background_not_kept` metric.
 When an m8 catalogue exists (the newest `m8_dedup`, else a plain m8), a last `m8` frame shows that
 catalogue over the m7 images: m8 adds forced cross-band photometry and writes no new mosaics. The
 first and last frames hold for 2.5 s, the others for 1.2 s.
@@ -782,7 +786,8 @@ and posts nothing; the reason is recorded as `na_reason` in the metrics.
 
 **Metrics.** `center_ra`, `center_dec`, `n_sw_sources_final` (short-wave sources in the chosen
 box), `iterations` (frame labels, e.g. `raw, m2, …, m7, m8`), `counts` (per frame:
-`both`/`sw`/`lw`), `inputs`; `passed` is always null.
+`both`/`sw`/`lw`), `background_not_kept` (`<filter> m<n>` for each pruned background map),
+`inputs`; `passed` is always null.
 
 Source: [`data_qa/diagnostics.py` → `stage14_iteration_animation`](../data_qa/diagnostics.py)
 (`_s14_iter_products`, `_s14_classify`, `_s14_m8_classes`, `_s14_pick_center`).

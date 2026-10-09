@@ -6720,8 +6720,10 @@ _S14_COLORS = {"sw": "#56B4E9", "lw": "#D55E00", "both": "#F0E442"}
 
 
 def _s14_iter_products(o: Observation, filt):
-    """{iteration: dict(tag, model, residual, background)} for every iteration whose model,
-    residual and smoothed-background mosaics all exist for this obs+filter."""
+    """{iteration: dict(tag, model, residual, background)} for every iteration whose model and
+    residual mosaics exist for this obs+filter.  ``background`` is None when the smoothed-background
+    mosaic is gone: the pipeline prunes all but the last two (jwst-gc-pipeline#1105), and the
+    gc-treasury F212N maps were swept entirely on 2026-10-06."""
     dirs = _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")
     out = {}
     for n in _S14_ITERS:
@@ -6735,8 +6737,9 @@ def _s14_iter_products(o: Observation, filt):
                     if g:
                         hit[kind] = g[-1]
                         break
-            if len(hit) == 3:
-                out[n] = dict(tag=tag, **hit)
+            if "model" in hit and "residual" in hit:
+                out[n] = dict(tag=tag, background=hit.get("background"),
+                              model=hit["model"], residual=hit["residual"])
                 break
     return out
 
@@ -6795,6 +6798,8 @@ def _s14_m8_classes(path, sw, lw, c, half):
         rr, dr = np.asarray(d["skycoord_ref.ra"], float), np.asarray(d["skycoord_ref.dec"], float)
         sel = np.flatnonzero(_s14_in_box(rr, dr, c, half))
         cols = h[1].columns.names
+        if not all(f"mask_{b}" in cols and f"skycoord_{b}.ra" in cols for b in (s, l)):
+            return None
 
         def det(b):
             ok = ~np.asarray(d[f"mask_{b}"][sel]).astype(bool)
@@ -6824,6 +6829,12 @@ def _s14_cutout(path, c, role):
         except NoOverlapError:
             return None
         return np.array(co.data, dtype="float32"), co.wcs
+
+
+def _s14_data(path, c, role):
+    """Cutout data of ``path`` around ``c``, or None when the file is absent or misses the cutout."""
+    cut = _s14_cutout(path, c, role) if path else None
+    return None if cut is None else cut[0]
 
 
 def _s14_pick_center(o, sw, lw, sw_rd, image_paths, final_paths, seed=None):
@@ -6871,7 +6882,9 @@ def _s14_frame(fig_axes, frame, norms, colors=_S14_COLORS):
             if data is None:
                 # a NaN image of the cutout's shape keeps the panel geometry fixed across frames
                 ax.imshow(np.full(b["image"].shape, np.nan), origin="lower", cmap="gray")
-                ax.text(0.5, 0.5, "no model yet", ha="center", va="center",
+                msg = ("no model yet" if frame["label"] == "raw" else
+                       "map not kept\n(pipeline retention)" if name == "background" else "no coverage")
+                ax.text(0.5, 0.5, msg, ha="center", va="center",
                         transform=ax.transAxes, fontsize=9, color="0.35")
             else:
                 ax.imshow(data, origin="lower", cmap="gray", norm=norms[band],
@@ -6901,6 +6914,8 @@ def stage14_iteration_animation(o: Observation, sw, lw):
     panels mark that iteration's sources: SW only, LW only, or found in both (mutual nearest
     neighbour within 0.10\", the pipeline's cross-filter rule)."""
     import io
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
     from astropy.visualization import ImageNormalize, AsinhStretch
     from PIL import Image
     metrics = dict(stage=14, sw=sw, lw=lw)
@@ -6922,7 +6937,8 @@ def stage14_iteration_animation(o: Observation, sw, lw):
                        na_reason=f"no {sw} m{last} catalogue to choose a cutout from")
         return None, metrics
     sw_last = _s14_cat_radec(_used(cats[last][0], f"{sw} m{last} catalogue"))
-    finals = [prods[b][last][k] for b in ("sw", "lw") for k in ("model", "residual", "background")]
+    finals = [prods[b][last][k] for b in ("sw", "lw") for k in ("model", "residual", "background")
+              if prods[b][last][k]]
     c, nsrc = _s14_pick_center(o, sw, lw, sw_last, img.values(), finals)
     if c is None:
         metrics.update(available=False, passed=None,
@@ -6955,15 +6971,16 @@ def stage14_iteration_animation(o: Observation, sw, lw):
         for b in ("sw", "lw"):
             p = prods[b][n]
             bands[b] = dict(image=cut_img[b][0], wcs=cut_img[b][1],
-                            model=_s14_cutout(p["model"], c, f"m{n} model mosaic")[0],
-                            background=_s14_cutout(p["background"], c, f"m{n} background mosaic")[0],
-                            residual=_s14_cutout(p["residual"], c, f"m{n} residual mosaic")[0])
+                            model=_s14_data(p["model"], c, f"m{n} model mosaic"),
+                            background=_s14_data(p["background"], c, f"m{n} background mosaic"),
+                            residual=_s14_data(p["residual"], c, f"m{n} residual mosaic"))
         frames.append(dict(label=f"m{n}", note=prods["sw"][n]["tag"], classes=classes_for(n),
                            bands=bands, band_names=band_names))
     m8 = _s14_m8_catalog(o)
-    if m8:
+    m8_classes = _s14_m8_classes(_used(m8, "m8 catalogue"), sw, lw, c, half) if m8 else None
+    if m8_classes is not None:
         frames.append(dict(label="m8", note="m8 catalogue (forced fills excluded); images are m7",
-                           classes=_s14_m8_classes(_used(m8, "m8 catalogue"), sw, lw, c, half),
+                           classes=m8_classes,
                            bands=frames[-1]["bands"], band_names=band_names))
 
     # one fixed stretch per band for the whole animation, so frames compare directly
@@ -6981,7 +6998,6 @@ def stage14_iteration_animation(o: Observation, sw, lw):
         soft = float(np.clip(3.0 * sig / max(hi - lo, 1e-12), 1e-4, 0.1))
         norms[b] = ImageNormalize(vmin=lo, vmax=hi, stretch=AsinhStretch(soft))
 
-    from astropy.coordinates import SkyCoord   # noqa: F401  (c is a SkyCoord)
     pil, counts = [], {}
     for fr in frames:
         fig, axes = _fig(2, 4, w=2.6, h=2.75)
@@ -6997,13 +7013,11 @@ def stage14_iteration_animation(o: Observation, sw, lw):
                      f"3\"x3\" at RA {c.ra.deg:.5f} Dec {c.dec.deg:+.5f};  one asinh stretch per row; "
                      f"residual = image − model (background not subtracted)",
                      fontsize=8.5)
-        from matplotlib.lines import Line2D
         handles = [Line2D([], [], marker="o", ls="", ms=6, mfc=_S14_COLORS[k_], mec="none", label=lab)
                    for k_, lab in (("sw", f"{sw} only"), ("lw", f"{lw} only"), ("both", "both (same star)"))]
         fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=8, frameon=False)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=90)
-        import matplotlib.pyplot as plt
         plt.close(fig)
         buf.seek(0)
         pil.append(Image.open(buf).convert("RGB").copy())
@@ -7025,7 +7039,9 @@ def stage14_iteration_animation(o: Observation, sw, lw):
     q[0].save(out, save_all=True, append_images=q[1:], duration=dur, loop=0)
     metrics.update(available=True, passed=None, center_ra=float(c.ra.deg), center_dec=float(c.dec.deg),
                    n_sw_sources_final=int(nsrc), iterations=[f["label"] for f in frames],
-                   counts=counts, inputs=[p for _r, p in _INPUTS])
+                   background_not_kept=[f"{band_names[b]} m{n}" for n in iters for b in ("sw", "lw")
+                                        if not prods[b][n]["background"]],
+                   counts=counts)
     return out, metrics
 
 
@@ -7415,6 +7431,9 @@ def _caption_stage14(metrics):
             f"cross-filter rule). "
             + ("The m8 frame shows the m8 catalogue (forced cross-band fills excluded) over the m7 "
                "images, since m8 writes no new mosaics. " if has_m8 else "")
+            + (f"Background maps not kept on disk (pipeline retention, jwst-gc-pipeline#1105), "
+               f"shown blank: {', '.join(metrics['background_not_kept'])}. "
+               if metrics.get("background_not_kept") else "")
             + "The cutout centre is a seeded-random typical spot in the field (median source "
               "count among fully covered candidates). No pass/fail is set. "
               "([how this is made](DOCROOT#stage14))")
