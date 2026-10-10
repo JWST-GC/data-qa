@@ -141,15 +141,17 @@ def test_stage14_caption_and_default_stage_list():
     assert 14 in D._STAGES_NEEDING_SW
 
 
-def test_post_stage_keeps_gif_extension(monkeypatch):
+def test_post_stage_keeps_gif_extension(monkeypatch, tmp_path):
     from data_qa import post_diagnostics as P
     names = []
     monkeypatch.setattr(P, "_issue_number", lambda repo, token, title: 5)
     monkeypatch.setattr(P, "_find_stage_comment", lambda repo, token, num, marker: None)
     monkeypatch.setattr(P, "upload_asset", lambda repo, token, path, name: names.append(name) or "u")
     monkeypatch.setattr(P, "_req", lambda *a, **k: (201, {"html_url": "h"}))
-    P.post_stage(_obs(), 14, "/x/jw10678-o066_stage14.gif", "cap", "JWST-GC/data-qa", token="t")
-    P.post_stage(_obs(), 4, "/x/jw10678-o066_stage4.png", "cap", "JWST-GC/data-qa", token="t")
+    for name in ("jw10678-o066_stage14.gif", "jw10678-o066_stage4.png"):
+        (tmp_path / name).write_bytes(b"img")
+    P.post_stage(_obs(), 14, str(tmp_path / "jw10678-o066_stage14.gif"), "cap", "JWST-GC/data-qa", token="t")
+    P.post_stage(_obs(), 4, str(tmp_path / "jw10678-o066_stage4.png"), "cap", "JWST-GC/data-qa", token="t")
     assert names == ["jw10678-o066_stage14.gif", "jw10678-o066_stage4.png"]
 
 

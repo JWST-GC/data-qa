@@ -16,6 +16,8 @@ import sys
 import urllib.error
 import urllib.request
 
+from . import _ratelimit
+
 REPO = os.environ.get("QA_REPO", "JWST-GC/data-qa")
 API = "https://api.github.com"
 
@@ -175,18 +177,24 @@ def request(method, url, token, data=None):
     req.add_header("User-Agent", "jwst-gc-data-qa")
     if body is not None:
         req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        # an error body is not always JSON (a proxy or rate-limit page is HTML)
-        raw = e.read().decode(errors="replace")
+
+    def send():
         try:
-            return e.code, json.loads(raw or "{}")
-        except json.JSONDecodeError:
-            return e.code, {"message": raw.strip()[:200] or f"HTTP {e.code}"}
-    except urllib.error.URLError as e:                  # DNS/refused/timeout
-        return NETWORK_ERROR_STATUS, {"message": f"network error: {e.reason}"}
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read().decode()), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            # an error body is not always JSON (a proxy or rate-limit page is HTML)
+            raw = e.read().decode(errors="replace")
+            try:
+                return e.code, json.loads(raw or "{}"), dict(e.headers)
+            except json.JSONDecodeError:
+                return e.code, {"message": raw.strip()[:200] or f"HTTP {e.code}"}, dict(e.headers)
+        except urllib.error.URLError as e:              # DNS/refused/timeout
+            return NETWORK_ERROR_STATUS, {"message": f"network error: {e.reason}"}, {}
+
+    # shared write budget + rate-limit retry (data_qa._ratelimit)
+    status, payload, _hdrs = _ratelimit.call(method, send)
+    return status, payload
 
 
 def _paginate(token, url_fmt):

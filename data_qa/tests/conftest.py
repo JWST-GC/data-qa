@@ -113,3 +113,9 @@ def synthetic_pair(tmp_path):
                             header=wcs.to_header(), name="SCI")
         fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path)
     return str(f212n), str(longp)
+
+
+@pytest.fixture(autouse=True)
+def _no_shared_write_bucket(monkeypatch):
+    """Keep the suite off the real cluster-wide GitHub write budget (~/.cache/data-qa)."""
+    monkeypatch.setenv("QA_WRITE_BUCKET", "off")
