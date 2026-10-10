@@ -4876,11 +4876,22 @@ def _stage8_intradetector(o: Observation, filt):
         m.update(available=False, na_reason=("no per-frame catalogues" if not frames
                                              else "no consensus (per-filter merged) catalogue"))
         return None, m
-    ref = I.load_consensus(_used(cons, f"intra-detector consensus ({filt})"))
+    # An unreadable file or a catalogue missing a column skips this part (or that frame) so the
+    # inter-filter map that follows still posts.
+    try:
+        ref = I.load_consensus(_used(cons, f"intra-detector consensus ({filt})"))
+    except (OSError, KeyError, ValueError) as e:
+        m.update(available=False, na_reason=f"consensus catalogue unreadable ({type(e).__name__})")
+        return None, m
     _used_many(frames, f"intra-detector per-frame catalogues ({filt})")
     per_det, reasons, bulks = {}, {}, []
     for p in frames:
-        fr = I.load_frame(p)
+        try:
+            fr = I.load_frame(p)
+        except (OSError, KeyError, ValueError) as e:
+            why = f"unreadable ({type(e).__name__})"
+            reasons[why] = reasons.get(why, 0) + 1
+            continue
         r = I.frame_residuals(fr, ref)
         det = fr["detector"] or "unknown"
         per_det.setdefault(det, []).append(r)

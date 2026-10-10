@@ -143,6 +143,24 @@ def test_stage8_intradetector_figure_and_metrics(catdir, tmp_path, monkeypatch):
     assert "Intra-detector residual (F212N)" in cap and "#stage8-intradetector" in cap
 
 
+def test_stage8_intradetector_skips_unreadable_inputs(catdir, tmp_path, monkeypatch):
+    """A corrupt per-frame file or one missing a column is counted and skipped; an unreadable
+    consensus makes the part n/a instead of failing stage 8."""
+    import glob
+    frames = sorted(glob.glob(str(catdir / "f212n_nrc*_o001_*_daophot_basic.fits")))
+    cons = str(catdir / "f212n_merged_o001_indivexp_merged_m3_dao_basic_vetted.fits")
+    bad = tmp_path / "corrupt.fits"; bad.write_bytes(b"not a fits file")
+    nocol = tmp_path / "nocol.fits"; Table({"x_fit": [1.0]}).write(nocol)
+    monkeypatch.setattr(D, "OUTDIR", str(tmp_path / "out"))
+    monkeypatch.setattr(D, "_intradet_inputs", lambda o, f: (frames + [str(bad), str(nocol)], cons))
+    png, m = D._stage8_intradetector(_obs(), "F212N")
+    assert png and m["n_frames_used"] == 6
+    assert sum(v for k, v in m["frames_failed"].items() if k.startswith("unreadable")) == 2
+    monkeypatch.setattr(D, "_intradet_inputs", lambda o, f: (frames, str(bad)))
+    png, m = D._stage8_intradetector(_obs(), "F212N")
+    assert png is None and m["available"] is False and "unreadable" in m["na_reason"]
+
+
 def test_stage8_intradetector_na_posts_nothing(monkeypatch):
     monkeypatch.setattr(D, "_intradet_inputs", lambda o, f: ([], None))
     png, m = D._stage8_intradetector(_obs(), "F212N")
