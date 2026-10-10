@@ -492,7 +492,10 @@ Source: [`data_qa/diagnostics.py` → `stage6_astrom_error`](../data_qa/diagnost
 (`_stage6_figure`, `_streaked_exposures`, `_peppar_precision`, `_peppar_frame_std`).
 
 <a id="stage8"></a>
-## Stage 8 — inter-filter distortion residual
+## Stage 8 — distortion residuals (inter-filter and intra-detector)
+
+Stage 8 posts two figures: the inter-filter map below and the
+[intra-detector map](#stage8-intradetector).
 
 The **inter-filter** position residual as a function of position across the field: filter `sw`
 minus a second JWST filter of the same field, using the **same source rows** in the merged
@@ -551,6 +554,97 @@ amplitude), `null_amp90_mas` and `amp90_significance` (observed ÷ null; also `a
 
 **Source:** [`data_qa/diagnostics.py` → `stage8_distortion`](../data_qa/diagnostics.py)
 (`_interfilter_residuals`, `_perfilter_interfilter_residuals`, `_binned_median_2d`).
+
+<a id="stage8-intradetector"></a>
+### Stage 8, second figure — intra-detector residual (each frame − consensus)
+
+A second stage-8 figure maps the distortion left inside each detector after the WCS distortion
+model. It needs only one filter (`sw`), so it is built when the inter-filter map is not
+applicable, and then it is the stage's only figure (no grey note is posted).
+
+**Inputs.** The per-frame catalogues (`<filt>_<det>_o<obs>_visit*_m3_daophot_basic.fits`; the
+roll-corrected copies under `catalogs_rollcorr/<tag>/` when the full set exists, as in
+[stage 5](#stage5)) and, as the reference, the **consensus catalogue**: the vetted per-filter merge
+of the *same* exposures (`<filt>_merged_o<obs>_indivexp_merged_m3_dao_basic_vetted.fits`), read
+from the directory the frames came from. That catalogue was built from these frames at the same
+fitting iteration and with the same roll correction, so the residual contains no external
+catalogue's errors and no cross-generation WCS difference. Each per-frame row carries both the
+detector position (`x_fit`, `y_fit`) and the sky position through that frame's WCS
+(`skycoord_centroid`).
+
+**Per frame** (`data_qa/intradetector.py` → `frame_residuals`):
+
+1. Frame stars with `flags == 0` (photutils sets bit 1 when pixels of the fit box are masked, so
+   this drops saturated stars and their neighbours), S/N > 30 and `qfit` ≤ 0.2; consensus stars
+   that are not `is_saturated`, have `nmatch_good` ≥ 2 and S/N > 30.
+2. The frame's bulk offset from the consensus is the [pair-histogram peak](#glossary-xcorr)
+   (0.5″ search, 20 mas bins, peak/background ≥ 4). A nearest-neighbour median against a dense
+   catalogue is pulled toward zero by chance pairs, so it is not used.
+3. Mutual nearest neighbours of the shifted frame and the consensus within 60 mas.
+4. Flux vet: pairs whose frame-minus-consensus magnitude differs from the frame median by more
+   than 0.2 mag are dropped (blends, wrong-star matches).
+5. The sky residual (frame − consensus, tangent plane) is rotated into the detector axes with the
+   frame's local Jacobian, a linear fit of `x_fit`/`y_fit` against the consensus tangent-plane
+   position, and scaled by the header `PIXSCALE` to mas. A robust 5σ clip removes the remaining
+   wrong-star tail. Only the bulk shift is removed, so a linear term left in the WCS (plate scale,
+   rotation, skew) stays visible as a gradient across the detector.
+
+**Stack.** All frames of the tile are stacked per detector on a fixed 8×8 grid of 256-pixel cells
+(cells with ≥ 20 pairs). Each quiver panel shows the binned median residual, with the grey scale
+giving its amplitude; the bottom row gives the median dx and dy against detector x and y, one line
+per detector.
+
+**Numbers.** Per detector: `sysrms_mas`, the RMS vector amplitude of the binned map;
+`null_rms_mas`, the median of the same RMS over 10 shuffles of the residual vectors across the fixed
+positions (what noise alone gives with these cell counts); and `sysrms_debiased_mas` =
+√(sysrms² − null²), which reads ~0 for pure noise. Also `perstar_rms_mas`, `n_pairs`,
+`frame_bulk_median_mas`, `n_frames`/`n_frames_used`, `frames_failed` (reason → count), and the
+median and maximum of `sysrms_debiased_mas` over detectors. All live under
+`metrics["intradetector"]`.
+
+**Two dilutions** make the map a lower bound on the residual distortion. The consensus includes
+the frame itself (weight ~1/N for N exposures of a star), which scales the residual by about
+(1 − 1/N). The consensus also averages each star over the detector positions it fell on in the
+other exposures, so a smooth pattern common to every exposure is partly absorbed when the dithers
+are short compared with the pattern's scale; structure on scales shorter than the dither steps is
+kept.
+
+**No pass/fail and no flag.** The few-tenths-of-a-mas to ~1 mas patterns seen on GC Treasury tiles
+have no established defect threshold, so this part is reported only. When the per-frame or
+consensus catalogues are missing it produces no figure and records `available: False` with an
+`na_reason`.
+
+**Source:** [`data_qa/diagnostics.py` → `_stage8_intradetector`](../data_qa/diagnostics.py),
+[`data_qa/intradetector.py`](../data_qa/intradetector.py).
+
+<a id="intradetector-aggregate"></a>
+## Intra-detector residual distortion, all pointings (aggregate tool)
+
+`python -m data_qa.intradetector_distortion --catdir <catalogs_rollcorr/tag> --filters F212N F480M
+--outdir <dir> --nproc N` runs the [stage-8 intra-detector measurement](#stage8-intradetector) on
+every pointing in a catalogue directory that has a vetted consensus catalogue, and stacks the
+residuals per detector and per filter. With ~70 pointings × 6 exposures, per-cell noise drops by
+~√70 relative to one tile, so a pattern that the distortion model leaves in every exposure stands
+out while tile-specific structure averages down. The stack uses a 16×16 grid (128-pixel cells).
+Each pointing's residuals are cached in `intradet_<filt>_residuals.npz` so a rerun only measures
+new pointings (`--no-cache` re-measures everything).
+
+Outputs per filter:
+
+- `intradet_<filt>_allpointings.png` — the stacked quiver maps and profiles, in the same layout as
+  the stage-8 figure;
+- `intradet_<filt>_consistency.png` — LEFT: each pointing's debiased tile-map RMS per detector
+  (8×8 grid, as in stage 8) against the stack's value; RIGHT: for each pointing and detector, the
+  Pearson correlation of that tile's binned map with the stack of all *other* pointings. A pattern
+  that repeats from tile to tile gives r > 0; tile-specific structure or noise gives r ≈ 0;
+- `intradet_<filt>.json` — per detector: the stacked numbers and binned maps (`map_dx_mas`,
+  `map_dy_mas`, `map_count`), `n_pointings`, `tile_sysrms_debiased_median_mas` and
+  `tile_r_vs_others_median`; per pointing: frame counts, failures and per-detector tile numbers.
+
+The two dilutions described for stage 8 apply to the stack too, since every frame is still
+measured against its own tile's consensus.
+
+**Source:** [`data_qa/intradetector_distortion.py`](../data_qa/intradetector_distortion.py).
 
 <a id="stage9"></a>
 ## Stage 9 — PSF vs aperture photometry

@@ -4263,6 +4263,8 @@ def test_not_applicable_stage_draws_neutral_card_not_red_flag(monkeypatch):
     monkeypatch.setattr(D, "_note_figure", lambda *a, **k: drawn.append("note") or "n.png")
     monkeypatch.setattr(D, "_interfilter_residuals", lambda o, sw: None)
     monkeypatch.setattr(D, "_perfilter_interfilter_residuals", lambda o, sw: None)
+    # no intra-detector map either (o086 has real per-frame catalogues on disk)
+    monkeypatch.setattr(D, "_stage8_intradetector", lambda o, sw: (None, dict(available=False)))
     from data_qa.observations import Observation
     o = Observation(program="10678", obs="086", target="T", release_field="gc-treasury",
                     instrument="NIRCam", filters=["F212N"], visits=[], epoch="", notes="")

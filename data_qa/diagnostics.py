@@ -4840,6 +4840,92 @@ def _shuffled_null_amp90(ra, dec, dra, dde, nb, cosd, minn=3, n_perm=20, seed=0)
     return float(np.median(nulls)), nulls
 
 
+def _intradet_inputs(o: Observation, filt):
+    """(per-frame catalogue paths, consensus catalogue path) for the stage-8 intra-detector map,
+    or (frames, None).  The consensus is the vetted per-filter merge of the SAME exposures, read
+    from the directory the frames came from (roll-corrected frames get the roll-corrected
+    consensus), else from ``catalogs/``; the unvetted merge is the fallback."""
+    frames = _daophot_glob(o, filt, "*", rollcorr=True)
+    if not frames:
+        return [], None
+    fl = filt.lower()
+    names = [f"{fl}_merged_o{o.obs}_indivexp_merged_m3_dao_basic_vetted.fits",
+             f"{fl}_merged_o{o.obs}_indivexp_merged_m3_dao_basic.fits"]
+    fdir = os.path.dirname(frames[0])
+    for n in names:
+        p = os.path.join(fdir, n)
+        if os.path.exists(p):
+            return frames, p
+    for n in names:
+        hits = _fglob(o, f"catalogs/{n}")
+        if hits:
+            return frames, hits[0]
+    return frames, None
+
+
+def _stage8_intradetector(o: Observation, filt):
+    """Intra-detector residual map of ``filt``: every per-frame catalogue against the consensus
+    catalogue, bulk offset removed per frame by the pair-histogram peak, mutual-NN matched,
+    flux-vetted, residual rotated into detector axes and stacked per detector over all frames of
+    the tile (``data_qa.intradetector``).  Returns (png or None, metrics dict).  Reported only; no
+    pass/fail and no flag.  When the inputs are missing it returns no figure."""
+    from . import intradetector as I
+    m = dict(filter=filt)
+    frames, cons = _intradet_inputs(o, filt)
+    if not frames or not cons:
+        m.update(available=False, na_reason=("no per-frame catalogues" if not frames
+                                             else "no consensus (per-filter merged) catalogue"))
+        return None, m
+    # An unreadable file or a catalogue missing a column skips this part (or that frame) so the
+    # inter-filter map that follows still posts.
+    try:
+        ref = I.load_consensus(_used(cons, f"intra-detector consensus ({filt})"))
+    except (OSError, KeyError, ValueError) as e:
+        m.update(available=False, na_reason=f"consensus catalogue unreadable ({type(e).__name__})")
+        return None, m
+    _used_many(frames, f"intra-detector per-frame catalogues ({filt})")
+    per_det, reasons, bulks = {}, {}, []
+    for p in frames:
+        try:
+            fr = I.load_frame(p)
+        except (OSError, KeyError, ValueError) as e:
+            why = f"unreadable ({type(e).__name__})"
+            reasons[why] = reasons.get(why, 0) + 1
+            continue
+        r = I.frame_residuals(fr, ref)
+        det = fr["detector"] or "unknown"
+        per_det.setdefault(det, []).append(r)
+        if "dx" in r:
+            bulks.append(np.hypot(r["bulk_dra"], r["bulk_ddec"]))
+        else:
+            reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+    by_det = {d: I.concat(rs) for d, rs in per_det.items()}
+    by_det = {d: r for d, r in by_det.items() if len(r["dx"]) >= I.MIN_PER_CELL * 4}
+    if not by_det:
+        m.update(available=False, na_reason="no frame matched the consensus catalogue",
+                 frames_failed=reasons)
+        return None, m
+    stacks = I.stack_maps(by_det)
+    deb = {d: s["sysrms_debiased_mas"] for d, s in stacks.items()}
+    m.update(available=True, consensus=os.path.basename(cons),
+             rollcorr=_is_rollcorr(frames), n_frames=len(frames),
+             n_frames_used=len(bulks), frames_failed=reasons,
+             frame_bulk_median_mas=float(np.median(bulks)) if bulks else None,
+             sysrms_mas={d: round(s["sysrms_mas"], 3) for d, s in stacks.items()},
+             null_rms_mas={d: round(s["null_rms_mas"], 3) for d, s in stacks.items()},
+             sysrms_debiased_mas={d: round(v, 3) for d, v in deb.items()},
+             perstar_rms_mas={d: round(s["perstar_rms_mas"], 3) for d, s in stacks.items()},
+             n_pairs={d: s["n"] for d, s in stacks.items()},
+             sysrms_debiased_max_mas=round(max(deb.values()), 3),
+             sysrms_debiased_median_mas=round(float(np.median(list(deb.values()))), 3))
+    os.makedirs(OUTDIR, exist_ok=True)
+    out = os.path.join(OUTDIR, f"{o.obsid}_stage8_intradet_{filt.lower()}.png")
+    title = (f"{o.target} {o.obsid} — intra-detector residual, {filt}: each frame − consensus "
+             f"(bulk removed), stacked over {len(bulks)} frames")
+    I.plot_stacks(stacks, by_det, title, out)
+    return out, m
+
+
 def stage8_distortion(o: Observation, sw):
     """Distortion diagnostic: the INTER-FILTER position residual (bulk-removed) as a function of
     position across the field -- ``sw`` minus a second JWST filter of the same field, same source
@@ -4853,6 +4939,9 @@ def stage8_distortion(o: Observation, sw):
     import matplotlib
     matplotlib.use("Agg")
     metrics = dict(stage=8, sw=sw)
+    # Intra-detector part: each frame against the consensus catalogue, stacked per detector.  It
+    # needs no second filter, so it is built first and survives an n/a inter-filter part.
+    intra_png, metrics["intradetector"] = _stage8_intradetector(o, sw)
     # Prefer the cross-band MERGED catalogue (both filters registered onto a common frame, so the
     # residual is a per-filter WCS/distortion term).  When none exists yet, fall back to the two
     # per-filter jicama DAO merges: a PROVISIONAL measurement that still carries the not-yet-cross-tied
@@ -4862,6 +4951,11 @@ def stage8_distortion(o: Observation, sw):
     if res is None:
         res = _perfilter_interfilter_residuals(o, sw)
         provisional = res is not None
+    if res is None and intra_png:
+        # inter-filter part not applicable; the intra-detector map is the figure (no grey note)
+        metrics.update(measurable=False, passed=None,
+                       na_reason="no second-filter positions for an inter-filter distortion map")
+        return intra_png, metrics
     if res is None:
         # NOT APPLICABLE, not a defect: a single-filter or not-yet-reduced obs simply has no second
         # band to difference.  Use a distinct "measurement unavailable" state -- do NOT red_flag it
@@ -4970,6 +5064,9 @@ def stage8_distortion(o: Observation, sw):
     if provisional:
         suptitle += "\nprovisional: per-filter catalogues, not yet cross-tied to a common frame"
     fig.suptitle(suptitle, fontsize=11, y=0.98)
+    if intra_png:
+        metrics.setdefault("extra_figures", []).append(
+            (f"intra-detector residual ({sw}, each frame − consensus)", intra_png))
     return _save(fig, f"{o.obsid}_stage8.png"), metrics
 
 
@@ -7255,7 +7352,48 @@ def caption_for(n, metrics):
     return _linkify(_caption_for_impl(n, metrics)) + _inputs_block(metrics)
 
 
+def _caption_stage8_intra(im, primary=False):
+    """Caption text for the stage-8 intra-detector figure ('' when it was not built)."""
+    if not im or not im.get("available"):
+        return ""
+    filt = im.get("filter", "SW")
+    deb = im.get("sysrms_debiased_mas") or {}
+    worst = max(deb, key=deb.get) if deb else None
+    where = "Figure" if primary else "The second figure"
+    txt = (f"**Intra-detector residual ({filt}).** {where} shows each per-frame catalogue minus "
+           f"the consensus catalogue (`{im.get('consensus')}`, the vetted merge of the same "
+           f"exposures), with each frame's bulk offset removed by the pair-histogram peak, stars "
+           f"paired by mutual nearest neighbour within 60 mas, flux-vetted, S/N > 30 and "
+           f"unflagged (so unsaturated). The residual is rotated into detector axes and stacked "
+           f"per detector over {im.get('n_frames_used')} of {im.get('n_frames')} frames on an "
+           f"8×8 grid of 256-px cells; the bottom row gives the median residual along each "
+           f"detector axis. ")
+    if worst is not None:
+        txt += (f"The binned-map RMS, with a shuffled-position null subtracted in quadrature, has "
+                f"a median of {im.get('sysrms_debiased_median_mas'):.2f} mas over detectors and a "
+                f"maximum of {deb[worst]:.2f} mas ({worst}). ")
+    txt += ("The consensus includes each frame and averages each star over its dithers, so this "
+            "is a lower bound on the residual distortion. Reported only; no pass/fail. "
+            "([how this is made](DOCROOT#stage8-intradetector))")
+    return txt
+
+
 def _caption_stage8(metrics):
+    """Stage-8 caption: the inter-filter part (``_caption_stage8_interfilter``) followed by the
+    intra-detector part.  When only the intra-detector map exists it leads."""
+    inter = _caption_stage8_interfilter(metrics)
+    im = metrics.get("intradetector") or {}
+    if metrics.get("measurable") is False and im.get("available"):
+        sw = metrics.get("sw", "SW")
+        return (f"**Stage 8 — distortion residuals ({sw}).** "
+                + _caption_stage8_intra(im, primary=True)
+                + f" The inter-filter map is not applicable here: no second-filter positions for "
+                  f"{sw} in a merged or per-filter catalogue.")
+    intra = _caption_stage8_intra(im)
+    return inter + (" " + intra if intra else "")
+
+
+def _caption_stage8_interfilter(metrics):
     """Stage-8 caption.  Handles three states: not-applicable (no second band, so no pass/fail is
     set), a normal measured residual (amplitude + null-based significance), and a gross
     inter-filter offset (red-flagged).  Kept out of the generic red-flag branch, whose wording
