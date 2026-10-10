@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 
+from . import _ratelimit
 from .observations import Observation
 
 API = "https://api.github.com"
@@ -70,7 +71,7 @@ def _token():
     return tok
 
 
-def _req(method, url, token, data=None, headers=None, raw=False, want_headers=False):
+def _send(method, url, token, data, headers, raw):
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"token {token}")
     req.add_header("Accept", "application/vnd.github+json")
@@ -81,14 +82,20 @@ def _req(method, url, token, data=None, headers=None, raw=False, want_headers=Fa
         with urllib.request.urlopen(req) as r:
             body = r.read()
             payload = body if raw else json.loads(body.decode() or "{}")
-            return (r.status, payload, dict(r.headers)) if want_headers else (r.status, payload)
+            return r.status, payload, dict(r.headers)
     except urllib.error.HTTPError as e:
         body = e.read()
         try:
             payload = json.loads(body.decode() or "{}")
         except ValueError:
             payload = {"raw": body}
-        return (e.code, payload, dict(e.headers)) if want_headers else (e.code, payload)
+        return e.code, payload, dict(e.headers)
+
+
+def _req(method, url, token, data=None, headers=None, raw=False, want_headers=False):
+    """One API call under the shared write budget, retrying rate-limit refusals (_ratelimit)."""
+    st, payload, hdrs = _ratelimit.call(method, lambda: _send(method, url, token, data, headers, raw))
+    return (st, payload, hdrs) if want_headers else (st, payload)
 
 
 # --------------------------------------------------------------------------- release-asset host
@@ -346,6 +353,21 @@ def _roll_downgrade(stage, existing, caption):
     return _ROLL_APPLIED in (existing.get("body") or "") and _ROLL_APPLIED not in (caption or "")
 
 
+_SHA_MARKER = "<!-- data-qa:sha:{h} -->"
+
+
+def _content_hash(stage, png_path, caption, extra_images, footer):
+    """Hash of everything a stage comment shows: the figures' bytes, their labels, the caption and
+    the footer.  The release-asset URLs are left out (they change on every upload), so an
+    unchanged rebuild hashes the same and the post can be skipped."""
+    h = hashlib.sha256(f"{stage}\0{caption}\0{footer}".encode())
+    for label, path in [("", png_path)] + list(extra_images or []):
+        h.update(f"\0{label}\0{os.path.basename(path)}\0".encode())
+        with open(path, "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()[:16]
+
+
 def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra_images=None):
     """Idempotently post/update the stage-N comment on ``o``'s issue with the figure.
 
@@ -363,15 +385,23 @@ def post_stage(o: Observation, stage, png_path, caption, repo, token=None, extra
     if _roll_downgrade(stage, existing, caption):
         raise RollDowngradeError("refusing to replace the roll-corrected stage-5 comment with "
                                  "an uncorrected one (set QA_ALLOW_ROLL_DOWNGRADE=1 to force)")
+    # Skip the upload + edit when the figures and caption match what the comment already shows:
+    # most refreshes rebuild an unchanged stage, and each post costs 3-4 content-creating requests
+    # against GitHub's secondary rate limit.  QA_FORCE_REPOST=1 posts regardless.
+    footer = _provenance_footer(repo, stage)
+    sha_line = _SHA_MARKER.format(h=_content_hash(stage, png_path, caption, extra_images, footer))
+    if existing and sha_line in (existing.get("body") or "") and os.environ.get("QA_FORCE_REPOST") != "1":
+        print(f"  stage {stage}: unchanged on #{num}, not re-posted -> {existing.get('html_url')}")
+        return existing
     # keep the figure's own extension: stage 14 posts an animated GIF
     asset_name = f"{o.obsid}_stage{stage}{os.path.splitext(png_path)[1] or '.png'}"
     img_url = upload_asset(repo, token, png_path, asset_name)
     extra_block = _details_block(repo, token, o, stage, extra_images) if extra_images else ""
-    body = (f"{marker}\n### QA diagnostic — stage {stage}\n\n"
+    body = (f"{marker}\n{sha_line}\n### QA diagnostic — stage {stage}\n\n"
             f"{caption}\n\n"
             f"![{asset_name}]({img_url})\n"
             f"{extra_block}\n\n"
-            f"<sub>{_provenance_footer(repo, stage)}</sub>\n"
+            f"<sub>{footer}</sub>\n"
             f"<sub>auto-posted by `data_qa.diagnostics`; updates in place as the pipeline advances.</sub>")
     if existing:
         st, data = _req("PATCH", f"{API}/repos/{repo}/issues/comments/{existing['id']}", token,

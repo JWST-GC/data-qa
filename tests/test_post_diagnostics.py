@@ -216,34 +216,37 @@ def test_ensure_release_rereads_after_concurrent_create(monkeypatch):
     assert seen["gets"] == 2
 
 
-def _guarded_post(monkeypatch, existing_body, caption, stage=5):
+def _guarded_post(monkeypatch, existing_body, caption, stage=5, tmp_path=None):
     from data_qa import post_diagnostics as P
     calls = []
+    png = tmp_path / "x.png"
+    png.write_bytes(b"png")
     monkeypatch.setattr(P, "_issue_number", lambda repo, token, title: 5)
     monkeypatch.setattr(P, "_find_stage_comment",
                         lambda repo, token, num, marker: {"id": 42, "body": existing_body})
     monkeypatch.setattr(P, "upload_asset", lambda *a, **k: calls.append("upload") or "url")
     monkeypatch.setattr(P, "_req", lambda *a, **k: calls.append(a[0]) or (200, {"html_url": "u"}))
-    P.post_stage(_obs(), stage, "x.png", caption, "JWST-GC/data-qa", token="tok")
+    P.post_stage(_obs(), stage, str(png), caption, "JWST-GC/data-qa", token="tok")
     return calls
 
 
-def test_post_stage_refuses_roll_correction_downgrade(monkeypatch):
+def test_post_stage_refuses_roll_correction_downgrade(monkeypatch, tmp_path):
     # a run without the roll tag must not overwrite a roll-corrected stage-5 comment (#346)
     from data_qa import post_diagnostics as P
     monkeypatch.delenv("QA_ALLOW_ROLL_DOWNGRADE", raising=False)
     with pytest.raises(P.PostError, match="roll-corrected"):
-        _guarded_post(monkeypatch, "... per-visit roll correction applied ...", "plain caption")
+        _guarded_post(monkeypatch, "... per-visit roll correction applied ...", "plain caption",
+                      tmp_path=tmp_path)
 
 
-def test_post_stage_roll_guard_allows_corrected_and_other_stages(monkeypatch):
+def test_post_stage_roll_guard_allows_corrected_and_other_stages(monkeypatch, tmp_path):
     monkeypatch.delenv("QA_ALLOW_ROLL_DOWNGRADE", raising=False)
     old = "... roll correction applied ..."
-    assert "PATCH" in _guarded_post(monkeypatch, old, "new: roll correction applied (set v1)")
-    assert "PATCH" in _guarded_post(monkeypatch, "uncorrected", "plain caption")
-    assert "PATCH" in _guarded_post(monkeypatch, old, "plain caption", stage=4)
+    assert "PATCH" in _guarded_post(monkeypatch, old, "new: roll correction applied (set v1)", tmp_path=tmp_path)
+    assert "PATCH" in _guarded_post(monkeypatch, "uncorrected", "plain caption", tmp_path=tmp_path)
+    assert "PATCH" in _guarded_post(monkeypatch, old, "plain caption", stage=4, tmp_path=tmp_path)
     monkeypatch.setenv("QA_ALLOW_ROLL_DOWNGRADE", "1")
-    assert "PATCH" in _guarded_post(monkeypatch, old, "plain caption")
+    assert "PATCH" in _guarded_post(monkeypatch, old, "plain caption", tmp_path=tmp_path)
 
 
 def test_roll_guard_phrase_matches_stage5_caption():

@@ -23,3 +23,9 @@ def _offline_auth_preflight(monkeypatch):
                         (True, "pytest-stub"))
     yield
     _github._AUTH_CHECKED.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_shared_write_bucket(monkeypatch):
+    """Keep the suite off the real cluster-wide GitHub write budget (~/.cache/data-qa)."""
+    monkeypatch.setenv("QA_WRITE_BUCKET", "off")
