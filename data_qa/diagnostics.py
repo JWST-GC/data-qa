@@ -897,7 +897,11 @@ def _rollcorr_set(o: Observation, filt):
     written by jwst-gc-pipeline ``catalog_roll_correction --include-perframe`` flat under
     ``<field>/catalogs_rollcorr/<tag>/``.  Decided once for the whole (obs, filt): the corrected
     set is used only when it holds every primary exposure on every detector, so a partial set
-    never puts rotated NRCA positions against unrotated NRCB ones."""
+    never puts rotated NRCA positions against unrotated NRCB ones.
+
+    When every primary catalogue was measured on a frame that already carries the roll
+    (``_frames_carry_roll``), the primary set itself is returned, for any program and whether
+    or not ``QA_ROLLCORR_TAG`` / the per-program default tag is set."""
     prim = _daophot_glob_in(o, f"{filt}/{filt.lower()}_*")
     if prim and _frames_carry_roll(prim):
         return prim
@@ -929,7 +933,7 @@ def _frames_carry_roll(paths):
     return bool(paths) and all(_header_rollcorr(p) for p in paths)
 
 
-@functools.lru_cache(maxsize=4096)
+@functools.lru_cache(maxsize=None)        # one bool per (path, mtime); a refresh reads each header once
 def _header_rollcorr_cached(path, mtime):
     from astropy.io import fits
     try:
