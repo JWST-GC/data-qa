@@ -1493,6 +1493,57 @@ def test_daophot_glob_rollcorr_scoped_to_callers_that_ask(tmp_path, monkeypatch)
     assert not D._is_rollcorr(D._daophot_glob(_obs(obs="023"), "F200W"))
 
 
+def _hybpsf_tree(tmp_path, hyb_dets, rollcorr_hyb=False):
+    """Plain m3 cats on nrca1+nrcb1 (2 exposures each) plus hybrid-PSF cats on ``hyb_dets``."""
+    d = tmp_path / "gc2211" / "F200W"; d.mkdir(parents=True)
+    r = tmp_path / "gc2211" / "catalogs_rollcorr" / "v1_perframe"; r.mkdir(parents=True)
+    for det in ("nrca1", "nrcb1"):
+        for e in (1, 2):
+            _touch(d, f"f200w_{det}_o023_visit001_exp{e}_m3_daophot_basic.fits")
+            _touch(r, f"f200w_{det}_o023_visit001_exp{e}_m3_daophot_basic.fits")
+            if det in hyb_dets:
+                _touch(d, f"f200w_{det}_o023_visit001_exp{e}_hybpsf_m3_daophot_basic.fits")
+                if rollcorr_hyb:
+                    _touch(r, f"f200w_{det}_o023_visit001_exp{e}_hybpsf_m3_daophot_basic.fits")
+
+
+def test_daophot_glob_uses_hybrid_psf_when_complete(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    _hybpsf_tree(tmp_path, ("nrca1", "nrcb1"))
+    o = _obs(obs="023")
+    got = D._daophot_glob(o, "F200W")
+    assert len(got) == 4 and all("_hybpsf_m3_" in g for g in got)
+    assert len(D._daophot_glob(o, "F200W", "nrcb1")) == 2
+
+
+def test_daophot_glob_partial_hybrid_psf_keeps_plain_on_every_detector(tmp_path, monkeypatch):
+    # hybrid cats only on NRCA1 (re-catalogue part-way): NRCA1 must not be hybrid against plain NRCB1
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    _hybpsf_tree(tmp_path, ("nrca1",))
+    o = _obs(obs="023")
+    for det in ("nrca1", "nrcb1", "*"):
+        got = D._daophot_glob(o, "F200W", det)
+        assert got and not any("_hybpsf" in g for g in got)
+    assert len(D._daophot_glob(o, "F200W")) == 4
+
+
+def test_daophot_glob_rollcorr_needs_hybrid_copies(tmp_path, monkeypatch):
+    # primary is hybrid, roll-corrected copies only plain -> uncorrected hybrid (the stage-5 guard
+    # then keeps the corrected comment); once hybrid copies exist they are used
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setenv("QA_ROLLCORR_TAG", "v1_perframe")
+    _hybpsf_tree(tmp_path, ("nrca1", "nrcb1"))
+    o = _obs(obs="023")
+    got = D._daophot_glob(o, "F200W", rollcorr=True)
+    assert not D._is_rollcorr(got) and all("_hybpsf" in g for g in got)
+    for det in ("nrca1", "nrcb1"):
+        for e in (1, 2):
+            _touch(tmp_path / "gc2211" / "catalogs_rollcorr" / "v1_perframe",
+                   f"f200w_{det}_o023_visit001_exp{e}_hybpsf_m3_daophot_basic.fits")
+    got = D._daophot_glob(o, "F200W", rollcorr=True)
+    assert len(got) == 4 and D._is_rollcorr(got) and all("_hybpsf" in g for g in got)
+
+
 def test_daophot_glob_ignores_rollcorr_without_tag(tmp_path, monkeypatch):
     monkeypatch.setattr(D, "BASE", str(tmp_path))
     monkeypatch.delenv("QA_ROLLCORR_TAG", raising=False)

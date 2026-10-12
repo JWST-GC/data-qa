@@ -33,6 +33,7 @@ import re
 import numpy as np
 
 from . import intradetector as I
+from . import psf_generation
 
 DEFAULT_CATDIR = "/orange/adamginsburg/jwst/gc-treasury/catalogs_rollcorr/v1_dataqa346_perframe"
 _OBS_RE = re.compile(r"_merged_o(\d{3})_indivexp_merged_m3_dao_basic_vetted\.fits$")
@@ -47,7 +48,8 @@ def pointings(catdir, filt):
         if not m:
             continue
         obs = m.group(1)
-        frames = sorted(p for p in glob.glob(os.path.join(catdir, f"{fl}_nrc*_o{obs}_visit*_m3_daophot_basic.fits")))
+        frames = sorted(psf_generation.select(
+            glob.glob(os.path.join(catdir, f"{fl}_nrc*_o{obs}_visit*_m3_daophot_basic.fits"))))
         if frames:
             out[obs] = (c, frames)
     return out

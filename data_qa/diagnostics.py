@@ -912,7 +912,7 @@ def _is_rollcorr(paths):
     return bool(paths) and all("/catalogs_rollcorr/" in p for p in paths)
 
 
-def _daophot_glob_in(o: Observation, base):
+def _daophot_glob_any(o: Observation, base):
     tok = _fglob(o, f"{base}_o{o.obs}_visit*_*_m3_daophot_basic.fits")
     if tok:
         return tok
@@ -920,6 +920,20 @@ def _daophot_glob_in(o: Observation, base):
         return []
     return [c for c in _fglob(o, f"{base}_visit*_*_m3_daophot_basic.fits")
             if not _DAO_OBS_RE.search(os.path.basename(c))]
+
+
+def _daophot_glob_in(o: Observation, base):
+    """Per-exposure m3 cats under ``base`` in ONE PSF generation (``data_qa.psf_generation``):
+    the hybrid-PSF ``_hybpsf`` cats when they cover every exposure of the filter on every
+    detector, else the plain ones.  Decided on the filter-wide set so a re-catalogue part-way
+    through never serves hybrid NRCA1 against plain NRCB1."""
+    from . import psf_generation
+    found = _daophot_glob_any(o, base)
+    if not found:
+        return found
+    d, b = os.path.split(base)
+    wide = _daophot_glob_any(o, os.path.join(d, b.split("_")[0] + "_*"))
+    return psf_generation.select(found, hybrid=psf_generation.use_hybrid(wide))
 
 
 def _virac_with_errors(o: Observation, epoch):
