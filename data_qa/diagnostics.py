@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import contextlib
 import fnmatch
 import glob
@@ -896,11 +897,17 @@ def _rollcorr_set(o: Observation, filt):
     written by jwst-gc-pipeline ``catalog_roll_correction --include-perframe`` flat under
     ``<field>/catalogs_rollcorr/<tag>/``.  Decided once for the whole (obs, filt): the corrected
     set is used only when it holds every primary exposure on every detector, so a partial set
-    never puts rotated NRCA positions against unrotated NRCB ones."""
+    never puts rotated NRCA positions against unrotated NRCB ones.
+
+    When every primary catalogue was measured on a frame that already carries the roll
+    (``_frames_carry_roll``), the primary set itself is returned, for any program and whether
+    or not ``QA_ROLLCORR_TAG`` / the per-program default tag is set."""
+    prim = _daophot_glob_in(o, f"{filt}/{filt.lower()}_*")
+    if prim and _frames_carry_roll(prim):
+        return prim
     tag = _rollcorr_tag(o)
     if not tag:
         return None
-    prim = _daophot_glob_in(o, f"{filt}/{filt.lower()}_*")
     corr = _daophot_glob_in(o, f"catalogs_rollcorr/{tag}/{filt.lower()}_*")
     have = {os.path.basename(c) for c in corr}
     if prim and all(os.path.basename(p) in have for p in prim):
@@ -909,10 +916,43 @@ def _rollcorr_set(o: Observation, filt):
 
 
 def _is_rollcorr(paths):
-    return bool(paths) and all("/catalogs_rollcorr/" in p for p in paths)
+    return bool(paths) and (all("/catalogs_rollcorr/" in p for p in paths)
+                            or _frames_carry_roll(paths))
 
 
-def _daophot_glob_in(o: Observation, base):
+# roll_tag recorded when the per-exposure cats were measured on frames that already carry the roll
+_FRAME_ROLL = "frame WCS (ROLLARC)"
+
+
+def _frames_carry_roll(paths):
+    """True when every per-exposure catalogue was measured on a frame whose WCS already carries
+    the per-visit roll: jwst-gc-pipeline (image_roll_wcs / ensure_roll_correction, #1169)
+    stamps ``ROLLCORR = T`` and ``ROLLARC`` into the frame, and the cataloguer copies them into
+    the catalogue header.  Such catalogues (e.g. the 10678 ``_hybpsf`` generation, 2026-10-12)
+    must not be rolled again by a ``catalogs_rollcorr`` copy."""
+    return bool(paths) and all(_header_rollcorr(p) for p in paths)
+
+
+@functools.lru_cache(maxsize=None)        # one bool per (path, mtime); a refresh reads each header once
+def _header_rollcorr_cached(path, mtime):
+    from astropy.io import fits
+    try:
+        hdr = fits.getheader(path, 1)
+    except (OSError, IndexError) as e:
+        print(f"  roll header unreadable: {path} ({e})", flush=True)
+        return False
+    return bool(hdr.get("ROLLCORR", False)) and hdr.get("ROLLARC") is not None
+
+
+def _header_rollcorr(path):
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return False
+    return _header_rollcorr_cached(path, mtime)
+
+
+def _daophot_glob_any(o: Observation, base):
     tok = _fglob(o, f"{base}_o{o.obs}_visit*_*_m3_daophot_basic.fits")
     if tok:
         return tok
@@ -920,6 +960,20 @@ def _daophot_glob_in(o: Observation, base):
         return []
     return [c for c in _fglob(o, f"{base}_visit*_*_m3_daophot_basic.fits")
             if not _DAO_OBS_RE.search(os.path.basename(c))]
+
+
+def _daophot_glob_in(o: Observation, base):
+    """Per-exposure m3 cats under ``base`` in ONE PSF generation (``data_qa.psf_generation``):
+    the hybrid-PSF ``_hybpsf`` cats when they cover every exposure of the filter on every
+    detector, else the plain ones.  Decided on the filter-wide set so a re-catalogue part-way
+    through never serves hybrid NRCA1 against plain NRCB1."""
+    from . import psf_generation
+    found = _daophot_glob_any(o, base)
+    if not found:
+        return found
+    d, b = os.path.split(base)
+    wide = _daophot_glob_any(o, os.path.join(d, b.split("_")[0] + "_*"))
+    return psf_generation.select(found, hybrid=psf_generation.use_hybrid(wide))
 
 
 def _virac_with_errors(o: Observation, epoch):
@@ -3264,11 +3318,13 @@ def stage5_intermodule(o: Observation, sw):
         return png, metrics
     if (a_sc is None) ^ (b_sc is None):
         single_module = "NRCA" if a_sc is not None else "NRCB"
-    if _rollcorr_tag(o):
+    roll_set = _rollcorr_set(o, filt)
+    if _rollcorr_tag(o) or roll_set is not None:
         # record which generation was measured: a requested tag without a COMPLETE corrected set
         # for this (obs, filt) falls back to the uncorrected cats, and the caption must say so
-        metrics.update(roll_tag=_rollcorr_tag(o),
-                       roll_corrected=_rollcorr_set(o, filt) is not None)
+        metrics.update(roll_tag=(_FRAME_ROLL if roll_set and _frames_carry_roll(roll_set)
+                                 else _rollcorr_tag(o)),
+                       roll_corrected=roll_set is not None)
     ov = _ab_overlap(a_sc, b_sc)
     if ov:
         metrics.update(intermodule_off=ov["off"], intermodule_rms=ov["rms"], n_overlap=ov["n"],
@@ -7582,6 +7638,10 @@ def _caption_stage14(metrics):
 def _roll_note(metrics):
     """Stage-5 caption suffix saying whether the per-exposure cats carry the per-visit roll
     correction (JWST-GC/data-qa#346)."""
+    if metrics.get("roll_corrected") and metrics.get("roll_tag") == _FRAME_ROLL:
+        return ("\n\nPositions come from per-exposure catalogues with the per-visit roll "
+                "correction applied in the frame WCS before cataloguing (`ROLLARC` header; "
+                "JWST-GC/data-qa#346).")
     if metrics.get("roll_corrected"):
         return (f"\n\nPositions come from per-exposure catalogues with the per-visit roll "
                 f"correction applied (JWST-GC/data-qa#346, set `{metrics['roll_tag']}`).")
