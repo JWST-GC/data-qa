@@ -1527,21 +1527,39 @@ def test_daophot_glob_partial_hybrid_psf_keeps_plain_on_every_detector(tmp_path,
     assert len(D._daophot_glob(o, "F200W")) == 4
 
 
-def test_daophot_glob_rollcorr_needs_hybrid_copies(tmp_path, monkeypatch):
-    # primary is hybrid, roll-corrected copies only plain -> uncorrected hybrid (the stage-5 guard
-    # then keeps the corrected comment); once hybrid copies exist they are used
+def _rolled_header_cat(path, rolled=True):
+    from astropy.io import fits
+    h = fits.Header()
+    if rolled:
+        h["ROLLCORR"] = True; h["ROLLARC"] = 17.93
+    fits.HDUList([fits.PrimaryHDU(), fits.BinTableHDU(header=h)]).writeto(path, overwrite=True)
+
+
+def test_daophot_glob_rollcorr_uses_frame_rolled_hybrid_cats_directly(tmp_path, monkeypatch):
+    # the hybrid cats were measured on frames already carrying the roll (ROLLCORR/ROLLARC):
+    # they are the corrected set themselves, never the plain catalogs_rollcorr copies
     monkeypatch.setattr(D, "BASE", str(tmp_path))
     monkeypatch.setenv("QA_ROLLCORR_TAG", "v1_perframe")
     _hybpsf_tree(tmp_path, ("nrca1", "nrcb1"))
+    d = tmp_path / "gc2211" / "F200W"
+    for p in d.glob("*_hybpsf_m3_*"):
+        _rolled_header_cat(p)
     o = _obs(obs="023")
     got = D._daophot_glob(o, "F200W", rollcorr=True)
-    assert not D._is_rollcorr(got) and all("_hybpsf" in g for g in got)
-    for det in ("nrca1", "nrcb1"):
-        for e in (1, 2):
-            _touch(tmp_path / "gc2211" / "catalogs_rollcorr" / "v1_perframe",
-                   f"f200w_{det}_o023_visit001_exp{e}_hybpsf_m3_daophot_basic.fits")
-    got = D._daophot_glob(o, "F200W", rollcorr=True)
-    assert len(got) == 4 and D._is_rollcorr(got) and all("_hybpsf" in g for g in got)
+    assert len(got) == 4 and all("_hybpsf" in g and "/catalogs_rollcorr/" not in g for g in got)
+    assert D._is_rollcorr(got) and D._rollcorr_set(o, "F200W") is not None
+    assert "frame WCS" in D._roll_note(dict(roll_corrected=True, roll_tag=D._FRAME_ROLL))
+    assert D._roll_note(dict(roll_corrected=True, roll_tag=D._FRAME_ROLL)).find("roll correction applied") > 0
+
+
+def test_daophot_glob_rollcorr_unrolled_hybrid_without_copies_is_uncorrected(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "BASE", str(tmp_path))
+    monkeypatch.setenv("QA_ROLLCORR_TAG", "v1_perframe")
+    _hybpsf_tree(tmp_path, ("nrca1", "nrcb1"))
+    for p in (tmp_path / "gc2211" / "F200W").glob("*_hybpsf_m3_*"):
+        _rolled_header_cat(p, rolled=False)
+    got = D._daophot_glob(_obs(obs="023"), "F200W", rollcorr=True)
+    assert all("_hybpsf" in g for g in got) and not D._is_rollcorr(got)
 
 
 def test_daophot_glob_ignores_rollcorr_without_tag(tmp_path, monkeypatch):
