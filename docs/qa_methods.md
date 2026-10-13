@@ -823,6 +823,72 @@ neighbour: `status`, `overlap_arcmin2`, `n_pairs`, `dra_mas`, `ddec_mas`, `offse
 Source: [`data_qa/diagnostics.py` → `stage13_neighbor_overlap`](../data_qa/diagnostics.py)
 (`_overlapping_neighbors`, `_load_nb_sample`, `_neighbor_agreement`).
 
+<a id="stage13-zeropoints"></a>
+## Stage 13 zero points across tiles and modules (aggregate tool)
+
+`python -m data_qa.neighbor_zeropoints --outdir <dir> --filters F212N F480M --nproc N` collects
+every [stage-13](#stage13) overlap of a mosaic program and
+solves for one photometric zero point per tile, and per NIRCam module, so field-to-field and
+module-to-module calibration differences can be read off directly instead of pair by pair. It
+reuses stage 13's footprints, sample cuts and matching (`_overlapping_neighbors`,
+`_load_nb_sample`, `_neighbor_agreement`) and runs them in each requested filter on three m8_dedup
+catalogue flavours: the merged catalogue and the per-module NRCA and NRCB catalogues.
+
+**Edges.** Each measurement is the median Δmag (Vega) of the vetted pairs, `d = m_a − m_b`, with
+error σ = 1.2533 · 1.4826 MAD / √N (the standard error of a median). Merged edges come from every
+overlapping tile pair. Module edges come from every cross-tile module combination that shares stars
+in the overlap (NRCA_i–NRCA_j, NRCA_i–NRCB_j, …) and, within one tile, from NRCA against NRCB over
+the whole footprint, where dithers put the two modules on the same sky.
+
+**Models** (weighted least squares, one set per filter):
+
+- `tile`: merged edges, `d = z_i − z_j`;
+- `tile+AB`: module edges, `d = z_i + s_a Δ/2 − z_j − s_b Δ/2` with s = +1 for NRCA and −1 for
+  NRCB, so Δ is one global NRCA − NRCB offset per filter;
+- `tile×module`: module edges, one free zero point per (tile, module); the per-tile `z_A − z_B` and
+  its error (propagated through the covariance) come from this model.
+
+**Gauge.** Zero points are relative: the mean over the nodes of each connected component of the
+overlap graph is fixed to zero (Lagrange constraint). A tile's `z` is its offset from the program
+mean; positive `z` means that tile's catalogue magnitudes are fainter than the mean.
+
+**Errors.** The formal median errors are small (≲1 mmag for thousands of pairs) and do not include
+systematics such as magnitude-dependent offsets, crowding or background differences, so χ²/dof is
+usually ≫ 1. The tool reports χ²/dof with the formal errors and the error floor that, added in
+quadrature to every edge, brings χ²/dof to 1. The quoted zero-point and Δ uncertainties include
+that floor; the formal ones are kept in the JSON as `*_err_formal`.
+
+Two properties of the formal errors were checked on the GC Treasury 10678 run (2026-10-13):
+
+- *Shared stars between edges.* A star in a tile-pair overlap lies on one module of each tile
+  (except in the narrow dither overlap between modules), so the four cross-tile module edges of a
+  pair use nearly disjoint stars. Their pair counts sum to the merged edge's count (ratio 1.00
+  median, 1.04 at the 95th percentile), so the module edges are treated as independent with no √2
+  correction.
+- *Flux-vet truncation.* `_neighbor_agreement` drops pairs more than 0.5 mag from the median Δmag
+  before the MAD is taken. The measured Δmag scatter is 0.03–0.10 mag (95th percentile 0.055 in
+  F212N, 0.071 in F480M), so the cut lies at ≥ 5σ and lowers the MAD by a negligible amount for a
+  near-Gaussian core. Non-Gaussian systematics are what the error floor absorbs.
+
+Each connected component of the overlap graph has its own gauge, so zero-point spreads are reported
+per component (`tile_zp_rms_components`; the headline is the largest component). The pooled
+`tile_zp_rms_pooled` mixes gauges and is kept for reference only. The sky map outlines each
+component in its own colour.
+
+Outputs per filter: `s13zp_<filt>_edges.json` (cached measurements, keyed on the catalogue
+directory, filter, tile set and every input catalogue's and footprint mosaic's size and mtime; a
+rerun with the same key re-solves without re-matching, any change re-measures, and `--no-cache`
+forces it), `s13zp_<filt>.json` (solutions, residuals, χ²/dof, error floor,
+per-tile date, visit and PA_APER), `s13zp_<filt>_skymap.png` (per-tile `z` and per-tile
+`z_A − z_B` about Δ, in Galactic coordinates), `s13zp_<filt>_residuals.png` (pair Δmag before and
+residuals after each solve, and residuals in units of the formal error),
+`s13zp_<filt>_modules.png` (per-tile `z_A − z_B` with the global Δ band) and
+`s13zp_<filt>_vs_time_roll.png` (`z` and `z_A − z_B` against EXPSTART and PA_APER). Across filters,
+`s13zp_summary.png` compares the per-tile `z` and `z_A − z_B` of the two filters and shows the
+per-filter RMS and Δ.
+
+**Source:** [`data_qa/neighbor_zeropoints.py`](../data_qa/neighbor_zeropoints.py).
+
 <a id="stage14"></a>
 ## Stage 14 — fit by iteration (animated cutout)
 
