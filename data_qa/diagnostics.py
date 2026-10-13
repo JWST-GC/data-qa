@@ -7207,27 +7207,53 @@ def stage14_iteration_animation(o: Observation, sw, lw):
 _S15_SIZE_ARCSEC = 5.0
 _S15_TOOLS = ("jicama", "peppar", "starfinder", "jwst1pass")
 _S15_ITERS = (7, 6, 5, 4, 3, 2)
-# hybrid-PSF mosaics first (data-qa#360 prefers the hybrid PSF wherever it exists), then the plain tags
-_S15_JICAMA_TAGS = ("hybpsf_m{n}", "resbgsub_hybpsf_m{n}", "m{n}", "resbgsub_m{n}")
+# (generation, tags): every hybrid-PSF iteration outranks every plain one (_s15_jicama)
+_S15_JICAMA_GENERATIONS = (("hybrid PSF", ("hybpsf_m{n}", "resbgsub_hybpsf_m{n}")),
+                           ("plain PSF", ("m{n}", "resbgsub_m{n}")))
 _S15_MIN_FINITE = 0.9             # a map "covers" the cutout when >= 90% of its pixels are finite
 _S15_NCAND = 40                   # seeded candidate centres tried
 _S15_CLIP_PCT = 99.0              # row colour limit: this percentile of |residual| over the row
 
 
 def _s15_jicama(o: Observation, filt):
-    """The highest-iteration jicama residual mosaic for this obs+filter as a product dict, or a
-    reason string.  jicama's residual mosaic is image − model; its smoothed background is NOT
-    subtracted."""
+    """The jicama residual mosaic for this obs+filter as a product dict, or a reason string.
+
+    Hybrid PSF first (user rule, 2026-10-12: "use hybrid psfs when they are available"): when any
+    non-quarantined hybrid-PSF residual mosaic exists, the highest hybrid iteration is shown even
+    if a plain-PSF generation reaches a higher iteration -- a tile mid-re-catalogue (10678 o068:
+    hybpsf m2/m3 beside the older plain m4-m7) would otherwise show the stale plain generation.
+    Otherwise the highest plain iteration.  Mosaics quarantined by the pipeline
+    (``..._residual_i2d_im0_badastrom*.fits``) are never shown; every quarantined tag of the
+    obs+filter is returned in ``quarantined`` so the metrics say what was skipped.  jicama's residual mosaic is
+    image − model; its smoothed background is NOT subtracted."""
     dirs = _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")
-    for n in _S15_ITERS:
-        for tag in (t.format(n=n) for t in _S15_JICAMA_TAGS):
-            stem = (f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_{tag}"
-                    f"_daophot_basic_mergedcat_residual_i2d.fits")
-            for d in dirs:
-                g = sorted(glob.glob(f"{d}/{stem}"))
-                if g:
-                    return dict(tool="jicama", kind="mosaic", path=g[-1], wcs_path=g[-1],
-                                iteration=f"m{n}", tag=tag)
+
+    def stem(tag):
+        return (f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_{tag}"
+                f"_daophot_basic_mergedcat_residual_i2d")
+
+    def find(tag):
+        for d in dirs:
+            g = sorted(glob.glob(f"{d}/{stem(tag)}.fits"))
+            if g:
+                return g[-1]
+        return None
+
+    # every quarantined residual mosaic of this obs+filter, whichever generation is shown
+    quarantined = [t.format(n=n) for _, tags in _S15_JICAMA_GENERATIONS for n in _S15_ITERS
+                   for t in tags
+                   if any(glob.glob(f"{d}/{stem(t.format(n=n))}_im0_badastrom*.fits") for d in dirs)]
+    for generation, tags in _S15_JICAMA_GENERATIONS:
+        for n in _S15_ITERS:
+            for tag in (t.format(n=n) for t in tags):
+                path = find(tag)
+                if path:
+                    return dict(tool="jicama", kind="mosaic", path=path, wcs_path=path,
+                                iteration=f"m{n}", tag=tag, generation=generation,
+                                quarantined=quarantined)
+    if quarantined:
+        return (f"every jicama residual mosaic is quarantined (`*_im0_badastrom`: "
+                f"{', '.join(quarantined)})")
     return "no jicama residual mosaic (`*-merged_<tag>_daophot_basic_mergedcat_residual_i2d.fits`)"
 
 
@@ -7543,6 +7569,8 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                 shown[t] = rs
                 units.add(m.unit or "unitless")
                 per_tool[t][f] = dict(file=os.path.basename(m.prod["path"]), iteration=m.prod["iteration"],
+                                      tag=m.prod.get("tag"), generation=m.prod.get("generation"),
+                                      quarantined_skipped=list(m.prod.get("quarantined") or []),
                                       unit=m.unit, rms=st["rms"], mad_sigma=st["mad_sigma"],
                                       median_subtracted=st["median"], n_pix=st["n_pix"],
                                       native_pixscale_arcsec=m.pixscale())
@@ -7579,6 +7607,8 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                     stem = pt["file"].replace(".fits", "")
                     stem = stem if len(stem) <= 34 else "…" + stem[-33:]
                     it = cuts[(t, f)][0].prod["tag"] or pt["iteration"]
+                    if pt.get("generation"):
+                        it += f", {pt['generation']}"
                     ax.set_title(f"{t}" + (f" ({it})" if it else "") + f"\n{stem}", fontsize=7)
                     ax.text(0.03, 0.03, f"RMS {pt['rms']:.3g}\nMAD-σ {pt['mad_sigma']:.3g}",
                             transform=ax.transAxes, fontsize=7, va="bottom",
@@ -8056,6 +8086,19 @@ def _caption_stage14(metrics):
               "([how this is made](DOCROOT#stage14))")
 
 
+def _s15_jicama_note(per_filter):
+    """'F212N hybpsf_m3 (hybrid PSF), ...' plus any quarantined iterations passed over."""
+    parts = []
+    for f, d in per_filter.items():
+        txt = f"{f} {d.get('tag') or d.get('iteration')}"
+        if d.get("generation"):
+            txt += f" ({d['generation']})"
+        if d.get("quarantined_skipped"):
+            txt += f", quarantined and skipped: {', '.join(d['quarantined_skipped'])}"
+        parts.append(txt)
+    return "; ".join(parts) or "none"
+
+
 def _caption_stage15(metrics):
     """Stage-15 caption: which tools are shown, which are skipped and why, and how panels are made."""
     if metrics.get("available") is False:
@@ -8077,7 +8120,9 @@ def _caption_stage15(metrics):
             + ("The first column is the released i2d (asinh stretch) for reference. "
                if metrics.get("has_reference") else "")
             + f"The other columns are the residual maps of {', '.join(present)}: jicama's merged "
-              f"residual mosaic of its highest iteration (image − model, background kept), and "
+              f"residual mosaic of its highest non-quarantined iteration, hybrid PSF whenever any "
+              f"hybrid-PSF mosaic exists (image − model, background kept; shown: "
+              f"{_s15_jicama_note(pt.get('jicama') or {})}), and "
               f"peppar's residual of one single exposure that covers the cutout (background "
               f"subtracted; fit in DN/s and multiplied back by the cal frame's PHOTMJSR; WCS from "
               f"the cal frame). Each cutout has its median subtracted "

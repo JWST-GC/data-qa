@@ -197,3 +197,48 @@ def test_stage15_caption_and_default_stage_list(field):
     here = os.path.dirname(__file__)
     sh = open(os.path.join(here, "..", "..", "scripts", "refresh_all_issues.sh")).read()
     assert "11 12 13 14 15}" in sh
+
+
+def _jicama_dir(tmp_path, monkeypatch, tags, quarantined=()):
+    """Empty residual-mosaic files for ``tags`` (and quarantined copies for ``quarantined``)."""
+    d = tmp_path / "F212N" / "pipeline"
+    d.mkdir(parents=True)
+    stem = "jw10678-o066_t001_nircam_clear-f212n-merged_{}_daophot_basic_mergedcat_residual_i2d"
+    for t in tags:
+        (d / (stem.format(t) + ".fits")).write_bytes(b"")
+    for t in quarantined:
+        (d / (stem.format(t) + "_im0_badastrom.fits")).write_bytes(b"")
+    monkeypatch.setattr(D, "_field_dirs", lambda o, *rels: [str(d)])
+
+
+def test_stage15_jicama_hybrid_psf_outranks_higher_plain_iteration(tmp_path, monkeypatch):
+    """A tile mid-re-catalogue (o068: hybpsf m2/m3 beside plain m4-m7) shows hybpsf_m3."""
+    _jicama_dir(tmp_path, monkeypatch, ["hybpsf_m2", "hybpsf_m3", "m2", "m3", "m4",
+                                        "resbgsub_m5", "resbgsub_m6", "resbgsub_m7"])
+    r = D._s15_jicama(_obs(), "F212N")
+    assert r["tag"] == "hybpsf_m3" and r["generation"] == "hybrid PSF" and r["iteration"] == "m3"
+
+
+def test_stage15_jicama_skips_quarantined_and_records_them(tmp_path, monkeypatch):
+    # o067-like: the whole plain generation quarantined, hybrid m2/m3 live
+    _jicama_dir(tmp_path, monkeypatch, ["hybpsf_m2", "hybpsf_m3"],
+                quarantined=["m2", "m3", "m4", "resbgsub_m5", "resbgsub_m6", "resbgsub_m7"])
+    r = D._s15_jicama(_obs(), "F212N")
+    assert r["tag"] == "hybpsf_m3"
+    assert r["quarantined"] == ["resbgsub_m7", "resbgsub_m6", "resbgsub_m5", "m4", "m3", "m2"]
+
+
+def test_stage15_jicama_plain_fallback_skips_quarantined_top(tmp_path, monkeypatch):
+    _jicama_dir(tmp_path, monkeypatch, ["m4", "resbgsub_m6"],
+                quarantined=["hybpsf_m3", "resbgsub_m7"])
+    r = D._s15_jicama(_obs(), "F212N")
+    assert r["tag"] == "resbgsub_m6" and r["generation"] == "plain PSF"
+    assert r["quarantined"] == ["hybpsf_m3", "resbgsub_m7"]       # hybrid first, high n first
+    note = D._s15_jicama_note({"F212N": dict(tag=r["tag"], generation=r["generation"],
+                                             quarantined_skipped=r["quarantined"])})
+    assert note == "F212N resbgsub_m6 (plain PSF), quarantined and skipped: hybpsf_m3, resbgsub_m7"
+
+
+def test_stage15_jicama_all_quarantined_gives_reason(tmp_path, monkeypatch):
+    _jicama_dir(tmp_path, monkeypatch, [], quarantined=["resbgsub_m7"])
+    assert "quarantined" in D._s15_jicama(_obs(), "F212N")

@@ -901,10 +901,16 @@ loses its column, and the reason is listed in the figure title, the caption and 
 blank.
 
 **Residual maps per tool.**
-* **jicama:** the merged residual mosaic of the highest iteration
-  (`<obsid>_t001_nircam_clear-<filt>-merged_<tag>_daophot_basic_mergedcat_residual_i2d.fits`,
-  tags `hybpsf_m<n>`, `resbgsub_hybpsf_m<n>`, `m<n>`, `resbgsub_m<n>` for n = 7 … 2). This is
-  image − model with the smoothed background kept.
+* **jicama:** the merged residual mosaic
+  `<obsid>_t001_nircam_clear-<filt>-merged_<tag>_daophot_basic_mergedcat_residual_i2d.fits`.
+  **Rule: hybrid PSF whenever available.** If any non-quarantined hybrid-PSF residual mosaic
+  (`hybpsf_m<n>`, `resbgsub_hybpsf_m<n>`) exists for the obs+filter, the highest hybrid iteration is
+  shown, even when a plain-PSF generation reaches a higher iteration (a tile mid-re-catalogue, e.g.
+  10678 o068 with hybpsf m2/m3 beside the older plain m4–m7, shows hybpsf_m3). Otherwise the
+  highest plain iteration (`m<n>`, `resbgsub_m<n>`, n = 7 … 2). Mosaics the pipeline quarantined
+  (`…_residual_i2d_im0_badastrom*.fits`) are never shown; every quarantined tag of the obs+filter is
+  listed in the caption and in `quarantined_skipped`. The chosen tag and PSF generation appear in the panel title, the
+  caption and the metrics. The residual is image − model with the smoothed background kept.
 * **peppar:** the per-exposure residual `*_res_FINAL.fits` (else `*_iter1_res.fits`) under
   `<field>/peppar/[o<obs>/]<FILT>/<DET>/`, scoped to this observation by its `jw<prog><obs>` file
   prefix. These files hold a bare image, so the WCS comes from the matching cal frame
@@ -948,7 +954,8 @@ covering the chosen centre: the stage returns no figure and posts nothing; the r
 as `na_reason`.
 
 **Metrics.** `center_ra`, `center_dec`, `tools_present`, `tools_missing` (tool → reason),
-`per_tool` (tool → filter → `file`, `iteration`, `unit`, `rms`, `mad_sigma`, `median_subtracted`,
+`per_tool` (tool → filter → `file`, `iteration`, `tag`, `generation` (jicama: `hybrid PSF` / `plain PSF`),
+`quarantined_skipped`, `unit`, `rms`, `mad_sigma`, `median_subtracted`,
 `n_pix`, `native_pixscale_arcsec`), `has_reference`, `inputs`; `passed` is always null.
 
 Source: [`data_qa/diagnostics.py` → `stage15_residual_comparison`](../data_qa/diagnostics.py)
