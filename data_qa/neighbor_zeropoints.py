@@ -29,7 +29,8 @@ so a tile's ``z`` is its offset from the program mean.  Positive ``z`` = that ti
 magnitudes are fainter than the mean.
 
 Outputs, per filter, in ``--outdir``: ``s13zp_<filt>_edges.json`` (cached pair measurements; a rerun
-re-solves without re-matching unless ``--no-cache``), ``s13zp_<filt>.json`` (solutions, residuals,
+re-solves without re-matching while the cache key -- catdir, filter, tile set, input
+catalogue and footprint size+mtime -- is unchanged, or unless ``--no-cache``), ``s13zp_<filt>.json`` (solutions, residuals,
 chi^2/dof, the error floor that brings chi^2/dof to 1, per-tile metadata), and figures:
 ``s13zp_<filt>_skymap.png``, ``s13zp_<filt>_residuals.png``, ``s13zp_<filt>_modules.png``,
 ``s13zp_<filt>_vs_time_roll.png``; across filters ``s13zp_summary.png``.
@@ -304,7 +305,14 @@ def summarise(m, sol):
     if t:
         z = np.asarray(t["z"])
         merged_d = np.array([e["d"] for e in m["edges"] if e["kind"] == "merged"])
-        s.update(tile_zp_rms=float(np.std(z)), tile_zp_mad=_mad(z), tile_zp_range=float(np.ptp(z)),
+        zd = dict(zip(t["nodes"], z))
+        comps = [dict(n=len(c), obs=list(c), rms=float(np.std([zd[o] for o in c])),
+                      range=float(np.ptp([zd[o] for o in c]))) for c in t["components"]]
+        # each component has its own mean-zero gauge, so only per-component spreads are physical;
+        # the pooled numbers mix gauges and are kept (labelled) for reference only
+        s.update(tile_zp_rms_components=comps, tile_zp_rms_largest=comps[0]["rms"],
+                 tile_zp_range_largest=comps[0]["range"],
+                 tile_zp_rms_pooled=float(np.std(z)), tile_zp_mad_pooled=_mad(z),
                  tile_chi2_dof=t["chi2_dof"], tile_sys_floor=t["sys_floor"],
                  tile_n_components=len(t["components"]),
                  pair_dmag_mad_before=_mad(merged_d), pair_resid_mad_after=_mad(t["resid"]),
@@ -340,7 +348,13 @@ def _galactic(vertices):
     return np.c_[lon, g.b.deg]
 
 
-def _skypanel(ax, meta, values, label, vmax=None, cmap="RdBu_r", errs=None):
+_COMP_COLOURS = ("k", "tab:green", "tab:purple", "tab:orange", "tab:cyan", "tab:olive")
+
+
+def _skypanel(ax, meta, values, label, vmax=None, cmap="RdBu_r", components=None):
+    """Tile footprints coloured by ``values``.  With ``components`` (lists of obs ids, largest
+    first), each component's tiles are outlined in their own colour and listed in a legend, since
+    each component carries its own mean-zero gauge."""
     import matplotlib as mpl
     from matplotlib.patches import Polygon as MPoly
     vals = [v for v in values.values() if np.isfinite(v)]
@@ -355,7 +369,11 @@ def _skypanel(ax, meta, values, label, vmax=None, cmap="RdBu_r", errs=None):
         allxy.append(xy)
         v = values.get(o, np.nan)
         fc = cm(norm(v)) if np.isfinite(v) else (0.85, 0.85, 0.85, 1)
-        ax.add_patch(MPoly(xy, closed=True, fc=fc, ec="k", lw=0.4))
+        ec, lw = "k", 0.4
+        for k, c in enumerate(components or []):
+            if o in c:
+                ec, lw = _COMP_COLOURS[k % len(_COMP_COLOURS)], 1.6
+        ax.add_patch(MPoly(xy, closed=True, fc=fc, ec=ec, lw=lw))
         cx, cy = xy.mean(0)
         ax.text(cx, cy, o, ha="center", va="center", fontsize=5)
     if allxy:
@@ -367,6 +385,15 @@ def _skypanel(ax, meta, values, label, vmax=None, cmap="RdBu_r", errs=None):
     ax.set_ylabel("Galactic b (deg)")
     sm = mpl.cm.ScalarMappable(norm=norm, cmap=cm)
     ax.figure.colorbar(sm, ax=ax, label=label, shrink=0.8)
+    if components:
+        from matplotlib.lines import Line2D
+        hand = [Line2D([], [], color=_COMP_COLOURS[k % len(_COMP_COLOURS)], lw=2,
+                       label=f"component {k + 1}: {len(c)} tiles"
+                       + (f", RMS {np.std([values[o] for o in c if o in values]):.3f}"
+                          if any(o in values for o in c) else ""))
+                for k, c in enumerate(components)]
+        ax.legend(handles=hand, fontsize=7, loc="upper left", title="separate gauges (mean 0 each)",
+                  title_fontsize=7)
 
 
 def plot_skymap(m, sol, path):
@@ -375,10 +402,12 @@ def plot_skymap(m, sol, path):
     fig, ax = plt.subplots(1, 2, figsize=(15, 5.6))
     t = sol.get("tile")
     z = {n: float(v) for n, v in zip(t["nodes"], t["z"])} if t else {}
-    _skypanel(ax[0], m["meta"], z, f"{f} tile zero point z (Vega mag; + = fainter than mean)")
-    ax[0].set_title(f"{f}: per-tile zero point (merged m8, gauge mean 0)\n"
-                    f"RMS {np.std(list(z.values())):.3f} mag, χ²/dof {t['chi2_dof']:.1f}"
-                    if t else f"{f}: no merged edges")
+    comps = t["components"] if t else None
+    _skypanel(ax[0], m["meta"], z, f"{f} tile zero point z (Vega mag; + = fainter than its component's mean)",
+              components=comps)
+    ax[0].set_title(f"{f}: per-tile zero point (merged m8, mean 0 per connected component)\n"
+                    f"largest component RMS {np.std([z[o] for o in comps[0]]):.3f} mag, "
+                    f"χ²/dof {t['chi2_dof']:.1f}" if t else f"{f}: no merged edges")
     ab = {o: v[0] for o, v in (sol.get("ab_per_tile") or {}).items()}
     g = sol.get("tile+AB")
     _skypanel(ax[1], m["meta"], {o: v - (g["delta"] if g else 0) for o, v in ab.items()},
@@ -540,11 +569,11 @@ def plot_summary(results, path):
     for res in results:
         s = res["summary"]
         labs.append(s["filter"])
-        rms.append(s.get("tile_zp_rms", np.nan))
+        rms.append(s.get("tile_zp_rms_largest", np.nan))
         ab.append(s.get("ab_global", np.nan))
         abe.append(s.get("ab_global_err", np.nan))
     xx = np.arange(len(labs))
-    ax[2].bar(xx - 0.2, rms, 0.4, label="tile zero-point RMS (merged)", color="C0")
+    ax[2].bar(xx - 0.2, rms, 0.4, label="tile zero-point RMS (merged, largest component)", color="C0")
     ax[2].bar(xx + 0.2, ab, 0.4, yerr=abe, label="global NRCA − NRCB Δ", color="C1", capsize=4)
     ax[2].axhline(0, color="k", lw=0.5)
     ax[2].set_xticks(xx); ax[2].set_xticklabels(labs)
@@ -558,14 +587,40 @@ def plot_summary(results, path):
 
 
 # ------------------------------------------------------------------------------------ main
+def cache_key(catdir, filt, obs_list):
+    """What the edges depend on: the catalogue directory, the filter, the tile set and every input
+    catalogue's (path, size, mtime), plus each tile's footprint mosaic.  A regenerated m8 or a
+    changed ``--obs``/``--catdir`` changes the key, so the cached edges are re-measured."""
+    files = {}
+    for o in obs_list:
+        for mod in ("merged",) + MODULES:
+            p = _cat(catdir, mod, o)
+            st = os.stat(p) if os.path.exists(p) else None
+            files[p] = [st.st_size, st.st_mtime] if st else None
+        fp = D._footprint_path(_obs(o), filt)
+        if fp:
+            st = os.stat(fp)
+            files[fp] = [st.st_size, st.st_mtime]
+    return dict(catdir=os.path.abspath(catdir), filter=filt, tiles=list(obs_list), files=files)
+
+
 def run_filter(catdir, filt, outdir, nproc=1, cache=True, obs_list=None):
     ep = os.path.join(outdir, f"s13zp_{filt.lower()}_edges.json")
+    obs_list = sorted(obs_list) if obs_list else tiles(catdir)
+    key = cache_key(catdir, filt, obs_list)
+    m = None
     if cache and os.path.exists(ep):
         with open(ep) as fh:
             m = json.load(fh)
-        print(f"[s13zp] {filt}: {len(m['edges'])} cached edges from {ep}", flush=True)
-    else:
+        if m.get("cache_key") == key:
+            print(f"[s13zp] {filt}: {len(m['edges'])} cached edges from {ep}", flush=True)
+        else:
+            print(f"[s13zp] {filt}: cached edges in {ep} are stale (inputs or arguments changed); "
+                  "re-measuring", flush=True)
+            m = None
+    if m is None:
         m = measure_filter(catdir, filt, nproc=nproc, obs_list=obs_list)
+        m["cache_key"] = key
         with open(ep, "w") as fh:
             json.dump(m, fh, indent=1)
     sol = solve_filter(m)

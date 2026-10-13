@@ -858,8 +858,27 @@ usually ≫ 1. The tool reports χ²/dof with the formal errors and the error fl
 quadrature to every edge, brings χ²/dof to 1. The quoted zero-point and Δ uncertainties include
 that floor; the formal ones are kept in the JSON as `*_err_formal`.
 
-Outputs per filter: `s13zp_<filt>_edges.json` (cached measurements; a rerun re-solves without
-re-matching unless `--no-cache`), `s13zp_<filt>.json` (solutions, residuals, χ²/dof, error floor,
+Two properties of the formal errors were checked on the GC Treasury 10678 run (2026-10-13):
+
+- *Shared stars between edges.* A star in a tile-pair overlap lies on one module of each tile
+  (except in the narrow dither overlap between modules), so the four cross-tile module edges of a
+  pair use nearly disjoint stars. Their pair counts sum to the merged edge's count (ratio 1.00
+  median, 1.04 at the 95th percentile), so the module edges are treated as independent with no √2
+  correction.
+- *Flux-vet truncation.* `_neighbor_agreement` drops pairs more than 0.5 mag from the median Δmag
+  before the MAD is taken. The measured Δmag scatter is 0.03–0.10 mag (95th percentile 0.055 in
+  F212N, 0.071 in F480M), so the cut lies at ≥ 5σ and lowers the MAD by a negligible amount for a
+  near-Gaussian core. Non-Gaussian systematics are what the error floor absorbs.
+
+Each connected component of the overlap graph has its own gauge, so zero-point spreads are reported
+per component (`tile_zp_rms_components`; the headline is the largest component). The pooled
+`tile_zp_rms_pooled` mixes gauges and is kept for reference only. The sky map outlines each
+component in its own colour.
+
+Outputs per filter: `s13zp_<filt>_edges.json` (cached measurements, keyed on the catalogue
+directory, filter, tile set and every input catalogue's and footprint mosaic's size and mtime; a
+rerun with the same key re-solves without re-matching, any change re-measures, and `--no-cache`
+forces it), `s13zp_<filt>.json` (solutions, residuals, χ²/dof, error floor,
 per-tile date, visit and PA_APER), `s13zp_<filt>_skymap.png` (per-tile `z` and per-tile
 `z_A − z_B` about Δ, in Galactic coordinates), `s13zp_<filt>_residuals.png` (pair Δmag before and
 residuals after each solve, and residuals in units of the formal error),

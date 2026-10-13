@@ -1,5 +1,7 @@
 """Network zero-point solver tests (data_qa.neighbor_zeropoints) on synthetic overlap graphs with
 known zero points and a known NRCA - NRCB module term."""
+import os
+
 import numpy as np
 
 from data_qa import neighbor_zeropoints as Z
@@ -93,4 +95,31 @@ def test_solve_filter_per_tile_module_offsets():
     assert abs(summ["ab_global"] + 0.03) < 0.002
     assert summ["n_edges"] == dict(merged=len(merged), module=len(edges) - len(tiles[::3]),
                                    intra=len(tiles[::3]))
-    assert np.isclose(summ["tile_zp_rms"], np.std([z[t] for t in tiles]), atol=1e-6)
+    assert summ["tile_n_components"] == 1
+    assert np.isclose(summ["tile_zp_rms_largest"], np.std([z[t] for t in tiles]), atol=1e-6)
+
+
+def test_summary_reports_rms_per_component():
+    edges = [dict(a="a", b="b", kind="merged", d=0.2, err=0.01),
+             dict(a="b", b="c", kind="merged", d=0.0, err=0.01),
+             dict(a="x", b="y", kind="merged", d=0.02, err=0.01)]
+    m = dict(filter="F212N", tiles=["a", "b", "c", "x", "y"], edges=edges, meta={})
+    summ = Z.summarise(m, Z.solve_filter(m))
+    comps = summ["tile_zp_rms_components"]
+    assert [c["n"] for c in comps] == [3, 2]
+    assert np.isclose(comps[1]["rms"], 0.01) and np.isclose(comps[1]["range"], 0.02)
+    assert summ["tile_zp_rms_largest"] == comps[0]["rms"]
+
+
+def test_cache_key_tracks_inputs_and_arguments(tmp_path, monkeypatch):
+    monkeypatch.setattr(Z.D, "_footprint_path", lambda o, f: None)
+    for o in ("001", "002"):
+        for mod in ("merged",) + Z.MODULES:
+            (tmp_path / Z._CAT_FMT.format(mod=mod, obs=o)).write_text("x")
+    k1 = Z.cache_key(str(tmp_path), "F212N", ["001", "002"])
+    assert k1 == Z.cache_key(str(tmp_path), "F212N", ["001", "002"])
+    assert k1 != Z.cache_key(str(tmp_path), "F212N", ["001"])
+    assert k1 != Z.cache_key(str(tmp_path), "F480M", ["001", "002"])
+    p = tmp_path / Z._CAT_FMT.format(mod="nrca", obs="002")
+    os.utime(p, (1e9, 1e9))
+    assert k1 != Z.cache_key(str(tmp_path), "F212N", ["001", "002"])
