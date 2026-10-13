@@ -6880,7 +6880,8 @@ def _s14_iter_products(o: Observation, filt):
     dirs = _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")
     out = {}
     for n in _S14_ITERS:
-        for tag in (f"m{n}", f"resbgsub_m{n}"):
+        # hybrid-PSF products first (data_qa.psf_generation), then the plain ones
+        for tag in (f"hybpsf_m{n}", f"resbgsub_hybpsf_m{n}", f"m{n}", f"resbgsub_m{n}"):
             stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_{tag}_daophot_basic_mergedcat"
             hit = {}
             for kind, suffix in (("model", "model_i2d"), ("residual", "residual_i2d"),
