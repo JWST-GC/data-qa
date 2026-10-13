@@ -7200,12 +7200,430 @@ def stage14_iteration_animation(o: Observation, sw, lw):
     return out, metrics
 
 
+# --------------------------------------------------------------------------- stage 15
+# Residual maps of one ~5"x5" cutout side by side, one column per photometry tool (jicama, peppar,
+# starfinder, jwst1pass) and one row per filter.  A tool with no residual map covering the cutout
+# loses its column; the reason is recorded in the metrics.
+_S15_SIZE_ARCSEC = 5.0
+_S15_TOOLS = ("jicama", "peppar", "starfinder", "jwst1pass")
+_S15_ITERS = (7, 6, 5, 4, 3, 2)
+# hybrid-PSF mosaics first (data-qa#360 prefers the hybrid PSF wherever it exists), then the plain tags
+_S15_JICAMA_TAGS = ("hybpsf_m{n}", "resbgsub_hybpsf_m{n}", "m{n}", "resbgsub_m{n}")
+_S15_MIN_FINITE = 0.9             # a map "covers" the cutout when >= 90% of its pixels are finite
+_S15_NCAND = 40                   # seeded candidate centres tried
+_S15_CLIP_PCT = 99.0              # row colour limit: this percentile of |residual| over the row
+
+
+def _s15_jicama(o: Observation, filt):
+    """The highest-iteration jicama residual mosaic for this obs+filter as a product dict, or a
+    reason string.  jicama's residual mosaic is image − model; its smoothed background is NOT
+    subtracted."""
+    dirs = _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")
+    for n in _S15_ITERS:
+        for tag in (t.format(n=n) for t in _S15_JICAMA_TAGS):
+            stem = (f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_{tag}"
+                    f"_daophot_basic_mergedcat_residual_i2d.fits")
+            for d in dirs:
+                g = sorted(glob.glob(f"{d}/{stem}"))
+                if g:
+                    return dict(tool="jicama", kind="mosaic", path=g[-1], wcs_path=g[-1],
+                                iteration=f"m{n}", tag=tag)
+    return "no jicama residual mosaic (`*-merged_<tag>_daophot_basic_mergedcat_residual_i2d.fits`)"
+
+
+def _s15_peppar(o: Observation, filt):
+    """Every peppar per-frame residual for this obs+filter, as a list of product dicts (one per
+    frame, each with the cal frame that carries its WCS), or a reason string.  The residual FITS
+    hold only a bare image; the cal frame's SCI header supplies the WCS and the units."""
+    pdir = _peppar_dir(o, filt)
+    if pdir is None:
+        return "no peppar directory for this filter"
+    prefix = f"jw{int(o.program):05d}{o.obs}"          # obs-scoping for the flat layout
+    for pat, it in (("*_res_FINAL.fits", "FINAL"), ("*_iter1_res.fits", "iter1")):
+        hits = [p for p in sorted(glob.glob(f"{pdir}/*/{pat}"))
+                if os.path.basename(p).startswith(prefix)]
+        if not hits:
+            continue
+        out = []
+        for p in hits:
+            stem = p[: -len(pat) + 1]                   # drop the suffix after the '*'
+            cal = _peppar_cal_for_cat(stem + "_iter1_cat.fits")
+            if cal:
+                out.append(dict(tool="peppar", kind="frame", path=p, wcs_path=cal, iteration=it,
+                                tag=f"single frame, {it}"))
+        if out:
+            return out
+        return f"peppar {it} residuals found but none maps to a cal frame (no WCS)"
+    return "no peppar per-frame residuals (`*_res_FINAL.fits` / `*_iter1_res.fits`)"
+
+
+def _s15_starfinder(o: Observation, filt):
+    """A StarFinder residual image for this obs+filter, or a reason string.  Shallow, obs-scoped
+    globs only: the one StarFinder residual on disk today (sickle F480M) sits in a
+    ``v4_tainted_backup_*`` directory and is deliberately not picked up."""
+    pats = [f"starfinder/o{o.obs}/{filt}/*resid*.fits", f"starfinder/{filt}/*o{o.obs}*resid*.fits",
+            f"{filt}/starfinder*{o.obsid}*resid*.fits", f"{filt}/pipeline/*{o.obsid}*starfinder*resid*.fits"]
+    for pat in pats:
+        hits = _fglob(o, pat)
+        if hits:
+            return dict(tool="starfinder", kind="mosaic", path=hits[-1], wcs_path=hits[-1],
+                        iteration="", tag="")
+    return "no StarFinder residual images on disk"
+
+
+def _s15_jwst1pass(o: Observation, filt):
+    """A jwst1pass residual image for this obs+filter, or a reason string.  jwst1pass writes PSF
+    grids (``*_psf.fits``), ``LOG.psfperts.fits`` (PSF-perturbation residuals, not sky residuals)
+    and catalogues; no residual images exist yet (2026-10-13), so this normally returns the reason."""
+    base = f"{_JWST1PASS_ROOTS.get(o.field, _JWST1PASS_DEFAULT_ROOT)}/{o.field}/jwst1pass/{filt}/o{o.obs}"
+    for pat in (f"{base}/*resid*.fits", f"{base}/*/*resid*.fits", f"{base}/*_res.fits"):
+        hits = [h for h in sorted(glob.glob(pat)) if "psfperts" not in os.path.basename(h)]
+        if hits:
+            return dict(tool="jwst1pass", kind="mosaic", path=hits[-1], wcs_path=hits[-1],
+                        iteration="", tag="")
+    return "no residual images written by jwst1pass (PSF grids and catalogues only)"
+
+
+_S15_FINDERS = {"jicama": _s15_jicama, "peppar": _s15_peppar,
+                "starfinder": _s15_starfinder, "jwst1pass": _s15_jwst1pass}
+
+
+class _S15Map:
+    """An open residual map: memory-mapped data, its celestial WCS, its unit and the factor that
+    brings it to that unit.
+
+    peppar fits each cal frame divided by its ``PHOTMJSR`` (DN/s): on 10678 o066 and brick o001,
+    SW and LW, the peppar ``_iter1_orig`` image is the cal SCI plane times 1/PHOTMJSR to 7 digits.
+    Its residuals are therefore multiplied back by the cal frame's PHOTMJSR to put them in the
+    cal frame's MJy/sr, the unit of the jicama mosaics."""
+
+    def __init__(self, prod):
+        import warnings
+        from astropy.io import fits
+        from astropy.wcs import WCS, FITSFixedWarning
+        self.prod = prod
+        self.hdul = fits.open(prod["path"], memmap=True)
+        hdu = self.hdul["SCI"] if "SCI" in self.hdul else next(
+            h for h in self.hdul if getattr(h, "data", None) is not None and h.data.ndim == 2)
+        self.data = hdu.data
+        self.scale = 1.0
+        if prod["wcs_path"] == prod["path"]:
+            hdr = hdu.header
+            self.unit = str(hdr.get("BUNIT", "") or "").strip()
+        else:                                           # peppar: WCS + unit from the cal frame
+            hdr = fits.getheader(prod["wcs_path"], "SCI")
+            photmjsr = hdr.get("PHOTMJSR")
+            if photmjsr:
+                self.scale = float(photmjsr)
+                self.unit = str(hdr.get("BUNIT", "") or "MJy/sr").strip()
+            else:
+                self.unit = "DN/s"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            self.wcs = WCS(hdr).celestial
+        self.ny, self.nx = self.data.shape
+
+    def close(self):
+        self.hdul.close()
+
+    def covers(self, c, half_pix):
+        """Cheap footprint test: is the full cutout inside the array?  The linear WCS core screens
+        first (with a margin for the distortion), because the SIP inverse of a cal frame does not
+        converge for points far off the detector."""
+        if not self.wcs.has_celestial:
+            return False
+        x, y = self.wcs.wcs_world2pix([[c.ra.deg, c.dec.deg]], 0)[0]
+        m = half_pix - 50.0
+        if not ((m <= x <= self.nx - 1 - m) and (m <= y <= self.ny - 1 - m)):
+            return False
+        x, y = self.wcs.world_to_pixel(c)
+        return (half_pix <= x <= self.nx - 1 - half_pix) and (half_pix <= y <= self.ny - 1 - half_pix)
+
+    def cutout(self, c):
+        """(data, wcs) of the _S15_SIZE_ARCSEC cutout, or None when it misses the map or is mostly
+        blank."""
+        from astropy.nddata import Cutout2D, NoOverlapError
+        import astropy.units as u
+        if not self.wcs.has_celestial:
+            return None
+        try:
+            co = Cutout2D(self.data, c, _S15_SIZE_ARCSEC * u.arcsec, wcs=self.wcs, mode="partial",
+                          fill_value=np.nan)
+        except NoOverlapError:
+            return None
+        d = np.array(co.data, dtype="float32") * np.float32(self.scale)
+        if np.isfinite(d).mean() < _S15_MIN_FINITE:
+            return None
+        return d, co.wcs
+
+    def pixscale(self):
+        from astropy.wcs.utils import proj_plane_pixel_scales
+        return float(np.mean(proj_plane_pixel_scales(self.wcs)) * 3600.0)
+
+
+def _s15_open(prods):
+    """Open every product, skipping files that will not open or carry no celestial WCS."""
+    out = []
+    for p in prods:
+        try:
+            m = _S15Map(p)
+        except (OSError, ValueError, KeyError, StopIteration):
+            continue
+        if m.wcs.has_celestial:
+            out.append(m)
+        else:
+            m.close()
+    return out
+
+
+def _s15_cover(maps, c):
+    """The first map (sorted order) whose cutout around ``c`` is >= 90% finite, with its cutout."""
+    for m in maps:
+        half_pix = 0.5 * _S15_SIZE_ARCSEC / m.pixscale()
+        if not m.covers(c, half_pix):
+            continue
+        cut = m.cutout(c)
+        if cut is not None:
+            return m, cut
+    return None, None
+
+
+def _s15_candidates(o, sw, opened, rng):
+    """Seeded candidate centres: random SW sources from the jicama catalogue of the displayed
+    iteration when it exists, else random positions inside the first SW map's footprint."""
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    jm = opened.get(("jicama", sw)) or []
+    cat = _s14_perfilter_catalog(o, sw, jm[0].prod["tag"]) if jm else None
+    if cat:
+        ra, de = _s14_cat_radec(cat)
+        ok = np.isfinite(ra) & np.isfinite(de)
+        ra, de = ra[ok], de[ok]
+        if len(ra):
+            idx = rng.choice(len(ra), size=min(_S15_NCAND, len(ra)), replace=False)
+            return [SkyCoord(ra[i] * u.deg, de[i] * u.deg) for i in idx], (ra, de)
+    ref = next((ms[0] for (t, f), ms in sorted(opened.items()) if f == sw and ms), None)
+    if ref is None:
+        return [], None
+    x = rng.uniform(0.1 * ref.nx, 0.9 * ref.nx, _S15_NCAND)
+    y = rng.uniform(0.1 * ref.ny, 0.9 * ref.ny, _S15_NCAND)
+    return [ref.wcs.pixel_to_world(xi, yi) for xi, yi in zip(x, y)], None
+
+
+def _s15_pick_center(o, sw, filters, opened, seed=None):
+    """A reproducible centre (rng seeded by the obsid) that the most (tool, filter) residual maps
+    cover; ties go to the candidate with the median SW source count in the box."""
+    import zlib
+    rng = np.random.default_rng(zlib.crc32(o.obsid.encode()) if seed is None else seed)
+    cands, srcs = _s15_candidates(o, sw, opened, rng)
+    half = _S15_SIZE_ARCSEC / 2.0
+    scored = []
+    for c in cands:
+        ncov = sum(1 for f in filters for t in _S15_TOOLS
+                   if opened.get((t, f)) and _s15_cover(opened[(t, f)], c)[0] is not None)
+        nsrc = int(_s14_in_box(*srcs, c, half).sum()) if srcs else 0
+        scored.append((ncov, nsrc, c))
+    if not scored:
+        return None
+    best = max(s[0] for s in scored)
+    if best == 0:
+        return None
+    keep = sorted((s for s in scored if s[0] == best), key=lambda s: s[1])
+    return keep[len(keep) // 2][2]
+
+
+def _s15_target_wcs(c, pixscale):
+    """North-up TAN grid centred on ``c`` spanning _S15_SIZE_ARCSEC at ``pixscale`` arcsec/pix."""
+    from astropy.wcs import WCS
+    n = int(np.ceil(_S15_SIZE_ARCSEC / pixscale))
+    w = WCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crval = [c.ra.deg, c.dec.deg]
+    w.wcs.crpix = [(n + 1) / 2.0, (n + 1) / 2.0]
+    w.wcs.cdelt = [-pixscale / 3600.0, pixscale / 3600.0]
+    return w, (n, n)
+
+
+def _s15_stats(d):
+    """Median-subtracted residual RMS and 1.4826·MAD of a native-pixel cutout."""
+    v = d[np.isfinite(d)]
+    med = float(np.median(v))
+    return dict(median=med, rms=float(np.sqrt(np.mean((v - med) ** 2))),
+                mad_sigma=float(1.4826 * np.median(np.abs(v - med))), n_pix=int(v.size))
+
+
+def stage15_residual_comparison(o: Observation, sw, lw):
+    """Residual maps of one 5"x5" cutout from every photometry tool that wrote one.
+
+    Rows: the SW and LW filter.  Columns: the released i2d (reference, own asinh stretch) and then
+    one column per tool with a residual map covering the cutout (jicama mosaic of the highest
+    iteration, one peppar single-frame residual, StarFinder, jwst1pass).  A tool missing in every
+    row loses its column.  Each residual cutout is median-subtracted (jicama keeps its background
+    in the residual, peppar subtracts it) and resampled onto one north-up grid per row; all
+    residual panels in a row share one symmetric linear colour scale."""
+    from astropy.visualization import ImageNormalize, AsinhStretch
+    from matplotlib.colors import Normalize
+    from reproject import reproject_interp
+    metrics = dict(stage=15, sw=sw, lw=lw)
+    filters = [f for f in (sw, lw) if f]
+    found, missing = {}, {}
+    for t in _S15_TOOLS:
+        per = {}
+        reasons = []
+        for f in filters:
+            r = _S15_FINDERS[t](o, f)
+            if isinstance(r, str):
+                reasons.append((f, r))
+            else:
+                per[f] = r if isinstance(r, list) else [r]
+        if per:
+            found[t] = per
+        else:                                   # one reason when every filter gives the same one
+            texts = {r for _, r in reasons}
+            missing[t] = texts.pop() if len(texts) == 1 else "; ".join(f"{f}: {r}" for f, r in reasons)
+    if len(found) < 2:
+        metrics.update(available=False, passed=None, tools_present=sorted(found, key=_S15_TOOLS.index),
+                       tools_missing=missing,
+                       na_reason=f"fewer than two tools wrote a residual map for this tile "
+                                 f"(present: {', '.join(found) or 'none'})")
+        return None, metrics
+    opened = {(t, f): _s15_open(ps) for t, per in found.items() for f, ps in per.items()}
+    try:
+        c = _s15_pick_center(o, sw, filters, opened)
+        if c is None:
+            metrics.update(available=False, passed=None, tools_present=[], tools_missing=missing,
+                           na_reason="no 5\" cutout is covered by any tool's residual map")
+            return None, metrics
+        cuts = {}
+        for (t, f), maps in opened.items():
+            m, cut = _s15_cover(maps, c)
+            if m is not None:
+                cuts[(t, f)] = (m, cut)
+        present = [t for t in _S15_TOOLS if any((t, f) in cuts for f in filters)]
+        for t in found:
+            if t not in present:
+                missing[t] = "no residual map of this tool covers the cutout centre"
+        metrics.update(center_ra=float(c.ra.deg), center_dec=float(c.dec.deg),
+                       tools_present=present, tools_missing=missing)
+        if len(present) < 2:
+            metrics.update(available=False, passed=None,
+                           na_reason=f"fewer than two tools cover the chosen cutout "
+                                     f"(present: {', '.join(present) or 'none'})")
+            return None, metrics
+        ref = {f: _mosaic_path(o, f) for f in filters}
+        ref_cut = {}
+        for f, p in ref.items():
+            if p:
+                rm = _s15_open([dict(path=p, wcs_path=p)])
+                if rm:
+                    rc = rm[0].cutout(c)
+                    if rc is not None:
+                        _used(p, f"{f} released mosaic (reference)")
+                        ref_cut[f] = rc
+                    rm[0].close()
+        has_ref = bool(ref_cut)
+        ncol = len(present) + (1 if has_ref else 0)
+        fig, axes = _fig(len(filters), ncol, w=2.7, h=2.85)
+        fig.subplots_adjust(left=0.06, right=0.90, bottom=0.04, top=0.84, wspace=0.05, hspace=0.22)
+        per_tool = {t: {} for t in present}
+        for row, f in enumerate(filters):
+            row_maps = [cuts[(t, f)][0] for t in present if (t, f) in cuts]
+            scale = min(m.pixscale() for m in row_maps) if row_maps else 0.031
+            tw, shape = _s15_target_wcs(c, scale)
+            shown, units = {}, set()
+            for t in present:
+                if (t, f) not in cuts:
+                    continue
+                m, (d, w) = cuts[(t, f)]
+                _used(m.prod["path"], f"{f} {t} residual (displayed)")
+                if m.prod["wcs_path"] != m.prod["path"]:
+                    _used(m.prod["wcs_path"], f"{f} {t} cal frame (WCS + unit)")
+                st = _s15_stats(d)
+                rs, _ = reproject_interp((d - st["median"], w), tw, shape_out=shape)
+                shown[t] = rs
+                units.add(m.unit or "unitless")
+                per_tool[t][f] = dict(file=os.path.basename(m.prod["path"]), iteration=m.prod["iteration"],
+                                      unit=m.unit, rms=st["rms"], mad_sigma=st["mad_sigma"],
+                                      median_subtracted=st["median"], n_pix=st["n_pix"],
+                                      native_pixscale_arcsec=m.pixscale())
+            pool = np.concatenate([np.abs(v[np.isfinite(v)]) for v in shown.values()]) if shown else np.array([1.0])
+            vlim = float(np.nanpercentile(pool, _S15_CLIP_PCT)) if pool.size else 1.0
+            vlim = vlim if vlim > 0 else 1.0
+            norm = Normalize(-vlim, vlim)
+            col = 0
+            if has_ref:
+                ax = axes[row][col]; col += 1
+                ax.set_xticks([]); ax.set_yticks([]); ax.set_facecolor("0.85")
+                if f in ref_cut:
+                    rd, rw = ref_cut[f]
+                    ri, _ = reproject_interp((rd, rw), tw, shape_out=shape)
+                    sky = np.nanmedian(ri)
+                    sig = 1.4826 * np.nanmedian(np.abs(ri - sky))
+                    lo, hi = sky - 2.0 * sig, np.nanpercentile(ri, 99.95)
+                    soft = float(np.clip(3.0 * sig / max(hi - lo, 1e-12), 1e-4, 0.1))
+                    ax.imshow(ri, origin="lower", cmap="gray", interpolation="nearest",
+                              norm=ImageNormalize(vmin=lo, vmax=hi, stretch=AsinhStretch(soft)))
+                else:
+                    ax.text(0.5, 0.5, "no i2d", ha="center", va="center", transform=ax.transAxes,
+                            fontsize=9, color="0.35")
+                ax.set_title(f"{f} released i2d\n(asinh, reference)", fontsize=8)
+                ax.set_ylabel(f, fontsize=10)
+            im = None
+            for t in present:
+                ax = axes[row][col]; col += 1
+                ax.set_xticks([]); ax.set_yticks([]); ax.set_facecolor("0.85")
+                if t in shown:
+                    im = ax.imshow(shown[t], origin="lower", cmap="RdBu_r", norm=norm,
+                                   interpolation="nearest")
+                    pt = per_tool[t][f]
+                    stem = pt["file"].replace(".fits", "")
+                    stem = stem if len(stem) <= 34 else "…" + stem[-33:]
+                    it = cuts[(t, f)][0].prod["tag"] or pt["iteration"]
+                    ax.set_title(f"{t}" + (f" ({it})" if it else "") + f"\n{stem}", fontsize=7)
+                    ax.text(0.03, 0.03, f"RMS {pt['rms']:.3g}\nMAD-σ {pt['mad_sigma']:.3g}",
+                            transform=ax.transAxes, fontsize=7, va="bottom",
+                            bbox=dict(fc="white", ec="none", alpha=0.7, pad=1.5))
+                else:
+                    ax.text(0.5, 0.5, f"no {t}\nresidual here", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=9, color="0.35")
+                    ax.set_title(t, fontsize=8)
+                if col == 1:
+                    ax.set_ylabel(f, fontsize=10)
+            if im is not None:
+                pos = axes[row][-1].get_position()
+                cax = fig.add_axes([pos.x1 + 0.01, pos.y0, 0.012, pos.height])
+                cb = fig.colorbar(im, cax=cax)
+                ulab = units.pop() if len(units) == 1 else "mixed: " + ", ".join(sorted(units))
+                cb.set_label(f"residual − median [{ulab}]", fontsize=8)
+                cb.ax.tick_params(labelsize=7)
+        miss = "; ".join(f"{t}: {r}" for t, r in missing.items())
+        fig.suptitle(f"{o.obsid}  residual maps by tool — {_S15_SIZE_ARCSEC:.0f}\"×{_S15_SIZE_ARCSEC:.0f}\" "
+                     f"at RA {c.ra.deg:.5f} Dec {c.dec.deg:+.5f} (north up)\n"
+                     f"one symmetric linear scale per row (±{_S15_CLIP_PCT:.0f}th pct |residual|); "
+                     f"each cutout median-subtracted"
+                     + (f"\nskipped — {miss}" if miss else ""), fontsize=8)
+        # own footer: peppar residual basenames carry no "peppar" token for _annotate_sources
+        srcs = (["released i2d"] if has_ref else []) + [
+            f"{t}-{cuts[(t, f)][0].prod['iteration']}" if t == "jicama" else t
+            for t in present for f in filters[:1] if (t, f) in cuts] + [
+            t for t in present if (t, filters[0]) not in cuts]
+        fig.text(0.5, 0.002, "Data source: " + ", ".join(dict.fromkeys(srcs)),
+                 ha="center", fontsize=7.5, color="0.4")
+        png = _save(fig, f"{o.obsid}_stage15.png")
+    finally:
+        for maps in opened.values():
+            for m in maps:
+                m.close()
+    metrics.update(available=True, passed=None, per_tool=per_tool, has_reference=has_ref)
+    return png, metrics
+
+
 # Stages that need an SW filter name to build at all.  A treasury tile whose LW mosaic lands
 # before its SW reduction (10678 o075-o087: F480M reduced, F212N still at image2) crashed these on
 # ``sw.lower()`` (stages 8/9 via _interfilter_residuals on o077/o084); they now report
 # "pending" until the SW products exist.  (Stages 4, 6, 7 and 10-12 already degrade to a neutral
 # n/a card on their own.)
-_STAGES_NEEDING_SW = (2, 3, 5, 8, 9, 13, 14)
+_STAGES_NEEDING_SW = (2, 3, 5, 8, 9, 13, 14, 15)
 
 
 def _dispatch_stage(o, n, sw, lw):
@@ -7240,6 +7658,8 @@ def _dispatch_stage(o, n, sw, lw):
         return stage13_neighbor_overlap(o, sw, lw)
     if n == 14:
         return stage14_iteration_animation(o, sw, lw)
+    if n == 15:
+        return stage15_residual_comparison(o, sw, lw)
     raise ValueError(n)
 
 
@@ -7316,6 +7736,7 @@ _HEADLINE = {
     12: "**Stage 12 — photometric linearity.**",
     13: "**Stage 13 — agreement with neighbouring tiles.**",
     14: "**Stage 14 — fit by iteration (animated cutout).**",
+    15: "**Stage 15 — residual maps by photometry tool.**",
 }
 
 # Templates reached via the generic `CAPTIONS[n].format(...)` fallback in _caption_for_impl.  Only
@@ -7635,6 +8056,40 @@ def _caption_stage14(metrics):
               "([how this is made](DOCROOT#stage14))")
 
 
+def _caption_stage15(metrics):
+    """Stage-15 caption: which tools are shown, which are skipped and why, and how panels are made."""
+    if metrics.get("available") is False:
+        return (f"**Stage 15 — pending.** The input data for this stage are not yet on disk "
+                f"({metrics.get('na_reason', 'not available')}); it will appear once the data land.")
+    sw, lw = metrics.get("sw", "SW"), metrics.get("lw")
+    present = metrics.get("tools_present") or []
+    pt = metrics.get("per_tool") or {}
+    rows = ["| tool | filter | file | residual RMS | 1.4826·MAD | unit |", "|---|---|---|---|---|---|"]
+    for t in present:
+        for f, d in (pt.get(t) or {}).items():
+            rows.append(f"| {t} | {f} | `{d['file']}` | {d['rms']:.3g} | {d['mad_sigma']:.3g} "
+                        f"| {d.get('unit') or 'unitless'} |")
+    skipped = metrics.get("tools_missing") or {}
+    return (f"**Stage 15 — residual maps by photometry tool.** A {_S15_SIZE_ARCSEC:.0f}\"×"
+            f"{_S15_SIZE_ARCSEC:.0f}\" cutout at RA {metrics.get('center_ra', float('nan')):.5f}, Dec "
+            f"{metrics.get('center_dec', float('nan')):+.5f}, top row {sw}"
+            + (f", bottom row {lw}" if lw else "") + ". "
+            + ("The first column is the released i2d (asinh stretch) for reference. "
+               if metrics.get("has_reference") else "")
+            + f"The other columns are the residual maps of {', '.join(present)}: jicama's merged "
+              f"residual mosaic of its highest iteration (image − model, background kept), and "
+              f"peppar's residual of one single exposure that covers the cutout (background "
+              f"subtracted; fit in DN/s and multiplied back by the cal frame's PHOTMJSR; WCS from "
+              f"the cal frame). Each cutout has its median subtracted "
+              f"and is resampled onto one north-up grid per row; the residual panels of a row share "
+              f"one symmetric linear colour scale (±{_S15_CLIP_PCT:.0f}th percentile of |residual| "
+              f"over the row). RMS and MAD are measured on the native-pixel cutout. "
+            + ("Skipped: " + "; ".join(f"{t} ({r})" for t, r in skipped.items()) + ". "
+               if skipped else "")
+            + "The centre is a seeded-random spot covered by the most maps. No pass/fail is set. "
+              "([how this is made](DOCROOT#stage15))\n\n" + "\n".join(rows))
+
+
 def _roll_note(metrics):
     """Stage-5 caption suffix saying whether the per-exposure cats carry the per-visit roll
     correction (JWST-GC/data-qa#346)."""
@@ -7735,6 +8190,8 @@ def _caption_for_impl(n, metrics):
         return _caption_stage13(metrics)
     if n == 14:
         return _caption_stage14(metrics)
+    if n == 15:
+        return _caption_stage15(metrics)
     # Stage 7, and stage 3's registration / magnitude-system flags, build their own red-flag captions (those
     # cases still render a full figure, so the generic "the plot is empty" wording would not fit).
     if metrics.get("available") is False:
@@ -8337,7 +8794,7 @@ def main(argv=None):
     ap.add_argument("--program", required=True)
     ap.add_argument("--obs", required=True)
     ap.add_argument("--stage", nargs="+", type=int,
-                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
+                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
     ap.add_argument("--sw", default=None); ap.add_argument("--lw", default=None)
     ap.add_argument("--target", default=None, help="override display target (issue-title match)")
     ap.add_argument("--post", action="store_true", help="post/update the issue comments")
