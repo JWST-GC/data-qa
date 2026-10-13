@@ -173,3 +173,18 @@ def test_stage14_m8_without_band_columns_is_skipped(field, tmp_path, monkeypatch
     monkeypatch.setattr(D, "_s14_m8_catalog", lambda o: str(tmp_path / "m8bare.fits"))
     _, m = D.stage14_iteration_animation(_obs(), "F212N", "F480M")
     assert m["iterations"] == ["raw", "m2", "m3"]
+
+
+def test_s14_iter_products_prefers_hybrid_psf(tmp_path, monkeypatch):
+    """Hybrid-PSF (``_hybpsf``) iteration mosaics are used when present; a quarantined plain
+    product (``_i2d_im0_badastrom.fits``) is never picked up."""
+    o = _obs()
+    d = tmp_path / "F212N" / "pipeline"; d.mkdir(parents=True)
+    stem = f"{o.obsid}_t001_nircam_clear-f212n-merged_{{tag}}_daophot_basic_mergedcat_{{kind}}.fits"
+    for kind in ("model_i2d", "residual_i2d"):
+        (d / stem.format(tag="hybpsf_m2", kind=kind)).touch()
+        (d / stem.format(tag="m2", kind=kind)).touch()
+        (d / stem.format(tag="m3", kind=kind + "_im0_badastrom")).touch()
+    monkeypatch.setattr(D, "_field_dirs", lambda o, *pats: [str(d)])
+    got = D._s14_iter_products(o, "F212N")
+    assert set(got) == {2} and got[2]["tag"] == "hybpsf_m2" and "_hybpsf_m2_" in got[2]["model"]
