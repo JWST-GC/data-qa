@@ -599,8 +599,9 @@ def cache_key(catdir, filt, obs_list):
             files[p] = [st.st_size, st.st_mtime] if st else None
         fp = D._footprint_path(_obs(o), filt)
         if fp:
-            st = os.stat(fp)
-            files[fp] = [st.st_size, st.st_mtime]
+            # a mosaic can be renamed (quarantined) between the glob and here
+            st = os.stat(fp) if os.path.exists(fp) else None
+            files[fp] = [st.st_size, st.st_mtime] if st else None
     return dict(catdir=os.path.abspath(catdir), filter=filt, tiles=list(obs_list), files=files)
 
 
