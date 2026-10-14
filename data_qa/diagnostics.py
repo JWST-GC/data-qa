@@ -6880,7 +6880,8 @@ def _s14_iter_products(o: Observation, filt):
     dirs = _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged")
     out = {}
     for n in _S14_ITERS:
-        for tag in (f"m{n}", f"resbgsub_m{n}"):
+        # hybrid-PSF products first (data_qa.psf_generation), then the plain ones
+        for tag in (f"hybpsf_m{n}", f"resbgsub_hybpsf_m{n}", f"m{n}", f"resbgsub_m{n}"):
             stem = f"{o.obsid}_t001_nircam_clear-{filt.lower()}-merged_{tag}_daophot_basic_mergedcat"
             hit = {}
             for kind, suffix in (("model", "model_i2d"), ("residual", "residual_i2d"),
@@ -6905,8 +6906,15 @@ def _s14_cat_radec(path, prefix="skycoord"):
 
 
 def _s14_perfilter_catalog(o: Observation, filt, tag):
-    hits = _fglob(o, f"catalogs/{filt.lower()}_merged_o{o.obs}_indivexp_merged_{tag}_dao_basic.fits")
-    return hits[0] if hits else None
+    """Per-filter catalogue of iteration ``tag``.  The hybrid-PSF re-catalogue (pipeline #1169,
+    2026-10-12) writes ``hybpsf_m<n>`` mosaics but plain-named ``m<n>`` catalogues (header
+    PSFMODEL=STPSF+EPSFCORE, written minutes before the mosaics), so a hybpsf tag falls back to
+    the plain name."""
+    for t in dict.fromkeys((tag, tag.replace("hybpsf_", ""))):
+        hits = _fglob(o, f"catalogs/{filt.lower()}_merged_o{o.obs}_indivexp_merged_{t}_dao_basic.fits")
+        if hits:
+            return hits[0]
+    return None
 
 
 def _s14_m8_catalog(o: Observation):

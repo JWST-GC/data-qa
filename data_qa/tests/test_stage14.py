@@ -14,6 +14,8 @@ from astropy.wcs import WCS
 from data_qa import diagnostics as D
 from data_qa.observations import Observation
 
+_REAL_CATALOG = D._s14_perfilter_catalog
+
 RA0, DEC0 = 266.40, -29.00
 NPIX, PIXAS = 120, 0.1          # 12" square mosaics
 
@@ -173,3 +175,47 @@ def test_stage14_m8_without_band_columns_is_skipped(field, tmp_path, monkeypatch
     monkeypatch.setattr(D, "_s14_m8_catalog", lambda o: str(tmp_path / "m8bare.fits"))
     _, m = D.stage14_iteration_animation(_obs(), "F212N", "F480M")
     assert m["iterations"] == ["raw", "m2", "m3"]
+
+
+def test_s14_iter_products_prefers_hybrid_psf(tmp_path, monkeypatch):
+    """Hybrid-PSF (``_hybpsf``) iteration mosaics are used when present; a quarantined plain
+    product (``_i2d_im0_badastrom.fits``) is never picked up."""
+    o = _obs()
+    d = tmp_path / "F212N" / "pipeline"; d.mkdir(parents=True)
+    stem = f"{o.obsid}_t001_nircam_clear-f212n-merged_{{tag}}_daophot_basic_mergedcat_{{kind}}.fits"
+    for kind in ("model_i2d", "residual_i2d"):
+        (d / stem.format(tag="hybpsf_m2", kind=kind)).touch()
+        (d / stem.format(tag="m2", kind=kind)).touch()
+        (d / stem.format(tag="m3", kind=kind + "_im0_badastrom")).touch()
+    monkeypatch.setattr(D, "_field_dirs", lambda o, *pats: [str(d)])
+    got = D._s14_iter_products(o, "F212N")
+    assert set(got) == {2} and got[2]["tag"] == "hybpsf_m2" and "_hybpsf_m2_" in got[2]["model"]
+
+
+def test_s14_perfilter_catalog_hybrid_falls_back_to_plain_name(tmp_path, monkeypatch):
+    """The hybrid-PSF re-catalogue names its catalogues ``m<n>``; a ``hybpsf_m<n>`` tag finds
+    them, and a hybpsf-named catalogue wins when one exists."""
+    o = _obs()
+    c = tmp_path / "catalogs"; c.mkdir()
+    name = "f212n_merged_o066_indivexp_merged_{}_dao_basic.fits"
+    (c / name.format("m2")).touch()
+    monkeypatch.setattr(D, "_field_roots", lambda o: [str(tmp_path)])
+    assert D._s14_perfilter_catalog(o, "F212N", "hybpsf_m2") == str(c / name.format("m2"))
+    assert D._s14_perfilter_catalog(o, "F212N", "hybpsf_m3") is None
+    (c / name.format("hybpsf_m2")).touch()
+    assert D._s14_perfilter_catalog(o, "F212N", "hybpsf_m2") == str(c / name.format("hybpsf_m2"))
+
+
+def test_stage14_hybrid_mosaics_with_plain_catalogues(field, tmp_path, monkeypatch):
+    """End to end: hybpsf-tagged iteration mosaics plus plain-named catalogues give a GIF."""
+    c = tmp_path / "catalogs"; c.mkdir()
+    for (f, tag), src in field["cats"].items():
+        os.symlink(src, c / f"{f.lower()}_merged_o066_indivexp_merged_{tag}_dao_basic.fits")
+    prods = {f: {n: dict(p, tag=f"hybpsf_{p['tag']}") for n, p in d.items()}
+             for f, d in field["prods"].items()}
+    monkeypatch.setattr(D, "_s14_iter_products", lambda o, f: prods.get(f, {}))
+    monkeypatch.setattr(D, "_s14_perfilter_catalog", _REAL_CATALOG)
+    monkeypatch.setattr(D, "_field_roots", lambda o: [str(tmp_path)])
+    out, m = D.stage14_iteration_animation(_obs(), "F212N", "F480M")
+    assert m["available"] is True and out.endswith("_stage14.gif")
+    assert m["iterations"] == ["raw", "m2", "m3", "m8"]
