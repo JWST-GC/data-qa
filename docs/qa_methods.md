@@ -952,6 +952,81 @@ box), `iterations` (frame labels, e.g. `raw, m2, …, m7, m8`), `counts` (per fr
 Source: [`data_qa/diagnostics.py` → `stage14_iteration_animation`](../data_qa/diagnostics.py)
 (`_s14_iter_products`, `_s14_classify`, `_s14_m8_classes`, `_s14_pick_center`).
 
+<a id="stage15"></a>
+## Stage 15 — residual maps by photometry tool
+
+**What it shows.** One 5″×5″ cutout of the tile as each photometry tool leaves it after
+subtracting its PSF model, side by side, so a reader can compare how jicama, peppar, StarFinder
+and jwst1pass handle the same stars. It is a visual check and carries no pass/fail.
+
+**Layout.** Rows are the short-wave and long-wave filters (F212N and F480M for 10678). The first
+column is the released i2d for reference (sky-anchored asinh stretch as in [stage 14](#stage14)).
+Each further column is one tool. A tool with no residual map covering the cutout in any filter
+loses its column, and the reason is listed in the figure title, the caption and the
+`tools_missing` metric. A tool present in only one filter keeps its column, with the other row
+blank.
+
+**Residual maps per tool.**
+* **jicama:** the merged residual mosaic
+  `<obsid>_t001_nircam_clear-<filt>-merged_<tag>_daophot_basic_mergedcat_residual_i2d.fits`.
+  **Rule: hybrid PSF whenever available.** If any non-quarantined hybrid-PSF residual mosaic
+  (`hybpsf_m<n>`, `resbgsub_hybpsf_m<n>`) exists for the obs+filter, the highest hybrid iteration is
+  shown, even when a plain-PSF generation reaches a higher iteration (a tile mid-re-catalogue, e.g.
+  10678 o068 with hybpsf m2/m3 beside the older plain m4–m7, shows hybpsf_m3). Otherwise the
+  highest plain iteration (`m<n>`, `resbgsub_m<n>`, n = 7 … 2). Mosaics the pipeline quarantined
+  (`…_residual_i2d_im0_badastrom*.fits`) are never shown; every quarantined tag of the obs+filter is
+  listed in the caption and in `quarantined_skipped`. The chosen tag and PSF generation appear in the panel title, the
+  caption and the metrics. The residual is image − model with the smoothed background kept.
+* **peppar:** the per-exposure residual `*_res_FINAL.fits` (else `*_iter1_res.fits`) under
+  `<field>/peppar/[o<obs>/]<FILT>/<DET>/`, scoped to this observation by its `jw<prog><obs>` file
+  prefix. These files hold a bare image, so the WCS comes from the matching cal frame
+  (`<field>/<FILT>/pipeline/<exp>_<det>_cal.fits`, SCI header). peppar fits the cal frame divided
+  by its `PHOTMJSR` (DN/s; the peppar `_iter1_orig` image equals the cal SCI plane × 1/PHOTMJSR to
+  7 digits on 10678 o066 and brick o001, SW and LW), so the residual is multiplied by the cal
+  frame's `PHOTMJSR` to bring it to MJy/sr. Without a `PHOTMJSR` card it stays in DN/s and the
+  colourbar says so. The panel shows the first exposure
+  in sorted order that covers the cutout: a single frame, so it is noisier than the mosaics and
+  carries cosmic rays and bad pixels the mosaics reject. peppar subtracts its background.
+* **StarFinder:** a residual image under `starfinder/o<obs>/<FILT>/`, `starfinder/<FILT>/`
+  (name containing `o<obs>`) or the filter directories (name containing the obsid). None exist for
+  a released field as of 2026-10-13; the one StarFinder residual on disk (sickle F480M) sits in a
+  `v4_tainted_backup_*` directory and is not used.
+* **jwst1pass:** a residual image under `<field>/jwst1pass/<FILT>/o<obs>/`. jwst1pass writes PSF
+  grids, `LOG.psfperts.fits` (PSF-perturbation residuals, not sky residuals; see [stage 11](#stage11))
+  and catalogues, and no residual images as of 2026-10-13, so this column is skipped.
+
+**Display.** Each residual cutout has its median subtracted, which removes jicama's kept
+background level and any pedestal, and is resampled (bilinear, `reproject_interp`) onto one
+north-up TAN grid per row at the finest native pixel scale in that row; peppar frames are in
+detector orientation before resampling. All residual panels of a row share one symmetric linear
+colour scale, ±the 99th percentile of |residual| pooled over the row, with a colourbar in the
+maps' unit (MJy/sr for jicama, and for peppar after the PHOTMJSR rescaling). Each panel is labelled with the tool, its
+iteration or frame, and the file stem.
+
+**Numbers.** Per tool and filter, on the native-pixel cutout before resampling: the median that
+was subtracted, the RMS about it, and 1.4826·MAD. Bright-star residuals dominate the RMS; the MAD
+tracks the background noise. Single-frame peppar values are not directly comparable with the
+mosaic values, since the mosaics average several exposures.
+
+**Choosing the cutout.** Up to 40 candidate centres are random short-wave sources from jicama's
+catalogue at the displayed iteration (else random positions in the first short-wave map), drawn
+with a generator seeded by the obsid (CRC-32), so the same tile gives the same cutout. A map covers
+a candidate when the whole 5″ box lies inside its array and at least 90% of the cutout pixels are
+finite. The centre is the candidate covered by the most (tool, filter) maps; among ties, the one
+with the median short-wave source count in its box.
+
+**Not applicable.** Fewer than two tools with a residual map for the tile, or fewer than two
+covering the chosen centre: the stage returns no figure and posts nothing; the reason is recorded
+as `na_reason`.
+
+**Metrics.** `center_ra`, `center_dec`, `tools_present`, `tools_missing` (tool → reason),
+`per_tool` (tool → filter → `file`, `iteration`, `tag`, `generation` (jicama: `hybrid PSF` / `plain PSF`),
+`quarantined_skipped`, `unit`, `rms`, `mad_sigma`, `median_subtracted`,
+`n_pix`, `native_pixscale_arcsec`), `has_reference`, `inputs`; `passed` is always null.
+
+Source: [`data_qa/diagnostics.py` → `stage15_residual_comparison`](../data_qa/diagnostics.py)
+(`_s15_jicama`, `_s15_peppar`, `_s15_starfinder`, `_s15_jwst1pass`, `_s15_pick_center`).
+
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
 
