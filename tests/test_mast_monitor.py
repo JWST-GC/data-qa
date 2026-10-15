@@ -2994,7 +2994,7 @@ def test_act_report_treasury_arrival_opens_one_issue_per_observation(monkeypatch
     tile = [(t, b, kw) for t, b, kw in posted if "o088" in t][0]
     assert tile[2]["create_labels"] == ["QA", "NIRCam", "program:10678",
                                         "target:GC Treasury"]
-    assert "QA checklist" in tile[2]["create_body"]      # the standard template
+    assert "### Human review" in tile[2]["create_body"]   # the standard template
     assert tile[2]["update_last"] is True                # treasury: edit-in-place
                                                          # (the create still opens
                                                          # + notifies once)

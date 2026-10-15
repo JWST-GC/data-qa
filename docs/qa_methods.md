@@ -12,12 +12,37 @@ the exact source function that built it.
 - **The `passed` and `failed` flags should only serve as suggestions for the reviewer**. Each stage below defines "passing" criteria.
 - Every stage reports the **full path of every file it read** — see
   [which files a stage used](#inputs).
+- The issue body separates an **automatic status** table (product availability and the stage
+  flags; no checkboxes) from a **human review** checklist; see [issue body](#issue-body).
 
 Jump to: [Glossary](#glossary) ·
 [Stage 1](#stage1) · [Stage 2](#stage2) · [Stage 3](#stage3) · [Stage 4](#stage4) ·
 [Stage 5](#stage5) · [Stage 6](#stage6) · [Stage 7](#stage7)
 
 ---
+
+<a id="issue-body"></a>
+## Issue body: automatic status and human review
+
+Built by [`data_qa/make_issues.py`](../data_qa/make_issues.py) (JWST-GC/data-qa#364).
+
+- **Automatic status** — a table of product availability and stage flags, each ✅ (flag met or
+  product present), ⚠️ (flag not met or product absent) or ⏳ (not yet measured), with the basis of
+  each flag spelled out (for example, the stage 2 flag counts finite magnitude pairs and says
+  nothing about depth; stage 3 compares the short-wave filter with VIRAC Ks only). A sync without
+  metrics (the scheduled GitHub Action) keeps the table already on the issue.
+- **Human review** — one row per review action, each linking the stage comments it covers. A
+  checkmark means the review action is complete; a review that found a problem is still complete.
+  No automatic flag ticks a row. Replace a row's `[ ]` with `N/A` to mark it inapplicable; N/A
+  rows drop out of GitHub's task count and stay N/A across syncs.
+- **Reviewer stamps** — on the next sync a newly ticked row gets a visible `@reviewer, date`
+  stamp, read from the issue's edit history (the edit that placed the tick), and a hidden
+  evidence version: a hash of the path, size and modification time of every input file the
+  row's stages recorded. When a later sync finds different inputs, the row is unticked with a note
+  naming the previous reviewer and date, and stays that way until someone re-ticks it.
+- **Earlier checklist** — ticks on the checklist used before #364 are not carried into the review
+  rows, since several of its rows were ticked by flags. They are listed once in a collapsed
+  block, each attributed from the edit history where it shows who placed the tick.
 
 <a id="inputs"></a>
 ## Which files a stage used
@@ -770,7 +795,7 @@ holds the remaining filters in an expandable block; the per-filter slope, turn-o
 correction and star count for every filter are listed in the caption table. Metrics:
 `primary_filter`, `filters_measured`, `per_filter` (slope, slope_err, turnover_mag, aper_corr, n per
 filter), `slope`/`turnover_mag`/`aper_corr`/`n_isolated` for the primary filter, and `n_flagged`.
-Stage 12 is display-only (it does not drive an issue-body checkbox); the flag surfaces the number.
+Stage 12 is display-only (it does not feed the issue-body status table); the flag surfaces the number.
 
 Source: [`data_qa/diagnostics.py` → `stage12_photometric_linearity`](../data_qa/diagnostics.py)
 (`_measure_psf_aper`, `_linearity_fit`).
