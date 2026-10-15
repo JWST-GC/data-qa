@@ -9,7 +9,7 @@ It reuses stage 13's footprints, sample cuts and matching (``diagnostics._overla
 F212N and F480M) on three catalogue flavours: the merged m8 catalogue and the two per-module (NRCA,
 NRCB) m8 catalogues.
 
-Three weighted least-squares models are solved per filter.  Every edge is one pair measurement
+Four weighted least-squares models are solved per filter.  Every edge is one pair measurement
 ``d = median(m_a - m_b)`` (Vega) with weight ``1/sigma^2``, ``sigma = 1.2533 * 1.4826 MAD / sqrt(N)``
 (the standard error of a median):
 
@@ -18,6 +18,17 @@ Three weighted least-squares models are solved per filter.  Every edge is one pa
   ``s = +1`` for NRCA and -1 for NRCB, so ``Delta`` is one global NRCA - NRCB offset per filter;
 * ``tile×module``  -- per-module catalogues; one free zero point per (tile, module); the per-tile
   ``z_A - z_B`` and its covariance-propagated error come from this model.
+
+* ``tile+G``       -- merged catalogues; ``d = z_i - z_j + G . (c_i - c_j)``, where ``c`` is the
+  (east, north) arcmin offset of the edge's matched stars from each tile's centre: the tile zero
+  points plus one linear within-tile gradient ``G`` shared by every tile (#362).  With every tile at
+  the same roll, a gradient and a ramp of tile zero points along the grid predict the same overlap
+  differences, so the overlaps alone cannot separate them.  ``G`` is anchored externally: per-star
+  F<filt> - VIRAC2 Ks over each tile's whole footprint (Ks 14.5-16.5, PM-propagated to the epoch),
+  fitted as ``t_tile + G . c + k (Ks - 15.5) + a (H - Ks - 1.5)`` (stars with VIRAC2 H) with a bootstrap over tiles for the covariance, enters
+  the network as a Gaussian prior on ``G``.  The reference fit's tile offsets ``t`` are reported next
+  to the ``tile+G`` zero points as an external check.  The H - Ks term absorbs reddening that varies
+  across a tile; without it the F480M - Ks anchor took up the extinction gradient.  ``--no-reference`` skips it.
 
 Module edges are every cross-tile module pair that overlaps (NRCA_i-NRCA_j, NRCA_i-NRCB_j, ...) and,
 within one tile, NRCA against NRCB over the whole footprint (the modules overlap only where the
@@ -33,7 +44,8 @@ re-solves without re-matching while the cache key -- catdir, filter, tile set, i
 catalogue and footprint size+mtime -- is unchanged, or unless ``--no-cache``), ``s13zp_<filt>.json`` (solutions, residuals,
 chi^2/dof, the error floor that brings chi^2/dof to 1, per-tile metadata), and figures:
 ``s13zp_<filt>_skymap.png``, ``s13zp_<filt>_residuals.png``, ``s13zp_<filt>_modules.png``,
-``s13zp_<filt>_vs_time_roll.png``; across filters ``s13zp_summary.png``.
+``s13zp_<filt>_vs_time_roll.png``, ``s13zp_<filt>_gradient.png`` (with the reference; its matches
+are cached in ``s13zp_<filt>_reference.json``); across filters ``s13zp_summary.png``.
 
 Usage::
 
@@ -59,6 +71,11 @@ _OBS_RE = re.compile(r"_m8_dedup_o(\d{3})\.fits$")
 MODULES = ("nrca", "nrcb")
 _MED_SE = 1.2533                # standard error of a median = 1.2533 sigma / sqrt(N) (Gaussian)
 _SIGN = {"nrca": 1.0, "nrcb": -1.0}
+EDGE_VERSION = 2                # 2: edges carry the sky position (ra, dec) of their matched stars
+REF_KS_RANGE = (14.5, 16.5)     # VIRAC2 Ks window for the gradient anchor (F212N saturates ~14.5)
+REF_MATCH_AS = 0.1
+REF_MIN_STARS = 30
+REF_BOOTSTRAP = 300
 
 
 # ----------------------------------------------------------------------------------- solver
@@ -82,17 +99,21 @@ def _components(nodes, edges):
     return sorted(comp.values(), key=len, reverse=True)
 
 
-def solve_network(edges, nodes=None, node_of=None, sign_of=None):
+def solve_network(edges, nodes=None, node_of=None, sign_of=None, extra_of=None, prior=None):
     """Weighted least squares for relative zero points on an overlap graph.
 
     ``edges``: dicts with ``a``, ``b`` (node keys), ``d`` (measured ``m_a - m_b``) and ``err``.
     ``node_of(key)`` maps an edge endpoint to the zero-point node it constrains (default: itself);
     ``sign_of(key)`` returns +1/-1/0 for a global term ``Delta`` that enters as ``+s*Delta/2``
-    (``None`` = no global term).  Gauge: mean zero over the nodes of each connected component.
+    (``None`` = no global term).  ``extra_of(edge)`` returns the design-row entries of further
+    global parameters ``g`` (e.g. a within-tile gradient), and ``prior=(mean, cov)`` adds a Gaussian
+    prior on them, counted as ``len(g)`` extra observations in chi^2 and dof (the error floor applies
+    to the edges only).  Gauge: mean zero over the nodes of each connected component.
 
     Returns dict(nodes, z, z_err, cov, delta, delta_err, resid, chi2, dof, chi2_dof, components,
-    sys_floor) where ``resid`` is ``d - model`` per edge and ``sys_floor`` is the error added in
-    quadrature to every edge that brings chi^2/dof to 1 (0 when it is already <= 1)."""
+    sys_floor), plus g, g_err, g_cov with ``extra_of``, where ``resid`` is ``d - model`` per edge and
+    ``sys_floor`` is the error added in quadrature to every edge that brings chi^2/dof to 1 (0 when
+    it is already <= 1)."""
     node_of = node_of or (lambda k: k)
     if nodes is None:
         nodes = sorted({node_of(e[s]) for e in edges for s in ("a", "b")})
@@ -100,7 +121,9 @@ def solve_network(edges, nodes=None, node_of=None, sign_of=None):
     idx = {n: k for k, n in enumerate(nodes)}
     nn = len(nodes)
     glob_term = sign_of is not None
-    npar = nn + (1 if glob_term else 0)
+    ng = nn + (1 if glob_term else 0)            # first column of the extra global parameters
+    nx = len(np.atleast_1d(extra_of(edges[0]))) if extra_of is not None else 0
+    npar = ng + nx
     A = np.zeros((len(edges), npar))
     d = np.array([e["d"] for e in edges], float)
     err = np.array([e["err"] for e in edges], float)
@@ -109,24 +132,36 @@ def solve_network(edges, nodes=None, node_of=None, sign_of=None):
         A[r, idx[node_of(e["b"])]] -= 1.0
         if glob_term:
             A[r, nn] = 0.5 * (sign_of(e["a"]) - sign_of(e["b"]))
+        if nx:
+            A[r, ng:] = extra_of(e)
     comps = _components(nodes, [dict(a=node_of(e["a"]), b=node_of(e["b"])) for e in edges])
     C = np.zeros((len(comps), npar))
     for k, c in enumerate(comps):
         C[k, c] = 1.0 / len(c)
 
+    if prior is not None:
+        pmu = np.asarray(prior[0], float)
+        pinv = np.linalg.inv(np.asarray(prior[1], float))
+
     def _solve(err_eff):
         w = 1.0 / err_eff ** 2
         N = A.T @ (A * w[:, None])
+        rhs = A.T @ (w * d)
+        if prior is not None:
+            N[ng:, ng:] += pinv
+            rhs[ng:] += pinv @ pmu
         K = np.block([[N, C.T], [C, np.zeros((len(comps), len(comps)))]])
-        rhs = np.r_[A.T @ (w * d), np.zeros(len(comps))]
         Kinv = np.linalg.pinv(K)
-        p = (Kinv @ rhs)[:npar]
+        p = (Kinv @ np.r_[rhs, np.zeros(len(comps))])[:npar]
         cov = Kinv[:npar, :npar]
         res = d - A @ p
-        return p, cov, res, float(np.sum(w * res ** 2))
+        chi2 = float(np.sum(w * res ** 2))
+        if prior is not None:
+            chi2 += float((p[ng:] - pmu) @ pinv @ (p[ng:] - pmu))
+        return p, cov, res, chi2
 
     p, cov, res, chi2 = _solve(err)
-    dof = len(edges) - npar + len(comps)
+    dof = len(edges) - npar + len(comps) + (nx if prior is not None else 0)
     floor = 0.0
     if dof > 0 and chi2 / dof > 1.0:
         lo, hi = 0.0, max(1.0, float(np.max(np.abs(res))))
@@ -147,6 +182,9 @@ def solve_network(edges, nodes=None, node_of=None, sign_of=None):
     if glob_term:
         out.update(delta=float(p[nn]), delta_err=float(np.sqrt(max(covf[nn, nn], 0.0))),
                    delta_err_formal=float(np.sqrt(max(cov[nn, nn], 0.0))))
+    if nx:
+        out.update(g=p[ng:], g_err=np.sqrt(np.clip(np.diag(covf)[ng:], 0, None)),
+                   g_cov=covf[ng:, ng:])
     return out
 
 
@@ -177,11 +215,15 @@ def _cat(catdir, mod, obs):
     return os.path.join(catdir, _CAT_FMT.format(mod=mod, obs=obs))
 
 
-def _edge(res, a, b, kind):
+def _edge(res, a, b, kind, sample):
+    """One edge; ``ra``/``dec`` is the mean position of the matched stars of ``sample`` (side a),
+    where the gradient model evaluates each tile's within-tile offset."""
     sig = _MED_SE * res["dmag_scatter"] / np.sqrt(res["n_pairs"])
+    ia = res["ia"]
     return dict(a=a, b=b, kind=kind, d=res["dmag_bulk"], err=float(max(sig, 1e-4)),
                 n_pairs=res["n_pairs"], dmag_scatter=res["dmag_scatter"],
-                offset_mas=res["offset_mas"])
+                offset_mas=res["offset_mas"], ra=float(np.mean(sample["ra"][ia])),
+                dec=float(np.mean(sample["dec"][ia])))
 
 
 def measure_pair(args):
@@ -194,7 +236,7 @@ def measure_pair(args):
         sb = D._load_nb_sample(_cat(catdir, "nrcb", i), filt, poly, frame)
         r = D._neighbor_agreement(sa, sb)
         if r:
-            out.append(_edge(r, f"{i}:nrca", f"{i}:nrcb", "intra"))
+            out.append(_edge(r, f"{i}:nrca", f"{i}:nrcb", "intra", sa))
         return out
     s = {}
     for mod in ("merged",) + MODULES:
@@ -202,12 +244,12 @@ def measure_pair(args):
             s[(t, mod)] = D._load_nb_sample(_cat(catdir, mod, t), filt, poly, frame)
     r = D._neighbor_agreement(s[(i, "merged")], s[(j, "merged")])
     if r:
-        out.append(_edge(r, i, j, "merged"))
+        out.append(_edge(r, i, j, "merged", s[(i, "merged")]))
     for ma in MODULES:
         for mb in MODULES:
             r = D._neighbor_agreement(s[(i, ma)], s[(j, mb)])
             if r:
-                out.append(_edge(r, f"{i}:{ma}", f"{j}:{mb}", "module"))
+                out.append(_edge(r, f"{i}:{ma}", f"{j}:{mb}", "module", s[(i, ma)]))
     return out
 
 
@@ -253,15 +295,179 @@ def measure_filter(catdir, filt, nproc=1, obs_list=None):
                 n_pair_jobs=len(jobs))
 
 
+def tile_centre(meta):
+    """(ra, dec) of a tile's footprint centre (vertex mean, as stage 13 uses), or None."""
+    v = meta.get("vertices") if meta else None
+    if not v:
+        return None
+    v = np.asarray(v, float)
+    return float(np.mean(v[:, 0])), float(np.mean(v[:, 1]))
+
+
+def _offset_arcmin(ra, dec, centre):
+    """(east, north) offset in arcmin of sky positions from a tile centre (tangent-plane approx.)."""
+    ra, dec = np.asarray(ra, float), np.asarray(dec, float)
+    return ((ra - centre[0]) * np.cos(np.radians(centre[1])) * 60.0, (dec - centre[1]) * 60.0)
+
+
+def _reference_with_h(o, ep):
+    """(SkyCoord, Ks, H) of the stage-3 VIRAC2 reference, PM-propagated to ``ep``; H is NaN where
+    VIRAC2 has none.  Same source and propagation as ``diagnostics._stage3_reference``."""
+    from astropy.table import Table
+    from . import astrometry_audit as aa
+    path = (D._viraccache_path(o) or D._fetch_virac2_ks(o)) if ep else None
+    if not path:
+        return None, None, None
+    t = Table.read(path)
+    cols = {c.lower(): c for c in t.colnames}
+    if "ksmag" not in cols or "hmag" not in cols:
+        return None, None, None
+    sc, ks = aa.load_reference(path, ep)
+
+    def col(n):
+        return np.asarray(np.ma.filled(np.ma.asarray(t[cols[n]], dtype=float), np.nan), float)
+    # load_reference keeps the rows with finite coordinates, in order
+    good = np.isfinite(col("raj2000" if "raj2000" in cols else "ra")) & \
+        np.isfinite(col("dej2000" if "dej2000" in cols else "dec"))
+    return sc, ks, col("hmag")[good]
+
+
+def measure_reference_tile(args):
+    """F<filt> − VIRAC2 Ks per matched star over one tile's whole footprint (merged m8 catalogue).
+
+    Same clean-source cuts as the overlaps (``_load_nb_sample``), VIRAC2 PM-propagated to the
+    mosaic epoch and paired one-to-one within ``REF_MATCH_AS`` after the stage-3 bulk alignment;
+    Ks restricted to ``REF_KS_RANGE``.  Positions are (east, north) arcmin from the tile centre.
+    Returns a dict of lists, or None when the tile has no footprint, reference or enough stars."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    catdir, filt, obs = args
+    o = _obs(obs)
+    fp = D._footprint_path(o, filt)
+    v = D._sregion_radec(fp) if fp else None
+    if v is None:
+        return None
+    centre = (float(np.mean(v[:, 0])), float(np.mean(v[:, 1])))
+    ref_sc, ks, hmag = _reference_with_h(o, D._obs_epoch(o, fp))
+    if ref_sc is None or ks is None:
+        return None
+    smp = D._load_nb_sample(_cat(catdir, "merged", obs), filt, D._radec_to_plane(v, *centre), centre)
+    if smp is None or len(smp["ra"]) < REF_MIN_STARS:
+        return None
+    jsc = SkyCoord(smp["ra"] * u.deg, smp["dec"] * u.deg)
+    jal, _, _ = D._stage3_align(jsc, ref_sc)
+    ir, ij = D._one_to_one_match(ref_sc, jal, REF_MATCH_AS)
+    k, h = np.asarray(ks, float)[ir], hmag[ir]
+    keep = np.isfinite(k) & np.isfinite(h) & (k > REF_KS_RANGE[0]) & (k < REF_KS_RANGE[1])
+    if keep.sum() < REF_MIN_STARS:
+        return None
+    ir, ij, k, h = ir[keep], ij[keep], k[keep], h[keep]
+    x, y = _offset_arcmin(smp["ra"][ij], smp["dec"][ij], centre)
+    return dict(obs=obs, x=x.tolist(), y=y.tolist(), d=(smp["mag"][ij] - k).tolist(), ks=k.tolist(),
+                hk=(h - k).tolist())
+
+
+def measure_reference(catdir, filt, nproc=1, obs_list=None):
+    obs_list = obs_list or tiles(catdir)
+    jobs = [(catdir, filt, o) for o in obs_list]
+    if nproc > 1:
+        with Pool(nproc) as pool:
+            res = pool.map(measure_reference_tile, jobs, chunksize=1)
+    else:
+        res = [measure_reference_tile(j) for j in jobs]
+    return dict(filter=filt, ks_range=list(REF_KS_RANGE), tiles=[r for r in res if r])
+
+
+def _within_fit(tidx, X, d, nt, clip=4.0, niter=6):
+    """Robust fixed-effects fit ``d = t_tile + X @ beta``: per-tile means are removed (over the kept
+    stars) and ``beta`` solved by least squares, clipping at ``clip`` x 1.4826 MAD."""
+    keep = np.ones(len(d), bool)
+    for _ in range(niter):
+        cnt = np.bincount(tidx[keep], minlength=nt).astype(float)
+        cnt[cnt == 0] = np.nan
+        mx = np.stack([np.bincount(tidx[keep], X[keep, j], nt) for j in range(X.shape[1])], 1) / cnt[:, None]
+        md = np.bincount(tidx[keep], d[keep], nt) / cnt
+        Xw, dw = X - mx[tidx], d - md[tidx]
+        beta, *_ = np.linalg.lstsq(Xw[keep], dw[keep], rcond=None)
+        r = dw - Xw @ beta
+        sig = 1.4826 * np.median(np.abs(r[keep]))
+        new = np.isfinite(r) & (np.abs(r) < clip * sig)
+        if np.array_equal(new, keep):
+            break
+        keep = new
+    t = md - mx @ beta
+    return beta, t, keep, float(sig)
+
+
+def fit_reference(ref, rng=None):
+    """Within-tile gradient against the external reference: ``d = t_tile + Gx x + Gy y +
+    c (Ks − 15.5) + a (H − Ks − 1.5)`` with x east, y north (arcmin from the tile centre).  The
+    colour term absorbs reddening that varies across a tile (extinction gradients, which would
+    otherwise enter G, most strongly for F480M − Ks).  ``g_cov`` comes from a
+    bootstrap over tiles (the gradient varies a little from tile to tile, so per-star errors
+    understate it); ``g_cov_formal`` from the per-star scatter.  ``t`` are the tile offsets
+    against the reference (mean removed), the external check on the network zero points."""
+    tl = [r for r in ref["tiles"] if len(r["d"]) >= REF_MIN_STARS]
+    if len(tl) < 3:
+        return None
+    obs = [r["obs"] for r in tl]
+    tidx = np.concatenate([np.full(len(r["d"]), k) for k, r in enumerate(tl)])
+    X = np.c_[np.concatenate([r["x"] for r in tl]), np.concatenate([r["y"] for r in tl]),
+              np.concatenate([r["ks"] for r in tl]) - 15.5,
+              np.concatenate([r["hk"] for r in tl]) - 1.5]
+    d = np.concatenate([r["d"] for r in tl])
+    beta, t, keep, sig = _within_fit(tidx, X, d, len(tl))
+    Xk = X[keep] - np.array([np.mean(X[keep & (tidx == k)], 0) for k in range(len(tl))])[tidx[keep]]
+    cov_formal = np.linalg.inv(Xk.T @ Xk) * sig ** 2
+    rng = rng or np.random.default_rng(0)
+    boots = []
+    for _ in range(REF_BOOTSTRAP):
+        pick = rng.integers(0, len(tl), len(tl))
+        rows = np.concatenate([np.flatnonzero(keep & (tidx == k)) for k in pick])
+        newt = np.concatenate([np.full(int(np.sum(keep & (tidx == k))), n) for n, k in enumerate(pick)])
+        b, *_ = _within_fit(newt, X[rows], d[rows], len(pick), niter=1)
+        boots.append(b)
+    cov = np.cov(np.array(boots).T)
+    nk = np.bincount(tidx[keep], minlength=len(tl))
+    t_err = sig / np.sqrt(np.maximum(nk, 1))
+    good = nk > 0
+    t = t - np.mean(t[good])
+    return dict(g=beta[:2].tolist(), g_cov=cov[:2, :2].tolist(), g_err=np.sqrt(np.diag(cov)[:2]).tolist(),
+                g_err_formal=np.sqrt(np.diag(cov_formal)[:2]).tolist(), ks_slope=float(beta[2]),
+                hk_slope=float(beta[3]),
+                n_stars=int(keep.sum()), n_tiles=int(good.sum()), sigma=sig,
+                t={o: (float(t[k]), float(t_err[k])) for k, o in enumerate(obs) if good[k]})
+
+
 # ------------------------------------------------------------------------------- solutions
-def solve_filter(m):
-    """The three models of the module docstring for one filter's measurements."""
+def _gradient_columns(meta):
+    """``extra_of`` for the within-tile gradient: an edge ``d = m_a − m_b`` measured at sky
+    position p gains ``G · (c_a − c_b)``, with c the (east, north) arcmin offset of p from each
+    tile's centre."""
+    cen = {o: tile_centre(mm) for o, mm in meta.items()}
+
+    def cols(e):
+        xa, ya = _offset_arcmin(e["ra"], e["dec"], cen[e["a"]])
+        xb, yb = _offset_arcmin(e["ra"], e["dec"], cen[e["b"]])
+        return np.array([xa - xb, ya - yb])
+    return cols, cen
+
+
+def solve_filter(m, ref=None):
+    """The models of the module docstring for one filter's measurements; with ``ref`` (the
+    ``fit_reference`` result) also ``tile+G``."""
     edges = m["edges"]
     merged = [e for e in edges if e["kind"] == "merged"]
     modular = [e for e in edges if e["kind"] in ("module", "intra")]
     out = dict(filter=m["filter"])
     if merged:
         out["tile"] = solve_network(merged)
+    if merged and ref:
+        cols, cen = _gradient_columns(m["meta"])
+        gm = [e for e in merged if "ra" in e and cen.get(e["a"]) and cen.get(e["b"])]
+        if gm:
+            out["tile+G"] = solve_network(gm, extra_of=cols, prior=(ref["g"], ref["g_cov"]))
+            out["reference"] = ref
     if modular:
         out["tile+AB"] = solve_network(modular, node_of=lambda k: k.split(":")[0],
                                        sign_of=lambda k: _SIGN[k.split(":")[1]])
@@ -323,6 +529,37 @@ def summarise(m, sol):
         s.update(ab_global=ab["delta"], ab_global_err=ab["delta_err"],
                  ab_global_err_formal=ab["delta_err_formal"], ab_chi2_dof=ab["chi2_dof"],
                  ab_sys_floor=ab["sys_floor"], ab_resid_mad=_mad(ab["resid"]))
+    tg, ref = sol.get("tile+G"), sol.get("reference")
+    if tg:
+        zg = dict(zip(tg["nodes"], np.asarray(tg["z"])))
+        comps = [dict(n=len(c), obs=list(c), rms=float(np.std([zg[o] for o in c])),
+                      range=float(np.ptp([zg[o] for o in c]))) for c in tg["components"]]
+        s.update(grad_g=[float(v) for v in tg["g"]], grad_g_err=[float(v) for v in tg["g_err"]],
+                 grad_tile_zp_rms_components=comps, grad_tile_zp_rms_largest=comps[0]["rms"],
+                 grad_chi2_dof=tg["chi2_dof"], grad_sys_floor=tg["sys_floor"],
+                 grad_resid_mad=_mad(tg["resid"]))
+        com = [o for o in zg if o in ref["t"]]
+        if len(com) > 2:
+            # each component has its own gauge: compare after removing the component means
+            zc, tc = [], []
+            for c in tg["components"]:
+                cc = [o for o in c if o in ref["t"]]
+                if len(cc) > 1:
+                    zc += list(np.array([zg[o] for o in cc]) - np.mean([zg[o] for o in cc]))
+                    tc += list(np.array([ref["t"][o][0] for o in cc]) - np.mean([ref["t"][o][0] for o in cc]))
+            if len(zc) > 2:
+                s.update(grad_vs_ref_n=len(zc), grad_vs_ref_r=float(np.corrcoef(zc, tc)[0, 1]),
+                         grad_vs_ref_rms_diff=float(np.std(np.array(zc) - np.array(tc))))
+    if ref:
+        s.update(ref_g=ref["g"], ref_g_err=ref["g_err"], ref_g_err_formal=ref["g_err_formal"],
+                 ref_ks_slope=ref["ks_slope"], ref_hk_slope=ref["hk_slope"],
+                 ref_n_stars=ref["n_stars"], ref_n_tiles=ref["n_tiles"], ref_sigma=ref["sigma"],
+                 ref_tile_offset_rms=float(np.std([v[0] for v in ref["t"].values()])))
+    pas = [mm.get("pa_v3") for mm in (m.get("meta") or {}).values() if mm and mm.get("pa_v3") is not None]
+    if pas:
+        # the gradient is fitted in sky (east, north) axes, which equal the detector axes only
+        # while every tile shares one roll
+        s.update(pa_v3_range=[float(min(pas)), float(max(pas))])
     per = sol.get("ab_per_tile") or {}
     if per:
         v = np.array([x[0] for x in per.values()])
@@ -532,6 +769,69 @@ def plot_time_roll(m, sol, path):
     plt.close(fig)
 
 
+def plot_gradient(m, sol, rm, path):
+    """Gradient model: (1) the tile-only z against the ramp one within-tile gradient predicts,
+    (2) tile+G z against the tile offsets measured against VIRAC2 Ks, (3) the stacked
+    F<filt> − Ks profile along east and north."""
+    import matplotlib.pyplot as plt
+    filt, tg, ref = m["filter"], sol["tile+G"], sol["reference"]
+    g = np.asarray(tg["g"])
+    cen = {o: tile_centre(mm) for o, mm in m["meta"].items()}
+    fig, ax = plt.subplots(1, 3, figsize=(17, 5))
+    t = sol.get("tile")
+    if t:
+        for k, comp in enumerate(t["components"]):
+            cc = [o for o in comp if cen.get(o)]
+            if len(cc) < 2:
+                continue
+            zt = dict(zip(t["nodes"], t["z"]))
+            c0 = np.mean([cen[o] for o in cc], 0)
+            x, y = _offset_arcmin([cen[o][0] for o in cc], [cen[o][1] for o in cc], c0)
+            pred = -(g[0] * x + g[1] * y)
+            ax[0].scatter(pred - pred.mean(), [zt[o] for o in cc], s=12, label=f"component {k + 1} ({len(cc)})")
+        lim = ax[0].get_xlim()
+        ax[0].plot(lim, lim, "k:", lw=0.8)
+        ax[0].set_xlabel("ramp predicted by the within-tile gradient, −G·c (mag)")
+        ax[0].set_ylabel(f"tile-only network z ({filt}, Vega mag)")
+        ax[0].set_title(f"G = ({g[0]:+.4f}, {g[1]:+.4f}) mag/arcmin (east, north)")
+        ax[0].legend(fontsize=7)
+    zg = dict(zip(tg["nodes"], tg["z"]))
+    for comp in tg["components"]:
+        cc = [o for o in comp if o in ref["t"]]
+        if len(cc) < 2:
+            continue
+        zz = np.array([zg[o] for o in cc]); tt = np.array([ref["t"][o][0] for o in cc])
+        ax[1].errorbar(tt - tt.mean(), zz - zz.mean(), xerr=[ref["t"][o][1] for o in cc], fmt="o", ms=3, lw=0.5)
+    lim = ax[1].get_xlim()
+    ax[1].plot(lim, lim, "k:", lw=0.8)
+    ax[1].set_xlabel("tile offset vs VIRAC2 Ks, gradient fitted (Vega mag)")
+    ax[1].set_ylabel(f"tile+G network z ({filt}, Vega mag)")
+    ax[1].set_title("network zero points after the gradient vs the external reference")
+    x = np.concatenate([r["x"] for r in rm["tiles"]]); y = np.concatenate([r["y"] for r in rm["tiles"]])
+    d = np.concatenate([r["d"] for r in rm["tiles"]])
+    tid = np.concatenate([[r["obs"]] * len(r["d"]) for r in rm["tiles"]])
+    d = d - np.array([ref["t"].get(o, (np.nan,))[0] for o in tid]) - ref["ks_slope"] * (
+        np.concatenate([r["ks"] for r in rm["tiles"]]) - 15.5) - ref["hk_slope"] * (
+        np.concatenate([r["hk"] for r in rm["tiles"]]) - 1.5)
+    d -= np.nanmedian(d)
+    bins = np.linspace(-1.5, 1.5, 16)
+    for v, lab in ((x, "east"), (y, "north")):
+        k = np.digitize(v, bins)
+        med = [np.nanmedian(d[k == i]) if np.sum(k == i) > 20 else np.nan for i in range(1, len(bins))]
+        ax[2].plot(0.5 * (bins[1:] + bins[:-1]), med, "o-", ms=3, label=lab)
+    ax[2].plot(bins, ref["g"][0] * bins, "C0:", lw=0.8)
+    ax[2].plot(bins, ref["g"][1] * bins, "C1:", lw=0.8)
+    ax[2].axhline(0, color="k", lw=0.5)
+    ax[2].set_xlabel("offset from tile centre (arcmin)")
+    ax[2].set_ylabel(f"{filt} − Ks, tile offset removed (Vega mag)")
+    ax[2].set_title(f"stacked profile vs VIRAC2 Ks ({ref['n_stars']} stars, {ref['n_tiles']} tiles)")
+    ax[2].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return path
+
+
 def plot_summary(results, path):
     """Across filters: per-tile z and per-tile A−B of one filter against the other."""
     import matplotlib.pyplot as plt
@@ -602,31 +902,43 @@ def cache_key(catdir, filt, obs_list):
             # a mosaic can be renamed (quarantined) between the glob and here
             st = os.stat(fp) if os.path.exists(fp) else None
             files[fp] = [st.st_size, st.st_mtime] if st else None
-    return dict(catdir=os.path.abspath(catdir), filter=filt, tiles=list(obs_list), files=files)
+    return dict(catdir=os.path.abspath(catdir), filter=filt, tiles=list(obs_list), files=files,
+                edge_version=EDGE_VERSION)
 
 
-def run_filter(catdir, filt, outdir, nproc=1, cache=True, obs_list=None):
-    ep = os.path.join(outdir, f"s13zp_{filt.lower()}_edges.json")
-    obs_list = sorted(obs_list) if obs_list else tiles(catdir)
-    key = cache_key(catdir, filt, obs_list)
-    m = None
-    if cache and os.path.exists(ep):
-        with open(ep) as fh:
+def _cached(path, key, build, label, use_cache=True):
+    """JSON cache keyed on ``key``: reuse ``path`` while its key matches, else rebuild."""
+    if use_cache and os.path.exists(path):
+        with open(path) as fh:
             m = json.load(fh)
         if m.get("cache_key") == key:
-            print(f"[s13zp] {filt}: {len(m['edges'])} cached edges from {ep}", flush=True)
-        else:
-            print(f"[s13zp] {filt}: cached edges in {ep} are stale (inputs or arguments changed); "
-                  "re-measuring", flush=True)
-            m = None
-    if m is None:
-        m = measure_filter(catdir, filt, nproc=nproc, obs_list=obs_list)
-        m["cache_key"] = key
-        with open(ep, "w") as fh:
-            json.dump(m, fh, indent=1)
-    sol = solve_filter(m)
-    summ = summarise(m, sol)
+            print(f"[s13zp] {label}: cached from {path}", flush=True)
+            return m
+        print(f"[s13zp] {label}: cache {path} is stale (inputs or arguments changed); re-measuring",
+              flush=True)
+    m = build()
+    m["cache_key"] = key
+    with open(path, "w") as fh:
+        json.dump(m, fh, indent=1)
+    return m
+
+
+def run_filter(catdir, filt, outdir, nproc=1, cache=True, obs_list=None, reference=True):
     fl = filt.lower()
+    obs_list = sorted(obs_list) if obs_list else tiles(catdir)
+    key = cache_key(catdir, filt, obs_list)
+    m = _cached(os.path.join(outdir, f"s13zp_{fl}_edges.json"), key,
+                lambda: measure_filter(catdir, filt, nproc=nproc, obs_list=obs_list), f"{filt} edges",
+                cache)
+    ref = None
+    if reference:
+        rm = _cached(os.path.join(outdir, f"s13zp_{fl}_reference.json"),
+                     dict(key, ks_range=list(REF_KS_RANGE), match_as=REF_MATCH_AS, ref_version=2),
+                     lambda: measure_reference(catdir, filt, nproc=nproc, obs_list=obs_list),
+                     f"{filt} VIRAC2 Ks reference", cache)
+        ref = fit_reference(rm)
+    sol = solve_filter(m, ref)
+    summ = summarise(m, sol)
     with open(os.path.join(outdir, f"s13zp_{fl}.json"), "w") as fh:
         json.dump(dict(summary=summ, solutions=_jsonable(sol), meta=m["meta"],
                        gauge="mean zero over the tiles (nodes) of each connected component"),
@@ -635,6 +947,8 @@ def run_filter(catdir, filt, outdir, nproc=1, cache=True, obs_list=None):
     plot_residuals(m, sol, os.path.join(outdir, f"s13zp_{fl}_residuals.png"))
     plot_modules(m, sol, os.path.join(outdir, f"s13zp_{fl}_modules.png"))
     plot_time_roll(m, sol, os.path.join(outdir, f"s13zp_{fl}_vs_time_roll.png"))
+    if sol.get("tile+G"):
+        plot_gradient(m, sol, rm, os.path.join(outdir, f"s13zp_{fl}_gradient.png"))
     print(json.dumps(summ, indent=1, default=float), flush=True)
     return dict(m=m, sol=sol, summary=summ)
 
@@ -647,9 +961,12 @@ def main(argv=None):
     ap.add_argument("--obs", nargs="+", default=None, help="restrict to these obs ids (testing)")
     ap.add_argument("--nproc", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", "1")))
     ap.add_argument("--no-cache", action="store_true", help="re-measure every pair")
+    ap.add_argument("--no-reference", action="store_true",
+                    help="skip the VIRAC2 Ks anchor and the tile+G gradient model")
     a = ap.parse_args(argv)
     os.makedirs(a.outdir, exist_ok=True)
-    results = [run_filter(a.catdir, f, a.outdir, a.nproc, cache=not a.no_cache, obs_list=a.obs)
+    results = [run_filter(a.catdir, f, a.outdir, a.nproc, cache=not a.no_cache, obs_list=a.obs,
+                          reference=not a.no_reference)
                for f in a.filters]
     plot_summary(results, os.path.join(a.outdir, "s13zp_summary.png"))
 
