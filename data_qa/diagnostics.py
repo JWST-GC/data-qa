@@ -7492,9 +7492,9 @@ def stage15_residual_comparison(o: Observation, sw, lw):
     Rows: the SW and LW filter.  Columns: the released i2d (reference, own asinh stretch) and then
     one column per tool with a residual map covering the cutout (jicama mosaic of the highest
     iteration, one peppar single-frame residual, StarFinder, jwst1pass).  A tool missing in every
-    row loses its column.  Each residual cutout is median-subtracted (jicama keeps its background
-    in the residual, peppar subtracts it) and resampled onto one north-up grid per row; all
-    residual panels in a row share one symmetric linear colour scale."""
+    row loses its column.  Each residual cutout is shown as written, with no median or pedestal
+    removed (jicama keeps its background in the residual, peppar subtracts it), resampled onto one
+    north-up grid per row; all residual panels in a row share one symmetric linear colour scale."""
     from astropy.visualization import ImageNormalize, AsinhStretch
     from matplotlib.colors import Normalize
     from reproject import reproject_interp
@@ -7573,14 +7573,14 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                 if m.prod["wcs_path"] != m.prod["path"]:
                     _used(m.prod["wcs_path"], f"{f} {t} cal frame (WCS + unit)")
                 st = _s15_stats(d)
-                rs, _ = reproject_interp((d - st["median"], w), tw, shape_out=shape)
+                rs, _ = reproject_interp((d, w), tw, shape_out=shape)
                 shown[t] = rs
                 units.add(m.unit or "unitless")
                 per_tool[t][f] = dict(file=os.path.basename(m.prod["path"]), iteration=m.prod["iteration"],
                                       tag=m.prod.get("tag"), generation=m.prod.get("generation"),
                                       quarantined_skipped=list(m.prod.get("quarantined") or []),
                                       unit=m.unit, rms=st["rms"], mad_sigma=st["mad_sigma"],
-                                      median_subtracted=st["median"], n_pix=st["n_pix"],
+                                      median=st["median"], n_pix=st["n_pix"],
                                       native_pixscale_arcsec=m.pixscale())
             pool = np.concatenate([np.abs(v[np.isfinite(v)]) for v in shown.values()]) if shown else np.array([1.0])
             vlim = float(np.nanpercentile(pool, _S15_CLIP_PCT)) if pool.size else 1.0
@@ -7618,7 +7618,7 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                     if pt.get("generation"):
                         it += f", {pt['generation']}"
                     ax.set_title(f"{t}" + (f" ({it})" if it else "") + f"\n{stem}", fontsize=7)
-                    ax.text(0.03, 0.03, f"RMS {pt['rms']:.3g}\nMAD-σ {pt['mad_sigma']:.3g}",
+                    ax.text(0.03, 0.03, f"median {pt['median']:.3g}\nRMS {pt['rms']:.3g}\nMAD-σ {pt['mad_sigma']:.3g}",
                             transform=ax.transAxes, fontsize=7, va="bottom",
                             bbox=dict(fc="white", ec="none", alpha=0.7, pad=1.5))
                 else:
@@ -7632,13 +7632,13 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                 cax = fig.add_axes([pos.x1 + 0.01, pos.y0, 0.012, pos.height])
                 cb = fig.colorbar(im, cax=cax)
                 ulab = units.pop() if len(units) == 1 else "mixed: " + ", ".join(sorted(units))
-                cb.set_label(f"residual − median [{ulab}]", fontsize=8)
+                cb.set_label(f"residual [{ulab}]", fontsize=8)
                 cb.ax.tick_params(labelsize=7)
         miss = "; ".join(f"{t}: {r}" for t, r in missing.items())
         fig.suptitle(f"{o.obsid}  residual maps by tool — {_S15_SIZE_ARCSEC:.0f}\"×{_S15_SIZE_ARCSEC:.0f}\" "
                      f"at RA {c.ra.deg:.5f} Dec {c.dec.deg:+.5f} (north up)\n"
                      f"one symmetric linear scale per row (±{_S15_CLIP_PCT:.0f}th pct |residual|); "
-                     f"each cutout median-subtracted"
+                     f"residuals as written (no median removed)"
                      + (f"\nskipped — {miss}" if miss else ""), fontsize=8)
         # own footer: peppar residual basenames carry no "peppar" token for _annotate_sources
         srcs = (["released i2d"] if has_ref else []) + [
@@ -8133,10 +8133,12 @@ def _caption_stage15(metrics):
               f"{_s15_jicama_note(pt.get('jicama') or {})}), and "
               f"peppar's residual of one single exposure that covers the cutout (background "
               f"subtracted; fit in DN/s and multiplied back by the cal frame's PHOTMJSR; WCS from "
-              f"the cal frame). Each cutout has its median subtracted "
+              f"the cal frame). Each cutout is shown as written, with no median removed, "
               f"and is resampled onto one north-up grid per row; the residual panels of a row share "
               f"one symmetric linear colour scale (±{_S15_CLIP_PCT:.0f}th percentile of |residual| "
-              f"over the row). RMS and MAD are measured on the native-pixel cutout. "
+              f"over the row), so a pedestal such as jicama's kept background shows as an "
+              f"overall tint. Median, RMS about the median, and MAD are measured on the "
+              f"native-pixel cutout. "
             + ("Skipped: " + "; ".join(f"{t} ({r})" for t, r in skipped.items()) + ". "
                if skipped else "")
             + "The centre is a seeded-random spot covered by the most maps. No pass/fail is set. "

@@ -91,13 +91,13 @@ def test_stage15_all_four_tools(field):
     assert m["available"] is True and m["passed"] is None
     assert m["tools_present"] == ["jicama", "peppar", "starfinder", "jwst1pass"]
     assert m["tools_missing"] == {} and m["has_reference"] is True
-    # medians removed, noise measured on native pixels: unit-variance noise -> RMS and MAD ~ 1
+    # median reported (not removed), noise measured on native pixels: unit-variance noise -> RMS and MAD ~ 1
     for t in m["tools_present"]:
         for f in ("F212N", "F480M"):
             d = m["per_tool"][t][f]
             k = PHOTMJSR if t == "peppar" else 1.0      # peppar DN/s rescaled to MJy/sr
             assert 0.7 * k < d["rms"] < 1.3 * k and 0.7 * k < d["mad_sigma"] < 1.3 * k
-    assert abs(m["per_tool"]["jicama"]["F212N"]["median_subtracted"] - 3.0) < 0.3
+    assert abs(m["per_tool"]["jicama"]["F212N"]["median"] - 3.0) < 0.3
     # peppar's unit comes from the cal frame (the residual file carries none)
     assert m["per_tool"]["peppar"]["F212N"]["unit"] == "MJy/sr"
     # centre is reproducible (seeded by the obsid)
@@ -242,3 +242,21 @@ def test_stage15_jicama_plain_fallback_skips_quarantined_top(tmp_path, monkeypat
 def test_stage15_jicama_all_quarantined_gives_reason(tmp_path, monkeypatch):
     _jicama_dir(tmp_path, monkeypatch, [], quarantined=["resbgsub_m7"])
     assert "quarantined" in D._s15_jicama(_obs(), "F212N")
+
+
+def test_stage15_displays_residuals_without_median_removed(field, monkeypatch):
+    """Every residual panel shows the residual as written: jicama's +3 pedestal reaches the
+    resampled display unchanged, so all panels of a row sit on exactly the same scale."""
+    import reproject
+    seen = []
+    real = reproject.reproject_interp
+
+    def spy(inp, *a, **k):
+        seen.append(float(np.nanmedian(inp[0])))
+        return real(inp, *a, **k)
+    monkeypatch.setattr(reproject, "reproject_interp", spy)
+    _, m = D.stage15_residual_comparison(_obs(), "F212N", "F480M")
+    jic = m["per_tool"]["jicama"]["F212N"]["median"]
+    assert abs(jic - 3.0) < 0.3
+    assert any(abs(v - jic) < 1e-6 for v in seen)
+    assert "no median removed" in D.caption_for(15, m)

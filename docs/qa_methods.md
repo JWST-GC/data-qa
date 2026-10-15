@@ -995,16 +995,17 @@ blank.
   grids, `LOG.psfperts.fits` (PSF-perturbation residuals, not sky residuals; see [stage 11](#stage11))
   and catalogues, and no residual images as of 2026-10-13, so this column is skipped.
 
-**Display.** Each residual cutout has its median subtracted, which removes jicama's kept
-background level and any pedestal, and is resampled (bilinear, `reproject_interp`) onto one
+**Display.** Each residual cutout is shown as written, with no median or pedestal removed, so
+every panel of a row is on exactly the same scale and jicama's kept background level shows as an
+overall tint. Each cutout is resampled (bilinear, `reproject_interp`) onto one
 north-up TAN grid per row at the finest native pixel scale in that row; peppar frames are in
 detector orientation before resampling. All residual panels of a row share one symmetric linear
 colour scale, ±the 99th percentile of |residual| pooled over the row, with a colourbar in the
 maps' unit (MJy/sr for jicama, and for peppar after the PHOTMJSR rescaling). Each panel is labelled with the tool, its
 iteration or frame, and the file stem.
 
-**Numbers.** Per tool and filter, on the native-pixel cutout before resampling: the median that
-was subtracted, the RMS about it, and 1.4826·MAD. Bright-star residuals dominate the RMS; the MAD
+**Numbers.** Per tool and filter, on the native-pixel cutout before resampling: the median (not
+removed from the display), the RMS about it, and 1.4826·MAD. Bright-star residuals dominate the RMS; the MAD
 tracks the background noise. Single-frame peppar values are not directly comparable with the
 mosaic values, since the mosaics average several exposures.
 
@@ -1021,7 +1022,7 @@ as `na_reason`.
 
 **Metrics.** `center_ra`, `center_dec`, `tools_present`, `tools_missing` (tool → reason),
 `per_tool` (tool → filter → `file`, `iteration`, `tag`, `generation` (jicama: `hybrid PSF` / `plain PSF`),
-`quarantined_skipped`, `unit`, `rms`, `mad_sigma`, `median_subtracted`,
+`quarantined_skipped`, `unit`, `rms`, `mad_sigma`, `median`,
 `n_pix`, `native_pixscale_arcsec`), `has_reference`, `inputs`; `passed` is always null.
 
 Source: [`data_qa/diagnostics.py` → `stage15_residual_comparison`](../data_qa/diagnostics.py)
