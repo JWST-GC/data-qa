@@ -7265,10 +7265,40 @@ def _s15_jicama(o: Observation, filt):
     return "no jicama residual mosaic (`*-merged_<tag>_daophot_basic_mergedcat_residual_i2d.fits`)"
 
 
+# Frames of the same exposure that carry the realigned WCS, in order of preference.  The pipeline
+# writes the alignment into these (``RAOFFSET``/``DEOFFSET`` in the SCI header, from
+# fix_alignment); the ``_cal`` frame keeps the guide-star pointing WCS, which sits 0.2-0.3" off the
+# released mosaics on 10678 and brick o001 and 7.9" off on cloudc o002 (JWST-GC/data-qa#6).
+_S15_ALIGNED_SUFFIXES = ("destreak_o{obs}_crf", "align_o{obs}_crf", "destreak", "align")
+
+
+def _s15_aligned_frame(cal, obs):
+    """The realigned frame of ``cal``'s exposure (same detector grid, SCI header carrying
+    ``RAOFFSET``), or None.  A same-named frame without ``RAOFFSET`` is skipped: cloudc's stale
+    ``align_o002_crf`` predates the realignment and its WCS misses the mosaic as well."""
+    from astropy.io import fits
+    if not cal.endswith("_cal.fits"):
+        return None
+    root = cal[: -len("_cal.fits")]
+    for suf in _S15_ALIGNED_SUFFIXES:
+        p = f"{root}_{suf.format(obs=obs)}.fits"
+        if not os.path.isfile(p):
+            continue
+        try:
+            hdr = fits.getheader(p, "SCI")
+        except (OSError, KeyError):
+            continue
+        if hdr.get("RAOFFSET") is not None:
+            return p
+    return None
+
+
 def _s15_peppar(o: Observation, filt):
     """Every peppar per-frame residual for this obs+filter, as a list of product dicts (one per
-    frame, each with the cal frame that carries its WCS), or a reason string.  The residual FITS
-    hold only a bare image; the cal frame's SCI header supplies the WCS and the units."""
+    frame), or a reason string.  The residual FITS hold only a bare image on the cal frame's pixel
+    grid.  The units come from the cal frame (``unit_path``); the WCS comes from the realigned
+    frame of the same exposure when there is one (``_s15_aligned_frame``), else from the cal frame,
+    whose pointing WCS does not match the released mosaics (``wcs_aligned`` says which)."""
     pdir = _peppar_dir(o, filt)
     if pdir is None:
         return "no peppar directory for this filter"
@@ -7283,7 +7313,9 @@ def _s15_peppar(o: Observation, filt):
             stem = p[: -len(pat) + 1]                   # drop the suffix after the '*'
             cal = _peppar_cal_for_cat(stem + "_iter1_cat.fits")
             if cal:
-                out.append(dict(tool="peppar", kind="frame", path=p, wcs_path=cal, iteration=it,
+                aligned = _s15_aligned_frame(cal, o.obs)
+                out.append(dict(tool="peppar", kind="frame", path=p, wcs_path=aligned or cal,
+                                unit_path=cal, wcs_aligned=aligned is not None, iteration=it,
                                 tag=f"single frame, {it}"))
         if out:
             return out
@@ -7344,12 +7376,13 @@ class _S15Map:
         if prod["wcs_path"] == prod["path"]:
             hdr = hdu.header
             self.unit = str(hdr.get("BUNIT", "") or "").strip()
-        else:                                           # peppar: WCS + unit from the cal frame
+        else:                       # peppar: unit from the cal frame, WCS from the aligned frame
             hdr = fits.getheader(prod["wcs_path"], "SCI")
-            photmjsr = hdr.get("PHOTMJSR")
+            uhdr = fits.getheader(prod.get("unit_path") or prod["wcs_path"], "SCI")
+            photmjsr = uhdr.get("PHOTMJSR")
             if photmjsr:
                 self.scale = float(photmjsr)
-                self.unit = str(hdr.get("BUNIT", "") or "MJy/sr").strip()
+                self.unit = str(uhdr.get("BUNIT", "") or "MJy/sr").strip()
             else:
                 self.unit = "DN/s"
         with warnings.catch_warnings():
@@ -7570,7 +7603,10 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                     continue
                 m, (d, w) = cuts[(t, f)]
                 _used(m.prod["path"], f"{f} {t} residual (displayed)")
-                if m.prod["wcs_path"] != m.prod["path"]:
+                if m.prod.get("unit_path") and m.prod["unit_path"] != m.prod["wcs_path"]:
+                    _used(m.prod["unit_path"], f"{f} {t} cal frame (unit)")
+                    _used(m.prod["wcs_path"], f"{f} {t} aligned frame (WCS)")
+                elif m.prod["wcs_path"] != m.prod["path"]:
                     _used(m.prod["wcs_path"], f"{f} {t} cal frame (WCS + unit)")
                 st = _s15_stats(d)
                 rs, _ = reproject_interp((d, w), tw, shape_out=shape)
@@ -7581,7 +7617,10 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                                       quarantined_skipped=list(m.prod.get("quarantined") or []),
                                       unit=m.unit, rms=st["rms"], mad_sigma=st["mad_sigma"],
                                       median=st["median"], n_pix=st["n_pix"],
-                                      native_pixscale_arcsec=m.pixscale())
+                                      native_pixscale_arcsec=m.pixscale(),
+                                      **({"wcs_file": os.path.basename(m.prod["wcs_path"]),
+                                          "wcs_aligned": bool(m.prod.get("wcs_aligned"))}
+                                         if m.prod["wcs_path"] != m.prod["path"] else {}))
             pool = np.concatenate([np.abs(v[np.isfinite(v)]) for v in shown.values()]) if shown else np.array([1.0])
             vlim = float(np.nanpercentile(pool, _S15_CLIP_PCT)) if pool.size else 1.0
             vlim = vlim if vlim > 0 else 1.0
@@ -8133,7 +8172,7 @@ def _caption_stage15(metrics):
               f"{_s15_jicama_note(pt.get('jicama') or {})}), and "
               f"peppar's residual of one single exposure that covers the cutout (background "
               f"subtracted; fit in DN/s and multiplied back by the cal frame's PHOTMJSR; WCS from "
-              f"the cal frame). Each cutout is shown as written, with no median removed, "
+              f"the realigned frame of the same exposure{_s15_peppar_wcs_note(pt.get('peppar') or {})}). Each cutout is shown as written, with no median removed, "
               f"and is resampled onto one north-up grid per row; the residual panels of a row share "
               f"one symmetric linear colour scale (±{_S15_CLIP_PCT:.0f}th percentile of |residual| "
               f"over the row), so a pedestal such as jicama's kept background shows as an "
@@ -8143,6 +8182,15 @@ def _caption_stage15(metrics):
                if skipped else "")
             + "The centre is a seeded-random spot covered by the most maps. No pass/fail is set. "
               "([how this is made](DOCROOT#stage15))\n\n" + "\n".join(rows))
+
+
+def _s15_peppar_wcs_note(per_filter):
+    """Caption suffix naming the peppar filters whose WCS fell back to the cal frame."""
+    raw = [f for f, d in per_filter.items() if d.get("wcs_aligned") is False]
+    if not raw:
+        return ""
+    return (f"; {', '.join(raw)}: no realigned frame found, so the cal frame's guide-star WCS is "
+            f"used and the panel can sit up to several arcseconds off the mosaic")
 
 
 def _roll_note(metrics):

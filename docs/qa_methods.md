@@ -1004,8 +1004,14 @@ blank.
   caption and the metrics. The residual is image − model with the smoothed background kept.
 * **peppar:** the per-exposure residual `*_res_FINAL.fits` (else `*_iter1_res.fits`) under
   `<field>/peppar/[o<obs>/]<FILT>/<DET>/`, scoped to this observation by its `jw<prog><obs>` file
-  prefix. These files hold a bare image, so the WCS comes from the matching cal frame
-  (`<field>/<FILT>/pipeline/<exp>_<det>_cal.fits`, SCI header). peppar fits the cal frame divided
+  prefix. These files hold a bare image on the pixel grid of the matching cal frame
+  (`<field>/<FILT>/pipeline/<exp>_<det>_cal.fits`). The WCS comes from the realigned frame of the
+  same exposure, the first of `<exp>_<det>_destreak_o<obs>_crf.fits`, `..._align_o<obs>_crf.fits`,
+  `..._destreak.fits`, `..._align.fits` whose SCI header carries `RAOFFSET` (written by the
+  pipeline's realignment). The cal frame keeps the guide-star pointing WCS, which sits 0.2–0.3″
+  off the released mosaics on 10678 o066 and brick o001 and 7.9″ off on Cloud C o002
+  ([#6](https://github.com/JWST-GC/data-qa/issues/6)); it is used only when no realigned frame
+  exists, and the caption then says so. peppar fits the cal frame divided
   by its `PHOTMJSR` (DN/s; the peppar `_iter1_orig` image equals the cal SCI plane × 1/PHOTMJSR to
   7 digits on 10678 o066 and brick o001, SW and LW), so the residual is multiplied by the cal
   frame's `PHOTMJSR` to bring it to MJy/sr. Without a `PHOTMJSR` card it stays in DN/s and the
