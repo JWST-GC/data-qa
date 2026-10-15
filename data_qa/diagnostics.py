@@ -7373,12 +7373,15 @@ class _S15Map:
             h for h in self.hdul if getattr(h, "data", None) is not None and h.data.ndim == 2)
         self.data = hdu.data
         self.scale = 1.0
+        self.wcs_offset = None          # (RAOFFSET, DEOFFSET) of a separate WCS frame, arcsec
         if prod["wcs_path"] == prod["path"]:
             hdr = hdu.header
             self.unit = str(hdr.get("BUNIT", "") or "").strip()
         else:                       # peppar: unit from the cal frame, WCS from the aligned frame
             hdr = fits.getheader(prod["wcs_path"], "SCI")
             uhdr = fits.getheader(prod.get("unit_path") or prod["wcs_path"], "SCI")
+            if hdr.get("RAOFFSET") is not None:
+                self.wcs_offset = (float(hdr["RAOFFSET"]), float(hdr.get("DEOFFSET", float("nan"))))
             photmjsr = uhdr.get("PHOTMJSR")
             if photmjsr:
                 self.scale = float(photmjsr)
@@ -7619,7 +7622,9 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                                       median=st["median"], n_pix=st["n_pix"],
                                       native_pixscale_arcsec=m.pixscale(),
                                       **({"wcs_file": os.path.basename(m.prod["wcs_path"]),
-                                          "wcs_aligned": bool(m.prod.get("wcs_aligned"))}
+                                          "wcs_aligned": bool(m.prod.get("wcs_aligned")),
+                                          "wcs_raoffset_arcsec": (m.wcs_offset or (None, None))[0],
+                                          "wcs_deoffset_arcsec": (m.wcs_offset or (None, None))[1]}
                                          if m.prod["wcs_path"] != m.prod["path"] else {}))
             pool = np.concatenate([np.abs(v[np.isfinite(v)]) for v in shown.values()]) if shown else np.array([1.0])
             vlim = float(np.nanpercentile(pool, _S15_CLIP_PCT)) if pool.size else 1.0

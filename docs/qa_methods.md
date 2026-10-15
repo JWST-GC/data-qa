@@ -1011,7 +1011,7 @@ blank.
   pipeline's realignment). The cal frame keeps the guide-star pointing WCS, which sits 0.2–0.3″
   off the released mosaics on 10678 o066 and brick o001 and 7.9″ off on Cloud C o002
   ([#6](https://github.com/JWST-GC/data-qa/issues/6)); it is used only when no realigned frame
-  exists, and the caption then says so. peppar fits the cal frame divided
+  exists, and the caption then says so. The metrics record the chosen frame (`wcs_file`) and its `RAOFFSET`/`DEOFFSET` (`wcs_raoffset_arcsec`, `wcs_deoffset_arcsec`), so a stale but realigned frame on a re-tied field can be spotted. peppar fits the cal frame divided
   by its `PHOTMJSR` (DN/s; the peppar `_iter1_orig` image equals the cal SCI plane × 1/PHOTMJSR to
   7 digits on 10678 o066 and brick o001, SW and LW), so the residual is multiplied by the cal
   frame's `PHOTMJSR` to bring it to MJy/sr. Without a `PHOTMJSR` card it stays in DN/s and the
