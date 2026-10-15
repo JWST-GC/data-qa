@@ -260,3 +260,42 @@ def test_stage15_displays_residuals_without_median_removed(field, monkeypatch):
     assert abs(jic - 3.0) < 0.3
     assert any(abs(v - jic) < 1e-6 for v in seen)
     assert "no median removed" in D.caption_for(15, m)
+
+
+def test_stage15_peppar_wcs_from_aligned_frame(tmp_path, monkeypatch):
+    """The cal frame keeps the pointing WCS; the realigned crf of the same exposure (RAOFFSET in
+    its header) supplies the WCS, a stale crf without RAOFFSET is skipped, and the unit still comes
+    from the cal frame (JWST-GC/data-qa#6: cloudc cal WCS 7.9" off the mosaic)."""
+    rng = np.random.default_rng(4)
+    root = tmp_path / "gc-treasury"
+    pdir = root / "peppar" / "o066" / "F212N" / "NRCA1"
+    pipe = root / "F212N" / "pipeline"
+    pdir.mkdir(parents=True); pipe.mkdir(parents=True)
+    exp = "jw10678066001_02101_00001_nrca1"
+    _bare(pdir / f"{exp}_cal_gc-treasury_res_FINAL.fits", 0.0, rng)
+    cal = _sci(pipe / f"{exp}_cal.fits", 0.0, rng, PHOTMJSR=PHOTMJSR)
+    stale = _sci(pipe / f"{exp}_align_o066_crf.fits", 0.0, rng, bunit="junk")
+    monkeypatch.setattr(D, "_PEPPAR_DEFAULT_ROOT", str(tmp_path))
+    assert D._s15_aligned_frame(cal, "066") is None
+    r = D._s15_peppar(_obs(), "F212N")
+    assert r[0]["wcs_path"] == cal and r[0]["wcs_aligned"] is False
+    good = _sci(pipe / f"{exp}_destreak_o066_crf.fits", 0.0, rng, bunit="junk", RAOFFSET=0.5,
+                DEOFFSET=7.9, CRVAL2=DEC0 + 7.9 / 3600.0)
+    assert D._s15_aligned_frame(cal, "066") == good and stale != good
+    r = D._s15_peppar(_obs(), "F212N")
+    assert r[0]["wcs_path"] == good and r[0]["unit_path"] == cal and r[0]["wcs_aligned"] is True
+    mp = D._S15Map(r[0])
+    assert mp.scale == PHOTMJSR and mp.unit == "MJy/sr"
+    assert np.isclose(mp.wcs.wcs.crval[1], DEC0 + 7.9 / 3600.0)
+    mp.close()
+
+
+def test_stage15_caption_flags_cal_wcs_fallback():
+    m = dict(available=True, tools_present=["jicama", "peppar"], center_ra=266.4, center_dec=-29.0,
+             sw="F212N", lw="F480M",
+             per_tool={"peppar": {"F212N": dict(file="a", rms=1, mad_sigma=1, unit="MJy/sr",
+                                                wcs_aligned=False),
+                                  "F480M": dict(file="b", rms=1, mad_sigma=1, unit="MJy/sr",
+                                                wcs_aligned=True)}})
+    cap = D.caption_for(15, m)
+    assert "F212N: no realigned frame found" in cap and "F480M: no realigned" not in cap
