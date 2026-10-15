@@ -935,8 +935,8 @@ def test_stage4_caption_states_when_spatial_check_skipped():
     assert "cells that agree with each other" not in whole
 
 
-def test_make_issues_frame_ok_untficked_when_spatial_unassessed(monkeypatch):
-    # ask 2 consumer: make_issues must NOT tick the astrometry box on a whole-field tie.
+def test_make_issues_frame_ok_not_passed_when_spatial_unassessed(monkeypatch):
+    # ask 2 consumer: the status table must not show a frame-tie pass on a whole-field tie.
     from data_qa import make_issues as MI
     monkeypatch.setattr(MI, "_guidestar_json", lambda: {})
     o = Observation(program="3958", obs="007", target="Sickle", release_field="sickle",
@@ -944,20 +944,21 @@ def test_make_issues_frame_ok_untficked_when_spatial_unassessed(monkeypatch):
 
     def _M(spatial):
         return {"stage1": {"passed": True}, "stage2": {"passed": True}, "stage3": {"passed": True},
-                "stage4": {"passed": True, "spatial_assessed": spatial}, "stage5": {}}
+                "stage4": {"passed": True, "spatial_assessed": spatial, "bulk_off": 4.0},
+                "stage5": {}}
 
+    def row():
+        return [l for l in MI.render_body(o).splitlines()
+                if l.startswith("| Registration onto VIRAC2/Gaia")][0]
     monkeypatch.setattr(MI, "_qa_metrics", lambda oo: _M(False))
-    line = [l for l in MI.render_body(o).splitlines() if "Astrometry" in l][0]
-    assert "[ ]" in line and "[x]" not in line
+    assert "⚠️" in row() and "per-cell check not run" in row()
     monkeypatch.setattr(MI, "_qa_metrics", lambda oo: _M(True))
-    line2 = [l for l in MI.render_body(o).splitlines() if "Astrometry" in l][0]
-    assert "[x]" in line2
+    assert "✅" in row()
 
 
-def test_make_issues_product_existence_checkboxes(monkeypatch):
-    # jicama / JWST1PASS / peppar presence boxes are auto-set from the diagnostics: a stage whose
-    # product is absent reports available=False (no red flag), so "not available" leaves the box
-    # unticked.
+def test_make_issues_product_existence_status(monkeypatch):
+    # jicama / JWST1PASS / peppar presence comes from the diagnostics: a stage whose product is
+    # absent reports available=False (no red flag), so "not available" shows as not found.
     from data_qa import make_issues as MI
     monkeypatch.setattr(MI, "_guidestar_json", lambda: {})
     o = Observation(program="2045", obs="001", target="Arches", release_field="arches",
@@ -967,15 +968,16 @@ def test_make_issues_product_existence_checkboxes(monkeypatch):
         "stage6": {"peppar_kind": "frame-to-frame σ"},    # peppar present
         "stage10": {"stage": 10, "available": False},     # JWST1PASS absent
         "stage11": {"stage": 11, "available": True}})
-    lines = {l.split("**Products**: ")[1].split(" present")[0]: l
-             for l in MI.render_body(o).splitlines() if "**Products**:" in l}
-    assert "[x]" in lines["jicama (merged/release catalogue)"]
-    assert "[ ]" in lines["JWST1PASS products"]           # stage 10 unavailable -> absent
-    assert "[x]" in lines["peppar products"]
-    # nothing present -> all three unticked
+
+    def rows():
+        return {l.split(" | ")[0][2:]: l.split(" | ")[1] for l in MI.render_body(o).splitlines()
+                if l.startswith(("| jicama", "| JWST1PASS", "| peppar"))}
+    r = rows()
+    assert r["jicama merged catalogue"].startswith("✅")
+    assert r["JWST1PASS products"].startswith("⚠️")      # stage 10 unavailable -> absent
+    assert r["peppar products"].startswith("✅")
     monkeypatch.setattr(MI, "_qa_metrics", lambda oo: {"stage10": {"available": False}})
-    lines2 = [l for l in MI.render_body(o).splitlines() if "**Products**:" in l]
-    assert len(lines2) == 3 and all("[ ]" in l for l in lines2)
+    assert all(v.startswith("⚠️") for v in rows().values())
 
 
 def test_mosaic_path_lone_module_incomplete_when_sibling_filter_two_module(tmp_path, monkeypatch):
