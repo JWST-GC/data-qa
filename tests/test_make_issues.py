@@ -255,3 +255,47 @@ def test_globus_block_empty_when_unreduced(tmp_path, monkeypatch, obs):
     monkeypatch.setattr(mi, "_GLOBUS_ROOT", str(tmp_path))
     (tmp_path / "brick").mkdir()
     assert "fills in once the observation is reduced" in mi._globus_block(obs)
+
+
+def _miri_o001_cloudc():
+    return Observation(program="2221", obs="001", target="Cloud C",
+                       release_field="cloudc", instrument="MIRI",
+                       filters=["F2550W"], visits=["001"], epoch="2022-08-28")
+
+
+def test_sync_renames_a_migrated_title_instead_of_creating(monkeypatch):
+    """#153: the relabel renames the existing issue (#30) and updates it in place; no POST,
+    so no duplicate issue."""
+    o = _miri_o001_cloudc()
+    assert o.issue_title == "Cloud C — jw02221-o001 (MIRI)"
+    calls = []
+    monkeypatch.setattr(mi, "_req", lambda method, url, token, data=None:
+                        calls.append((method, url, data)) or (200, {"data": {}}))
+    monkeypatch.setattr(mi, "_qa_metrics", lambda o: {})
+    existing = {"Brick — jw02221-o001 (MIRI)": {"number": 30, "body": mi.render_body(o)}}
+    msg = mi.sync_observation(o, "tok", "own/repo", existing, today="2026-10-17")
+    assert msg == "updated #30: Cloud C — jw02221-o001 (MIRI)"
+    assert not any(m == "POST" and u.endswith("/issues") for m, u, _ in calls)
+    assert calls[0] == ("PATCH", f"{mi.API}/repos/own/repo/issues/30",
+                        {"title": "Cloud C — jw02221-o001 (MIRI)"})
+    assert calls[-1][0] == "PATCH" and calls[-1][1].endswith("/issues/30")
+    assert "body" in calls[-1][2]
+    assert "Brick — jw02221-o001 (MIRI)" not in existing
+
+
+def test_sync_migration_dry_run_and_already_renamed(monkeypatch):
+    """Dry run reports the rename without calling GitHub; once the new title exists the
+    migration is inert (a plain update, no title PATCH)."""
+    o = _miri_o001_cloudc()
+    calls = []
+    monkeypatch.setattr(mi, "_req", lambda method, url, token, data=None:
+                        calls.append((method, url, data)) or (200, {"data": {}}))
+    monkeypatch.setattr(mi, "_qa_metrics", lambda o: {})
+    old = {"Brick — jw02221-o001 (MIRI)": {"number": 30, "body": ""}}
+    assert mi.sync_observation(o, None, "own/repo", old, dry_run=True).startswith("RETITLE #30")
+    assert calls == []
+    both = {"Cloud C — jw02221-o001 (MIRI)": {"number": 30, "body": mi.render_body(o)},
+            "Brick — jw02221-o001 (MIRI)": {"number": 99, "body": ""}}
+    mi.sync_observation(o, "tok", "own/repo", both, today="2026-10-17")
+    assert not any(d == {"title": "Cloud C — jw02221-o001 (MIRI)"} for _, _, d in calls)
+    assert all(u.endswith("/issues/30") for m, u, _ in calls if m == "PATCH")

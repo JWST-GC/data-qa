@@ -121,6 +121,16 @@ FIELD_OVERRIDE: Dict[tuple, str] = {
     (2221, "002", "MIRI"): "brick",
 }
 
+# Issue-title migrations, {new title: old title}.  make_issues matches tracking issues by TITLE,
+# so a relabel (a FIELD_OVERRIDE change renames ``Observation.issue_title``) would otherwise make
+# the sync open a duplicate issue and orphan the old one (#31 ended as "Duplicate of #5").  When
+# only the old title exists, ``make_issues.sync_observation`` renames that issue and updates it
+# in place.  The entry is inert once the rename has happened, and may then be removed.
+#   2221 o001 MIRI: Brick -> Cloud C (issue #153; the existing issue is #30).
+TITLE_MIGRATIONS: Dict[str, str] = {
+    "Cloud C — jw02221-o001 (MIRI)": "Brick — jw02221-o001 (MIRI)",
+}
+
 
 @dataclass(frozen=True)
 class Observation:
