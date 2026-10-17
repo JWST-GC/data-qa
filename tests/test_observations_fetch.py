@@ -62,6 +62,20 @@ def test_registry_groups_by_instrument(monkeypatch):
     assert all(o.obs == "001" and o.field == "sgrb2" for o in obs)
 
 
+def test_registry_2221_miri_parallels_label_by_where_they_point(monkeypatch):
+    """2221 numbers its NIRCam and MIRI observations of the Brick and Cloud C in opposite
+    order (issues #31, #153): o001 NIRCam=Brick / MIRI=Cloud C, o002 NIRCam=Cloud C /
+    MIRI=Brick.  Both directions are pinned, and NIRCam keeps the PROGRAMS routing."""
+    rows = [_row("jw02221-o001_t001_nircam", "F212N", inst="NIRCAM/IMAGE"),
+            _row("jw02221-o001_t001_miri", "F2550W", inst="MIRI/IMAGE"),
+            _row("jw02221-o002_t001_nircam", "F212N", inst="NIRCAM/IMAGE"),
+            _row("jw02221-o002_t001_miri", "F2550W", inst="MIRI/IMAGE")]
+    monkeypatch.setattr(mast_monitor, "query_program", lambda prog: rows)
+    got = {(o.obs, o.instrument): o.field for o in observations.registry(programs=[2221])}
+    assert got == {("001", "NIRCam"): "brick", ("001", "MIRI"): "cloudc",
+                   ("002", "NIRCam"): "cloudc", ("002", "MIRI"): "brick"}
+
+
 def test_registry_records_mast_failure_loudly(monkeypatch, capsys):
     """A MAST query failure contributes no observations but is RECORDED (never a
     silent empty), so make_issues can refuse to sync."""
