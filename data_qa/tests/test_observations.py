@@ -28,7 +28,9 @@ def test_miri_o002_overrides_to_brick_nircam_stays_cloudc(monkeypatch):
 
 
 def test_field_override_is_instrument_specific():
-    # the override key is (program, obsnum, instrument): only 2221 o002 MIRI is remapped
+    # the override key is (program, obsnum, instrument): the two 2221 MIRI parallels are
+    # remapped (o001 -> cloudc, #153; o002 -> brick, #31); NIRCam keeps the PROGRAMS routing
     assert obsmod.FIELD_OVERRIDE.get((2221, "002", "MIRI")) == "brick"
+    assert obsmod.FIELD_OVERRIDE.get((2221, "001", "MIRI")) == "cloudc"
     assert obsmod.FIELD_OVERRIDE.get((2221, "002", "NIRCam")) is None
-    assert obsmod.FIELD_OVERRIDE.get((2221, "001", "MIRI")) is None
+    assert obsmod.FIELD_OVERRIDE.get((2221, "001", "NIRCam")) is None
