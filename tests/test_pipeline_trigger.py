@@ -733,7 +733,10 @@ def test_registry_preflight_registered_passes(tmp_path, capsys):
     """A clean pass is SILENT: any warning here would print on every poll for
     every registered observation, which is how a fail-open branch hides."""
     py = _fake_python(tmp_path, "exit 0")
-    assert _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py) is None
+    warns = []
+    assert _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py,
+                           warnings=warns) is None
+    assert warns == []
     assert capsys.readouterr().err == ""
 
 
@@ -744,6 +747,35 @@ def test_registry_preflight_timeout_fails_open(tmp_path, capsys):
     _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py, timeout_s=0.2)
     err = capsys.readouterr().err
     assert "TIMED OUT" in err and "fail-open" in err
+
+
+def test_registry_preflight_fail_open_returns_its_warning(tmp_path, capsys):
+    """Issue #152: the fail-open warning is handed to the caller as well as
+    printed, so it can reach the run notice instead of only the scrontab log."""
+    py = _fake_python(tmp_path, "sleep 5")
+    warns = []
+    _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe", python=py, timeout_s=0.2,
+                    warnings=warns)
+    assert len(warns) == 1 and "TIMED OUT" in warns[0]
+    missing = []
+    _REAL_PREFLIGHT(2221, "001", pipe_root="/pipe",
+                    python=str(tmp_path / "no-such-python"), warnings=missing)
+    assert len(missing) == 1 and "could not run" in missing[0]
+
+
+def test_submit_carries_preflight_warnings(monkeypatch):
+    """submit() hands the preflight's fail-open warnings back to its caller
+    (issue #152); a checked submit returns an empty list."""
+    monkeypatch.setattr(pt, "registry_preflight",
+                        lambda program, obs, warnings=None, **kw:
+                        warnings.append("preflight TIMED OUT"))
+    out = pt.submit(2221, "001", field="brick", filters=FILTERS,
+                    pipe_root="/pipe", execute=False, probe=False)
+    assert out["warnings"] == ["preflight TIMED OUT"]
+    monkeypatch.setattr(pt, "registry_preflight", lambda program, obs, **kw: None)
+    out = pt.submit(2221, "001", field="brick", filters=FILTERS,
+                    pipe_root="/pipe", execute=False, probe=False)
+    assert out["warnings"] == []
 
 
 def test_registry_preflight_missing_interpreter_fails_open(tmp_path, capsys):

@@ -120,8 +120,17 @@ class NotRegisteredInPipelineError(RuntimeError):
     minutes later, burning the monitor's one-shot trigger key (issue #68)."""
 
 
+def _fail_open(msg: str, warnings=None) -> None:
+    """Print one registry-preflight fail-open warning and, when ``warnings`` is
+    a list, append it there for the caller's run notice (issue #152)."""
+    print(f"pipeline_trigger: {msg}", file=sys.stderr)
+    if warnings is not None:
+        warnings.append(msg)
+
+
 def registry_preflight(program, obs, pipe_root=None, python=None,
-                       timeout_s=PREFLIGHT_TIMEOUT_S, instrument="nircam"):
+                       timeout_s=PREFLIGHT_TIMEOUT_S, instrument="nircam",
+                       warnings=None):
     """Verify (program, obs) is registered in the pipeline's fields.yaml BEFORE
     any sbatch; raises NotRegisteredInPipelineError when it is not.
 
@@ -150,7 +159,11 @@ def registry_preflight(program, obs, pipe_root=None, python=None,
     not silence real triggers: a false skip leaves delivered data unreduced
     with no error recorded anywhere and the operator pointed at a registration
     that is already correct, while proceeding reproduces the pre-preflight
-    burn-on-submit behaviour for that one observation."""
+    burn-on-submit behaviour for that one observation.
+
+    Returns None.  ``warnings``, when a list, receives each fail-open warning
+    (it is also printed), so a caller can carry it past the scrontab log into
+    the run notice (issue #152); a "registered" verdict appends nothing."""
     obs_token = str(obs)
     if not _OBS_TOKEN_RE.fullmatch(obs_token):
         raise ValueError(
@@ -174,17 +187,15 @@ def registry_preflight(program, obs, pipe_root=None, python=None,
         proc = subprocess.run([python, "-c", code], env=env,
                               capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        print(f"pipeline_trigger: registry preflight TIMED OUT after "
-              f"{timeout_s}s ({python}); proceeding WITHOUT the registry "
-              "check (fail-open: a wedged pipeline import must not silence "
-              "real triggers)", file=sys.stderr)
-        return
+        return _fail_open(
+            f"registry preflight TIMED OUT after {timeout_s}s ({python}); "
+            "proceeding WITHOUT the registry check (fail-open: a wedged "
+            "pipeline import must not silence real triggers)", warnings)
     except OSError as ex:
-        print(f"pipeline_trigger: registry preflight could not run "
-              f"({ex.__class__.__name__}: {ex}); proceeding WITHOUT the "
-              "registry check (fail-open, same rationale as the timeout)",
-              file=sys.stderr)
-        return
+        return _fail_open(
+            f"registry preflight could not run ({ex.__class__.__name__}: "
+            f"{ex}); proceeding WITHOUT the registry check (fail-open, same "
+            "rationale as the timeout)", warnings)
     lines = [ln.strip() for ln
              in ((proc.stderr or "") + (proc.stdout or "")).splitlines()
              if ln.strip()]
@@ -193,23 +204,22 @@ def registry_preflight(program, obs, pipe_root=None, python=None,
         plain = [ln for ln in lines
                  if not ln.startswith((_VERDICT_MARK, _MODULE_MARK))]
         raise_line = plain[-1] if plain else "no output"
-        print(f"pipeline_trigger: registry preflight FAILED to reach a verdict "
-              f"for program {int(program)} obs {obs_token} (rc="
-              f"{proc.returncode}: {raise_line}); proceeding WITHOUT the "
-              "registry check (fail-open: a broken pipeline env must not "
-              "silence real triggers)", file=sys.stderr)
-        return
+        return _fail_open(
+            f"registry preflight FAILED to reach a verdict for program "
+            f"{int(program)} obs {obs_token} (rc={proc.returncode}: "
+            f"{raise_line}); proceeding WITHOUT the registry check (fail-open: "
+            "a broken pipeline env must not silence real triggers)", warnings)
     consulted = ([""] + _marked(lines, _MODULE_MARK))[-1]
     root = os.path.realpath(pipe_root)
     if not (consulted == root or consulted.startswith(root + os.sep)):
         # the answer came from a registry other than the checkout being
         # submitted against (pip-installed package, inert PYTHONPATH prepend)
-        print(f"pipeline_trigger: registry preflight consulted "
-              f"{consulted or 'an unidentified registry'}, which is not under "
-              f"{pipe_root}; proceeding WITHOUT the registry check (fail-open: "
-              "a verdict must come from the checkout being submitted against)",
-              file=sys.stderr)
-        return
+        return _fail_open(
+            f"registry preflight consulted "
+            f"{consulted or 'an unidentified registry'}, which is not under "
+            f"{pipe_root}; proceeding WITHOUT the registry check (fail-open: "
+            "a verdict must come from the checkout being submitted against)",
+            warnings)
     if proc.returncode == 0:
         return
     verdict = _marked(lines, _VERDICT_MARK)
@@ -378,8 +388,11 @@ def _warn_destreak_contradiction(field, obs, destreak, policy) -> List[str]:
 def build_plan(program, obs, field=None, filters=None, pipe_root=None,
                modules="nrca,nrcb,merged", catalog_modules="merged",
                each_suffix=None, destreak=None, skip_step12=False,
-               probe=True) -> List[dict]:
+               probe=True, warnings=None) -> List[dict]:
     """The full submission sequence for one observation (list of step dicts).
+
+    ``warnings``, when a list, receives the registry preflight's fail-open
+    warnings (issue #152); the return value stays the step list.
 
     With no explicit ``each_suffix`` the pipeline's destreak policy is probed.
     On the --auto trigger path (no override at all) it sets EACH_SUFFIX, so the
@@ -401,7 +414,10 @@ def build_plan(program, obs, field=None, filters=None, pipe_root=None,
     # an observation the registry rejects has nothing to probe a policy for.
     # The nircam section is the one asked: every step this plan submits is a
     # NIRCam wrapper (submit_reduction.sbatch / submit_cataloging_chain.sh).
-    registry_preflight(program, obs, pipe_root=pipe_root)
+    if warnings is None:
+        registry_preflight(program, obs, pipe_root=pipe_root)
+    else:
+        registry_preflight(program, obs, pipe_root=pipe_root, warnings=warnings)
     policy = None
     if probe and each_suffix is None:
         # probed even under an explicit --destreak/--no-destreak: the flag still
@@ -531,13 +547,15 @@ def run_plan(plan: List[dict]) -> Dict[str, str]:
 def submit(program, obs, field=None, filters=None, pipe_root=None, execute=False,
            **kwargs) -> dict:
     """Build + print the plan; submit it when execute=True.  Returns
-    ``{"plan": steps, "results": {step: stdout}, "jobids": [ids]}`` --
-    results/jobids are empty on dry-run; jobids are parsed from the captured
-    sbatch output so the caller (act_trigger) can record them alongside the
-    one-shot trigger key."""
+    ``{"plan": steps, "results": {step: stdout}, "jobids": [ids],
+    "warnings": [str]}`` -- results/jobids are empty on dry-run; jobids are
+    parsed from the captured sbatch output so the caller (act_trigger) can
+    record them alongside the one-shot trigger key; warnings are the registry
+    preflight's fail-open warnings (issue #152), empty on a checked submit."""
     pipe_root = pipe_root or paths.pipe_root()
+    warnings: List[str] = []
     plan = build_plan(program, obs, field=field, filters=filters,
-                      pipe_root=pipe_root, **kwargs)
+                      pipe_root=pipe_root, warnings=warnings, **kwargs)
     missing = missing_scripts(pipe_root)
     results: Dict[str, str] = {}
     if execute:
@@ -553,7 +571,7 @@ def submit(program, obs, field=None, filters=None, pipe_root=None, execute=False
             print(f"# WARNING: missing under {pipe_root}: {missing} "
                   "(--execute would refuse)", file=sys.stderr)
     jobids = parse_jobids(results)
-    return dict(plan=plan, results=results, jobids=jobids)
+    return dict(plan=plan, results=results, jobids=jobids, warnings=warnings)
 
 
 def main(argv=None):
