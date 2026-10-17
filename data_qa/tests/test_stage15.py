@@ -100,6 +100,8 @@ def test_stage15_all_four_tools(field):
     assert abs(m["per_tool"]["jicama"]["F212N"]["median"] - 3.0) < 0.3
     # peppar's unit comes from the cal frame (the residual file carries none)
     assert m["per_tool"]["peppar"]["F212N"]["unit"] == "MJy/sr"
+    # the fixture's cal frame carries no RAOFFSET: offsets recorded as None
+    assert m["per_tool"]["peppar"]["F212N"]["wcs_raoffset_arcsec"] is None
     # centre is reproducible (seeded by the obsid)
     _, m2 = D.stage15_residual_comparison(_obs(), "F212N", "F480M")
     assert (m2["center_ra"], m2["center_dec"]) == (m["center_ra"], m["center_dec"])
@@ -287,6 +289,7 @@ def test_stage15_peppar_wcs_from_aligned_frame(tmp_path, monkeypatch):
     mp = D._S15Map(r[0])
     assert mp.scale == PHOTMJSR and mp.unit == "MJy/sr"
     assert np.isclose(mp.wcs.wcs.crval[1], DEC0 + 7.9 / 3600.0)
+    assert mp.wcs_offset == (0.5, 7.9)
     mp.close()
 
 
