@@ -299,3 +299,25 @@ def test_sync_migration_dry_run_and_already_renamed(monkeypatch):
     mi.sync_observation(o, "tok", "own/repo", both, today="2026-10-17")
     assert not any(d == {"title": "Cloud C — jw02221-o001 (MIRI)"} for _, _, d in calls)
     assert all(u.endswith("/issues/30") for m, u, _ in calls if m == "PATCH")
+
+
+def test_sync_failed_rename_creates_no_issue(monkeypatch):
+    """A rename that GitHub rejects (e.g. 422) is reported as FAILED and must not fall
+    through to the create path: no POST to /issues, no body PATCH, #30 left as it was."""
+    o = _miri_o001_cloudc()
+    calls = []
+
+    def req(method, url, token, data=None):
+        calls.append((method, url, data))
+        if method == "PATCH" and data == {"title": o.issue_title}:
+            return 422, {"message": "Validation Failed"}
+        return 200, {"number": 999, "data": {}}
+
+    monkeypatch.setattr(mi, "_req", req)
+    monkeypatch.setattr(mi, "_qa_metrics", lambda o: {})
+    monkeypatch.setattr(mi, "ensure_labels", lambda *a, **kw: None)
+    existing = {"Brick — jw02221-o001 (MIRI)": {"number": 30, "body": ""}}
+    msg = mi.sync_observation(o, "tok", "own/repo", existing, today="2026-10-17")
+    assert msg.startswith("FAILED (422) retitle #30")
+    assert calls == [("PATCH", f"{mi.API}/repos/own/repo/issues/30", {"title": o.issue_title})]
+    assert "Brick — jw02221-o001 (MIRI)" in existing and o.issue_title not in existing
