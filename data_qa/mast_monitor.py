@@ -1342,8 +1342,12 @@ def act_peppar(events, execute=False):
     obs.  Reuses peppar_trigger.submit_all (which dedups in-flight by SLURM job name), so it is
     safe to re-fire every poll.  Same NIRCam-only / released-data gates as act_trigger.
 
-    NOT wired into --auto: the peppar env needs repair (a dev photutils shadows the pinned
-    1.12.0) before these jobs can succeed; enable with --peppar once it imports."""
+    NOT wired into --auto; run it with --peppar.  The env problem that used to justify this (a
+    dev photutils shadowing the pinned 1.12.0) was checked resolved on 2026-09-04 and again on
+    2026-10-17 (data-qa#160; see scripts/peppar/run_peppar_generic.sbatch).  Whether to add it to
+    --auto is an open maintainer choice: one treasury tile fans out ~one job per detector per
+    filter, and the only dedup is the in-flight SLURM job name, so under --auto it re-fires
+    every poll until the jobs are queued."""
     from .peppar_trigger import submit_all   # stdlib-only
     for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
         field = evs[0]["field"]
