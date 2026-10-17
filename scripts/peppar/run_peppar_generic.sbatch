@@ -30,7 +30,9 @@ PEPPAR_ENV="${PEPPAR_ENV:-/orange/adamginsburg/miniconda3/envs/peppar}"
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PEPPAR_RUNNER="${PEPPAR_RUNNER:-${_HERE}/run_peppar_generic.py}"
 
-source "${PEPPAR_ENV}/bin/activate"
+# The env is a conda env with no bin/activate of its own, so activate it through the base
+# install's activate script (sourcing ${PEPPAR_ENV}/bin/activate exited 1 under set -e; data-qa#372 review).
+source /orange/adamginsburg/miniconda3/bin/activate "${PEPPAR_ENV}"
 export PYTHONPATH="${PEPPAR_REPO}"                 # peppar package only -- no dev-checkout paths
 export PYSYN_CDBS="${PYSYN_CDBS:-/orange/adamginsburg/synphot/grp/hst/cdbs}"   # webbpsf phoenix grid
 

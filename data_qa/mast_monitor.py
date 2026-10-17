@@ -1347,7 +1347,7 @@ def act_peppar(events, execute=False):
     2026-10-17 (data-qa#160; see scripts/peppar/run_peppar_generic.sbatch).  Whether to add it to
     --auto is an open maintainer choice: one treasury tile fans out ~one job per detector per
     filter, and the only dedup is the in-flight SLURM job name, so under --auto it re-fires
-    every poll until the jobs are queued."""
+    every poll whenever none of its jobs are in squeue, including after they complete."""
     from .peppar_trigger import submit_all   # stdlib-only
     for (program, obsnum, instr), evs in sorted(_group_by_obs(events).items()):
         field = evs[0]["field"]
