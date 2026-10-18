@@ -1,0 +1,112 @@
+{
+ "F212N:nrca1": {
+  "flat": "crds://jwst_nircam_flat_0713.fits",
+  "area": "crds://jwst_nircam_area_0305.fits",
+  "beta": 0.9621802489920223,
+  "beta_err": 0.033136000468702805,
+  "beta_plane": 5.0019737806977815,
+  "beta_plane_err": 0.21679120273788255,
+  "corr": 0.6719933446033929,
+  "flat_ls_rms_mmag": 14.991367921040439,
+  "area_rms_mmag": 10.470075102865163
+ },
+ "F212N:nrca2": {
+  "flat": "crds://jwst_nircam_flat_0669.fits",
+  "area": "crds://jwst_nircam_area_0315.fits",
+  "beta": 1.3720834272453077,
+  "beta_err": 0.050808064660381756,
+  "beta_plane": 3.043881395247835,
+  "beta_plane_err": 0.2785562635756215,
+  "corr": 0.6449438854880837,
+  "flat_ls_rms_mmag": 14.276959962973951,
+  "area_rms_mmag": 6.710844143030379
+ },
+ "F212N:nrca3": {
+  "flat": "crds://jwst_nircam_flat_0703.fits",
+  "area": "crds://jwst_nircam_area_0292.fits",
+  "beta": 0.45360836559787704,
+  "beta_err": 0.029382057118653895,
+  "beta_plane": -6.4203336557311035,
+  "beta_plane_err": 0.3327520834207616,
+  "corr": 0.4345208407827161,
+  "flat_ls_rms_mmag": 11.83524577035987,
+  "area_rms_mmag": 11.337226852570472
+ },
+ "F212N:nrca4": {
+  "flat": "crds://jwst_nircam_flat_0734.fits",
+  "area": "crds://jwst_nircam_area_0202.fits",
+  "beta": 0.8807634102551544,
+  "beta_err": 0.04508655383721393,
+  "beta_plane": -10.891655257127338,
+  "beta_plane_err": 0.31116436541685194,
+  "corr": 0.5210497187901203,
+  "flat_ls_rms_mmag": 13.53864301414056,
+  "area_rms_mmag": 8.009308803228048
+ },
+ "F212N:nrcb1": {
+  "flat": "crds://jwst_nircam_flat_0693.fits",
+  "area": "crds://jwst_nircam_area_0238.fits",
+  "beta": 0.872855644866998,
+  "beta_err": 0.027524785279014696,
+  "beta_plane": 3.302404068119436,
+  "beta_plane_err": 0.2983867659724202,
+  "corr": 0.7038990161097185,
+  "flat_ls_rms_mmag": 8.401040715554348,
+  "area_rms_mmag": 6.774870883578305
+ },
+ "F212N:nrcb2": {
+  "flat": "crds://jwst_nircam_flat_0676.fits",
+  "area": "crds://jwst_nircam_area_0251.fits",
+  "beta": 0.6777563584953779,
+  "beta_err": 0.03673944832364065,
+  "beta_plane": -1.754623651339867,
+  "beta_plane_err": 0.316400854446348,
+  "corr": 0.49944024757088584,
+  "flat_ls_rms_mmag": 14.166736751247434,
+  "area_rms_mmag": 10.439501484017194
+ },
+ "F212N:nrcb3": {
+  "flat": "crds://jwst_nircam_flat_0679.fits",
+  "area": "crds://jwst_nircam_area_0275.fits",
+  "beta": 1.5352255438782556,
+  "beta_err": 0.03139028549937506,
+  "beta_plane": -4.702055318284487,
+  "beta_plane_err": 0.2924632396165608,
+  "corr": 0.8367978541504114,
+  "flat_ls_rms_mmag": 14.624496644188751,
+  "area_rms_mmag": 7.971302626304862
+ },
+ "F212N:nrcb4": {
+  "flat": "crds://jwst_nircam_flat_0710.fits",
+  "area": "crds://jwst_nircam_area_0310.fits",
+  "beta": 0.9448549454365918,
+  "beta_err": 0.03599206417987002,
+  "beta_plane": -9.903581995301723,
+  "beta_plane_err": 0.31990036515350956,
+  "corr": 0.6342494290738295,
+  "flat_ls_rms_mmag": 17.048673696869333,
+  "area_rms_mmag": 11.444202743426342
+ },
+ "F480M:nrcalong": {
+  "flat": "crds://jwst_nircam_flat_0746.fits",
+  "area": "crds://jwst_nircam_area_0232.fits",
+  "beta": 0.9705940979889868,
+  "beta_err": 0.06569951352174712,
+  "beta_plane": 7.470959120928266,
+  "beta_plane_err": 0.2633295547963906,
+  "corr": 0.41915174319044674,
+  "flat_ls_rms_mmag": 39.590556318594025,
+  "area_rms_mmag": 17.097209563916525
+ },
+ "F480M:nrcblong": {
+  "flat": "crds://jwst_nircam_flat_0772.fits",
+  "area": "crds://jwst_nircam_area_0231.fits",
+  "beta": -0.37208163522114396,
+  "beta_err": 0.044868250864045195,
+  "beta_plane": -2.3462478544230354,
+  "beta_plane_err": 0.13503169250009492,
+  "corr": -0.2508619189632837,
+  "flat_ls_rms_mmag": 25.972774484242233,
+  "area_rms_mmag": 17.51115731375759
+ }
+}
