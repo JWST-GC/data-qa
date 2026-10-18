@@ -1016,6 +1016,21 @@ def _defer_owed(state, old_obs_by_prog, actionable, owed, label, verb, key_name)
 TRIGGER_REARM_REASONS = ("no-filters", "not-registered")
 
 
+def _preflight_notice(pairs) -> str:
+    """The clause naming the groups whose registry preflight FAILED OPEN
+    (issue #152): the check itself broke (timeout, missing interpreter, no
+    verdict, verdict from another checkout), so the trigger proceeded without
+    it.  That is a property of the RUN's pipeline environment, so it goes in
+    the run notice that every report comment of the run carries."""
+    groups = sorted({k for k, _ in pairs}, key=str)
+    named = ", ".join(_group_label(k) for k in groups)
+    first = pairs[0][1]
+    return (f"TRIGGER PREFLIGHT FAILED OPEN — {len(groups)} group(s) were "
+            f"submitted WITHOUT the pipeline registry check: {named}.  First "
+            f"warning: {first}  Check the pipeline env / checkout before the "
+            "next poll.")
+
+
 def _inflight_notice(keys) -> str:
     """The clause naming the groups act_trigger skipped because squeue already
     holds a job of their own.  They are RETIRED, not re-armed: the queued job
@@ -1219,7 +1234,8 @@ def act_download(events, execute=False, download_dir=DEFAULT_DOWNLOAD_DIR,
     return owed
 
 
-def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=None):
+def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=None,
+                preflight_warnings=None):
     """Submit the reduction chain for each actionable NIRCam (program, obs) group.
 
     Returns ``{group key: SKIP reason}`` for the MID-RUN skips -- the ones
@@ -1251,7 +1267,12 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
     someone edits PROGRAMS, a planned tile re-fires on its own when the data
     lands (a NEWLY_RELEASED / CALIB_LEVEL_UP event), MIRI has no automated
     trigger path to owe, and an already-triggered group is done.  Mirrors
-    act_download's split."""
+    act_download's split.
+
+    ``preflight_warnings``, when a list, receives one ``(group key, warning)``
+    pair per registry-preflight fail-open (issue #152): that submission went
+    out with the registry check skipped, and main() names it in the run
+    notice so the QA comment says so."""
     from . import pipeline_trigger   # stdlib-only
     from .pipeline_trigger import NotRegisteredInPipelineError
     triggered = (state or {}).get("triggered", {})
@@ -1326,6 +1347,9 @@ def act_trigger(events, execute=False, pipe_root=None, state=None, state_path=No
                   "fields.yaml; trigger stays armed", file=sys.stderr)
             skips[(program, obsnum, instr)] = "not-registered"
             continue
+        if preflight_warnings is not None and isinstance(outcome, dict):
+            for w in outcome.get("warnings") or []:
+                preflight_warnings.append(((program, obsnum, instr), w))
         if execute and state_path:
             # written IMMEDIATELY (not at the end-of-run commit) so a partial
             # failure in a later group cannot re-fire this submission; the
@@ -1945,9 +1969,16 @@ def main(argv=None):
                 print(f"--download: {deferred_download}", file=sys.stderr)
                 owed_labels += [_group_label(k) for k in owed]
         if args.trigger:
+            preflight_warnings: list = []
             skips = act_trigger(actionable, execute=args.execute,
                                 pipe_root=args.pipe_root, state=state,
-                                state_path=args.state) or {}
+                                state_path=args.state,
+                                preflight_warnings=preflight_warnings) or {}
+            if preflight_warnings:
+                failed_open = _preflight_notice(preflight_warnings)
+                notice = (f"{notice}  {failed_open}" if notice
+                          else failed_open)
+                print(f"--trigger: {failed_open}", file=sys.stderr)
             owed = {k: r for k, r in skips.items()
                     if r in TRIGGER_REARM_REASONS}
             in_flight = [k for k, r in skips.items() if r == "in-flight"]

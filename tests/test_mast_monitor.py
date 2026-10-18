@@ -1756,6 +1756,53 @@ def test_main_notices_the_deferred_trigger(monkeypatch, tmp_path, capsys):
     assert "TRIGGER DEFERRED" in capsys.readouterr().err
 
 
+def test_main_notices_a_preflight_that_failed_open(monkeypatch, tmp_path,
+                                                   capsys):
+    """Issue #152: a submission whose registry preflight FAILED OPEN went out
+    unchecked.  The run notice says so, so the QA comment of that run differs
+    from a clean run's."""
+    from data_qa import pipeline_trigger
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    monkeypatch.setattr(
+        pipeline_trigger, "submit",
+        lambda **kw: dict(plan=[], results={}, jobids=[],
+                          warnings=["registry preflight TIMED OUT after 60s"]))
+    reported = {}
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: reported.update(kw))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    assert mm.main(["--program", "2221", "--trigger", "--report", "--execute",
+                    "--commit-state", "--state", str(state)]) == 0
+    assert "TRIGGER PREFLIGHT FAILED OPEN" in reported["notice"]
+    assert "2221-o001-NIRCam" in reported["notice"]
+    assert "TIMED OUT" in reported["notice"]
+    assert "TRIGGER PREFLIGHT FAILED OPEN" in capsys.readouterr().err
+
+
+def test_main_clean_trigger_carries_no_preflight_notice(monkeypatch, tmp_path):
+    """A checked submission (empty warning list) adds nothing to the notice."""
+    from data_qa import pipeline_trigger
+    rows = [_row("jw02221-o001_t001_nircam_clear-f405n")]
+    monkeypatch.setattr(mm, "mast_login_if_token", lambda: False)
+    monkeypatch.setattr(mm, "query_program", lambda prog: list(rows))
+    monkeypatch.setattr(mm, "inflight_job_names", lambda: set())
+    monkeypatch.setattr(
+        pipeline_trigger, "submit",
+        lambda **kw: dict(plan=[], results={}, jobids=[], warnings=[]))
+    reported = {}
+    monkeypatch.setattr(mm, "act_report",
+                        lambda evs, **kw: reported.update(kw))
+    state = tmp_path / "state.json"
+    _seed_state(state)
+    assert mm.main(["--program", "2221", "--trigger", "--report", "--execute",
+                    "--commit-state", "--state", str(state)]) == 0
+    assert "PREFLIGHT" not in (reported.get("notice") or "")
+
+
 def test_main_notices_the_inflight_skip(monkeypatch, tmp_path, capsys):
     """An in-flight skip is retired rather than deferred, so the QA issue is
     the only place the operator can see it happened."""
