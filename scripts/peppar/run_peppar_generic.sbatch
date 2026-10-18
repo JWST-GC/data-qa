@@ -17,10 +17,11 @@
 #   PEPPAR_REPO     peppar package checkout (for `from peppar import peppar`)
 #   PEPPAR_ENV      conda env prefix
 #
-# NOTE (2026-07-29): the peppar env currently imports a dev photutils (repos/photutils 3.0.1)
-# that shadows the pinned photutils==1.12.0 peppar needs -> `import peppar` fails
-# (cannot import name 'IntegratedGaussianPRF'). This job will not succeed until that env is
-# repaired -- fix in the env, not here.
+# ENV CHECK (2026-09-04, re-checked 2026-10-17; data-qa#160): with this env's interpreter and
+# PYTHONPATH=${PEPPAR_REPO} as set below, photutils is the pinned 1.12.0 from the env's own
+# site-packages, `from photutils.psf import IntegratedGaussianPRF` and `from peppar import
+# peppar` both import.  The 2026-07-29 note (a dev photutils 3.0.1 shadowing the pin) no longer
+# applies.  This is an import check; it does not certify that a full job completes.
 set -euo pipefail
 
 PEPPAR_REPO="${PEPPAR_REPO:-/blue/adamginsburg/adamginsburg/repos/peppar}"
@@ -29,7 +30,9 @@ PEPPAR_ENV="${PEPPAR_ENV:-/orange/adamginsburg/miniconda3/envs/peppar}"
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PEPPAR_RUNNER="${PEPPAR_RUNNER:-${_HERE}/run_peppar_generic.py}"
 
-source "${PEPPAR_ENV}/bin/activate"
+# The env is a conda env with no bin/activate of its own, so activate it through the base
+# install's activate script (sourcing ${PEPPAR_ENV}/bin/activate exited 1 under set -e; data-qa#372 review).
+source /orange/adamginsburg/miniconda3/bin/activate "${PEPPAR_ENV}"
 export PYTHONPATH="${PEPPAR_REPO}"                 # peppar package only -- no dev-checkout paths
 export PYSYN_CDBS="${PYSYN_CDBS:-/orange/adamginsburg/synphot/grp/hst/cdbs}"   # webbpsf phoenix grid
 
