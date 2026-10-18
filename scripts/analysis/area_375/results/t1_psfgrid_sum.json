@@ -1,0 +1,202 @@
+{
+ "F212N:nrca1": {
+  "grid": "nircam_nrca1_f212n_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 38.577415383407974,
+  "area_spread_nodes_mmag": 39.18626430871722,
+  "computed": {
+   "beta": -0.9781433704583393,
+   "beta_err": 0.0174163712852303,
+   "resid_rms_mmag": 0.8890668981172163,
+   "corr": -0.9977880995797976
+  },
+  "transposed": {
+   "beta": 0.11892143465472868,
+   "beta_err": 0.26006438287932965,
+   "resid_rms_mmag": 13.275706541314484,
+   "corr": 0.12130981599133459
+  }
+ },
+ "F212N:nrca2": {
+  "grid": "nircam_nrca2_f212n_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 24.561927065903056,
+  "area_spread_nodes_mmag": 25.094691825798066,
+  "computed": {
+   "beta": -0.9703664679318668,
+   "beta_err": 0.018514834818656987,
+   "resid_rms_mmag": 0.5878567807505146,
+   "corr": -0.9974613086725008
+  },
+  "transposed": {
+   "beta": 0.1517266785513935,
+   "beta_err": 0.256819737311629,
+   "resid_rms_mmag": 8.154176123519866,
+   "corr": 0.15596323280930968
+  }
+ },
+ "F212N:nrca3": {
+  "grid": "nircam_nrca3_f212n_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 51.54896251394699,
+  "area_spread_nodes_mmag": 52.17985872897885,
+  "computed": {
+   "beta": -0.9882437970641249,
+   "beta_err": 0.01717884392521405,
+   "resid_rms_mmag": 0.9468404554499665,
+   "corr": -0.9978914571604404
+  },
+  "transposed": {
+   "beta": 0.7045007117266987,
+   "beta_err": 0.18601768869668397,
+   "resid_rms_mmag": 10.25267322143878,
+   "corr": 0.711378350042814
+  }
+ },
+ "F212N:nrca4": {
+  "grid": "nircam_nrca4_f212n_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 36.833021905830435,
+  "area_spread_nodes_mmag": 38.021933567703904,
+  "computed": {
+   "beta": -0.9705522821279621,
+   "beta_err": 0.022145948457704945,
+   "resid_rms_mmag": 0.848588566489303,
+   "corr": -0.9963752137937526
+  },
+  "transposed": {
+   "beta": 0.8909494463741556,
+   "beta_err": 0.10523681417663262,
+   "resid_rms_mmag": 4.03246478490651,
+   "corr": 0.9146544307372345
+  }
+ },
+ "F212N:nrcb1": {
+  "grid": "nircam_nrcb1_f212n_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 24.913259880748342,
+  "area_spread_nodes_mmag": 25.696622990365668,
+  "computed": {
+   "beta": -0.96115010115198,
+   "beta_err": 0.017412060251134204,
+   "resid_rms_mmag": 0.5700954839839416,
+   "corr": -0.9977105955533283
+  },
+  "transposed": {
+   "beta": -0.16560993244332564,
+   "beta_err": 0.2536346338747961,
+   "resid_rms_mmag": 8.304356708421276,
+   "corr": -0.17190944903354882
+  }
+ },
+ "F212N:nrcb2": {
+  "grid": "nircam_nrcb2_f212n_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 38.25338410278927,
+  "area_spread_nodes_mmag": 38.23461020913063,
+  "computed": {
+   "beta": -0.9843248967127493,
+   "beta_err": 0.019462603277781428,
+   "resid_rms_mmag": 0.9767824249714802,
+   "corr": -0.9972745097417373
+  },
+  "transposed": {
+   "beta": -0.09984173604008195,
+   "beta_err": 0.26243777915671807,
+   "resid_rms_mmag": 13.171136803752903,
+   "corr": -0.10115523715153311
+  }
+ },
+ "F212N:nrcb3": {
+  "grid": "nircam_nrcb3_f212n_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 36.76279088089733,
+  "area_spread_nodes_mmag": 38.523125359359966,
+  "computed": {
+   "beta": -0.9624898727525592,
+   "beta_err": 0.022803637930524236,
+   "resid_rms_mmag": 0.87985586174816,
+   "corr": -0.9960937193042964
+  },
+  "transposed": {
+   "beta": -0.8788165284209724,
+   "beta_err": 0.10735400290809491,
+   "resid_rms_mmag": 4.142148240933979,
+   "corr": -0.9094990494575145
+  }
+ },
+ "F212N:nrcb4": {
+  "grid": "nircam_nrcb4_f212n_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 50.45321674517239,
+  "area_spread_nodes_mmag": 52.1898179862407,
+  "computed": {
+   "beta": -0.9765215578332355,
+   "beta_err": 0.018369849155512638,
+   "resid_rms_mmag": 1.0168169848042579,
+   "corr": -0.9975320548199446
+  },
+  "transposed": {
+   "beta": -0.6916401729069853,
+   "beta_err": 0.1851548662888511,
+   "resid_rms_mmag": 10.248783823310125,
+   "corr": -0.7065212614525296
+  }
+ },
+ "F480M:nrcalong": {
+  "grid": "nircam_nrca5_f480m_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 70.39108554508782,
+  "area_spread_nodes_mmag": 73.2801793692156,
+  "computed": {
+   "beta": -0.9465367887478188,
+   "beta_err": 0.01388414133710474,
+   "resid_rms_mmag": 1.1489672109369495,
+   "corr": -0.9984972688297604
+  },
+  "transposed": {
+   "beta": 0.438106439260083,
+   "beta_err": 0.22467332025175157,
+   "resid_rms_mmag": 18.592599417849883,
+   "corr": 0.46215645103095027
+  }
+ },
+ "F480M:nrcblong": {
+  "grid": "nircam_nrcb5_f480m_fovp101_samp2_npsf16.fits",
+  "version": "2.2.0",
+  "normaliz": "first",
+  "distort": "True",
+  "sum_spread_mmag": 72.17461863389988,
+  "area_spread_nodes_mmag": 75.12509606917736,
+  "computed": {
+   "beta": -0.9468673590632747,
+   "beta_err": 0.013645893719256797,
+   "resid_rms_mmag": 1.157591011448035,
+   "corr": -0.9985492991344647
+  },
+  "transposed": {
+   "beta": -0.5270081181044886,
+   "beta_err": 0.21068378216230446,
+   "resid_rms_mmag": 17.87245727590515,
+   "corr": -0.5557732896105075
+  }
+ }
+}
