@@ -10,6 +10,10 @@ photometry for all 68 tiles, against VIRAC2 / GNS Ks and the stage 13 zero-point
 (`frames/*.npz`, `test2_maps.npz`, `t1_psfgrid_nodes.npz`) and figures are not committed; the figures are on
 the issue.
 
+The numbers in `results/` came from the original scratch-directory copies of these scripts. The
+repository copies differ only in paths (work directory, log directory, `data_qa` and pipeline
+imports via `data_qa.paths.pipe_root()`, which honours `$PIPE_ROOT`), and the renames `test2.py` -> `t2_repeat_stars.py` and `test3.py` -> `t3_external_ref.py` (so a bare `pytest` run does not collect them); they have not been re-run.
+
 ## Main finding
 STPSF grids sum to AREA^-0.97, so a PSF fit with correctly paired grid planes already includes the area
 term. jwst-gc-pipeline 3393a5f5 (#1154, 2026-10-09) fixed a transposed plane pairing; every non-hybrid
@@ -26,8 +30,8 @@ do not.
 | `t1_flat_vs_area.py` | test 1a: large-scale flat against AREA (CRDS references) |
 | `t1_psfgrid_sum.py` | test 1b: STPSF grid sum against AREA; writes `t1_psfgrid_nodes.npz` |
 | `build_frames.py <obs>` | per-frame star tables (PSF, hybrid PSF, aperture on crf) -> `frames/<filt>_o<obs>.npz` |
-| `test2.py` | test 2: frame-to-frame repeat-star differences against a / pT |
-| `test3.py` | test 3: absolute comparison with VIRAC2 and GNS Ks (Vega) |
+| `t2_repeat_stars.py` | test 2: frame-to-frame repeat-star differences against a / pT |
+| `t3_external_ref.py` | test 3: absolute comparison with VIRAC2 and GNS Ks (Vega) |
 | `test4_network.py` | test 4: stage 13 zero-point network with each area/grid correction variant |
 | `tables.py`, `figs.py` | tables and figures for the report |
 
@@ -41,12 +45,12 @@ cd scripts/analysis/area_375
 export AREA375_WORKDIR=/path/to/workdir
 (cd $AREA375_WORKDIR && $PY $OLDPWD/t1_flat_vs_area.py && $PY $OLDPWD/t1_psfgrid_sum.py)
 sbatch --export=ALL build.sbatch                       # array 1-68 -> frames/
-sbatch --export=ALL test2.sbatch                       # -> test2.json, test2_maps.npz
-AREA375_GNS_DIR=/path/to/gns_tiles sbatch --export=ALL test3.sbatch   # -> test3.json
+sbatch --export=ALL t2_repeat_stars.sbatch                       # -> test2.json, test2_maps.npz
+AREA375_GNS_DIR=/path/to/gns_tiles sbatch --export=ALL t3_external_ref.sbatch   # -> test3.json
 for v in none area1 pT1 areak pTk pTvp pTvk; do sbatch --export=ALL,AREA_VARIANT=$v net.sbatch; done
 (cd $AREA375_WORKDIR && $PY $OLDPWD/tables.py >| tables.md && $PY $OLDPWD/figs.py)
 ```
-`test3.py` reads GNS Ks tiles cut around each pointing (`AREA375_GNS_DIR`, default
+`t3_external_ref.py` reads GNS Ks tiles cut around each pointing (`AREA375_GNS_DIR`, default
 `$AREA375_WORKDIR/gns_tiles`); these were built during the #362 analysis and are not part of this
 directory. VIRAC2 tiles come from `/orange/adamginsburg/jwst/gc-treasury/catalogs/virac2_ks_cache/`.
 Logs go to `/orange/adamginsburg/jwst/logs/<job-name>_<jobid>.log`.

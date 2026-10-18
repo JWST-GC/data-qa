@@ -11,10 +11,12 @@ MJy/sr crf returns true flux with a constant PIXAR_SR (k_PSF = 0 when paired cor
 Writes t1_psfgrid_sum.json and t1_psfgrid_nodes.npz (per-node x, y, s, both assignments) for test 2.
 Usage: python t1_psfgrid_sum.py
 """
-import glob, json, sys
+import glob, json, os, sys
 import numpy as np
 from astropy.io import fits
-sys.path.insert(0, '/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
+from data_qa.paths import pipe_root  # noqa: E402
+sys.path.insert(0, pipe_root())
 from jwst_gc_pipeline.photometry.psf_grid_io import det_yx_positions, grid_plane_positions  # noqa
 
 P = '/orange/adamginsburg/jwst/gc-treasury/psfs/'

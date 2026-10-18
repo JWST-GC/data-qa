@@ -10,6 +10,10 @@ detectors in F480M):
 
 `results/tables.md` and `results/summary.json` hold the numbers quoted on the issue; figures are on the issue.
 
+The numbers in `results/` came from the original scratch-directory copies of these scripts. The
+repository copies differ only in paths (work directory, log directory, `data_qa` and pipeline
+imports via `data_qa.paths.pipe_root()`, which honours `$PIPE_ROOT`); they have not been re-run.
+
 ## Main finding
 CRDS leaves a repeatable residual of 0.57-0.80 mas (F212N) and 0.52-0.53 mas (F480M) binned RMS. STDGDC
 lowers it to 0.27-0.49 mas and the cross-validated data-qa map to 0.22-0.29 mas (F212N) and 0.25 mas

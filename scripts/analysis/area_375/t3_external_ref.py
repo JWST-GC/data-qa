@@ -11,7 +11,7 @@ neighbour > 1".  GNS: J/A+A/631/A20 central (epoch ~2015.5, no PM), Ks 14.5-17, 
 0.5" brighter than Ks + 3.  H - Ks from the same reference.  Matching: tile star list (i2d
 source_catalog positions) after a median bulk offset, 0.12" (GNS) / 0.15" (VIRAC), unique.
 Errors: bootstrap over tiles.
-Usage: python test3.py  -> test3.json
+Usage: python t3_external_ref.py  -> test3.json
 """
 import glob
 import json

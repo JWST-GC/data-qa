@@ -17,7 +17,7 @@ Cross-validation: tiles split into two halves (alternate obs ids); k fitted on o
 8x8 detector residual RMS (mmag) of the other half before / after, against a shuffled null.
 All magnitudes are frame-to-frame differences of one system (AB from PIXAR_SR); constants cancel.
 
-Usage: python test2.py   -> test2.json, test2_maps.npz
+Usage: python t2_repeat_stars.py   -> test2.json, test2_maps.npz
 """
 import json
 import os

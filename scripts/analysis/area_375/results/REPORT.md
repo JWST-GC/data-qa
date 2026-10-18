@@ -229,7 +229,7 @@ same loader. The reproduction (none) matches #368 (F212N tile+G Gx -0.0249 ± 0.
 
 ## Commands (as originally run, in the work directory; python = /blue/adamginsburg/adamginsburg/miniconda3/envs/python313/bin/python)
 
-With the copies in this repository, run them as in ../README.md (AREA375_WORKDIR selects the work directory).
+With the copies in this repository, run them as in ../README.md (AREA375_WORKDIR selects the work directory; test2.py/test3.py are now t2_repeat_stars.py/t3_external_ref.py).
 
 ```
 python t1_flat_vs_area.py                      # -> t1_flat_vs_area.json

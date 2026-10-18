@@ -23,7 +23,10 @@ import sys
 
 import numpy as np
 
-PIPE_REPO = "/blue/adamginsburg/adamginsburg/repos/jwst-gc-pipeline"
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+from data_qa.paths import pipe_root  # noqa: E402
+
+PIPE_REPO = pipe_root()
 if PIPE_REPO not in sys.path:
     sys.path.insert(0, PIPE_REPO)
 
