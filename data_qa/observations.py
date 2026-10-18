@@ -111,9 +111,24 @@ CURATED: Dict[str, dict] = {
 # where it actually points -- NOT by the NIRCam obsnum->field table.
 #   2221 o002: NIRCam images Cloud C, but the MIRI parallel (TARGPROP BRICK-IKP2016-G0.253+0.015,
 #   MAST target_name BRICK-...) images the Brick.  Without this the MIRI o002 issue is mislabeled
-#   "Cloud C" (issue #31); the actual Cloud C MIRI data is only the o003 background field.
+#   "Cloud C" (issue #31).
+#   2221 o001: the reverse.  NIRCam images the Brick, and the MIRI parallel images Cloud C: the
+#   pipeline registry maps it there (jwst-gc-pipeline fields.yaml cloudc: 2221 miri ['001']) and
+#   its 72 jw02221001*_mirimage_cal.fits reduce under cloudc/ (brick/ holds none).  MAST cannot
+#   arbitrate: target_name is BRICK-IKP2016-G0.253+0.015 on every o001/o002 row (issue #153).
 FIELD_OVERRIDE: Dict[tuple, str] = {
+    (2221, "001", "MIRI"): "cloudc",
     (2221, "002", "MIRI"): "brick",
+}
+
+# Issue-title migrations, {new title: old title}.  make_issues matches tracking issues by TITLE,
+# so a relabel (a FIELD_OVERRIDE change renames ``Observation.issue_title``) would otherwise make
+# the sync open a duplicate issue and orphan the old one (#31 ended as "Duplicate of #5").  When
+# only the old title exists, ``make_issues.sync_observation`` renames that issue and updates it
+# in place.  The entry is inert once the rename has happened, and may then be removed.
+#   2221 o001 MIRI: Brick -> Cloud C (issue #153; the existing issue is #30).
+TITLE_MIGRATIONS: Dict[str, str] = {
+    "Cloud C — jw02221-o001 (MIRI)": "Brick — jw02221-o001 (MIRI)",
 }
 
 

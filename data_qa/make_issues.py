@@ -633,6 +633,19 @@ def _carry_index(new_body: str, old_body: str) -> str:
 def sync_observation(o, token, repo, existing, dry_run=False, today=None, sync_login=None):
     import datetime
     title, labels = o.issue_title, labels_for(o)
+    old_title = observations.TITLE_MIGRATIONS.get(title)
+    if title not in existing and old_title and old_title in existing:
+        # a relabelled observation (TITLE_MIGRATIONS): rename the existing issue instead of
+        # opening a duplicate, then fall through to the ordinary in-place update
+        it = existing[old_title]
+        num = it["number"]
+        if dry_run:
+            return f"RETITLE #{num}: {old_title} -> {title} (then UPDATE)"
+        status, data = _req("PATCH", f"{API}/repos/{repo}/issues/{num}", token, {"title": title})
+        if status >= 300:
+            return f"FAILED ({status}) retitle #{num} {old_title} -> {title}: {data.get('message')}"
+        existing[title] = dict(it, title=title)
+        existing.pop(old_title, None)
     if title in existing:
         it = existing[title]
         num = it["number"]
