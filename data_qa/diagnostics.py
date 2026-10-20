@@ -2951,27 +2951,36 @@ def _stage4_offset_figure(o: Observation, sw, jsc, ref_sc, src, im, kind, other_
                            edgecolors="#e41a1c", linewidths=1.8,
                            label=f"{q} (deviating)")
     a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2, label="per-cell field offset")
-    # Whole-field crossmatch offsets (validated histogram-stacking): this catalogue's own and, on
-    # the jicama version, the raw MAST L3 catalogue's.  A hollow marker = low confidence
-    # (contrast/edge failed).  When both land near each other the field is well-registered; a
-    # jicama marker far from the MAST one is a jicama-reduction offset the raw data do not share.
-    for _x, _k in ((own_x, K), (ref_x, _STAGE4_KIND["mast"])):
-        if _x is not None:
-            a1.plot(_x["dra"], _x["dde"], _k["marker"], mfc=(_k["colour"] if _x["ok"] else "none"),
-                    mec=_k["colour"], ms=_k["ms"], mew=_k["mew"],
-                    label=f"{_k['xlabel']} {_x['off']:.0f} mas (C={_x['contrast']:.0f})")
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
     # Frame the DATA.  A limit floored at 1.2*THRESH (=90 mas) drew a field whose cells all sit
     # inside 20 mas as a few dots lost inside a 75 mas gate circle that dominated the panel.  Zoom
     # to the cells; draw the gate ring when it is near them, and otherwise say how far outside
     # the view it falls.
     dmax = float(np.max(np.hypot(cdra, cdde))) if len(cells) else 0.0
-    # include the crossmatch markers so they are in view, but cap each at 400 mas so an edge-alias
-    # (drawn hollow) cannot blow the panel scale.
-    for _x in (own_x, ref_x):
-        if _x is not None:
-            dmax = max(dmax, min(400.0, float(np.hypot(_x["dra"], _x["dde"]))))
+    # include this catalogue's crossmatch marker so it is in view, but cap it at 400 mas so an
+    # edge-alias (drawn hollow) cannot blow the panel scale.  The MAST comparison marker on the
+    # jicama version does NOT set the scale: a MAST L3 catalogue ~200 mas off VIRAC (10678 o066)
+    # would otherwise squash the jicama cells into a dot.
+    if own_x is not None:
+        dmax = max(dmax, min(400.0, float(np.hypot(own_x["dra"], own_x["dde"]))))
     lim = max(5.0, 1.5 * dmax)
+    # Whole-field crossmatch offsets (validated histogram-stacking): this catalogue's own and, on
+    # the jicama version, the raw MAST L3 catalogue's.  A hollow marker = low confidence
+    # (contrast/edge failed).  When both land near each other the field is well-registered; a
+    # jicama marker far from the MAST one is a jicama-reduction offset the raw data do not share.
+    # A marker outside the view is pinned to the panel edge along its true direction.
+    for _x, _k in ((own_x, K), (ref_x, _STAGE4_KIND["mast"])):
+        if _x is None:
+            continue
+        px, py = _x["dra"], _x["dde"]
+        r = float(np.hypot(px, py)); edge = 0.9 * lim
+        off_view = r > edge
+        if off_view:
+            px, py = px * edge / r, py * edge / r
+        a1.plot(px, py, _k["marker"], mfc=(_k["colour"] if _x["ok"] else "none"),
+                mec=_k["colour"], ms=_k["ms"], mew=_k["mew"],
+                label=(f"{_k['xlabel']} {_x['off']:.0f} mas (C={_x['contrast']:.0f})"
+                       + (", off view: drawn at edge" if off_view else "")))
     if aa.THRESH["absolute"] <= 1.05 * lim:
         a1.add_patch(Circle((0, 0), aa.THRESH["absolute"], fill=False, ec="r", ls=":", lw=0.9))
         gate_note = "dotted = 75 mas gate"
@@ -3027,7 +3036,7 @@ def _stage4_jicama_note(jm):
         return (f" The jicama release catalogue ({lab}) gave no measurable cell against VIRAC, so "
                 f"no jicama version of the figure is shown.")
     gate = jm.get("gate_off_mas")
-    gate_s = (f"; the gates test {gate:.0f} mas and would {'pass' if jm.get('passed') else 'fail'} "
+    gate_s = (f"; the gates test {gate:.1f} mas and would {'pass' if jm.get('passed') else 'fail'} "
               f"it" if gate is not None else "")
     return (f" The dropdown below shows the same analysis on the jicama release catalogue ({lab}), "
             f"which carries every jicama astrometric correction: field offset "
