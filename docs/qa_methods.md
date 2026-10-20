@@ -377,8 +377,17 @@ Source: [`data_qa/diagnostics.py` → `stage3_calibration`](../data_qa/diagnosti
 ## Stage 4 — positional offsets (JWST catalog − VIRAC)
 
 Stage 4 measures how far a star in the JWST catalog sits from the same star in VIRAC, and so how
-well the catalog is registered onto the [VIRAC/Gaia frame](#glossary-virac). The catalog it reads
-is the **jicama `mN` catalog**, the same one stages 2 and 3 use. The offset is measured in each cell
+well the catalog is registered onto the [VIRAC/Gaia frame](#glossary-virac). It runs the same
+analysis on two catalogs and shows each as its own figure:
+
+- the **MAST L3 catalog** (the pipeline-independent tie): the figure shown first, and the one the
+  stage verdict is taken from;
+- the **jicama release catalog** (`mN`, the one stages 2 and 3 use), which carries every jicama
+  astrometric correction: the second figure, in the dropdown, with the raw MAST whole-field
+  crossmatch drawn beside the jicama one for comparison.
+
+When no MAST catalog is on disk yet, the jicama figure is shown on its own and the stage carries no
+verdict. The offset is measured in each cell
 of a **4×4 grid (up to 16 cells)** over the footprint by the [xcorr histogram peak](#glossary-xcorr)
 against the local VIRAC reference; the [field offset](#glossary-bulk) is the source-count-weighted
 median over those cells.

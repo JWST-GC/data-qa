@@ -1834,10 +1834,89 @@ def test_stage4_unavailable_when_no_mast_catalogue(monkeypatch):
     monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2022.5)
     monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (object(), None))   # ref present
     monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: None)           # no MAST cat
+    monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (None, None))           # no jicama cat
     monkeypatch.setattr(D, "_save", lambda fig, name: name)
     _png, m = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
     assert m.get("available") is False and m.get("passed") is None and not m.get("red_flag")
     assert m.get("source") == "MAST L3 catalogue"
+
+
+def _stage4_two_catalogues(monkeypatch, mast_cells, jic_cells, jic_src="release:x_m8_dedup.fits",
+                           mast=True, same_star=None):
+    """Stage-4 seams with DIFFERENT MAST and jicama positions, so each catalogue gets its own
+    synthetic cell result and the two figures can be told apart."""
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    ra = 266.40 + np.linspace(0, 0.02, 300); dec = -28.90 + np.linspace(0, 0.02, 300)
+    msc = SkyCoord(ra * u.deg, dec * u.deg)
+    jsc = SkyCoord((ra + 1e-6) * u.deg, dec * u.deg)
+    monkeypatch.setattr(D, "_mosaic_path", lambda o, f: "/dev/null/x_i2d.fits")
+    monkeypatch.setattr(D, "_refcat_path", lambda o: "/dev/null/ref")
+    monkeypatch.setattr(D, "_obs_epoch", lambda o, p: 2024.0)
+    monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (msc, None))
+    monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, f: (msc, None) if mast else None)
+    monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, jic_src))
+    monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
+    monkeypatch.setattr(D, "_cell_offsets",
+                        lambda j, r: (mast_cells, [], 1) if j is msc else (jic_cells, [], 1))
+    monkeypatch.setattr(D.aa, "same_star_tie", lambda j, r: same_star)
+    monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
+    monkeypatch.setattr(D, "_save", lambda fig, name: name)
+
+
+def _one_cell(off):
+    return [dict(i=0, j=0, ra=266.41, dec=-28.89, dra=off, dde=0.0, off=abs(off),
+                 peak_ratio=20.0, n=5000, n_ref=5000, npairs=5000)]
+
+
+def test_stage4_jicama_version_goes_to_dropdown_and_leaves_mast_verdict(monkeypatch):
+    # The MAST figure stays primary and its verdict is the stage verdict; the jicama release
+    # catalogue runs the same analysis into a second figure in the dropdown.  A jicama tie that
+    # FAILS the gates must not touch the MAST pass.
+    _stage4_two_catalogues(monkeypatch, _one_cell(5.0), _one_cell(120.0))
+    png, m = D.stage4_offsets(_obs(), "F210M")
+    assert png.endswith("_stage4.png") and m["source"] == "MAST L3 catalogue"
+    assert m["passed"] is True and abs(m["offset_med_mas"] - 5.0) < 1e-6
+    (label, jpng), = m["extra_figures"]
+    assert jpng.endswith("_stage4_jicama.png") and "jicama" in label
+    jm = m["jicama"]
+    assert jm["source"] == "release:x_m8_dedup.fits" and jm["passed"] is False
+    assert abs(jm["offset_med_mas"] - 120.0) < 1e-6
+    cap = D.caption_for(4, m)
+    assert "dropdown below shows the same analysis" in cap and "120.0 mas" in cap
+    assert "The verdict above is the MAST one" in cap
+
+
+def test_stage4_no_jicama_version_when_positions_fall_back_to_mast(monkeypatch):
+    # `_jwst_positions` falls back to the MAST catalogue when no release catalogue exists; that
+    # would only duplicate the primary figure, so no jicama version is built.
+    _stage4_two_catalogues(monkeypatch, _one_cell(5.0), _one_cell(5.0), jic_src="MAST:x_cat.ecsv")
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    assert "jicama" not in m and not m.get("extra_figures")
+    assert "dropdown below shows the same analysis" not in D.caption_for(4, m)
+
+
+def test_stage4_jicama_shown_ungraded_when_no_mast_catalogue(monkeypatch):
+    # No MAST catalogue yet but a jicama release catalogue exists: show the jicama figure on its
+    # own, with no verdict and no stage-4 offset for the board (both are the MAST tie's).
+    _stage4_two_catalogues(monkeypatch, None, _one_cell(5.0), mast=False)
+    png, m = D.stage4_offsets(_obs(), "F210M")
+    assert png.endswith("_stage4_jicama.png") and m["primary_figure"] == "jicama"
+    assert m.get("available") is not False and m["passed"] is None
+    assert m["offset_med_mas"] is None and m["jicama"]["passed"] is True
+    cap = D.caption_for(4, m)
+    assert "ungraded" in cap and "No MAST L3 catalogue is on disk" in cap
+
+
+def test_stage4_large_histogram_offset_fails_despite_small_same_star_tie(monkeypatch):
+    # PR #258 review: the same-star tie only matches inside 0.05", so it always reads small.  The
+    # REPORTED value may be that refinement, but the gate must test the larger histogram value --
+    # a 90 mas mis-registration with a 5 mas same-star read must FAIL.
+    _stage4_two_catalogues(monkeypatch, _one_cell(90.0), _one_cell(90.0),
+                           same_star=dict(off=5.0, npairs=400, scatter=3.0))
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    assert m["bulk_source"] == "same-star" and abs(m["offset_med_mas"] - 5.0) < 1e-6
+    assert abs(m["gate_off_mas"] - 90.0) < 1e-6 and m["passed"] is False
 
 
 def test_source_label_from_path_tokens():

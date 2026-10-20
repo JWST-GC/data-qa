@@ -2602,7 +2602,13 @@ def stage4_offsets(o: Observation, sw):
     Reported as the field offset (the component-wise source-weighted median over cells) with the
     cell-to-cell spread.  A PASS needs a small field offset AND cells that agree with each other:
     one scalar cannot describe a frame whose two halves are registered differently, which is the
-    failure this stage exists to catch (PR #54)."""
+    failure this stage exists to catch (PR #54).
+
+    Two versions of the same figure are built.  The PRIMARY one (and the verdict) measures the
+    MAST-delivered L3 catalogue, the pipeline-independent tie.  The second measures the jicama
+    release catalogue, which carries every jicama astrometric correction, through the identical
+    analysis; it goes to the dropdown, with its numbers under ``metrics["jicama"]``.  When no MAST
+    catalogue is on disk yet the jicama figure is shown on its own and the stage stays ungraded."""
     import astropy.units as u
     metrics = dict(stage=4, sw=sw, offset_med_mas=None)
     path = _mosaic_path(o, sw)
@@ -2610,14 +2616,18 @@ def stage4_offsets(o: Observation, sw):
     ep = _obs_epoch(o, path)
     ref_sc, _ = (aa.load_reference(_used(ref, "VIRAC2/Gaia reference catalogue"), ep)
                  if (ref and ep) else (None, None))
-    # Stage 4 measures the MAST-delivered L3 catalogue against VIRAC -- the pipeline-independent
-    # tie (the jicama-vs-VIRAC view is stage 7).  A missing MAST catalogue is a not-yet-delivered
-    # state, not a defect, so report it unavailable and leave the stage blank rather than red-flag it.
+    # Stage 4 grades the MAST-delivered L3 catalogue against VIRAC -- the pipeline-independent tie.
+    # A missing MAST catalogue is a not-yet-delivered state, not a defect, so it is never red-flagged.
     mp = _mast_catalog_positions(o, sw)
     jsc = mp[0] if mp else None
     src = "MAST L3 catalogue"
     metrics["source"] = src
-    if jsc is None or ref_sc is None:
+    # The jicama release catalogue, for the second version of the figure.  Only a RELEASE source
+    # qualifies: `_jwst_positions` falls back to the MAST catalogue when no release catalogue
+    # exists, and that would only duplicate the primary figure.
+    jpos, jsrc = (_jwst_positions(o, sw) if ref_sc is not None else (None, None))
+    jic_ok = jpos is not None and str(jsrc).startswith("release")
+    if ref_sc is None or (jsc is None and not jic_ok):
         why = ("no MAST L3 catalogue on disk for this filter" if jsc is None
                else "no VIRAC2/Gaia reference catalogue on disk")
         png = _note_figure(o, "stage4", "MAST↔VIRAC OFFSET UNAVAILABLE",
@@ -2629,30 +2639,81 @@ def stage4_offsets(o: Observation, sw):
     # the xcorr histogram peak, which recovers offsets out to the 1.5" search radius.  A 0.1"
     # nearest-match would run out of real pairs once the two modules sit more than ~100 mas apart,
     # and its median would collapse toward zero exactly when this gate needs to fire.  Omitted when
-    # the per-detector catalogs for both modules are absent.
+    # the per-detector catalogs for both modules are absent.  It is independent of which catalogue
+    # is measured against VIRAC, so both versions of the figure share it.
     a_sc, b_sc, _minfo = _module_positions(o, sw)
     im = None
     if a_sc is not None and b_sc is not None and len(a_sc) >= 50 and len(b_sc) >= 50:
         xc = aa.xcorr(a_sc, b_sc, maxsep=1.5 * u.arcsec)
         if xc and xc.get("peak_ratio", 0) >= aa.MIN_PEAK_RATIO and xc.get("npairs", 0) >= 100:
             im = dict(dra=xc["dra"], ddec=xc["ddec"], off=xc["off"])
+
+    mast_x = None
+    if jsc is not None:
+        png, metrics, mast_x = _stage4_offset_figure(o, sw, jsc, ref_sc, src, im, "mast")
+        if png is None:
+            png = _red_flag_figure(o, "stage4", "JWST↔VIRAC OFFSET UNMEASURABLE",
+                                   f"The positional-offset plot is empty: "
+                                   f"{metrics['red_flag_reason']}.")
+    else:
+        png = None
+        metrics.update(passed=None, n_cells=0, mast_missing=True,
+                       na_reason="no MAST L3 catalogue on disk for this filter")
+        if im:
+            metrics.update(intermodule_off=float(im["off"]), intermodule_filt=sw)
+    if jic_ok:
+        jpng, jm, _jx = _stage4_offset_figure(o, sw, jpos, ref_sc, jsrc, im, "jicama", other_x=mast_x)
+        jm.pop("stage", None)
+        metrics["jicama"] = jm
+        if jpng is not None and png is None:
+            # no MAST catalogue yet: show the jicama version on its own, ungraded
+            png = jpng
+            metrics["primary_figure"] = "jicama"
+        elif jpng is not None:
+            metrics.setdefault("extra_figures", []).append(
+                (f"jicama catalogue − VIRAC (same analysis; {_dataset_label(jm)}, all jicama "
+                 f"corrections)", jpng))
+    if png is None:
+        # MAST absent and the jicama catalogue had no measurable cell: nothing real to show
+        why = "no MAST L3 catalogue on disk for this filter"
+        png = _note_figure(o, "stage4", "MAST↔VIRAC OFFSET UNAVAILABLE",
+                           f"The positional-offset plot is empty: {why}.")
+        metrics.update(available=False, na_reason=why, passed=None, n_cells=0)
+    return png, metrics
+
+
+# Per-catalogue styling of the stage-4 figure: suptitle wording, output name, the whole-field
+# crossmatch marker, and the metrics prefix that marker's numbers are stored under.
+_STAGE4_KIND = {
+    "mast": dict(title="MAST catalogue − VIRAC", suffix="", prefix="mast_xoff",
+                 marker="*", colour="#ee7733", ms=15, mew=1.4, xlabel="raw MAST xmatch"),
+    "jicama": dict(title="jicama catalogue − VIRAC", suffix="_jicama", prefix="jic_xoff",
+                   marker="o", colour="#3366cc", ms=10, mew=1.6, xlabel="jicama xmatch"),
+}
+
+
+def _stage4_offset_figure(o: Observation, sw, jsc, ref_sc, src, im, kind, other_x=None):
+    """Measure one JWST catalogue against VIRAC and draw the stage-4 figure for it.
+
+    ``kind`` is "mast" (the graded primary, written to ``<obsid>_stage4.png``) or "jicama" (the
+    same analysis on the jicama release catalogue, ``<obsid>_stage4_jicama.png``).  ``other_x`` is
+    the MAST whole-field crossmatch, drawn on the jicama version for comparison.  Returns
+    (png, metrics, whole-field crossmatch); png is None when no spatial cell is measurable, with
+    the reason in ``metrics["red_flag_reason"]`` so the caller decides how to show it."""
+    K = _STAGE4_KIND[kind]
+    metrics = dict(stage=4, sw=sw, offset_med_mas=None, source=src)
     if im:
         metrics.update(intermodule_off=float(im["off"]), intermodule_filt=sw)
 
     # Measure the offset PER SPATIAL CELL (robust at density) before building the figure, so an
     # unmeasurable result becomes a red flag rather than an empty panel.
-    if jsc is not None and ref_sc is not None:
-        cells, dropped, grid_used = _cell_offsets(jsc, ref_sc)
-    else:
-        cells, dropped, grid_used = [], [], 0
+    cells, dropped, grid_used = _cell_offsets(jsc, ref_sc)
 
     if not cells:
-        bulk = aa.xcorr(jsc, ref_sc) if (jsc is not None and ref_sc is not None) else None
+        bulk = aa.xcorr(jsc, ref_sc)
         reason = _offset_failure_reason(o, sw, jsc, ref_sc, bulk)
-        png = _red_flag_figure(o, "stage4", "JWST↔VIRAC OFFSET UNMEASURABLE",
-                               f"The positional-offset plot is empty: {reason}.")
         metrics.update(red_flag=True, red_flag_reason=reason, n_cells=0, passed=False)
-        return png, metrics
+        return None, metrics, None
 
     cc = _cell_consistency(cells, dropped)
     cells, dropped = cc["cells"], cc["dropped"]      # spurious cells moved to `dropped`; plot the rest
@@ -2762,14 +2823,16 @@ def stage4_offsets(o: Observation, sw):
                        alignment_date=adate, stale_catalog_name=cname)
 
     # Whole-field crossmatch offset via the pipeline's validated histogram-stacking (sweep +
-    # contrast + edge-alias rejection).  Stage 4 is the MAST-vs-VIRAC tie, so only the MAST marker
-    # is drawn here; the jicama-vs-VIRAC crossmatch is stage 7.
-    jic_x = None
-    mast_x = _crossmatch_offset(jsc, ref_sc, restrict_footprint=True)
-    if mast_x is not None:
-        metrics.update(mast_xoff_mas=mast_x["off"], mast_xoff_dra=mast_x["dra"],
-                       mast_xoff_dde=mast_x["dde"], mast_xoff_contrast=mast_x["contrast"],
-                       mast_xoff_ok=mast_x["ok"], mast_xoff_n=mast_x["n"])
+    # contrast + edge-alias rejection) -- the swept measurement made above for this catalogue.
+    # The MAST version draws only its own marker; the jicama version also draws the MAST one, so
+    # a jicama-reduction offset the raw MAST data do not share stands out.
+    own_x = wf
+    if own_x is not None:
+        p = K["prefix"]
+        metrics.update({f"{p}_mas": own_x["off"], f"{p}_dra": own_x["dra"],
+                        f"{p}_dde": own_x["dde"], f"{p}_contrast": own_x["contrast"],
+                        f"{p}_ok": own_x["ok"], f"{p}_n": own_x["n"]})
+    ref_x = other_x if kind != "mast" else None
 
     from matplotlib.patches import Circle
     cdra = np.array([c["dra"] for c in cells]); cdde = np.array([c["dde"] for c in cells])
@@ -2888,18 +2951,15 @@ def stage4_offsets(o: Observation, sw):
                            edgecolors="#e41a1c", linewidths=1.8,
                            label=f"{q} (deviating)")
     a1.plot(cc["off_dra"], cc["off_dde"], "k+", ms=15, mew=2, label="per-cell field offset")
-    # Whole-field crossmatch offsets (validated histogram-stacking): jicama catalogue and the raw
-    # MAST L3 catalogue.  A hollow marker = low confidence (contrast/edge failed).  When both land
-    # near each other the field is well-registered; a jicama marker far from the MAST one is a
-    # jicama-reduction offset the raw data do not share.
-    if jic_x is not None:
-        a1.plot(jic_x["dra"], jic_x["dde"], "o", mfc=("#3366cc" if jic_x["ok"] else "none"),
-                mec="#3366cc", ms=10, mew=1.6,
-                label=f"jicama xmatch {jic_x['off']:.0f} mas (C={jic_x['contrast']:.0f})")
-    if mast_x is not None:
-        a1.plot(mast_x["dra"], mast_x["dde"], "*", mfc=("#ee7733" if mast_x["ok"] else "none"),
-                mec="#ee7733", ms=15, mew=1.4,
-                label=f"raw MAST xmatch {mast_x['off']:.0f} mas (C={mast_x['contrast']:.0f})")
+    # Whole-field crossmatch offsets (validated histogram-stacking): this catalogue's own and, on
+    # the jicama version, the raw MAST L3 catalogue's.  A hollow marker = low confidence
+    # (contrast/edge failed).  When both land near each other the field is well-registered; a
+    # jicama marker far from the MAST one is a jicama-reduction offset the raw data do not share.
+    for _x, _k in ((own_x, K), (ref_x, _STAGE4_KIND["mast"])):
+        if _x is not None:
+            a1.plot(_x["dra"], _x["dde"], _k["marker"], mfc=(_k["colour"] if _x["ok"] else "none"),
+                    mec=_k["colour"], ms=_k["ms"], mew=_k["mew"],
+                    label=f"{_k['xlabel']} {_x['off']:.0f} mas (C={_x['contrast']:.0f})")
     a1.axhline(0, color="k", lw=0.4); a1.axvline(0, color="k", lw=0.4); a1.set_aspect("equal")
     # Frame the DATA.  A limit floored at 1.2*THRESH (=90 mas) drew a field whose cells all sit
     # inside 20 mas as a few dots lost inside a 75 mas gate circle that dominated the panel.  Zoom
@@ -2908,7 +2968,7 @@ def stage4_offsets(o: Observation, sw):
     dmax = float(np.max(np.hypot(cdra, cdde))) if len(cells) else 0.0
     # include the crossmatch markers so they are in view, but cap each at 400 mas so an edge-alias
     # (drawn hollow) cannot blow the panel scale.
-    for _x in (jic_x, mast_x):
+    for _x in (own_x, ref_x):
         if _x is not None:
             dmax = max(dmax, min(400.0, float(np.hypot(_x["dra"], _x["dde"]))))
     lim = max(5.0, 1.5 * dmax)
@@ -2948,11 +3008,31 @@ def stage4_offsets(o: Observation, sw):
         a2.text(0.5, 0.14, f"({'≤' if ok else '>'} {aa.THRESH['intermodule']:.0f} mas gate)",
                 ha="center", va="center", fontsize=9,
                 color=("#2a7" if ok else "#c33"), transform=a2.transAxes)
-    fig.suptitle(f"{o.target} {o.obsid} — positional offsets (MAST catalogue − VIRAC)",
+    fig.suptitle(f"{o.target} {o.obsid} — positional offsets ({K['title']})",
                  fontsize=11, y=0.99)
-    fig.text(0.5, 0.005, f"Data source: {_dataset_label(metrics)}",
+    fig.text(0.5, 0.005, f"Data source: {_dataset_label(metrics)}"
+             + (f" ({src})" if kind != "mast" else ""),
              ha="center", fontsize=8, color="0.4")
-    return _save(fig, f"{o.obsid}_stage4.png"), metrics
+    return _save(fig, f"{o.obsid}_stage4{K['suffix']}.png"), metrics, own_x
+
+
+def _stage4_jicama_note(jm):
+    """Caption sentence for the jicama version of the stage-4 figure (the dropdown), or "" when no
+    jicama release catalogue was measured.  The verdict stays the MAST one; the jicama numbers are
+    quoted so the two ties can be compared without opening the figure."""
+    if not jm:
+        return ""
+    lab = _dataset_label(jm)
+    if not jm.get("n_cells") or jm.get("offset_med_mas") is None:
+        return (f" The jicama release catalogue ({lab}) gave no measurable cell against VIRAC, so "
+                f"no jicama version of the figure is shown.")
+    gate = jm.get("gate_off_mas")
+    gate_s = (f"; the gates test {gate:.0f} mas and would {'pass' if jm.get('passed') else 'fail'} "
+              f"it" if gate is not None else "")
+    return (f" The dropdown below shows the same analysis on the jicama release catalogue ({lab}), "
+            f"which carries every jicama astrometric correction: field offset "
+            f"{jm['offset_med_mas']:.1f} mas [{jm.get('bulk_source')}] over {jm['n_cells']} cells"
+            f"{gate_s}. The verdict above is the MAST one.")
 
 
 # --------------------------------------------------------------------------- STAGE 5
@@ -8360,12 +8440,22 @@ def _caption_for_impl(n, metrics):
                      f"on the y axis. ")
         return body + "([how this is made](DOCROOT#stage2))"
     if n == 4:
+        jm = metrics.get("jicama")
+        if metrics.get("primary_figure") == "jicama" and jm:
+            # no MAST catalogue yet: the jicama version is the figure shown, and it carries no verdict
+            inner = caption_for(4, {**jm, "sw": metrics.get("sw")})
+            return inner.replace(
+                "**Stage 4 — positional offsets (JWST catalogue − VIRAC).**",
+                "**Stage 4 — positional offsets (jicama catalogue − VIRAC; ungraded).** No MAST L3 "
+                "catalogue is on disk for this filter yet, so this figure measures the jicama release "
+                "catalogue and the stage carries no verdict.", 1)
         # Built in code so it renders cleanly whatever was measured, and gated on the CELL COUNT:
         # a field whose cells all agree has zero spread and must still pass.
         om = metrics.get("offset_med_mas"); nc = metrics.get("n_cells") or 0
         if om is None or nc == 0:
             return ("**Stage 4 — positional offsets.** The JWST−VIRAC offset could not be measured "
-                    "(no usable spatial cells). ([how this is made](DOCROOT#stage4))")
+                    "(no usable spatial cells). ([how this is made](DOCROOT#stage4))"
+                    + _stage4_jicama_note(jm))
         sp = metrics.get("offset_scatter_mas")
         nd = metrics.get("n_cells_dropped") or 0; ncf = metrics.get("n_cells_confirmed") or 0
         badf = metrics.get("bad_src_frac")
@@ -8489,6 +8579,7 @@ def _caption_for_impl(n, metrics):
         if str(metrics.get("source", "")).startswith("release-dao"):
             base += (" (Positions here come from a per-filter DAO catalogue. This observation has "
                      "yet to be photometrically catalogued, which is what stage 3 red-flags.)")
+        base += _stage4_jicama_note(jm)
         return base
     if n == 5:
         return _stage5_caption(metrics) + _roll_note(metrics)
