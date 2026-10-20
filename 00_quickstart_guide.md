@@ -34,6 +34,10 @@ The very basic summary of each stage is:
 - Stage 9: How do PSF and aperture photometry compare?
 - Stage 10: Are source positions consistent across exposures?
 - Stage 11: Did any exposures lose tracking?
+- Stage 12: Is photometry linear over a range of magnitudes?
+- Stage 13: Do measurements agree with overlapping tiles?
+- Stage 14: Were there any issues in cataloging iterations for jicama pipeline?
+- Stage 15: How well is PSF subtraction performing?
 
 ## Brief Workflow
 
