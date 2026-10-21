@@ -384,7 +384,14 @@ analysis on two catalogs and shows each as its own figure:
   stage verdict is taken from;
 - the **jicama release catalog** (`mN`, the one stages 2 and 3 use), which carries every jicama
   astrometric correction: the second figure, in the dropdown, with the raw MAST whole-field
-  crossmatch drawn beside the jicama one for comparison.
+  crossmatch drawn beside the jicama one for comparison. When an observation has no merged
+  release catalog yet, its per-filter DAO catalog (positions only) is used instead, and the
+  figure's data-source label names it.
+
+The jicama figure is built only from a catalog that belongs to this observation: one carrying the
+observation's `_o<obs>` token or sitting in its `<field>_o<obs>` split tree. A field-level catalog
+shared by every observation of a field is skipped, and the caption says so. A read error on the
+jicama catalog skips the jicama figure and leaves the MAST figure and verdict in place.
 
 When no MAST catalog is on disk yet, the jicama figure is shown on its own and the stage carries no
 verdict. The offset is measured in each cell

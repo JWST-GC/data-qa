@@ -1804,6 +1804,7 @@ def _stage4_injection(monkeypatch, shift_mas):
     # stage 4 sources positions from the MAST L3 catalogue; feed the shifted synthetic field there.
     monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: (jsc, None))
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, "release-m8"))
+    monkeypatch.setattr(D, "_catalog_with_vega", lambda o, f: (None, None, None))
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
     monkeypatch.setattr(D, "_crossmatch_offset", lambda j, r, restrict_footprint=False: None)
     _png, metrics = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
@@ -1835,6 +1836,7 @@ def test_stage4_unavailable_when_no_mast_catalogue(monkeypatch):
     monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (object(), None))   # ref present
     monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, sw: None)           # no MAST cat
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (None, None))           # no jicama cat
+    monkeypatch.setattr(D, "_catalog_with_vega", lambda o, f: (None, None, None))
     monkeypatch.setattr(D, "_save", lambda fig, name: name)
     _png, m = D.stage4_offsets(_obs(field="brick", obs="001", filt="F212N"), "F212N")
     assert m.get("available") is False and m.get("passed") is None and not m.get("red_flag")
@@ -1842,9 +1844,11 @@ def test_stage4_unavailable_when_no_mast_catalogue(monkeypatch):
 
 
 def _stage4_two_catalogues(monkeypatch, mast_cells, jic_cells, jic_src="release:x_m8_dedup.fits",
-                           mast=True, same_star=None):
+                           mast=True, same_star=None,
+                           jic_cat="/x/gc2211/catalogs/x_m8_dedup_o023.fits"):
     """Stage-4 seams with DIFFERENT MAST and jicama positions, so each catalogue gets its own
-    synthetic cell result and the two figures can be told apart."""
+    synthetic cell result and the two figures can be told apart.  ``jic_cat`` is the path the
+    release-catalogue resolver returns (obs-scoped to the default ``_obs()`` o023)."""
     import astropy.units as u
     from astropy.coordinates import SkyCoord
     ra = 266.40 + np.linspace(0, 0.02, 300); dec = -28.90 + np.linspace(0, 0.02, 300)
@@ -1856,6 +1860,7 @@ def _stage4_two_catalogues(monkeypatch, mast_cells, jic_cells, jic_src="release:
     monkeypatch.setattr(D.aa, "load_reference", lambda ref, ep: (msc, None))
     monkeypatch.setattr(D, "_mast_catalog_positions", lambda o, f: (msc, None) if mast else None)
     monkeypatch.setattr(D, "_jwst_positions", lambda o, sw: (jsc, jic_src))
+    monkeypatch.setattr(D, "_catalog_with_vega", lambda o, f: (jic_cat, None, None))
     monkeypatch.setattr(D, "_module_positions", lambda o, sw: (None, None, None))
     monkeypatch.setattr(D, "_cell_offsets",
                         lambda j, r: (mast_cells, [], 1) if j is msc else (jic_cells, [], 1))
@@ -1906,6 +1911,74 @@ def test_stage4_jicama_shown_ungraded_when_no_mast_catalogue(monkeypatch):
     assert m["offset_med_mas"] is None and m["jicama"]["passed"] is True
     cap = D.caption_for(4, m)
     assert "ungraded" in cap and "No MAST L3 catalogue is on disk" in cap
+
+
+def test_stage4_no_jicama_version_from_field_level_catalogue(monkeypatch):
+    # Review of #379: cloudef o002 and o005 both resolve to one untokened field-level
+    # `..._resbgsub_m8.fits`.  The jicama figure posts per-observation numbers, so a catalogue
+    # shared by every obs of the field is refused (before it is read) and the MAST verdict stays.
+    shared = "/x/cloudef/catalogs/basic_merged_indivexp_photometry_tables_merged_resbgsub_m8.fits"
+    for obs in ("002", "005"):
+        _stage4_two_catalogues(monkeypatch, _one_cell(5.0), _one_cell(120.0), jic_cat=shared)
+
+        def _never(o, sw):
+            raise AssertionError("the field-level catalogue must not be read")
+        monkeypatch.setattr(D, "_jwst_positions", _never)
+        _png, m = D.stage4_offsets(_obs(field="cloudef", obs=obs, filt="F210M"), "F210M")
+        assert m["passed"] is True and abs(m["offset_med_mas"] - 5.0) < 1e-6
+        assert not m.get("extra_figures")
+        assert m["jicama"]["available"] is False and "field-level" in m["jicama"]["na_reason"]
+        assert "No jicama version of the figure is shown" in D.caption_for(4, m)
+
+
+def test_stage4_jicama_version_from_split_tree_catalogue_without_token(monkeypatch):
+    # A catalogue in this observation's split tree (`<field>_o<obs>/catalogs/`) is this obs's by
+    # location, so it is accepted even without the `_o<obs>` token in its name.
+    _stage4_two_catalogues(monkeypatch, _one_cell(5.0), _one_cell(120.0),
+                           jic_cat="/x/gc2211_o023/catalogs/x_m8_dedup.fits")
+    _png, m = D.stage4_offsets(_obs(), "F210M")
+    (_label, jpng), = m["extra_figures"]
+    assert jpng.endswith("_stage4_jicama.png") and m["jicama"]["passed"] is False
+
+
+def test_stage4_jicama_read_error_keeps_mast_verdict(monkeypatch):
+    # Review of #379: a truncated or half-written release catalogue raises from Table.read.  The
+    # jicama figure is supplementary, so the error skips it and the MAST figure and verdict stand.
+    _stage4_two_catalogues(monkeypatch, _one_cell(5.0), _one_cell(120.0))
+
+    def _broken(o, sw):
+        raise OSError("Empty or corrupt FITS file")
+    monkeypatch.setattr(D, "_jwst_positions", _broken)
+    png, m = D.stage4_offsets(_obs(), "F210M")
+    assert png.endswith("_stage4.png") and m["passed"] is True
+    assert abs(m["offset_med_mas"] - 5.0) < 1e-6 and not m.get("extra_figures")
+    assert m["jicama"]["available"] is False and "OSError" in m["jicama"]["na_reason"]
+
+
+def test_stage4_jicama_figure_pins_off_view_mast_marker_to_edge(monkeypatch):
+    # 10678 o066: the MAST L3 catalogue sits ~200 mas off VIRAC while the jicama cells sit within a
+    # few mas.  The jicama panel keeps its own scale and draws the MAST marker at the panel edge,
+    # saying so in the legend.
+    import matplotlib.pyplot as plt
+    _stage4_two_catalogues(monkeypatch, _one_cell(5.0), _one_cell(3.0))
+    msc = D._mast_catalog_positions(None, None)[0]
+    far = dict(dra=200.0, dde=0.0, off=200.0, contrast=12.0, ok=True, n=900)
+    monkeypatch.setattr(D, "_crossmatch_offset",
+                        lambda j, r, restrict_footprint=False: far if j is msc else None)
+    figs = {}
+
+    def _keep(fig, name):
+        figs[name] = [t.get_text() for ax in fig.axes if ax.get_legend()
+                      for t in ax.get_legend().get_texts()]
+        plt.close(fig)
+        return name
+    monkeypatch.setattr(D, "_save", _keep)
+    D.stage4_offsets(_obs(), "F210M")
+    jic = next(v for k, v in figs.items() if k.endswith("_stage4_jicama.png"))
+    mast = next(v for k, v in figs.items() if k.endswith("_stage4.png"))
+    assert any("raw MAST xmatch 200 mas" in t and "off view: drawn at edge" in t for t in jic)
+    # on the MAST figure the marker sets its own scale, so it is in view
+    assert any("raw MAST xmatch 200 mas" in t and "off view" not in t for t in mast)
 
 
 def test_stage4_large_histogram_offset_fails_despite_small_same_star_tie(monkeypatch):

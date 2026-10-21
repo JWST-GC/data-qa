@@ -756,6 +756,28 @@ def _jwst_positions(o: Observation, filt):
     return None, None
 
 
+def _stage4_jicama_positions(o: Observation, sw):
+    """Positions for the jicama version of the stage-4 figure: (SkyCoord, label, None), or
+    (None, None, reason) when there is none for THIS observation.
+
+    The figure posts per-observation numbers, so the catalogue must be this observation's own.
+    ``_catalog_candidates`` falls back to the untokened field-level catalogue when no catalogue
+    carries this obs's ``_o<obs>`` token, and on a multi-obs field that file is shared by every
+    observation (cloudef o002/o005 both resolve to one ``..._resbgsub_m8.fits``).  Such a
+    catalogue is refused before it is read.  Only a RELEASE source qualifies: ``_jwst_positions``
+    falls back to the MAST catalogue when no release catalogue exists, which would only duplicate
+    the primary figure.  The per-filter DAO fallback (``release-dao(positions):``) is globbed on
+    this obs's token, so it is obs-scoped by construction."""
+    cat = _catalog_with_vega(o, sw)[0]
+    if cat and not _jicama_obs_scoped(os.path.basename(cat).lower(), cat, o):
+        return None, None, (f"the jicama release catalogue ({os.path.basename(cat)}) is the "
+                            f"field-level one, shared by every observation of the field")
+    sc, src = _jwst_positions(o, sw)
+    if sc is None or not str(src).startswith("release"):
+        return None, None, None
+    return sc, src, None
+
+
 def _crossmatch_cmd_arrays(o: Observation, sw, lw):
     """Build CMD (color, mag) by crossmatching the two SINGLE-BAND source catalogs -- MAST
     per-i2d, or per-filter RELEASE catalogs -- when no single MERGED catalog carries both bands.
@@ -2605,10 +2627,12 @@ def stage4_offsets(o: Observation, sw):
     failure this stage exists to catch (PR #54).
 
     Two versions of the same figure are built.  The PRIMARY one (and the verdict) measures the
-    MAST-delivered L3 catalogue, the pipeline-independent tie.  The second measures the jicama
-    release catalogue, which carries every jicama astrometric correction, through the identical
-    analysis; it goes to the dropdown, with its numbers under ``metrics["jicama"]``.  When no MAST
-    catalogue is on disk yet the jicama figure is shown on its own and the stage stays ungraded."""
+    MAST-delivered L3 catalogue, the pipeline-independent tie.  The second measures this
+    observation's jicama release catalogue, which carries every jicama astrometric correction,
+    through the identical analysis; it goes to the dropdown, with its numbers under
+    ``metrics["jicama"]`` (or the reason it was skipped: a field-level catalogue shared by every
+    obs, or a read error).  When no MAST catalogue is on disk yet the jicama figure is shown on its
+    own and the stage stays ungraded."""
     import astropy.units as u
     metrics = dict(stage=4, sw=sw, offset_med_mas=None)
     path = _mosaic_path(o, sw)
@@ -2622,11 +2646,16 @@ def stage4_offsets(o: Observation, sw):
     jsc = mp[0] if mp else None
     src = "MAST L3 catalogue"
     metrics["source"] = src
-    # The jicama release catalogue, for the second version of the figure.  Only a RELEASE source
-    # qualifies: `_jwst_positions` falls back to the MAST catalogue when no release catalogue
-    # exists, and that would only duplicate the primary figure.
-    jpos, jsrc = (_jwst_positions(o, sw) if ref_sc is not None else (None, None))
-    jic_ok = jpos is not None and str(jsrc).startswith("release")
+    # The jicama release catalogue, for the second version of the figure.  It is supplementary:
+    # a read error on it (a truncated or half-written release FITS) skips the jicama figure and
+    # leaves the MAST figure and verdict as they are.
+    jpos, jsrc, jic_why = None, None, None
+    if ref_sc is not None:
+        try:
+            jpos, jsrc, jic_why = _stage4_jicama_positions(o, sw)
+        except (OSError, ValueError, KeyError) as exc:
+            jic_why = f"the jicama release catalogue could not be read ({type(exc).__name__}: {exc})"
+    jic_ok = jpos is not None
     if ref_sc is None or (jsc is None and not jic_ok):
         why = ("no MAST L3 catalogue on disk for this filter" if jsc is None
                else "no VIRAC2/Gaia reference catalogue on disk")
@@ -2661,8 +2690,15 @@ def stage4_offsets(o: Observation, sw):
                        na_reason="no MAST L3 catalogue on disk for this filter")
         if im:
             metrics.update(intermodule_off=float(im["off"]), intermodule_filt=sw)
+    if jic_why:
+        metrics["jicama"] = dict(available=False, na_reason=jic_why)
     if jic_ok:
-        jpng, jm, _jx = _stage4_offset_figure(o, sw, jpos, ref_sc, jsrc, im, "jicama", other_x=mast_x)
+        try:
+            jpng, jm, _ = _stage4_offset_figure(o, sw, jpos, ref_sc, jsrc, im, "jicama",
+                                                other_x=mast_x)
+        except (OSError, ValueError, KeyError) as exc:
+            jpng, jm = None, dict(available=False,
+                                  na_reason=f"the jicama figure failed ({type(exc).__name__}: {exc})")
         jm.pop("stage", None)
         metrics["jicama"] = jm
         if jpng is not None and png is None:
@@ -3031,6 +3067,8 @@ def _stage4_jicama_note(jm):
     quoted so the two ties can be compared without opening the figure."""
     if not jm:
         return ""
+    if jm.get("available") is False:
+        return f" No jicama version of the figure is shown: {jm.get('na_reason')}."
     lab = _dataset_label(jm)
     if not jm.get("n_cells") or jm.get("offset_med_mas") is None:
         return (f" The jicama release catalogue ({lab}) gave no measurable cell against VIRAC, so "
