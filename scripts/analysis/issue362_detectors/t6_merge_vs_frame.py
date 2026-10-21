@@ -34,9 +34,14 @@ def F(c):
 
 
 def merged_cat(obs):
-    fs = sorted(glob.glob(os.path.join(CATDIR, f'basic_merged_indivexp_photometry_tables_merged_resbgsub_*_o{obs}.fits')))
-    fs = [f for f in fs if ('hybpsf_m7' in f or 'm8_dedup' in f)]
-    return fs[0] if fs else None
+    # hybpsf_m7 first.  m8_dedup is only for the #362 s13zp_hyb snapshot directory, whose files are
+    # hybpsf m7 merged catalogues renamed m8_dedup (its manifest.json records each `src`); a live
+    # m8_dedup from the 10-17..20 rebuilds is STPSF-filled (jwst-gc-pipeline #1214) and is the wrong input.
+    for tok in ('hybpsf_m7', 'm8_dedup'):
+        fs = sorted(glob.glob(os.path.join(CATDIR, f'basic_merged_indivexp_photometry_tables_merged_resbgsub_{tok}_o{obs}.fits')))
+        if fs:
+            return fs[0]
+    return None
 
 
 def sc_cols(t, filt):
