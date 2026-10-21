@@ -25,7 +25,7 @@ fig C removes the 27 mmag west-east column step and lowers the per-detector rms 
 | `results/t7.json` | t7 output, tiles o040 044 061 066 072 080 100 112 124 133 |
 | `results/t7_fig_summary.json` | per-detector `PIXAR_SR`, fig C, merge term, prediction, residual |
 | `results/figC_detectors.json` | fig C per-detector offsets (input to `t7_fig.py`), from the 2026-10-19 hybrid m7 snapshot |
-| `results/t6_frames_2026-10-17.json` | t6 on the 2026-10-17 frame tables (pre-10-19 refit); same per-detector pattern |
+| `results/t6_frames_2026-10-17.json` | t6 on the 2026-10-17 frame tables (pre-10-19 refit); same per-detector pattern. Its `sources` read `m8_dedup`: that run used the #362 `s13zp_hyb` snapshot, whose files are the 2026-10-19 hybpsf m7 merged catalogues under an `m8_dedup` name |
 
 ## Usage
     python t7_merge_vs_newframe.py /orange/adamginsburg/jwst/gc-treasury/catalogs <out_dir> 040 044 ...
@@ -34,3 +34,6 @@ fig C removes the 27 mmag west-east column step and lowers the per-detector rms 
 
 `results/figC_detectors.json` is the output of the #362 fig C script (per-detector hybrid m7 minus VIRAC Ks,
 both Vega); that script and its zero-point network inputs are not in this directory.
+
+The scripts read the GC Treasury tree (`/orange/adamginsburg/jwst/gc-treasury`) directly; `t7_fig.py`'s
+"68 tiles" refers to fig C, which used all 68 tiles.
