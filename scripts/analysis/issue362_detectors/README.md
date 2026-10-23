@@ -18,8 +18,12 @@ fig C removes the 27 mmag west-east column step and lowers the per-detector rms 
 
 ## Follow-up (2026-10-23): per-frame photometry against Ks
 `t5_detector_offsets.py` on frame tables rebuilt 2026-10-22 from the current hybpsf m7 per-frame fits
-(68 tiles). Hybrid PSF minus r2 aperture (both on the same crf frame) is within 3.5 mmag on every
-detector, so the PSF normalisation adds no per-detector term. Against VIRAC Ks, the per-frame PSF and the
+(68 tiles). Hybrid PSF minus aperture on the same crf frame is within 3.5 mmag on every detector for
+the r2 (6 px) aperture and within 4.8 mmag for r1 (3.5 px; A3 +4.2, B3 -4.8). The plain STPSF per-frame
+fits go further (A3 +9.5 / B3 -5.9 against r2, +8.4 / -7.7 against r1; bootstrap errors < 1 mmag); those
+catalogues predate jwst-gc-pipeline #1154 (#375). The A3/B3 internal offsets have the sign of the Ks
+pattern below, so the PSF carries a small share of it (up to about 5 mmag for the hybrid PSF). Against
+VIRAC Ks, the per-frame PSF and the
 aperture photometry show the same per-detector pattern (hybrid PSF, centred: A1 -6, A2 -4, A3 +16,
 A4 +23, B1 +10, B2 -1, B3 -23, B4 -15 mmag, bootstrap errors about 2). Aperture photometry on the crf
 frames carries it too, so it enters before the PSF fit and the merge: in the image calibration or in the
