@@ -7649,6 +7649,344 @@ def _s15_stats(d):
                 mad_sigma=float(1.4826 * np.median(np.abs(v - med))), n_pix=int(v.size))
 
 
+# --- extra Stage-15 figures: per-exposure 3-panel views and the merged-image catalogue overlay ---
+_S15_MAX_EXPOSURES = 8            # per-exposure figures posted; the metrics keep the full count
+_S15_GROUP_MAS = 40.0             # peppar detections of one star from different exposures group within this
+_S15_HEAD_IN = 1.05               # inches above the panels for the suptitle and the panel titles
+_S15_FRAME_RE = re.compile(r"^jw\d{5}\d{3}(\d{3})_(\d{5})_(\d{5})_(nrc[ab](?:\d|long))_")
+_S15_FRAME_RES_RE = re.compile(r"-(nrc[ab](?:\d|long))_visit(\d{3})_vgroup(\d{5})_exp(\d{5})_(.+?)"
+                               r"_daophot_basic(_mergedcat)?_residual\.fits$")
+
+
+def _s15_frame_key(path):
+    """(visit, vgroup, exp, detector) of a per-frame product from its ``jw<prog><obs><visit>_<vgroup>_
+    <exp>_<det>_...`` basename, or None."""
+    mo = _S15_FRAME_RE.match(os.path.basename(path))
+    return mo.groups() if mo else None
+
+
+def _s15_asinh_norm(img):
+    """Sky-anchored asinh stretch of the reference image panels (released i2d and single exposures)."""
+    from astropy.visualization import ImageNormalize, AsinhStretch
+    sky = np.nanmedian(img)
+    sig = 1.4826 * np.nanmedian(np.abs(img - sky))
+    lo, hi = sky - 2.0 * sig, np.nanpercentile(img, 99.95)
+    soft = float(np.clip(3.0 * sig / max(hi - lo, 1e-12), 1e-4, 0.1))
+    return ImageNormalize(vmin=lo, vmax=hi, stretch=AsinhStretch(soft))
+
+
+def _s15_jicama_frame_index(o: Observation, filt):
+    """{(det, visit, vgroup, exp): {(tag, mergedcat): path}} of the per-frame jicama residuals of
+    this obs+filter.  One directory listing per directory, not one glob per frame and tag."""
+    idx = {}
+    for d in _field_dirs(o, f"{filt}/pipeline", "*/pipeline", "images-merged"):
+        pat = (f"{d}/{o.obsid}_t*_nircam_clear-{filt.lower()}-nrc*_visit*_vgroup*_exp*"
+               f"_daophot_basic*_residual.fits")
+        for p in sorted(glob.glob(pat)):
+            mo = _S15_FRAME_RES_RE.search(os.path.basename(p))
+            if mo:
+                det, visit, vgroup, exp, tag, merged = mo.groups()
+                idx.setdefault((det, visit, vgroup, exp), {}).setdefault((tag, bool(merged)), p)
+    return idx
+
+
+def _s15_frame_tags(shown, quarantined=()):
+    """jicama tags to try for a per-frame residual: the tag of the displayed mosaic first, then the
+    same hybrid-before-plain, highest-iteration order the mosaic finder uses, skipping quarantined
+    tags.  The pipeline retires the per-frame files of superseded iterations, so the displayed tag
+    is often the only one left."""
+    tags = [t.format(n=n) for _, ts in _S15_JICAMA_GENERATIONS for n in _S15_ITERS for t in ts]
+    skip = set(quarantined) - {shown}       # a quarantined copy can sit beside the shown mosaic's tag
+    return [t for t in dict.fromkeys(([shown] if shown else []) + tags) if t not in skip]
+
+
+def _s15_jicama_frame(index, key, tags):
+    """The per-frame jicama residual product for frame ``key`` = (visit, vgroup, exp, det), or None.
+    Per tag the merged-catalogue fit (the one the mosaic is built from) outranks the frame's
+    own-catalogue fit; ``variant`` says which one it is."""
+    visit, vgroup, exp, det = key
+    have = index.get((det, visit, vgroup, exp)) or {}
+    for tag in tags:
+        for merged in (True, False):
+            p = have.get((tag, merged))
+            if p:
+                return dict(tool="jicama", kind="frame", path=p, wcs_path=p, iteration="", tag=tag,
+                            variant="merged-catalogue fit" if merged else "own-catalogue fit")
+    return None
+
+
+def _s15_open_one(prod):
+    """One ``_S15Map`` or None when the file will not open or carries no celestial WCS."""
+    maps = _s15_open([prod])
+    return maps[0] if maps else None
+
+
+def _s15_exposure_figures(o: Observation, filters, c, opened, metrics):
+    """One figure per exposure that covers the cutout: for each filter row, the exposure's own
+    image (the realigned frame the peppar WCS comes from), its jicama per-frame residual and its
+    peppar residual, on the same 5" cutout as the primary figure.  Returns ``[(label, png)]``;
+    ``metrics`` gains ``n_exposures`` / ``n_exposures_shown`` / ``per_exposure``."""
+    from matplotlib.colors import Normalize
+    from reproject import reproject_interp
+    exposures = {}               # (visit, vgroup, exp) -> {filter: (peppar map, cutout, detector)}
+    for f in filters:
+        for m in opened.get(("peppar", f)) or []:
+            key = _s15_frame_key(m.prod["path"])
+            if key is None or f in exposures.get(key[:3], {}):
+                continue
+            if not m.covers(c, 0.5 * _S15_SIZE_ARCSEC / m.pixscale()):
+                continue
+            cut = m.cutout(c)
+            if cut is not None:
+                exposures.setdefault(key[:3], {})[f] = (m, cut, key[3])
+    metrics.update(n_exposures=len(exposures), n_exposures_shown=0, per_exposure=[])
+    if not exposures:
+        metrics["exposures_na_reason"] = "no peppar single-frame residual covers the cutout"
+        return []
+    jidx, jtags = {}, {}
+    for f in filters:
+        jm = opened.get(("jicama", f)) or []
+        if jm:
+            jidx[f] = _s15_jicama_frame_index(o, f)
+            jtags[f] = _s15_frame_tags(jm[0].prod.get("tag"), jm[0].prod.get("quarantined") or ())
+    keys = sorted(exposures)[:_S15_MAX_EXPOSURES]
+    out = []
+    for i, ek in enumerate(keys, start=1):
+        rows = [f for f in filters if f in exposures[ek]]
+        total_h = 2.85 * len(rows) + _S15_HEAD_IN
+        fig, axes = _fig(len(rows), 3, w=2.7, h=total_h / len(rows))
+        fig.subplots_adjust(left=0.06, right=0.90, bottom=0.04, top=1.0 - _S15_HEAD_IN / total_h,
+                            wspace=0.05, hspace=0.30)
+        rec = {}
+        srcs = []
+        for row, f in enumerate(rows):
+            pm, pcut, det = exposures[ek][f]
+            frame_prod = dict(path=pm.prod["wcs_path"], wcs_path=pm.prod["wcs_path"])
+            img = _s15_open_one(frame_prod)
+            icut = img.cutout(c) if img is not None else None
+            jprod = _s15_jicama_frame(jidx.get(f, {}), ek + (det,), jtags.get(f, []))
+            jmap = _s15_open_one(jprod) if jprod else None
+            jcut = jmap.cutout(c) if jmap is not None else None
+            native = [m for m in (pm, img, jmap) if m is not None]
+            tw, shape = _s15_target_wcs(c, min(m.pixscale() for m in native))
+            for m, role in ((pm, "peppar residual"), (img, "exposure image"), (jmap, "jicama frame residual")):
+                if m is not None:
+                    _used(m.prod["path"], f"{f} {ek[0]}/{ek[1]}/{ek[2]} {role} (displayed)")
+            shown = {}
+            for name, cut in (("jicama", jcut), ("peppar", pcut)):
+                if cut is not None:
+                    shown[name] = reproject_interp(cut, tw, shape_out=shape)[0]
+            pool = (np.concatenate([np.abs(v[np.isfinite(v)]) for v in shown.values()])
+                    if shown else np.array([1.0]))
+            vlim = float(np.nanpercentile(pool, _S15_CLIP_PCT)) if pool.size else 1.0
+            norm = Normalize(-(vlim if vlim > 0 else 1.0), vlim if vlim > 0 else 1.0)
+            ax = axes[row][0]
+            ax.set_xticks([]); ax.set_yticks([]); ax.set_facecolor("0.85")
+            if icut is not None:
+                ri = reproject_interp(icut, tw, shape_out=shape)[0]
+                ax.imshow(ri, origin="lower", cmap="gray", interpolation="nearest",
+                          norm=_s15_asinh_norm(ri))
+            else:
+                ax.text(0.5, 0.5, "no exposure image\ncovers here", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9, color="0.35")
+            ax.set_title(f"{f} exposure image\n{det.upper()} (asinh)", fontsize=8)
+            ax.set_ylabel(f, fontsize=10)
+            im = None
+            units = set()
+            frec = {}
+            for col, (name, m, cut) in enumerate((("jicama", jmap, jcut), ("peppar", pm, pcut)), start=1):
+                ax = axes[row][col]
+                ax.set_xticks([]); ax.set_yticks([]); ax.set_facecolor("0.85")
+                if cut is not None:
+                    im = ax.imshow(shown[name], origin="lower", cmap="RdBu_r", norm=norm,
+                                   interpolation="nearest")
+                    st = _s15_stats(cut[0])
+                    units.add(m.unit or "unitless")
+                    stem = os.path.basename(m.prod["path"]).replace(".fits", "")
+                    stem = stem if len(stem) <= 34 else "…" + stem[-33:]
+                    lab = (f"jicama frame ({m.prod['tag']}, {m.prod['variant']})" if name == "jicama"
+                           else "peppar single frame")
+                    ax.set_title(f"{lab}\n{stem}", fontsize=7)
+                    ax.text(0.03, 0.03, f"median {st['median']:.3g}\nRMS {st['rms']:.3g}\n"
+                            f"MAD-σ {st['mad_sigma']:.3g}", transform=ax.transAxes, fontsize=7,
+                            va="bottom", bbox=dict(fc="white", ec="none", alpha=0.7, pad=1.5))
+                    frec[name] = dict(file=os.path.basename(m.prod["path"]), unit=m.unit,
+                                      rms=st["rms"], mad_sigma=st["mad_sigma"], median=st["median"],
+                                      n_pix=st["n_pix"], **({"tag": m.prod["tag"],
+                                                             "variant": m.prod["variant"]}
+                                                            if name == "jicama" else {}))
+                    srcs.append(f"jicama-{m.prod['tag']}" if name == "jicama" else "peppar")
+                else:
+                    why = ("no per-frame jicama residual on disk" if name == "jicama" and jprod is None
+                           else f"no {name}\nresidual here")
+                    ax.text(0.5, 0.5, why, ha="center", va="center", transform=ax.transAxes,
+                            fontsize=9, color="0.35")
+                    ax.set_title(name, fontsize=8)
+                    frec[name] = None
+            if im is not None:
+                pos = axes[row][-1].get_position()
+                cax = fig.add_axes([pos.x1 + 0.01, pos.y0, 0.012, pos.height])
+                cb = fig.colorbar(im, cax=cax)
+                cb.set_label(f"residual [{units.pop() if len(units) == 1 else 'mixed'}]", fontsize=8)
+                cb.ax.tick_params(labelsize=7)
+            frec["detector"] = det
+            frec["image_file"] = os.path.basename(frame_prod["path"]) if icut is not None else None
+            rec[f] = frec
+            for m in native:
+                if m is not pm:
+                    m.close()
+        fig.suptitle(f"{o.obsid}  exposure {i} of {len(exposures)}: visit {ek[0]}, group {ek[1]}, "
+                     f"exp {ek[2]}\n{_S15_SIZE_ARCSEC:.0f}\"×{_S15_SIZE_ARCSEC:.0f}\" at RA "
+                     f"{c.ra.deg:.5f} Dec {c.dec.deg:+.5f} (north up), the primary figure's cutout\n"
+                     f"one symmetric linear scale per row (±{_S15_CLIP_PCT:.0f}th pct |residual|); "
+                     f"residuals as written (no median removed)", fontsize=8)
+        fig.text(0.5, 0.002, "Data source: exposure image, " + ", ".join(dict.fromkeys(srcs)),
+                 ha="center", fontsize=7.5, color="0.4")
+        png = _save(fig, f"{o.obsid}_stage15_exp{ek[0]}_{ek[1]}_{ek[2]}.png")
+        out.append((f"exposure {i}/{len(exposures)} (visit {ek[0]}, {ek[1]}_{ek[2]})", png))
+        metrics["per_exposure"].append(dict(exposure="_".join(ek), filters=rec))
+    metrics["n_exposures_shown"] = len(out)
+    return out
+
+
+def _s15_peppar_cat(res_path):
+    """The per-frame peppar catalogue that goes with a ``*_res_FINAL.fits`` / ``*_iter1_res.fits``
+    residual (``*_cat_FINAL.fits`` and ``*_iter1_cat.fits`` hold the same rows), or None."""
+    for suffix, cats in (("_res_FINAL.fits", ("_cat_FINAL.fits", "_iter1_cat.fits")),
+                         ("_iter1_res.fits", ("_iter1_cat.fits",))):
+        if res_path.endswith(suffix):
+            for cat in cats:
+                p = res_path[: -len(suffix)] + cat
+                if os.path.isfile(p):
+                    return p
+    return None
+
+
+def _s15_peppar_groups(maps, c, half, tol_mas=_S15_GROUP_MAS):
+    """peppar has no merged catalogue for these tiles, so build one for the overlay: the per-frame
+    catalogues of every exposure are mapped to the sky through the realigned frame WCS and the
+    detections inside the box are grouped single-link within ``tol_mas``.  Returns (ra, dec, n_det,
+    n_exp, n_frames): one entry per group at its mean position, the detections and distinct
+    exposures in it, and the number of frames that contributed."""
+    from astropy.table import Table
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+    margin = 0.3                                    # arcsec beyond the box so edge groups are whole
+    dx, dy, ex = [], [], []
+    nframes = 0
+    cosd = np.cos(np.deg2rad(c.dec.deg))
+    for m in maps:
+        cat = _s15_peppar_cat(m.prod["path"])
+        key = _s15_frame_key(m.prod["path"])
+        if cat is None or key is None:
+            continue
+        px, py = m.wcs.wcs_world2pix([[c.ra.deg, c.dec.deg]], 0)[0]
+        lim = (half + margin) / m.pixscale() + 50.0   # linear-WCS screen; the SIP shifts tens of pixels
+        if not (-lim <= px <= m.nx - 1 + lim and -lim <= py <= m.ny - 1 + lim):
+            continue
+        try:
+            t = Table.read(cat)
+        except (OSError, ValueError):
+            continue
+        if not {"x_fit", "y_fit"} <= set(t.colnames):
+            continue
+        x = np.asarray(t["x_fit"], float)
+        y = np.asarray(t["y_fit"], float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        ra, de = m.wcs.all_pix2world(x[ok], y[ok], 0)          # peppar x/y are 0-based pixels
+        sel = _s14_in_box(ra, de, c, half + margin)
+        if not sel.any():
+            continue
+        nframes += 1
+        dx.append((ra[sel] - c.ra.deg) * cosd * 3600.0)
+        dy.append((de[sel] - c.dec.deg) * 3600.0)
+        ex.append(np.full(int(sel.sum()), "_".join(key[:3])))
+    if not dx:
+        return np.array([]), np.array([]), np.array([], int), np.array([], int), 0
+    dx, dy, ex = np.concatenate(dx), np.concatenate(dy), np.concatenate(ex)
+    pairs = np.array(sorted(cKDTree(np.c_[dx, dy]).query_pairs(tol_mas / 1000.0)), dtype=int).reshape(-1, 2)
+    n = dx.size
+    g = connected_components(coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n)),
+                             directed=False)[1]
+    ng = int(g.max()) + 1
+    cnt = np.bincount(g, minlength=ng)
+    gx = np.bincount(g, weights=dx, minlength=ng) / cnt
+    gy = np.bincount(g, weights=dy, minlength=ng) / cnt
+    nexp = np.array([len(set(ex[g == k])) for k in range(ng)])
+    inbox = (np.abs(gx) < half) & (np.abs(gy) < half)
+    return (c.ra.deg + gx[inbox] / (cosd * 3600.0), c.dec.deg + gy[inbox] / 3600.0,
+            cnt[inbox], nexp[inbox], nframes)
+
+
+def _s15_overlay_figure(o: Observation, filters, c, opened, ref_cut, metrics):
+    """The released i2d cutout per filter with the peppar groups (circles) and jicama catalogue
+    sources (crosses) in the same 5" box, like the catalogue-on-mosaic views of data-qa#313.
+    Returns ``[(label, png)]`` (empty when no filter has an i2d cutout) and sets ``metrics['overlay']``."""
+    from astropy.wcs.utils import proj_plane_pixel_scales
+    from matplotlib.lines import Line2D
+    from reproject import reproject_interp
+    panels = [f for f in filters if f in ref_cut]
+    if not panels:
+        return []
+    half = _S15_SIZE_ARCSEC / 2.0
+    total_h = 4.6 + _S15_HEAD_IN + 0.6
+    fig, axes = _fig(1, len(panels), w=4.6, h=total_h)
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.6 / total_h, top=1.0 - _S15_HEAD_IN / total_h,
+                        wspace=0.06)
+    ov = {}
+    for ax, f in zip(axes[0], panels):
+        rd, rw = ref_cut[f]
+        scale = float(np.mean(proj_plane_pixel_scales(rw)) * 3600.0)
+        tw, shape = _s15_target_wcs(c, scale)
+        ri = reproject_interp((rd, rw), tw, shape_out=shape)[0]
+        ax.imshow(ri, origin="lower", cmap="gray", interpolation="nearest", norm=_s15_asinh_norm(ri))
+        ax.set_xticks([]); ax.set_yticks([])
+        rec = dict(group_tol_mas=_S15_GROUP_MAS)
+        handles = []
+        pm = opened.get(("peppar", f)) or []
+        if pm:
+            ra, de, ndet, nexp, nfr = _s15_peppar_groups(pm, c, half)
+            px, py = tw.world_to_pixel_values(ra, de)
+            ax.scatter(px, py, s=70, facecolors="none", edgecolors="#4cff2e", linewidths=1.0)
+            handles.append(Line2D([], [], marker="o", ls="", mfc="none", mec="#4cff2e", mew=1.0,
+                                  label=f"peppar: {len(ra)} groups from {nfr} frames"))
+            rec.update(n_peppar_groups=int(len(ra)), n_peppar_frames=int(nfr),
+                       n_peppar_groups_ge2_exposures=int((nexp >= 2).sum()))
+        jm = opened.get(("jicama", f)) or []
+        cat = _s14_perfilter_catalog(o, f, jm[0].prod["tag"]) if jm else None
+        if cat:
+            ra, de = _s14_cat_radec(_used(cat, f"{f} jicama catalogue (overlay)"))
+            ok = np.isfinite(ra) & np.isfinite(de)
+            ra, de = ra[ok], de[ok]
+            sel = _s14_in_box(ra, de, c, half)
+            px, py = tw.world_to_pixel_values(ra[sel], de[sel])
+            ax.scatter(px, py, s=45, marker="x", c="#35e0ff", linewidths=1.1)
+            handles.append(Line2D([], [], marker="x", ls="", mec="#35e0ff", mew=1.1,
+                                  label=f"jicama {jm[0].prod['tag']}: {int(sel.sum())} sources"))
+            rec.update(n_jicama=int(sel.sum()), jicama_tag=jm[0].prod["tag"],
+                       jicama_catalog=os.path.basename(cat))
+        ax.set_xlim(-0.5, shape[1] - 0.5); ax.set_ylim(-0.5, shape[0] - 0.5)
+        ax.set_title(f"{f} released i2d (asinh)", fontsize=9)
+        if handles:
+            ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.01), fontsize=7.5,
+                      frameon=False, handletextpad=0.3)
+        ov[f] = rec
+    if not any(len(r) > 1 for r in ov.values()):
+        import matplotlib.pyplot as plt
+        plt.close(fig)
+        return []
+    fig.suptitle(f"{o.obsid}  released i2d with peppar (○) and jicama (×) catalogues\n"
+                 f"{_S15_SIZE_ARCSEC:.0f}\"×{_S15_SIZE_ARCSEC:.0f}\" at RA {c.ra.deg:.5f} "
+                 f"Dec {c.dec.deg:+.5f} (north up), the primary figure's cutout\n"
+                 f"peppar writes no merged catalogue: its per-frame detections are grouped within "
+                 f"{_S15_GROUP_MAS:.0f} mas", fontsize=8)
+    fig.text(0.5, 0.002, "Data source: released i2d, peppar per-frame catalogues, jicama merged catalogue",
+             ha="center", fontsize=7.5, color="0.4")
+    metrics["overlay"] = ov
+    return [("catalogue overlay on the released i2d", _save(fig, f"{o.obsid}_stage15_overlay.png"))]
+
+
 def stage15_residual_comparison(o: Observation, sw, lw):
     """Residual maps of one 5"x5" cutout from every photometry tool that wrote one.
 
@@ -7658,7 +7996,6 @@ def stage15_residual_comparison(o: Observation, sw, lw):
     row loses its column.  Each residual cutout is shown as written, with no median or pedestal
     removed (jicama keeps its background in the residual, peppar subtracts it), resampled onto one
     north-up grid per row; all residual panels in a row share one symmetric linear colour scale."""
-    from astropy.visualization import ImageNormalize, AsinhStretch
     from matplotlib.colors import Normalize
     from reproject import reproject_interp
     metrics = dict(stage=15, sw=sw, lw=lw)
@@ -7764,12 +8101,8 @@ def stage15_residual_comparison(o: Observation, sw, lw):
                 if f in ref_cut:
                     rd, rw = ref_cut[f]
                     ri, _ = reproject_interp((rd, rw), tw, shape_out=shape)
-                    sky = np.nanmedian(ri)
-                    sig = 1.4826 * np.nanmedian(np.abs(ri - sky))
-                    lo, hi = sky - 2.0 * sig, np.nanpercentile(ri, 99.95)
-                    soft = float(np.clip(3.0 * sig / max(hi - lo, 1e-12), 1e-4, 0.1))
                     ax.imshow(ri, origin="lower", cmap="gray", interpolation="nearest",
-                              norm=ImageNormalize(vmin=lo, vmax=hi, stretch=AsinhStretch(soft)))
+                              norm=_s15_asinh_norm(ri))
                 else:
                     ax.text(0.5, 0.5, "no i2d", ha="center", va="center", transform=ax.transAxes,
                             fontsize=9, color="0.35")
@@ -7819,6 +8152,11 @@ def stage15_residual_comparison(o: Observation, sw, lw):
         fig.text(0.5, 0.002, "Data source: " + ", ".join(dict.fromkeys(srcs)),
                  ha="center", fontsize=7.5, color="0.4")
         png = _save(fig, f"{o.obsid}_stage15.png")
+        # extra figures on the same cutout; the primary figure above is unchanged
+        extra = _s15_overlay_figure(o, filters, c, opened, ref_cut, metrics)
+        extra += _s15_exposure_figures(o, filters, c, opened, metrics)
+        if extra:
+            metrics["extra_figures"] = extra
     finally:
         for maps in opened.values():
             for m in maps:
@@ -8313,7 +8651,29 @@ def _caption_stage15(metrics):
             + ("Skipped: " + "; ".join(f"{t} ({r})" for t, r in skipped.items()) + ". "
                if skipped else "")
             + "The centre is a seeded-random spot covered by the most maps. No pass/fail is set. "
-              "([how this is made](DOCROOT#stage15))\n\n" + "\n".join(rows))
+              "([how this is made](DOCROOT#stage15))" + _s15_extra_note(metrics)
+            + "\n\n" + "\n".join(rows))
+
+
+def _s15_extra_note(metrics):
+    """Caption paragraph for the extra figures (catalogue overlay, per-exposure views), or ''."""
+    parts = []
+    if metrics.get("overlay"):
+        parts.append(f"the released i2d with the peppar groups (circles) and jicama catalogue "
+                     f"sources (crosses) in the same box; peppar writes no merged catalogue, so its "
+                     f"circles are the per-frame detections of all exposures grouped within "
+                     f"{_S15_GROUP_MAS:.0f} mas")
+    if metrics.get("n_exposures"):
+        n, k = metrics["n_exposures"], metrics.get("n_exposures_shown", 0)
+        lead = "each of the" if k == n else f"the first {k} of the {n}"
+        parts.append(f"{lead} exposures that cover "
+                     f"the box (rows are the filters that exposure observed), with the exposure's own "
+                     f"image, its jicama per-frame residual (the merged-catalogue fit where the pipeline "
+                     f"kept it, else the frame's own-catalogue fit, named on the panel) and its peppar "
+                     f"residual")
+    if not parts:
+        return ""
+    return "\n\nFurther figures on the same cutout, under the expandable block: " + "; and ".join(parts) + "."
 
 
 def _s15_peppar_wcs_note(per_filter):

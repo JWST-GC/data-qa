@@ -302,3 +302,140 @@ def test_stage15_caption_flags_cal_wcs_fallback():
                                                 wcs_aligned=True)}})
     cap = D.caption_for(15, m)
     assert "F212N: no realigned frame found" in cap and "F480M: no realigned" not in cap
+
+
+# --------------------------------------------------------------------------- extra figures
+def _frame_name(exp, det="nrca1"):
+    return f"jw10678066001_02101_{exp:05d}_{det}"
+
+
+def test_stage15_frame_key_and_jicama_frame_lookup(tmp_path, monkeypatch):
+    """Per-frame jicama residuals are keyed by (det, visit, vgroup, exp): the shown mosaic's tag
+    first, the merged-catalogue fit before the frame's own-catalogue fit, quarantined tags skipped
+    unless they are the shown tag (a quarantined copy can sit beside the live mosaic)."""
+    assert D._s15_frame_key(f"{_frame_name(4)}_cal_gc-treasury_res_FINAL.fits") == (
+        "001", "02101", "00004", "nrca1")
+    assert D._s15_frame_key("jw10678066001_02101_00002_nrcblong_cal_x.fits")[3] == "nrcblong"
+    assert D._s15_frame_key("not_a_frame.fits") is None
+    pipe = tmp_path / "pipe"
+    pipe.mkdir()
+    stem = "jw10678-o066_t001_nircam_clear-f212n-nrca1_visit001_vgroup02101_exp00001_{}_daophot_basic{}_residual.fits"
+    for tag, var in (("resbgsub_m7", ""), ("resbgsub_m7", "_mergedcat"), ("resbgsub_m6", "_mergedcat"),
+                     ("hybpsf_m3", "")):
+        (pipe / stem.format(tag, var)).write_bytes(b"")
+    (pipe / "jw10678-o066_t001_nircam_clear-f212n-merged_resbgsub_m7_daophot_basic_mergedcat_residual_i2d.fits"
+     ).write_bytes(b"")                                      # a mosaic: not a per-frame product
+    monkeypatch.setattr(D, "_field_dirs", lambda o, *rels: [str(pipe)])
+    idx = D._s15_jicama_frame_index(_obs(), "F212N")
+    assert list(idx) == [("nrca1", "001", "02101", "00001")]
+    key = ("001", "02101", "00001", "nrca1")
+    r = D._s15_jicama_frame(idx, key, D._s15_frame_tags("resbgsub_m7"))
+    assert r["tag"] == "resbgsub_m7" and r["variant"] == "merged-catalogue fit"
+    assert r["path"].endswith("resbgsub_m7_daophot_basic_mergedcat_residual.fits")
+    # shown tag has no per-frame file: hybrid outranks plain in the fallback, like the mosaic finder
+    r = D._s15_jicama_frame(idx, key, D._s15_frame_tags("resbgsub_m5"))
+    assert r["tag"] == "hybpsf_m3" and r["variant"] == "own-catalogue fit"
+    # a quarantined tag is skipped in the fallback but kept when it is the shown tag
+    assert "hybpsf_m3" not in D._s15_frame_tags("resbgsub_m7", quarantined=["hybpsf_m3"])
+    assert "resbgsub_m7" in D._s15_frame_tags("resbgsub_m7", quarantined=["resbgsub_m7"])
+    assert D._s15_jicama_frame(idx, ("001", "02101", "00009", "nrca1"), ["resbgsub_m7"]) is None
+
+
+def test_stage15_peppar_groups_pool_exposures(tmp_path):
+    """Detections of one star in different exposures form one group; stars further apart than the
+    tolerance stay separate; only groups inside the box are returned."""
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    rng = np.random.default_rng(5)
+    w = _wcs(30.0)
+    c = SkyCoord(RA0 * u.deg, DEC0 * u.deg)
+    cosd = np.cos(np.radians(DEC0))
+
+    def pix(dra, ddec):                                     # arcsec offsets east/north of c -> 0-based x, y
+        x, y = w.all_world2pix(RA0 + dra / 3600.0 / cosd, DEC0 + ddec / 3600.0, 0)
+        return float(x), float(y)
+    stars = [(0.5, 0.2), (-1.0, 1.0), (1.0, -1.5), (1.05, -1.5), (6.0, 6.0)]   # (1.0, -1.5) pair 50 mas apart
+    maps = []
+    for exp, shift in ((1, 0.0), (2, 0.010)):                # frame 2: stars 10 mas further north
+        base = f"{_frame_name(exp)}_cal_gc-treasury"
+        res = _bare(tmp_path / f"{base}_res_FINAL.fits", 0.0, rng)
+        xy = np.array([pix(a, b + shift) for a, b in stars])
+        Table({"x_fit": xy[:, 0], "y_fit": xy[:, 1], "m": np.full(len(stars), 18.0)}).write(
+            tmp_path / f"{base}_cat_FINAL.fits")
+        cal = _sci(tmp_path / f"{base}.fits", 0.0, rng, rot_deg=30.0, PHOTMJSR=PHOTMJSR)
+        maps.append(D._S15Map(dict(path=res, wcs_path=cal, unit_path=cal, iteration="FINAL", tag="")))
+    ra, de, ndet, nexp, nfr = D._s15_peppar_groups(maps, c, D._S15_SIZE_ARCSEC / 2.0)
+    assert nfr == 2
+    assert len(ra) == 4                                     # (6", 6") lies outside the box
+    # each star is seen once per exposure; the two stars 50 mas apart stay separate groups
+    assert list(ndet) == [2, 2, 2, 2] and list(nexp) == [2, 2, 2, 2]
+    close = [np.hypot((ra[i] - ra[j]) * cosd, de[i] - de[j]) * 3600.0
+             for i in range(len(ra)) for j in range(i)]
+    assert min(close) > 0.04
+    for m in maps:
+        m.close()
+
+
+@pytest.fixture
+def frames_field(field, tmp_path, monkeypatch):
+    """The `field` fixture with peppar as two named exposures per filter (+ per-frame catalogues)
+    and per-frame jicama residuals for every frame but F480M's second exposure."""
+    rng = np.random.default_rng(7)
+    pipe = tmp_path / "pipe"
+    pipe.mkdir()
+    for f in ("F212N", "F480M"):
+        frames = []
+        (tmp_path / "peppar" / f).mkdir(parents=True)
+        for exp in (1, 2):
+            res = _bare(tmp_path / "peppar" / f / f"{_frame_name(exp)}_cal_gc-treasury_res_FINAL.fits", 0.0, rng)
+            cal = _sci(tmp_path / f"{_frame_name(exp)}_cal_{f}.fits", 0.0, rng, rot_deg=30.0, PHOTMJSR=PHOTMJSR)
+            frames.append(dict(tool="peppar", kind="frame", path=res, wcs_path=cal, unit_path=cal,
+                               wcs_aligned=False, iteration="FINAL", tag="single frame, FINAL"))
+            if not (f == "F480M" and exp == 2):
+                _sci(pipe / (f"jw10678-o066_t001_nircam_clear-{f.lower()}-nrca1_visit001_vgroup02101_"
+                             f"exp{exp:05d}_resbgsub_m7_daophot_basic_residual.fits"), 2.0, rng)
+        field["peppar"][f] = frames
+    monkeypatch.setattr(D, "_field_dirs", lambda o, *rels: [str(pipe)])
+    return field
+
+
+def test_stage15_exposure_and_overlay_figures(frames_field):
+    png, m = D.stage15_residual_comparison(_obs(), "F212N", "F480M")
+    assert png.endswith("jw10678-o066_stage15.png")
+    labels = [lab for lab, _ in m["extra_figures"]]
+    names = [os.path.basename(p) for _, p in m["extra_figures"]]
+    assert names == ["jw10678-o066_stage15_overlay.png", "jw10678-o066_stage15_exp001_02101_00001.png",
+                     "jw10678-o066_stage15_exp001_02101_00002.png"]
+    assert all(os.path.exists(p) for _, p in m["extra_figures"])
+    assert labels[0].startswith("catalogue overlay") and labels[1].startswith("exposure 1/2")
+    assert m["n_exposures"] == 2 and m["n_exposures_shown"] == 2
+    e1, e2 = m["per_exposure"]
+    assert e1["exposure"] == "001_02101_00001" and set(e1["filters"]) == {"F212N", "F480M"}
+    j = e1["filters"]["F212N"]["jicama"]
+    assert j["tag"] == "resbgsub_m7" and j["variant"] == "own-catalogue fit" and abs(j["median"] - 2.0) < 0.3
+    assert e1["filters"]["F212N"]["detector"] == "nrca1"
+    assert e2["filters"]["F480M"]["jicama"] is None          # no per-frame jicama file: panel says so
+    p = e1["filters"]["F212N"]["peppar"]
+    assert p["unit"] == "MJy/sr" and 0.7 * PHOTMJSR < p["rms"] < 1.3 * PHOTMJSR
+    assert set(m["overlay"]) == {"F212N", "F480M"} and m["overlay"]["F212N"]["n_jicama"] > 0
+    # the primary figure's metrics are untouched by the extra figures
+    assert m["tools_present"] == ["jicama", "peppar", "starfinder", "jwst1pass"]
+    cap = D.caption_for(15, m)
+    assert "Further figures" in cap and "each of the exposures that cover the box" in cap
+
+
+def test_stage15_exposure_figures_are_capped(frames_field, monkeypatch):
+    monkeypatch.setattr(D, "_S15_MAX_EXPOSURES", 1)
+    _, m = D.stage15_residual_comparison(_obs(), "F212N", "F480M")
+    assert m["n_exposures"] == 2 and m["n_exposures_shown"] == 1 and len(m["per_exposure"]) == 1
+    assert len(m["extra_figures"]) == 2                      # overlay + one exposure
+    assert "the first 1 of the 2 exposures" in D.caption_for(15, m)
+
+
+def test_stage15_extra_figures_without_named_frames(field):
+    """The original fixture's peppar files carry no exposure name: the overlay still comes out
+    (jicama catalogue), the per-exposure figures are skipped with a reason."""
+    _, m = D.stage15_residual_comparison(_obs(), "F212N", "F480M")
+    assert m["n_exposures"] == 0 and "exposures_na_reason" in m
+    assert [os.path.basename(p) for _, p in m["extra_figures"]] == ["jw10678-o066_stage15_overlay.png"]
+    assert "Further figures" in D.caption_for(15, m) and "exposures that cover" not in D.caption_for(15, m)
