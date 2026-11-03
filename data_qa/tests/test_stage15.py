@@ -372,6 +372,13 @@ def test_stage15_peppar_groups_pool_exposures(tmp_path):
     close = [np.hypot((ra[i] - ra[j]) * cosd, de[i] - de[j]) * 3600.0
              for i in range(len(ra)) for j in range(i)]
     assert min(close) > 0.04
+    # absolute positions: each group sits at its star's true sky position (frame 2 is 10 mas north,
+    # so the mean is 5 mas north).  A 1-based pixel origin in the catalogue-to-sky step would move
+    # every group by one pixel (100 mas here) and leave the relative checks above unchanged.
+    gx, gy = (ra - RA0) * cosd * 3600.0, (de - DEC0) * 3600.0
+    want = np.array([(a, b + 0.005) for a, b in stars[:4]])
+    for x, y in zip(gx, gy):
+        assert np.min(np.hypot(want[:, 0] - x, want[:, 1] - y)) < 0.02
     for m in maps:
         m.close()
 
