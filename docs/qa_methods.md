@@ -1051,6 +1051,41 @@ colour scale, ±the 99th percentile of |residual| pooled over the row, with a co
 maps' unit (MJy/sr for jicama, and for peppar after the PHOTMJSR rescaling). Each panel is labelled with the tool, its
 iteration or frame, and the file stem.
 
+**Extra figures (same cutout).** The primary figure above is followed, under the expandable
+"Other figures" block of the comment, by:
+* **Catalogue overlay.** One panel per filter: the released i2d cutout (same asinh stretch as the
+  reference column) with the peppar catalogue as green circles and jicama's merged catalogue as cyan
+  crosses, both restricted to the same 5″ box; the legend gives the counts. The jicama crosses are the
+  per-filter merged catalogue of the displayed mosaic's tag (`catalogs/<filt>_merged_o<obs>_indivexp_merged_<tag>_dao_basic.fits`).
+  peppar writes no merged catalogue for these tiles, so the circles are built here: each exposure's
+  `*_cat_FINAL.fits` (else `*_iter1_cat.fits`; 0-based `x_fit`/`y_fit`) is mapped to the sky through the
+  realigned frame's WCS (the same frame as the primary peppar panel), the detections inside the box
+  (plus a 0.3″ margin, so edge groups are whole) are pooled across exposures, and detections within
+  40 mas are grouped single-link; one circle is drawn at each group's mean position. The metrics
+  record, per filter, `n_peppar_groups`, `n_peppar_frames` (frames that contributed),
+  `n_peppar_groups_ge2_exposures`, `n_jicama`, `jicama_tag` and `jicama_catalog` under `overlay`.
+  Counts differ between the tools for known reasons: on frames with many DO_NOT_USE (NaN) pixels,
+  such as Treasury F480M and Brick F405N/F466N, the peppar source finder drops peaks near those
+  pixels ([#382](https://github.com/JWST-GC/data-qa/issues/382)), so few circles are expected there.
+* **One figure per exposure.** For each exposure (`visit`, `vgroup`, `exp`) with a peppar single-frame
+  residual that covers the cutout, one 3-panel figure with a row per filter that exposure observed:
+  the exposure's own image (the realigned frame the peppar WCS comes from, asinh), its jicama
+  per-frame residual, and its peppar residual (× `PHOTMJSR`, as above). Residual panels of a row share
+  one symmetric linear scale, as in the primary figure. The detector that covers the cutout is named
+  on the image panel. The jicama per-frame residual is
+  `<obsid>_t001_nircam_clear-<filt>-<det>_visit<NNN>_vgroup<NNNNN>_exp<NNNNN>_<tag>_daophot_basic[_mergedcat]_residual.fits`
+  for the displayed mosaic's tag; per tag the merged-catalogue fit (the one the mosaic is built from)
+  is preferred, else the frame's own-catalogue fit, and the panel title says which. The pipeline
+  retires the per-frame files of superseded iterations, so when the displayed tag has none the
+  finder falls back through the other non-quarantined tags in the mosaic finder's order (hybrid PSF
+  first); a frame with no per-frame jicama residual at all shows a blank jicama panel that says so.
+  Own-catalogue and merged-catalogue fits differ (on 10678 o078 hybrid m7 only the own-catalogue
+  fits exist), so a per-frame jicama panel is not the same model as the mosaic panel. At most 8
+  exposures (the first in sorted order) are drawn; the metrics keep the full count
+  (`n_exposures`, `n_exposures_shown`) and, per exposure, the files, statistics and tag/variant
+  (`per_exposure`). When peppar has no named per-frame product covering the cutout, no exposure
+  figures are made and `exposures_na_reason` says so.
+
 **Numbers.** Per tool and filter, on the native-pixel cutout before resampling: the median (not
 removed from the display), the RMS about it, and 1.4826·MAD. Bright-star residuals dominate the RMS; the MAD
 tracks the background noise. Single-frame peppar values are not directly comparable with the
@@ -1070,10 +1105,13 @@ as `na_reason`.
 **Metrics.** `center_ra`, `center_dec`, `tools_present`, `tools_missing` (tool → reason),
 `per_tool` (tool → filter → `file`, `iteration`, `tag`, `generation` (jicama: `hybrid PSF` / `plain PSF`),
 `quarantined_skipped`, `unit`, `rms`, `mad_sigma`, `median`,
-`n_pix`, `native_pixscale_arcsec`), `has_reference`, `inputs`; `passed` is always null.
+`n_pix`, `native_pixscale_arcsec`), `has_reference`, `inputs`, and for the extra figures `overlay`,
+`n_exposures`, `n_exposures_shown`, `per_exposure`, `exposures_na_reason`, `extra_figures`
+(`<obsid>_stage15_overlay.png`, `<obsid>_stage15_exp<visit>_<vgroup>_<exp>.png`); `passed` is always null.
 
 Source: [`data_qa/diagnostics.py` → `stage15_residual_comparison`](../data_qa/diagnostics.py)
-(`_s15_jicama`, `_s15_peppar`, `_s15_starfinder`, `_s15_jwst1pass`, `_s15_pick_center`).
+(`_s15_jicama`, `_s15_peppar`, `_s15_starfinder`, `_s15_jwst1pass`, `_s15_pick_center`,
+`_s15_overlay_figure`, `_s15_peppar_groups`, `_s15_exposure_figures`, `_s15_jicama_frame`).
 
 <a id="stage7"></a>
 ## Stage 7 — MAST vs pipeline (improvement over the delivered products)
